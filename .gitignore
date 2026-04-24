@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment — never commit real secrets
+.env
+.env.local
+.env.*.local
+
+# Drizzle studio
+.drizzle/
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Cloud SQL Auth Proxy binary
+cloud-sql-proxy
+cloud-sql-proxy.darwin.*
+cloud-sql-proxy.linux.*

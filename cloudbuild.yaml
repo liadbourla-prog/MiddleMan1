@@ -1,0 +1,49 @@
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest'
+      - '.'
+
+  # Push both tags to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}'
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE}'
+      - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--add-cloudsql-instances=deepr-490316:${_REGION}:deepr-project'
+      - '--vpc-connector=pa-connector'
+      - '--vpc-egress=private-ranges-only'
+      - '--set-secrets=DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,WHATSAPP_ACCESS_TOKEN=wa-access-token:latest,WHATSAPP_PHONE_NUMBER_ID=wa-phone-number-id:latest,WHATSAPP_WEBHOOK_VERIFY_TOKEN=wa-verify-token:latest,WHATSAPP_APP_SECRET=wa-app-secret:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,GOOGLE_REDIRECT_URI=GOOGLE_REDIRECT_URI:latest,PROVIDER_WA_PHONE_NUMBER_ID=provider-wa-phone-number-id:latest,PROVIDER_WA_ACCESS_TOKEN=provider-wa-access-token:latest'
+      - '--set-env-vars=GOOGLE_CLOUD_PROJECT=deepr-490316,VERTEX_AI_LOCATION=us-central1,NODE_ENV=production,SESSION_EXPIRY_MINUTES=30,HOLD_EXPIRY_MINUTES=15,PROVIDER_WA_NUMBER=${_PROVIDER_WA_NUMBER},PUBLIC_BASE_URL=${_PUBLIC_BASE_URL}'
+      - '--min-instances=1'
+      - '--quiet'
+
+substitutions:
+  _REGION: europe-west3
+  _REPO: pa-images
+  _SERVICE: pa-backend
+  _PROVIDER_WA_NUMBER: ''
+  _PUBLIC_BASE_URL: ''
+
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
