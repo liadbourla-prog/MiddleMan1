@@ -12,7 +12,7 @@ function createConnection() {
     /^postgresql:\/\/([^:]+):([^@]+)@\/([^?]+)\?host=(.+)$/
   )
   if (socketMatch) {
-    const [, user, password, database, host] = socketMatch
+    const [, user, password, database, host] = socketMatch as [string, string, string, string, string]
     return postgres({ user, password, database, host, max: 10 })
   }
   return postgres(connectionString!, { max: 10 })
