@@ -1,4 +1,22 @@
 steps:
+  # Run DB migrations via Cloud SQL Auth Proxy
+  - name: 'node:20-slim'
+    entrypoint: bash
+    secretEnv: ['DB_MIGRATION_URL']
+    args:
+      - '-c'
+      - |
+        apt-get update -qq && apt-get install -y -qq curl
+        curl -sSLo /usr/local/bin/cloud-sql-proxy \
+          https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.1/cloud-sql-proxy.linux.amd64
+        chmod +x /usr/local/bin/cloud-sql-proxy
+        /usr/local/bin/cloud-sql-proxy ${_INSTANCE} --port 5432 &
+        PROXY_PID=$!
+        sleep 4
+        npm ci --ignore-scripts
+        DATABASE_URL="$$DB_MIGRATION_URL" npm run db:migrate
+        kill $PROXY_PID 2>/dev/null || true
+
   # Build the Docker image
   - name: 'gcr.io/cloud-builders/docker'
     args:
@@ -26,7 +44,7 @@ steps:
       - '--image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
       - '--region=${_REGION}'
       - '--platform=managed'
-      - '--add-cloudsql-instances=deepr-490316:${_REGION}:deepr-project'
+      - '--add-cloudsql-instances=${_INSTANCE}'
       - '--vpc-connector=pa-connector'
       - '--vpc-egress=private-ranges-only'
       - '--set-secrets=DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,WHATSAPP_ACCESS_TOKEN=wa-access-token:latest,WHATSAPP_PHONE_NUMBER_ID=wa-phone-number-id:latest,WHATSAPP_WEBHOOK_VERIFY_TOKEN=wa-verify-token:latest,WHATSAPP_APP_SECRET=wa-app-secret:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,GOOGLE_REDIRECT_URI=GOOGLE_REDIRECT_URI:latest,PROVIDER_WA_PHONE_NUMBER_ID=provider-wa-phone-number-id:latest,PROVIDER_WA_ACCESS_TOKEN=provider-wa-access-token:latest'
@@ -35,10 +53,16 @@ steps:
       - '--allow-unauthenticated'
       - '--quiet'
 
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/DB_MIGRATION_URL/versions/latest
+      env: DB_MIGRATION_URL
+
 substitutions:
   _REGION: europe-west3
   _REPO: pa-images
   _SERVICE: pa-backend
+  _INSTANCE: deepr-490316:europe-west3:deepr-project
   _PROVIDER_WA_NUMBER: ''
   _PUBLIC_BASE_URL: ''
 
