@@ -39,8 +39,10 @@ export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
       if (!value.messages) continue
 
       for (const msg of value.messages) {
-        const fromNumber = msg.from
-        const toNumber = value.metadata.display_phone_number
+        const fromNumber = msg.from.startsWith('+') ? msg.from : `+${msg.from}`
+        const toNumber = value.metadata.display_phone_number.startsWith('+')
+          ? value.metadata.display_phone_number
+          : `+${value.metadata.display_phone_number}`
 
         if (msg.type !== 'text' || !msg.text) {
           // Sticker, image, voice note, video, etc. — reply with guidance
