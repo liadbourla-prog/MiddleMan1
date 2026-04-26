@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Background -->
+  <rect width="1024" height="1024" rx="180" fill="#0A0A0A"/>
+
+  <!-- Speech bubble (outer) -->
+  <path d="M 512 200
+    C 340 200, 200 320, 200 468
+    C 200 560, 252 642, 336 694
+    L 300 824
+    L 440 752
+    C 462 756, 486 758, 512 758
+    C 684 758, 824 638, 824 468
+    C 824 320, 684 200, 512 200 Z"
+    fill="#25D366"/>
+
+  <!-- Letter M (for MiddleMan) -->
+  <text
+    x="512"
+    y="560"
+    font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif"
+    font-size="260"
+    font-weight="700"
+    text-anchor="middle"
+    fill="#0A0A0A"
+    letter-spacing="-8">M</text>
+</svg>
