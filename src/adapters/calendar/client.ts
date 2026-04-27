@@ -1,4 +1,5 @@
 import { google } from 'googleapis'
+import { and, eq, gt, lte, lt, gte, or } from 'drizzle-orm'
 import type {
   CalendarSlot,
   AvailabilityResult,
@@ -24,10 +25,89 @@ interface CalendarClientOptions {
   accessToken: string
   refreshToken: string
   calendarId: string
+  businessId?: string
+  calendarMode?: 'google' | 'internal'
+  colorId?: number | null
   managerPhoneNumber?: string | undefined
 }
 
-export function createCalendarClient(options: CalendarClientOptions) {
+// ── Internal DB calendar (no Google) ─────────────────────────────────────────
+
+function createInternalCalendarClient(options: CalendarClientOptions) {
+  const businessId = options.businessId ?? options.calendarId
+
+  async function checkAvailability(slot: CalendarSlot): Promise<AvailabilityResult> {
+    try {
+      const { db } = await import('../../db/client.js')
+      const { bookings } = await import('../../db/schema.js')
+      const conflicts = await db
+        .select({ id: bookings.id })
+        .from(bookings)
+        .where(
+          and(
+            eq(bookings.businessId, businessId),
+            or(
+              and(lte(bookings.slotStart, slot.start), gt(bookings.slotEnd, slot.start)),
+              and(lt(bookings.slotStart, slot.end), gte(bookings.slotEnd, slot.end)),
+              and(gte(bookings.slotStart, slot.start), lte(bookings.slotEnd, slot.end)),
+            ),
+            or(
+              eq(bookings.state, 'held'),
+              eq(bookings.state, 'pending_payment'),
+              eq(bookings.state, 'confirmed'),
+            ),
+          ),
+        )
+        .limit(1)
+
+      return conflicts.length > 0 ? { status: 'occupied' } : { status: 'available' }
+    } catch (err) {
+      return { status: 'error', reason: extractErrorMessage(err) }
+    }
+  }
+
+  async function placeHold(
+    slot: CalendarSlot,
+    bookingId: string,
+    _serviceName: string,
+    _expiresAt: Date,
+  ): Promise<HoldResult> {
+    const availability = await checkAvailability(slot)
+    if (availability.status === 'occupied') return { status: 'conflict' }
+    if (availability.status === 'error') return { status: 'error', reason: availability.reason }
+    // For internal mode the booking row IS the hold — use bookingId as the event id
+    return { status: 'held', eventId: `internal:${bookingId}` }
+  }
+
+  async function confirmHold(
+    eventId: string,
+    _summary: string,
+    _customerName: string,
+  ): Promise<ConfirmResult> {
+    // Nothing to do — DB booking row state is managed by booking engine
+    return { status: 'confirmed', eventId }
+  }
+
+  async function deleteEvent(_eventId: string): Promise<DeleteResult> {
+    // Deletion is handled by the booking engine (state → cancelled/expired)
+    return { status: 'deleted' }
+  }
+
+  async function createConfirmedEvent(
+    _slot: CalendarSlot,
+    _summary: string,
+    _description: string,
+  ): Promise<ConfirmResult> {
+    const eventId = `internal:${Date.now()}`
+    return { status: 'confirmed', eventId }
+  }
+
+  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent }
+}
+
+// ── Google Calendar ───────────────────────────────────────────────────────────
+
+function createGoogleCalendarClient(options: CalendarClientOptions) {
   const auth = buildOAuth2Client()
   auth.setCredentials({
     access_token: options.accessToken || null,
@@ -35,6 +115,8 @@ export function createCalendarClient(options: CalendarClientOptions) {
   })
   const calendar = google.calendar({ version: 'v3', auth })
   const calendarId = options.calendarId
+  // colorId for confirmed events: per-service setting or default green (2)
+  const confirmedColorId = options.colorId != null ? String(options.colorId) : '2'
 
   async function withTokenRefresh<T>(fn: () => Promise<T>): Promise<T> {
     try {
@@ -107,7 +189,6 @@ export function createCalendarClient(options: CalendarClientOptions) {
 
       const eventId = response.data.id
       if (!eventId) return { status: 'error', reason: 'Calendar returned no event id' }
-
       return { status: 'held', eventId }
     } catch (err) {
       return { status: 'error', reason: extractErrorMessage(err) }
@@ -127,7 +208,7 @@ export function createCalendarClient(options: CalendarClientOptions) {
           requestBody: {
             summary,
             description: `Confirmed booking for ${customerName}`,
-            colorId: '2',
+            colorId: confirmedColorId,
             status: 'confirmed',
           },
         }),
@@ -142,6 +223,8 @@ export function createCalendarClient(options: CalendarClientOptions) {
   }
 
   async function deleteEvent(eventId: string): Promise<DeleteResult> {
+    // Internal-mode events don't touch Google Calendar
+    if (eventId.startsWith('internal:')) return { status: 'deleted' }
     try {
       await withTokenRefresh(() => calendar.events.delete({ calendarId, eventId }))
       return { status: 'deleted' }
@@ -165,7 +248,7 @@ export function createCalendarClient(options: CalendarClientOptions) {
             description,
             start: { dateTime: slot.start.toISOString() },
             end: { dateTime: slot.end.toISOString() },
-            colorId: '2',
+            colorId: confirmedColorId,
             status: 'confirmed',
           },
         }),
@@ -182,7 +265,18 @@ export function createCalendarClient(options: CalendarClientOptions) {
   return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent }
 }
 
+// ── Factory ───────────────────────────────────────────────────────────────────
+
+export function createCalendarClient(options: CalendarClientOptions) {
+  if (options.calendarMode === 'internal') {
+    return createInternalCalendarClient(options)
+  }
+  return createGoogleCalendarClient(options)
+}
+
 export type CalendarClient = ReturnType<typeof createCalendarClient>
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function extractErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message

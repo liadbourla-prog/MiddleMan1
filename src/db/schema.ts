@@ -29,8 +29,22 @@ export const businesses = pgTable('businesses', {
   cancellationCutoffMinutes: integer('cancellation_cutoff_minutes').notNull().default(0),
   currency: text('currency').notNull().default('ILS'),
   botPersona: text('bot_persona', { enum: ['female', 'male', 'neutral'] }).notNull().default('neutral'),
+  // Booking policy
+  confirmationGate: text('confirmation_gate', { enum: ['immediate', 'post_payment'] }).notNull().default('immediate'),
+  paymentMethod: text('payment_method'),
+  // Availability policy
+  available247: boolean('available_247').notNull().default(true),
+  // Calendar backend
+  calendarMode: text('calendar_mode', { enum: ['google', 'internal'] }).notNull().default('google'),
+  // PA state
+  paused: boolean('paused').notNull().default(false),
+  // Language: default for the business, used when customer language is unknown
+  defaultLanguage: text('default_language', { enum: ['he', 'en'] }).notNull().default('he'),
+  // Owner-defined escalation rules: [{trigger, value?, customerMessage, customText?}]
+  escalationRules: jsonb('escalation_rules').notNull().default([]),
+  // Onboarding
   onboardingStep: text('onboarding_step', {
-    enum: ['business_name', 'services', 'hours', 'calendar', 'customer_import', 'verify'],
+    enum: ['business_name', 'services', 'hours', 'cancellation_policy', 'payment', 'escalation_policy', 'calendar', 'customer_import', 'verify'],
   }).default('business_name'),
   onboardingCompletedAt: timestamp('onboarding_completed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -50,6 +64,8 @@ export const identities = pgTable(
     grantedAt: timestamp('granted_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
     messagingOptOut: boolean('messaging_opt_out').notNull().default(false),
+    // Customer's preferred language for PA replies; null = use business default
+    preferredLanguage: text('preferred_language', { enum: ['he', 'en'] }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('identities_business_phone_idx').on(t.businessId, t.phoneNumber)],
@@ -67,6 +83,8 @@ export const serviceTypes = pgTable('service_types', {
   maxParticipants: integer('max_participants').notNull().default(1),
   requiresPayment: boolean('requires_payment').notNull().default(false),
   paymentAmount: numeric('payment_amount', { precision: 10, scale: 2 }),
+  // color_id maps to Google Calendar colorId (1-11) or null for default
+  colorId: integer('color_id'),
   isActive: boolean('is_active').notNull().default(true),
   deactivatedAt: timestamp('deactivated_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -93,6 +111,29 @@ export const availability = pgTable(
       sql`(${t.dayOfWeek} IS NOT NULL AND ${t.specificDate} IS NULL) OR (${t.dayOfWeek} IS NULL AND ${t.specificDate} IS NOT NULL)`,
     ),
     check('availability_day_of_week_range', sql`${t.dayOfWeek} BETWEEN 0 AND 6 OR ${t.dayOfWeek} IS NULL`),
+  ],
+)
+
+// Maps which staff members handle which service types
+export const providerAssignments = pgTable(
+  'provider_assignments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    identityId: uuid('identity_id')
+      .notNull()
+      .references(() => identities.id),
+    serviceTypeId: uuid('service_type_id')
+      .notNull()
+      .references(() => serviceTypes.id),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('provider_assignments_identity_service_idx').on(t.identityId, t.serviceTypeId),
+    index('provider_assignments_business_idx').on(t.businessId, t.isActive),
   ],
 )
 
@@ -127,6 +168,8 @@ export const bookings = pgTable(
     cancelledByRole: text('cancelled_by_role', { enum: ['customer', 'manager', 'system'] }),
     slotTzAtCreation: text('slot_tz_at_creation'),
     rescheduledFrom: uuid('rescheduled_from'),
+    // Set when manager bulk-cancels and agrees to help customer rebook
+    rebookingRequested: boolean('rebooking_requested').notNull().default(false),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -153,7 +196,7 @@ export const conversationSessions = pgTable(
       enum: ['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'manager_instruction', 'unknown'],
     }),
     state: text('state', {
-      enum: ['active', 'waiting_confirmation', 'waiting_clarification', 'completed', 'expired', 'failed'],
+      enum: ['active', 'waiting_confirmation', 'waiting_clarification', 'waiting_language_confirmation', 'completed', 'expired', 'failed'],
     }).notNull(),
     context: jsonb('context').notNull().default({}),
     lastMessageAt: timestamp('last_message_at', { withTimezone: true }).notNull(),
@@ -308,21 +351,57 @@ export const importTokens = pgTable('import_tokens', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
+// Tasks escalated to the operator (us) when a customer asks something no PA handles
+export const escalatedTasks = pgTable(
+  'escalated_tasks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    customerPhone: text('customer_phone').notNull(),
+    messageBody: text('message_body').notNull(),
+    receivedAt: timestamp('received_at', { withTimezone: true }).notNull(),
+    // 'platform' = unknown intent after threshold; 'owner_rule' = matched owner-defined trigger
+    escalationType: text('escalation_type', { enum: ['platform', 'owner_rule'] }).notNull(),
+    triggerRule: text('trigger_rule'),
+    forwardedAt: timestamp('forwarded_at', { withTimezone: true }),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('escalated_tasks_business_idx').on(t.businessId, t.resolvedAt),
+  ],
+)
+
+// Log of operator-triggered bulk updates pushed to all agents
+export const agentUpdateLog = pgTable('agent_update_log', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  triggeredAt: timestamp('triggered_at', { withTimezone: true }).notNull().defaultNow(),
+  updateType: text('update_type').notNull(),
+  payload: jsonb('payload').notNull(),
+  appliedToCount: integer('applied_to_count').notNull().default(0),
+})
+
+// ── Type exports ──────────────────────────────────────────────────────────────
+
 export type Business = typeof businesses.$inferSelect
 export type Identity = typeof identities.$inferSelect
 export type ServiceType = typeof serviceTypes.$inferSelect
 export type Availability = typeof availability.$inferSelect
+export type ProviderAssignment = typeof providerAssignments.$inferSelect
 export type Booking = typeof bookings.$inferSelect
 export type ConversationSession = typeof conversationSessions.$inferSelect
 export type ManagerInstruction = typeof managerInstructions.$inferSelect
 export type AuditLogEntry = typeof auditLog.$inferSelect
 export type CustomerProfile = typeof customerProfiles.$inferSelect
 export type ConversationMessage = typeof conversationMessages.$inferSelect
-
 export type Reminder = typeof reminders.$inferSelect
 export type WaitlistEntry = typeof waitlist.$inferSelect
 export type ImportToken = typeof importTokens.$inferSelect
 export type ProviderOnboardingSession = typeof providerOnboardingSessions.$inferSelect
+export type EscalatedTask = typeof escalatedTasks.$inferSelect
+export type AgentUpdateLog = typeof agentUpdateLog.$inferSelect
 
 export type BookingState = Booking['state']
 export type IdentityRole = Identity['role']
@@ -333,3 +412,13 @@ export type InstructionType = ManagerInstruction['classifiedAs']
 export type ApplyStatus = ManagerInstruction['applyStatus']
 export type BotPersona = Business['botPersona']
 export type OnboardingStep = NonNullable<Business['onboardingStep']>
+export type ConfirmationGate = Business['confirmationGate']
+export type CalendarMode = Business['calendarMode']
+
+export type EscalationRule = {
+  trigger: 'keyword' | 'unknown_intent' | 'emotional'
+  value?: string
+  threshold?: number
+  customerMessage: 'silent' | 'passed_to_owner' | 'owner_callback' | 'custom'
+  customText?: string
+}

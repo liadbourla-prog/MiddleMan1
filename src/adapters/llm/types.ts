@@ -10,6 +10,7 @@ export interface CustomerIntentOutput {
     dateAmbiguous?: boolean | undefined
   } | null
   serviceTypeHint: string | null
+  providerHint: string | null
   summary: string | null
   rawEntities: Record<string, string>
   detectedLanguage: 'he' | 'en'

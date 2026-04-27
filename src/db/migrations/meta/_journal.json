@@ -29,6 +29,20 @@
       "when": 1777043436257,
       "tag": "0003_medical_alex_power",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1745669400000,
+      "tag": "0004_v1_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1745758800000,
+      "tag": "0005_language_and_queuing",
+      "breakpoints": true
     }
   ]
 }

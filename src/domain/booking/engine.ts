@@ -1,6 +1,8 @@
 import { eq, and, or, lt, lte, gt, gte, count, isNotNull, ne } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { bookings, serviceTypes, businesses } from '../../db/schema.js'
+import { bookings, serviceTypes, businesses, identities } from '../../db/schema.js'
+import { enqueueMessage } from '../../workers/message-retry.js'
+import { resolveProvider } from '../provider/resolver.js'
 import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import { authorize } from '../authorization/check.js'
@@ -9,11 +11,13 @@ import type { BookingSlotRequest } from './types.js'
 import { logAudit } from '../audit/logger.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
+import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
+import { i18n, type Lang } from '../i18n/t.js'
 
 const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15', 10)
 
 export type BookingEngineResult =
-  | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean }
+  | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean; pendingPayment?: boolean }
   | { ok: false; reason: string }
 
 function validateSlotTiming(
@@ -64,6 +68,8 @@ export async function requestBooking(
       minBookingBufferMinutes: businesses.minBookingBufferMinutes,
       maxBookingDaysAhead: businesses.maxBookingDaysAhead,
       timezone: businesses.timezone,
+      confirmationGate: businesses.confirmationGate,
+      paymentMethod: businesses.paymentMethod,
     })
     .from(businesses)
     .where(eq(businesses.id, actor.businessId))
@@ -72,17 +78,30 @@ export async function requestBooking(
   const bufferMinutes = business?.minBookingBufferMinutes ?? 30
   const maxDaysAhead = business?.maxBookingDaysAhead ?? 365
   const businessTz = business?.timezone ?? 'UTC'
+  const confirmationGate = business?.confirmationGate ?? 'immediate'
+  const paymentMethod = business?.paymentMethod ?? null
 
   const timingError = validateSlotTiming(request.slotStart, request.slotEnd, bufferMinutes, maxDaysAhead)
   if (timingError) return { ok: false, reason: timingError }
 
+  // Resolve provider — may override request.providerId
+  const resolvedProvider = request.providerId
+    ? { identityId: request.providerId, displayName: null, phoneNumber: '' }
+    : await resolveProvider(db, actor.businessId, request.serviceTypeId, request.slotStart, request.slotEnd, request.providerHint)
+
+  const effectiveProviderId = resolvedProvider?.identityId ?? null
+  const effectiveRequest: typeof request = effectiveProviderId
+    ? { ...request, providerId: effectiveProviderId }
+    : { ...request }
+  const providerDisplayName = resolvedProvider?.displayName ?? null
+
   const isGroupClass = (service.maxParticipants ?? 1) > 1
 
   if (isGroupClass) {
-    return requestGroupClassBooking(db, calendar, actor, request, service, businessTz)
+    return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName)
   }
 
-  return requestPrivateBooking(db, calendar, actor, request, service, businessTz)
+  return requestPrivateBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName)
 }
 
 // ── Private (1-on-1) booking — hold/confirm two-step flow ────────────────────
@@ -94,6 +113,9 @@ async function requestPrivateBooking(
   request: BookingSlotRequest,
   service: { id: string; name: string; durationMinutes: number; maxParticipants: number },
   businessTz: string,
+  confirmationGate: string,
+  paymentMethod: string | null,
+  providerDisplayName: string | null = null,
 ): Promise<BookingEngineResult> {
   const holdExpiresAt = new Date(Date.now() + HOLD_EXPIRY_MINUTES * 60 * 1000)
 
@@ -147,10 +169,11 @@ async function requestPrivateBooking(
 
   if (!result.ok) return result
 
+  const eventTitle = providerDisplayName ? `${service.name} — ${providerDisplayName}` : service.name
   const holdResult = await calendar.placeHold(
     { start: request.slotStart, end: request.slotEnd },
     result.bookingId,
-    service.name,
+    eventTitle,
     holdExpiresAt,
   )
 
@@ -164,6 +187,48 @@ async function requestPrivateBooking(
     return { ok: false, reason: 'Could not place hold — please try again' }
   }
 
+  if (confirmationGate === 'post_payment') {
+    // Payment-first flow: set state to pending_payment, notify customer to pay
+    const toPayment = transition('requested', 'pending_payment')
+    if (!toPayment.ok) {
+      await markFailed(db, result.bookingId, actor.id, toPayment.reason)
+      return { ok: false, reason: 'Internal state error' }
+    }
+
+    await db
+      .update(bookings)
+      .set({
+        state: 'pending_payment',
+        holdExpiresAt,
+        calendarEventId: holdResult.eventId,
+        paymentStatus: 'pending',
+        updatedAt: new Date(),
+      })
+      .where(eq(bookings.id, result.bookingId))
+
+    await logAudit(db, {
+      businessId: actor.businessId,
+      actorId: actor.id,
+      action: 'booking.pending_payment',
+      entityType: 'booking',
+      entityId: result.bookingId,
+      beforeState: { state: 'requested' },
+      afterState: { state: 'pending_payment', holdExpiresAt },
+    })
+
+    const paymentNote = paymentMethod
+      ? `Please send payment via ${paymentMethod} to confirm your slot.`
+      : 'Please complete payment to confirm your slot.'
+
+    return {
+      ok: true,
+      bookingId: result.bookingId,
+      message: paymentNote,
+      pendingPayment: true,
+    }
+  }
+
+  // Immediate confirmation flow (default)
   const toHeld = transition('requested', 'held')
   if (!toHeld.ok) {
     await markFailed(db, result.bookingId, actor.id, toHeld.reason)
@@ -212,6 +277,9 @@ async function requestGroupClassBooking(
   request: BookingSlotRequest,
   service: { id: string; name: string; durationMinutes: number; maxParticipants: number },
   businessTz: string,
+  confirmationGate: string,
+  paymentMethod: string | null,
+  providerDisplayName: string | null = null,
 ): Promise<BookingEngineResult> {
   const maxParticipants = service.maxParticipants
 
@@ -301,10 +369,11 @@ async function requestGroupClassBooking(
 
   if (!calendarEventId) {
     // First participant — create the calendar event
+    const groupEventTitle = providerDisplayName ? `${service.name} — ${providerDisplayName}` : service.name
     const holdResult = await calendar.placeHold(
       { start: request.slotStart, end: request.slotEnd },
       txResult.bookingId,
-      service.name,
+      groupEventTitle,
       new Date(Date.now() + 60 * 60 * 1000), // dummy expiry; we confirm immediately
     )
 
@@ -340,6 +409,7 @@ async function requestGroupClassBooking(
   })
 
   await recordCompletedBooking(db, actor.businessId, actor.id, txResult.bookingId, request.serviceTypeId)
+  await scheduleReminders(actor.businessId, actor.id, txResult.bookingId, request.serviceTypeId, request.slotStart).catch(() => { /* non-fatal */ })
 
   const spotsLeft = maxParticipants - txResult.currentCount - 1
 
@@ -413,6 +483,7 @@ export async function confirmBooking(
   })
 
   await recordCompletedBooking(db, actor.businessId, actor.id, bookingId, booking.serviceTypeId)
+  await scheduleReminders(actor.businessId, actor.id, bookingId, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
 
   return { ok: true, bookingId, message: 'Booking confirmed.' }
 }
@@ -518,6 +589,9 @@ export async function cancelBooking(
     afterState: { state: 'cancelled', reason, cancelledByRole },
   })
 
+  // Cancel any pending reminders for this booking
+  cancelReminders(bookingId).catch(() => { /* non-fatal */ })
+
   // Trigger waitlist cascade so the freed slot can be offered to waiting customers
   triggerWaitlistForSlot(
     actor.businessId,
@@ -527,6 +601,109 @@ export async function cancelBooking(
   ).catch(() => { /* non-fatal — waitlist is best-effort */ })
 
   return { ok: true, bookingId, message: 'Booking cancelled.' }
+}
+
+// ── Manager confirms payment received ─────────────────────────────────────────
+
+export async function confirmPaymentReceived(
+  db: Db,
+  calendar: CalendarClient,
+  businessId: string,
+  customerPhone: string,
+): Promise<BookingEngineResult> {
+  // Find the manager identity to use as actor
+  const [manager] = await db
+    .select({ id: identities.id, role: identities.role, businessId: identities.businessId, phoneNumber: identities.phoneNumber })
+    .from(identities)
+    .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager')))
+    .limit(1)
+
+  if (!manager) return { ok: false, reason: 'Manager identity not found' }
+
+  // Find the customer identity
+  const [customer] = await db
+    .select({ id: identities.id, preferredLanguage: identities.preferredLanguage })
+    .from(identities)
+    .where(and(eq(identities.businessId, businessId), eq(identities.phoneNumber, customerPhone)))
+    .limit(1)
+
+  if (!customer) return { ok: false, reason: `No customer found for ${customerPhone}` }
+
+  // Find their pending_payment booking
+  const [booking] = await db
+    .select()
+    .from(bookings)
+    .where(
+      and(
+        eq(bookings.businessId, businessId),
+        eq(bookings.customerId, customer.id),
+        eq(bookings.state, 'pending_payment'),
+      ),
+    )
+    .orderBy(bookings.createdAt)
+    .limit(1)
+
+  if (!booking) return { ok: false, reason: `No pending-payment booking found for ${customerPhone}` }
+
+  const [service] = await db
+    .select({ name: serviceTypes.name })
+    .from(serviceTypes)
+    .where(eq(serviceTypes.id, booking.serviceTypeId))
+    .limit(1)
+
+  const eventId = booking.calendarEventId
+  if (!eventId) return { ok: false, reason: 'Booking has no calendar event' }
+
+  const confirmResult = await calendar.confirmHold(eventId, service?.name ?? 'Appointment', customerPhone)
+  if (confirmResult.status === 'error') {
+    return { ok: false, reason: 'Could not confirm calendar event' }
+  }
+
+  await db
+    .update(bookings)
+    .set({ state: 'confirmed', paymentStatus: 'paid', holdExpiresAt: null, updatedAt: new Date() })
+    .where(eq(bookings.id, booking.id))
+
+  await logAudit(db, {
+    businessId,
+    actorId: manager.id,
+    action: 'booking.confirmed',
+    entityType: 'booking',
+    entityId: booking.id,
+    beforeState: { state: 'pending_payment' },
+    afterState: { state: 'confirmed', paymentStatus: 'paid' },
+    metadata: { triggeredBy: 'manager_paid_command' },
+  })
+
+  await recordCompletedBooking(db, businessId, customer.id, booking.id, booking.serviceTypeId)
+  await scheduleReminders(businessId, customer.id, booking.id, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
+
+  // Send confirmation to the customer
+  const [biz] = await db
+    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage })
+    .from(businesses)
+    .where(eq(businesses.id, businessId))
+    .limit(1)
+
+  if (biz && service) {
+    const lang: Lang = (customer.preferredLanguage as Lang | null | undefined)
+      ?? (biz.defaultLanguage as Lang | null | undefined)
+      ?? 'he'
+    const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+    const tz = biz.timezone
+    const dateStr = new Intl.DateTimeFormat(locale, {
+      timeZone: tz, weekday: 'long', day: 'numeric', month: 'long',
+    }).format(booking.slotStart)
+    const timeStr = new Intl.DateTimeFormat(locale, {
+      timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(booking.slotStart)
+    await enqueueMessage(
+      customerPhone,
+      i18n.payment_confirmed[lang](service.name, biz.name, dateStr, timeStr),
+    ).catch(() => { /* non-fatal */ })
+  }
+
+  return { ok: true, bookingId: booking.id, message: `Booking confirmed for ${customerPhone}.` }
 }
 
 async function markFailed(db: Db, bookingId: string, actorId: string, reason: string) {

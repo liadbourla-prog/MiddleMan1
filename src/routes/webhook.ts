@@ -23,11 +23,23 @@ import { handleProviderOnboarding } from '../domain/flows/provider-onboarding.js
 import { classifyManagerInstruction } from '../adapters/llm/client.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
-import { applyInstruction, buildStatusReport } from '../domain/manager/apply.js'
+import {
+  applyInstruction,
+  buildStatusReport,
+  pausePA,
+  resumePA,
+  buildUpcomingReport,
+  markEscalationHandled,
+  checkServiceDeactivationSafety,
+} from '../domain/manager/apply.js'
+import { confirmPaymentReceived } from '../domain/booking/engine.js'
 import { enqueueMessage } from '../workers/message-retry.js'
 import { loadCustomerMemory } from '../domain/customer/profile.js'
 import { buildHydratedContext } from '../domain/session/hydration.js'
+import { checkBusinessHours, computeNextOpenMs } from '../domain/hours/gate.js'
+import { queueMessageForLater } from '../workers/queued-messages.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
+import { i18n, type Lang } from '../domain/i18n/t.js'
 
 export async function webhookRoutes(app: FastifyInstance) {
   // Webhook verification handshake (GET)
@@ -121,9 +133,10 @@ async function processInboundMessage(msg: InboundMessage, app: FastifyInstance) 
 
   if (!identityResult.found) {
     if (identityResult.reason === 'revoked') {
+      const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
       await sendMessage({
         toNumber: msg.fromNumber,
-        body: 'Your access has been revoked. Please contact the business directly.',
+        body: i18n.revoked_access[lang],
       })
       return
     }
@@ -187,6 +200,39 @@ async function routeCustomerMessage(
   business: Business,
   app: FastifyInstance,
 ) {
+  const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+
+  // Business hours gate — queue messages when closed; managers always pass through
+  if (!business.available247) {
+    const hoursCheck = await checkBusinessHours(db, business)
+    if (!hoursCheck.open) {
+      const delayMs = await computeNextOpenMs(db, business)
+      const opensAt = hoursCheck.opensAt ?? ''
+      if (delayMs !== null && delayMs > 0) {
+        await queueMessageForLater(business.id, msg.fromNumber, msg.toNumber, msg.body, delayMs)
+        await sendMessage({
+          toNumber: msg.fromNumber,
+          body: i18n.closed_queued[lang](business.name, opensAt),
+        })
+      } else {
+        await sendMessage({
+          toNumber: msg.fromNumber,
+          body: i18n.closed_drop[lang](business.name, opensAt),
+        })
+      }
+      return
+    }
+  }
+
+  // Paused gate — PA is silent when owner has manually paused it
+  if (business.paused) {
+    await sendMessage({
+      toNumber: msg.fromNumber,
+      body: i18n.paused_msg[lang](business.name),
+    })
+    return
+  }
+
   // Load or create session — hydrate new sessions with customer memory
   let session = await loadActiveSession(db, identity.id)
   if (!session) {
@@ -210,6 +256,8 @@ async function routeCustomerMessage(
     accessToken: '',
     refreshToken: business.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
     calendarId: business.googleCalendarId,
+    businessId: business.id,
+    calendarMode: business.calendarMode,
     ...(managerIdentity ? { managerPhoneNumber: managerIdentity.phoneNumber } : {}),
   })
 
@@ -229,12 +277,22 @@ async function routeCustomerMessage(
     business.name,
     transcript,
     business.botPersona,
+    business,
+    lang,
   )
 
   // Save outbound reply — failure must not kill the flow
-  await saveMessage(db, session.id, 'assistant', result.reply).catch((err) => {
-    app.log.warn({ err }, 'Failed to save outbound reply to transcript')
-  })
+  if (result.reply) {
+    await saveMessage(db, session.id, 'assistant', result.reply).catch((err) => {
+      app.log.warn({ err }, 'Failed to save outbound reply to transcript')
+    })
+  }
+
+  // Silent escalation: owner configured zero customer reply — skip send entirely
+  if (result.escalated && !result.reply) {
+    if (result.sessionComplete) await completeSession(db, session.id)
+    return
+  }
 
   const sendResult = await sendMessage({ toNumber: msg.fromNumber, body: result.reply })
 
@@ -277,10 +335,63 @@ async function routeManagerMessage(
     return
   }
 
-  // STATUS command — intercept before LLM to ensure it always works
-  if (msg.body.trim().toLowerCase() === 'status') {
-    const report = await buildStatusReport(db, business.id)
+  // Keyword commands — intercepted before LLM to ensure they always work
+  const upper = msg.body.trim().toUpperCase()
+  const raw = msg.body.trim()
+  const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+
+  if (upper === 'STATUS') {
+    const report = await buildStatusReport(db, business.id, lang)
     await sendMessage({ toNumber: msg.fromNumber, body: report }, waCredentials)
+    return
+  }
+
+  if (upper === 'PAUSE') {
+    const reply = await pausePA(db, business.id, lang)
+    await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
+    return
+  }
+
+  if (upper === 'RESUME') {
+    const reply = await resumePA(db, business.id, lang)
+    await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
+    return
+  }
+
+  if (upper === 'UPCOMING') {
+    const report = await buildUpcomingReport(db, business.id, undefined, lang)
+    await sendMessage({ toNumber: msg.fromNumber, body: report }, waCredentials)
+    return
+  }
+
+  if (upper.startsWith('BOOKINGS ')) {
+    const datePart = raw.slice('BOOKINGS '.length).trim()
+    const report = await buildUpcomingReport(db, business.id, datePart, lang)
+    await sendMessage({ toNumber: msg.fromNumber, body: report }, waCredentials)
+    return
+  }
+
+  if (upper.startsWith('PAID ')) {
+    const customerPhone = raw.slice('PAID '.length).trim()
+    const calendar = createCalendarClient({
+      accessToken: '',
+      refreshToken: business.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
+      calendarId: business.googleCalendarId,
+      businessId: business.id,
+      calendarMode: business.calendarMode,
+    })
+    const payResult = await confirmPaymentReceived(db, calendar, business.id, customerPhone)
+    const reply = payResult.ok
+      ? (lang === 'he' ? `✅ תשלום אושר עבור ${customerPhone}. התור נעול.` : `✅ Payment confirmed for ${customerPhone}. Booking locked in.`)
+      : (lang === 'he' ? `❌ לא ניתן לאשר תשלום: ${payResult.reason}` : `❌ Could not confirm payment: ${payResult.reason}`)
+    await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
+    return
+  }
+
+  if (upper.startsWith('HANDLED ')) {
+    const customerPhone = raw.slice('HANDLED '.length).trim()
+    const reply = await markEscalationHandled(db, business.id, customerPhone, lang)
+    await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
     return
   }
 
@@ -291,7 +402,7 @@ async function routeManagerMessage(
 
   if (!classifyResult.ok) {
     app.log.error({ error: classifyResult.error }, 'LLM manager classification failed')
-    await sendMessage({ toNumber: msg.fromNumber, body: "I couldn't process that instruction. Please try again." }, waCredentials)
+    await sendMessage({ toNumber: msg.fromNumber, body: i18n.manager_classify_error[lang] }, waCredentials)
     return
   }
 
@@ -334,7 +445,7 @@ async function routeManagerMessage(
     .limit(1)
 
   if (!savedInstruction) {
-    await sendMessage({ toNumber: msg.fromNumber, body: "I couldn't save that instruction. Please try again." }, waCredentials)
+    await sendMessage({ toNumber: msg.fromNumber, body: i18n.manager_save_error[lang] }, waCredentials)
     return
   }
 
@@ -345,11 +456,12 @@ async function routeManagerMessage(
     identity.id,
     instruction.instructionType,
     instruction.structuredParams as Record<string, unknown>,
+    lang,
   )
 
   const reply = applyResult.ok
     ? applyResult.confirmationMessage
-    : `I understood the instruction but couldn't apply it: ${applyResult.reason}. Please try rephrasing.`
+    : i18n.manager_apply_error[lang](applyResult.reason)
 
   await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
 }

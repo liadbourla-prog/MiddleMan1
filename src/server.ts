@@ -8,6 +8,8 @@ import { startHoldExpiryWorker, scheduleHoldExpiryJob } from './workers/hold-exp
 import { startMessageRetryWorker } from './workers/message-retry.js'
 import { startSessionExpiryWorker } from './workers/session-expiry.js'
 import { startWaitlistWorker } from './workers/waitlist.js'
+import { startReminderWorker } from './workers/reminder.js'
+import { startQueuedMessageWorker } from './workers/queued-messages.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
@@ -63,5 +65,7 @@ startHoldExpiryWorker()
 startMessageRetryWorker()
 startSessionExpiryWorker()
 startWaitlistWorker()
+startReminderWorker()
+startQueuedMessageWorker()
 await scheduleHoldExpiryJob()
 app.log.info('Background workers started')

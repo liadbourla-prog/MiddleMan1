@@ -1,9 +1,11 @@
 /**
- * Step 0 — Provider onboarding flow.
+ * Step 0 — Provider onboarding flow + operator admin routing.
  *
  * Runs exclusively on the central provider number (PROVIDER_WA_NUMBER).
- * A business owner texts this number once to set up their PA.
- * On completion, their WABA number is registered in our system and they
+ * - If sender is OPERATOR_PHONE → routes to operator admin handler.
+ * - Otherwise → new business owner onboarding (4-step conversation).
+ *
+ * On onboarding completion, their WABA number is registered and they
  * are told to text their PA number directly — this number is never needed again.
  */
 
@@ -11,6 +13,8 @@ import { eq } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { providerOnboardingSessions, businesses, identities } from '../../db/schema.js'
 import type { ProviderOnboardingSession } from '../../db/schema.js'
+import { handleOperatorMessage } from './operator.js'
+import { i18n, detectLang, type Lang } from '../i18n/t.js'
 
 export interface ProviderOnboardingResult {
   reply: string
@@ -25,6 +29,7 @@ type CollectedData = {
   phoneNumberId?: string
   accessToken?: string
   paPhoneNumber?: string
+  language?: Lang
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -34,15 +39,24 @@ export async function handleProviderOnboarding(
   fromNumber: string,
   body: string,
 ): Promise<ProviderOnboardingResult> {
+  // Operator admin channel — bypass onboarding entirely
+  const operatorPhone = process.env['OPERATOR_PHONE']
+  if (operatorPhone && fromNumber === operatorPhone) {
+    return handleOperatorMessage(db, body)
+  }
+
   let session = await loadSession(db, fromNumber)
 
   if (!session) {
     session = await createSession(db, fromNumber)
-    return { reply: PROMPTS.business_name }
+    // Welcome is bilingual — language not yet known
+    return { reply: `${i18n.mm_welcome.he}\n\n${i18n.mm_welcome.en}` }
   }
 
   if (session.completedAt) {
-    return { reply: 'Your PA is already set up! If you need help, contact support.' }
+    const data = session.collectedData as CollectedData
+    const lang: Lang = data.language ?? 'he'
+    return { reply: i18n.mm_already_done[lang] }
   }
 
   return handleStep(db, session, body.trim())
@@ -56,43 +70,43 @@ async function handleStep(
   text: string,
 ): Promise<ProviderOnboardingResult> {
   const data = session.collectedData as CollectedData
+  const lang: Lang = data.language ?? 'he'
 
   switch (session.step) {
     case 'business_name': {
       const name = text.slice(0, 100)
-      await advance(db, session.managerPhone, 'timezone', { ...data, businessName: name })
-      return { reply: `Great, "${name}"!\n\n${PROMPTS.timezone}` }
+      const detectedLang = detectLang(text)
+      await advance(db, session.managerPhone, 'timezone', { ...data, businessName: name, language: detectedLang })
+      const confirm = detectedLang === 'he' ? `מעולה, "${name}"!` : `Great, "${name}"!`
+      return { reply: `${confirm}\n\n${i18n.mm_ask_timezone[detectedLang]}` }
     }
 
     case 'timezone': {
       const tz = resolveTimezone(text)
       if (!tz) {
-        return { reply: `I didn't recognise that timezone. Please use an IANA name, for example:\n"Asia/Jerusalem", "America/New_York", "Europe/London"` }
+        return { reply: i18n.mm_bad_timezone[lang] }
       }
       await advance(db, session.managerPhone, 'calendar', { ...data, timezone: tz })
-      return { reply: PROMPTS.calendar }
+      return { reply: i18n.mm_ask_calendar[lang] }
     }
 
     case 'calendar': {
       const calendarId = text.toLowerCase() === 'skip' ? null : text.trim()
-      await advance(db, session.managerPhone, 'credentials', {
-        ...data,
-        calendarId,
-      })
-      return { reply: PROMPTS.credentials }
+      await advance(db, session.managerPhone, 'credentials', { ...data, calendarId })
+      return { reply: i18n.mm_ask_credentials[lang] }
     }
 
     case 'credentials': {
       const parsed = parseCredentials(text)
       if (!parsed) {
-        return { reply: RETRY_PROMPTS.credentials }
+        return { reply: i18n.mm_retry_credentials[lang] }
       }
 
       // Validate credentials + fetch the actual phone number from Meta
       const metaResult = await fetchPhoneNumberFromMeta(parsed.phoneNumberId, parsed.accessToken)
       if (!metaResult.ok) {
         return {
-          reply: `I couldn't validate those credentials (${metaResult.error}).\n\nDouble-check your Phone Number ID and Access Token in Meta Business Manager, then try again.\n\n${RETRY_PROMPTS.credentials}`,
+          reply: `${i18n.mm_credentials_error[lang](metaResult.error)}\n\n${i18n.mm_retry_credentials[lang]}`,
         }
       }
 
@@ -107,7 +121,7 @@ async function handleStep(
       // Provision the business
       const provisionResult = await provisionBusiness(db, session.managerPhone, fullData)
       if (!provisionResult.ok) {
-        return { reply: `Setup failed: ${provisionResult.error}. Please try again or contact support.` }
+        return { reply: i18n.mm_setup_failed[lang](provisionResult.error) }
       }
 
       // Mark session complete
@@ -116,9 +130,7 @@ async function handleStep(
         .set({ completedAt: new Date(), collectedData: fullData as Record<string, unknown>, updatedAt: new Date() })
         .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
 
-      return {
-        reply: `✅ Your PA is ready!\n\nPA number: *${paPhoneNumber}*\n\nNow text that number from your personal WhatsApp to complete setup (services, hours, calendar connection).\n\nYou won't need this number again — everything from here is managed through your PA number.`,
-      }
+      return { reply: i18n.mm_done[lang](paPhoneNumber) }
     }
   }
 }
@@ -295,15 +307,3 @@ function isValidIANA(tz: string): boolean {
   }
 }
 
-// ── Prompts ───────────────────────────────────────────────────────────────────
-
-const PROMPTS: Record<Step, string> = {
-  business_name: `Welcome! 👋 I'll help you set up your WhatsApp PA in just a few steps.\n\nWhat's the name of your business?`,
-  timezone: `What timezone is your business in?\n\nExamples: "Tel Aviv", "New York", "London", or an IANA name like "Asia/Jerusalem".`,
-  calendar: `What's your Google Calendar ID? (Find it in Google Calendar → Settings → your calendar → Calendar ID — it usually looks like your email address.)\n\nSay "skip" to connect it later.`,
-  credentials: `Last step! Share your WhatsApp Business API credentials from Meta Business Manager:\n\n• *Phone Number ID* — found under WhatsApp → Phone Numbers\n• *Access Token* — your System User permanent token\n\nSend them like this:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
-}
-
-const RETRY_PROMPTS = {
-  credentials: `Please send your credentials in this format:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
-}

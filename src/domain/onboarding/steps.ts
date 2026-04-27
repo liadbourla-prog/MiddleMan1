@@ -1,45 +1,57 @@
 import type { OnboardingStep } from '../../db/schema.js'
+import { i18n, type Lang } from '../i18n/t.js'
 
 export interface StepDefinition {
   prompt: string
   retryPrompt?: string
 }
 
+// Kept for backward-compat (oauth.ts uses it for the calendar-connected message)
 export const ONBOARDING_PROMPTS: Record<OnboardingStep, StepDefinition> = {
-  business_name: {
-    prompt:
-      "Hi! I'm your new PA. Let's finish setup together — it only takes a few minutes.\n\nFirst: what name should I use for your business when I talk to customers? (e.g. \"Liad's Barbershop\")",
-  },
-  services: {
-    prompt:
-      "Great! Now tell me your services.\n\nSend them like this:\n\"Haircut 30 min, Beard trim 20 min, Full grooming 60 min\"\n\nYou can always add or change services later.",
-    retryPrompt:
-      "I didn't quite catch that. Please list your services with a duration for each — for example:\n\"Haircut 30 min, Beard trim 20 min\"",
-  },
-  hours: {
-    prompt:
-      "Perfect! Now set your working hours.\n\nSend them like this:\n\"Mon–Fri 9am to 7pm, Saturday 9am to 3pm, closed Sunday\"\n\nYou can change these at any time.",
-    retryPrompt:
-      "I couldn't parse those hours. Please try again, for example:\n\"Mon–Fri 9:00–18:00, Saturday 9:00–14:00, closed Sunday\"",
-  },
-  calendar: {
-    prompt:
-      'Now let\'s connect your Google Calendar — this is where all bookings will appear.\n\nTap the link below (takes about 20 seconds):\n{{OAUTH_LINK}}\n\nOnce connected, I\'ll confirm here automatically.',
-  },
-  customer_import: {
-    prompt:
-      'Almost done! Do you have an existing customer list, booking history, or service catalog to import?\n\nReply "Yes" to get a secure upload link, or "Skip" to continue without importing.',
-  },
-  verify: {
-    prompt:
-      "You're all set! Send me any message to confirm your PA is live and working.",
-  },
+  business_name: { prompt: i18n.ob_business_name.en },
+  services: { prompt: i18n.ob_services.en, retryPrompt: i18n.ob_services_retry.en },
+  hours: { prompt: i18n.ob_hours.en, retryPrompt: i18n.ob_hours_retry.en },
+  cancellation_policy: { prompt: i18n.ob_cancellation.en, retryPrompt: i18n.ob_cancellation_retry.en },
+  payment: { prompt: i18n.ob_payment.en, retryPrompt: i18n.ob_payment_retry.en },
+  escalation_policy: { prompt: i18n.ob_escalation.en, retryPrompt: i18n.ob_escalation_retry.en },
+  calendar: { prompt: i18n.ob_calendar.en },
+  customer_import: { prompt: i18n.ob_import.en },
+  verify: { prompt: i18n.ob_verify.en },
+}
+
+export function getPrompt(step: OnboardingStep, lang: Lang): string {
+  const map: Record<OnboardingStep, string> = {
+    business_name: i18n.ob_business_name[lang],
+    services: i18n.ob_services[lang],
+    hours: i18n.ob_hours[lang],
+    cancellation_policy: i18n.ob_cancellation[lang],
+    payment: i18n.ob_payment[lang],
+    escalation_policy: i18n.ob_escalation[lang],
+    calendar: i18n.ob_calendar[lang],
+    customer_import: i18n.ob_import[lang],
+    verify: i18n.ob_verify[lang],
+  }
+  return map[step]
+}
+
+export function getRetryPrompt(step: OnboardingStep, lang: Lang): string | undefined {
+  const map: Partial<Record<OnboardingStep, string>> = {
+    services: i18n.ob_services_retry[lang],
+    hours: i18n.ob_hours_retry[lang],
+    cancellation_policy: i18n.ob_cancellation_retry[lang],
+    payment: i18n.ob_payment_retry[lang],
+    escalation_policy: i18n.ob_escalation_retry[lang],
+  }
+  return map[step]
 }
 
 export const ONBOARDING_STEP_ORDER: OnboardingStep[] = [
   'business_name',
   'services',
   'hours',
+  'cancellation_policy',
+  'payment',
+  'escalation_policy',
   'calendar',
   'customer_import',
   'verify',
@@ -53,4 +65,9 @@ export function nextStep(current: OnboardingStep): OnboardingStep | null {
 export function isAffirmative(text: string): boolean {
   const t = text.trim().toLowerCase()
   return ['yes', 'yeah', 'yep', 'sure', 'ok', 'okay', 'ken', 'כן'].some((w) => t.startsWith(w))
+}
+
+export function isNegative(text: string): boolean {
+  const t = text.trim().toLowerCase()
+  return ['no', 'nope', 'lo', 'לא'].some((w) => t.startsWith(w))
 }

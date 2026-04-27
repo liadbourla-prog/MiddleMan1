@@ -4,6 +4,8 @@ import { db } from '../db/client.js'
 import { importTokens, businesses, identities } from '../db/schema.js'
 import { processImportFile } from '../domain/onboarding/import.js'
 import { sendMessage } from '../adapters/whatsapp/sender.js'
+import { buildVerifySummary } from '../domain/flows/manager-onboarding.js'
+import { i18n, type Lang } from '../domain/i18n/t.js'
 
 export async function importRoutes(app: FastifyInstance) {
   // Serve the upload page
@@ -74,31 +76,39 @@ export async function importRoutes(app: FastifyInstance) {
       }
 
       // Advance onboarding if still on customer_import step
+      let advancedBusiness = business
       if (business.onboardingStep === 'customer_import') {
         await db
           .update(businesses)
           .set({ onboardingStep: 'verify' })
           .where(eq(businesses.id, business.id))
+        // Re-fetch so buildVerifySummary sees the latest state
+        const [refreshed] = await db.select().from(businesses).where(eq(businesses.id, business.id)).limit(1)
+        if (refreshed) advancedBusiness = refreshed
       }
 
-      // Send WhatsApp confirmation to manager
-      const waCredentials = business.whatsappPhoneNumberId && business.whatsappAccessToken
-        ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
+      // Send WhatsApp confirmation + verify summary to manager
+      const lang: Lang = (advancedBusiness.defaultLanguage as Lang | null | undefined) ?? 'he'
+      const waCredentials = advancedBusiness.whatsappPhoneNumberId && advancedBusiness.whatsappAccessToken
+        ? { accessToken: advancedBusiness.whatsappAccessToken, phoneNumberId: advancedBusiness.whatsappPhoneNumberId }
         : undefined
 
-      const parts = []
-      if (totalSummary.contacts > 0) parts.push(`${totalSummary.contacts} contacts`)
-      if (totalSummary.services > 0) parts.push(`${totalSummary.services} services`)
-      if (totalSummary.bookingHistory > 0) parts.push(`${totalSummary.bookingHistory} past bookings`)
-      const imported = parts.length > 0 ? parts.join(', ') : 'nothing'
+      const parts: string[] = []
+      if (totalSummary.contacts > 0) parts.push(i18n.ob_import_contacts[lang](totalSummary.contacts))
+      if (totalSummary.services > 0) parts.push(i18n.ob_import_services_count[lang](totalSummary.services))
+      if (totalSummary.bookingHistory > 0) parts.push(i18n.ob_import_history[lang](totalSummary.bookingHistory))
+      const imported = parts.length > 0 ? parts.join(', ') : i18n.ob_import_nothing[lang]
       const errorNote = totalSummary.errors.length > 0
-        ? `\n⚠️ ${totalSummary.errors.length} row(s) skipped.`
+        ? i18n.ob_import_skipped[lang](totalSummary.errors.length)
         : ''
+
+      const summary = await buildVerifySummary(db, advancedBusiness, lang).catch(() => '')
+      const importMsg = i18n.ob_import_complete_msg[lang](imported, errorNote)
 
       await sendMessage(
         {
           toNumber: record.managerPhone,
-          body: `✅ Import complete! Imported: ${imported}.${errorNote}\n\nSend me a message to confirm your PA is live and working.`,
+          body: summary ? `${importMsg}\n\n${summary}` : importMsg,
         },
         waCredentials,
       ).catch(() => {/* non-fatal */})

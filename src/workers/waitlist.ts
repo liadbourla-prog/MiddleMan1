@@ -5,6 +5,7 @@ import { waitlist, identities, businesses, serviceTypes } from '../db/schema.js'
 import { sendMessage } from '../adapters/whatsapp/sender.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
+import { i18n, type Lang } from '../domain/i18n/t.js'
 
 const QUEUE_NAME = 'waitlist'
 const OFFER_TTL_MINUTES = parseInt(process.env['WAITLIST_OFFER_TTL_MINUTES'] ?? '15', 10)
@@ -99,7 +100,7 @@ async function processJob(job: { data: WaitlistJob }) {
     .where(eq(waitlist.id, next.id))
 
   const [customer] = await db
-    .select({ phoneNumber: identities.phoneNumber })
+    .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
     .from(identities)
     .where(eq(identities.id, next.customerId))
     .limit(1)
@@ -111,13 +112,17 @@ async function processJob(job: { data: WaitlistJob }) {
     .limit(1)
 
   const [biz] = await db
-    .select({ name: businesses.name, timezone: businesses.timezone })
+    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage })
     .from(businesses)
     .where(eq(businesses.id, businessId))
     .limit(1)
 
   if (customer && biz) {
-    const dateStr = new Intl.DateTimeFormat('en-GB', {
+    const lang: Lang = (customer.preferredLanguage as Lang | null | undefined)
+      ?? (biz.defaultLanguage as Lang | null | undefined)
+      ?? 'he'
+    const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+    const dateStr = new Intl.DateTimeFormat(locale, {
       timeZone: biz.timezone,
       weekday: 'long', day: 'numeric', month: 'long',
       hour: '2-digit', minute: '2-digit', hour12: false,
@@ -125,7 +130,7 @@ async function processJob(job: { data: WaitlistJob }) {
 
     await sendMessage({
       toNumber: customer.phoneNumber,
-      body: `Great news! A slot opened up at ${biz.name}: ${service?.name ?? 'appointment'} on ${dateStr}. Reply YES to book it or NO to pass. This offer expires in ${OFFER_TTL_MINUTES} minutes.`,
+      body: i18n.waitlist_offer[lang](biz.name, service?.name ?? (lang === 'he' ? 'תור' : 'appointment'), dateStr, OFFER_TTL_MINUTES),
     }).catch(() => { /* retry queue handles failures */ })
   }
 

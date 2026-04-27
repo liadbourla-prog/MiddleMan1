@@ -1,6 +1,7 @@
 export interface FlowResult {
   reply: string
   sessionComplete: boolean
+  escalated?: boolean
 }
 
 export type ConfirmationParse = 'yes' | 'no' | 'unclear'
@@ -19,7 +20,7 @@ export function parseConfirmation(text: string): ConfirmationParse {
 
 export interface BookingFlowContext {
   pendingBookingId?: string
-  pendingSlot?: { start: string; end: string; serviceTypeId: string; serviceName: string }
+  pendingSlot?: { start: string; end: string; serviceTypeId: string; serviceName: string; providerHint?: string | null }
   awaitingConfirmationFor?: 'hold' | 'cancellation' | 'cancellation_selection'
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'
@@ -27,5 +28,10 @@ export interface BookingFlowContext {
   rescheduledFrom?: string
   clarificationAttempts?: number
   botPersona?: 'female' | 'male' | 'neutral'
+  sessionUnknownCount?: number
+  // Language switch offer
+  languageSwitchOffered?: boolean
+  languageOverride?: 'he' | 'en'
+  bufferedMessage?: string
   [key: string]: unknown
 }

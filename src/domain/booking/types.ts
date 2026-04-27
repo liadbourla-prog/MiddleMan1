@@ -7,6 +7,7 @@ export interface BookingSlotRequest {
   slotStart: Date
   slotEnd: Date
   providerId?: string
+  providerHint?: string | null
 }
 
 export type TransitionResult =

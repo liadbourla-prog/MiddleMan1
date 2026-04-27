@@ -4,7 +4,8 @@ import { eq, and, isNull } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { businesses, identities } from '../db/schema.js'
 import { sendMessage } from '../adapters/whatsapp/sender.js'
-import { ONBOARDING_PROMPTS } from '../domain/onboarding/steps.js'
+import { getPrompt } from '../domain/onboarding/steps.js'
+import { t, type Lang } from '../domain/i18n/t.js'
 
 function buildOAuth2Client() {
   return new google.auth.OAuth2(
@@ -126,6 +127,7 @@ export async function oauthRoutes(app: FastifyInstance) {
         .limit(1)
 
       if (managerIdentity && updatedBusiness) {
+        const lang: Lang = (updatedBusiness.defaultLanguage as Lang | null | undefined) ?? 'he'
         const waCredentials = updatedBusiness.whatsappPhoneNumberId && updatedBusiness.whatsappAccessToken
           ? { accessToken: updatedBusiness.whatsappAccessToken, phoneNumberId: updatedBusiness.whatsappPhoneNumberId }
           : undefined
@@ -133,7 +135,7 @@ export async function oauthRoutes(app: FastifyInstance) {
         await sendMessage(
           {
             toNumber: managerIdentity.phoneNumber,
-            body: `✅ Google Calendar connected!\n\n${ONBOARDING_PROMPTS.customer_import.prompt}`,
+            body: `${t('ob_calendar_connected', lang)}\n\n${getPrompt('customer_import', lang)}`,
           },
           waCredentials,
         ).catch((err) => app.log.warn({ err }, 'Failed to send calendar confirmation to manager'))

@@ -1,6 +1,7 @@
 import { eq, and, or, gt } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { serviceTypes, bookings } from '../../db/schema.js'
+import { serviceTypes, bookings, identities } from '../../db/schema.js'
+import type { Business } from '../../db/schema.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import type { ActiveSession } from '../session/types.js'
 import { updateSessionContext, completeSession, failSession } from '../session/manager.js'
@@ -12,6 +13,7 @@ import type { FlowResult, BookingFlowContext } from './types.js'
 import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 import type { HydratedContext } from '../session/hydration.js'
+import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/engine.js'
 
 type CustomerMemoryInput = {
   returningCustomer: boolean
@@ -66,12 +68,50 @@ export async function handleBookingFlow(
   businessName: string,
   transcript: TranscriptTurn[],
   botPersona?: 'female' | 'male' | 'neutral',
+  business?: Business,
+  businessDefaultLanguage?: 'he' | 'en',
 ): Promise<FlowResult> {
   const ctx = {
     ...(session.context as BookingFlowContext),
     ...(botPersona ? { botPersona } : {}),
   } as BookingFlowContext
-  const lang = ctx.detectedLanguage ?? 'en'
+  const defaultLang: 'he' | 'en' = businessDefaultLanguage ?? 'he'
+  const lang: 'he' | 'en' = (ctx.languageOverride ?? ctx.detectedLanguage) ?? defaultLang
+
+  // ── REBOOK shortcut — treat as fresh booking intent ──────────────────────
+  if (messageText.trim().toUpperCase() === 'REBOOK') {
+    await updateSessionContext(db, session.id, { ...ctx, detectedLanguage: lang }, 'active')
+    const reply = await generateCustomerReply({
+      businessName,
+      language: lang,
+      situation: 'Customer replied REBOOK — they want to book a new appointment after a cancellation. Ask them what service and when they would like.',
+      transcript,
+      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+      customerMemory: extractMemory(ctx),
+    })
+    return { reply, sessionComplete: false }
+  }
+
+  // ── Language switch confirmation branch ───────────────────────────────────
+  if (session.state === 'waiting_language_confirmation') {
+    return handleLanguageSwitchConfirmation(db, identity, session, ctx, messageText, businessTimezone, businessName, transcript, calendar, business, defaultLang)
+  }
+
+  // ── Owner-rule escalation check (runs before any intent logic) ────────────
+  if (business) {
+    const unknownCount = (ctx.sessionUnknownCount as number | undefined) ?? 0
+    const ownerEscalation = await checkOwnerEscalationRules(
+      db, business, identity.phoneNumber, messageText, 'unknown', unknownCount, lang,
+    )
+    if (ownerEscalation.escalated) {
+      await completeSession(db, session.id)
+      return {
+        reply: ownerEscalation.customerReply ?? '',
+        sessionComplete: true,
+        escalated: true,
+      }
+    }
+  }
 
   // ── Branch: cancellation_selection (multi-booking numbered pick) ──────────
   if (session.state === 'waiting_clarification' && ctx.awaitingConfirmationFor === 'cancellation_selection') {
@@ -136,6 +176,27 @@ export async function handleBookingFlow(
   const intent = intentResult.data
   const detectedLanguage = intent.detectedLanguage
 
+  // ── Language switch offer (once per customer, if they write in a different language) ──
+  // Only offer if: no override yet, not already offered, and detected language differs from business default
+  if (
+    !ctx.languageOverride &&
+    !ctx.languageSwitchOffered &&
+    detectedLanguage !== defaultLang
+  ) {
+    const switchCtx: BookingFlowContext = {
+      ...ctx,
+      detectedLanguage,
+      languageSwitchOffered: true,
+      bufferedMessage: messageText,
+    }
+    await updateSessionContext(db, session.id, switchCtx, 'waiting_language_confirmation')
+    // Ask bilingually so the customer understands regardless of language
+    const offerMsg = defaultLang === 'he'
+      ? `שים לב: הפאזל מגיב בעברית כברירת מחדל. האם להמשיך באנגלית? (כן / לא)\nNote: the assistant replies in Hebrew by default. Would you like to continue in English? (YES / NO)`
+      : `Note: the assistant replies in English by default. האם להמשיך בעברית? (YES / NO)`
+    return { reply: offerMsg, sessionComplete: false }
+  }
+
   // Persist language detection into context so all subsequent branches use it
   const updatedCtx: BookingFlowContext = { ...ctx, detectedLanguage }
 
@@ -172,7 +233,15 @@ export async function handleBookingFlow(
     }
 
     default: {
-      await updateSessionContext(db, session.id, updatedCtx)
+      const unknownCount = ((updatedCtx.sessionUnknownCount as number | undefined) ?? 0) + 1
+      const ctxWithCount: BookingFlowContext = { ...updatedCtx, sessionUnknownCount: unknownCount }
+
+      // Platform escalation: after 2 unknown messages, forward to operator
+      if (unknownCount >= 2 && business) {
+        await escalateToPlatform(db, business, identity.phoneNumber, messageText)
+      }
+
+      await updateSessionContext(db, session.id, ctxWithCount)
       const reply = await generateCustomerReply({
         businessName,
         language: detectedLanguage,
@@ -310,6 +379,7 @@ async function handleBookingIntent(
       end: slotEnd.toISOString(),
       serviceTypeId: service.id,
       serviceName: service.name,
+      providerHint: intent.providerHint ?? null,
     },
     awaitingConfirmationFor: 'hold',
   }
@@ -468,6 +538,7 @@ async function handleHoldConfirmation(
     serviceTypeId: pendingSlot.serviceTypeId,
     slotStart: new Date(pendingSlot.start),
     slotEnd: new Date(pendingSlot.end),
+    providerHint: (pendingSlot as unknown as { providerHint?: string }).providerHint ?? null,
   })
 
   if (!result.ok) {
@@ -843,6 +914,69 @@ async function handleListBookings(
     customerMemory: extractMemory(ctx),
   })
   return { reply, sessionComplete: true }
+}
+
+// ── Language switch handler ───────────────────────────────────────────────────
+
+async function handleLanguageSwitchConfirmation(
+  db: Db,
+  identity: ResolvedIdentity,
+  session: ActiveSession,
+  ctx: BookingFlowContext,
+  messageText: string,
+  businessTimezone: string,
+  businessName: string,
+  transcript: TranscriptTurn[],
+  calendar: CalendarClient,
+  business: Business | undefined,
+  defaultLang: 'he' | 'en',
+): Promise<FlowResult> {
+  const confirmation = parseConfirmation(messageText)
+  const buffered = ctx.bufferedMessage ?? ''
+
+  if (confirmation === 'unclear') {
+    const offerMsg = defaultLang === 'he'
+      ? `האם להמשיך באנגלית? (כן / לא) / Continue in English? (YES / NO)`
+      : `Continue in Hebrew? (YES / NO) / להמשיך בעברית? (כן / לא)`
+    return { reply: offerMsg, sessionComplete: false }
+  }
+
+  const chosenLang: 'he' | 'en' = confirmation === 'yes'
+    ? (defaultLang === 'he' ? 'en' : 'he')
+    : defaultLang
+
+  // Persist the preference on the identity so future sessions remember it
+  await db
+    .update(identities)
+    .set({ preferredLanguage: chosenLang })
+    .where(eq(identities.id, identity.id))
+    .catch(() => { /* non-fatal */ })
+
+  const { bufferedMessage: _dropped, ...ctxWithoutBuffer } = ctx
+  const newCtx: BookingFlowContext = {
+    ...ctxWithoutBuffer,
+    languageOverride: chosenLang,
+  }
+  await updateSessionContext(db, session.id, newCtx, 'active')
+
+  // Re-process the original message now that language is set
+  if (!buffered) {
+    const reply = await generateCustomerReply({
+      businessName,
+      language: chosenLang,
+      situation: 'Language preference set. Greet the customer and ask how you can help.',
+      transcript,
+      customerMemory: extractMemory(newCtx),
+    })
+    return { reply, sessionComplete: false }
+  }
+
+  return handleBookingFlow(
+    db, calendar, identity,
+    { ...session, state: 'active', context: newCtx },
+    buffered, businessTimezone, businessName, transcript,
+    ctx.botPersona, business, defaultLang,
+  )
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

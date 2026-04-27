@@ -4,6 +4,15 @@ import type { Db } from '../../db/client.js'
 import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages } from '../../db/schema.js'
 import { logAudit } from '../audit/logger.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
+import { i18n, t, type Lang } from '../i18n/t.js'
+
+// Bilingual day names (Sun=0 … Sat=6)
+function dayName(dayOfWeek: number | null | undefined, lang: Lang): string {
+  if (dayOfWeek === null || dayOfWeek === undefined) return lang === 'he' ? 'אותו יום' : 'that day'
+  const daysHe = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת']
+  const daysEn = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+  return (lang === 'he' ? daysHe : daysEn)[dayOfWeek] ?? (lang === 'he' ? 'אותו יום' : 'that day')
+}
 
 function isValidIANATimezone(tz: string): boolean {
   try {
@@ -58,25 +67,25 @@ export async function applyInstruction(
   actorId: string,
   instructionType: string,
   structuredParams: Record<string, unknown>,
+  lang: Lang = 'he',
 ): Promise<ApplyResult> {
   let result: ApplyResult
 
   switch (instructionType) {
     case 'availability_change':
-      result = await applyAvailabilityChange(db, businessId, actorId, structuredParams)
+      result = await applyAvailabilityChange(db, businessId, actorId, structuredParams, lang)
       break
     case 'service_change':
-      result = await applyServiceChange(db, businessId, actorId, structuredParams)
+      result = await applyServiceChange(db, businessId, actorId, structuredParams, lang)
       break
     case 'permission_change':
-      result = await applyPermissionChange(db, businessId, actorId, structuredParams)
+      result = await applyPermissionChange(db, businessId, actorId, structuredParams, lang)
       break
     case 'policy_change':
-      // Policy changes are stored in structured_output; no table mutation in V1
-      result = { ok: true, confirmationMessage: 'Policy instruction noted and saved.' }
+      result = { ok: true, confirmationMessage: t('apply_policy_noted', lang) }
       break
     default:
-      result = { ok: false, reason: `Unknown instruction type: ${instructionType}` }
+      result = { ok: false, reason: i18n.apply_unknown_type[lang](instructionType) }
   }
 
   const now = new Date()
@@ -107,6 +116,7 @@ async function applyAvailabilityChange(
   businessId: string,
   actorId: string,
   params: Record<string, unknown>,
+  lang: Lang = 'he',
 ): Promise<ApplyResult> {
   const parsed = availabilityChangeSchema.safeParse(params)
   if (!parsed.success) {
@@ -125,7 +135,7 @@ async function applyAvailabilityChange(
       const dayStart = new Date(`${p.specificDate}T00:00:00Z`)
       const dayEnd = new Date(`${p.specificDate}T23:59:59Z`)
       const affected = await db
-        .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart })
+        .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId })
         .from(bookings)
         .where(
           and(
@@ -137,36 +147,68 @@ async function applyAvailabilityChange(
         )
 
       if (affected.length > 0) {
-        // Notify affected customers
+        // Fetch business calendar info once for all affected bookings
         const [biz] = await db
-          .select({ whatsappNumber: businesses.whatsappNumber })
+          .select({
+            whatsappNumber: businesses.whatsappNumber,
+            googleCalendarId: businesses.googleCalendarId,
+            googleRefreshToken: businesses.googleRefreshToken,
+            calendarMode: businesses.calendarMode,
+          })
           .from(businesses)
           .where(eq(businesses.id, businessId))
           .limit(1)
 
+        const [managerIdentity] = await db
+          .select({ phoneNumber: identities.phoneNumber })
+          .from(identities)
+          .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager')))
+          .limit(1)
+
+        // Import calendar client lazily to avoid circular deps
+        const { createCalendarClient } = await import('../../adapters/calendar/client.js')
+        const calClient = biz ? createCalendarClient({
+          accessToken: '',
+          refreshToken: biz.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
+          calendarId: biz.googleCalendarId,
+          businessId,
+          calendarMode: (biz.calendarMode as 'google' | 'internal') ?? 'google',
+          ...(managerIdentity ? { managerPhoneNumber: managerIdentity.phoneNumber } : {}),
+        }) : null
+
         for (const booking of affected) {
+          // Delete the Google Calendar event before cancelling the DB row
+          if (booking.calendarEventId && calClient) {
+            await calClient.deleteEvent(booking.calendarEventId).catch(() => { /* non-fatal — log but continue */ })
+          }
+
           const [customerIdentity] = await db
-            .select({ phoneNumber: identities.phoneNumber })
+            .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
             .from(identities)
             .where(eq(identities.id, booking.customerId))
             .limit(1)
 
           if (customerIdentity) {
-            const dateStr = booking.slotStart.toLocaleDateString('en-GB', {
+            const custLang: Lang = (customerIdentity.preferredLanguage as Lang | null | undefined) ?? 'he'
+            const locale = custLang === 'he' ? 'he-IL' : 'en-GB'
+            const dateStr = booking.slotStart.toLocaleDateString(locale, {
               weekday: 'long', day: 'numeric', month: 'long',
             })
             await enqueueMessage(
               customerIdentity.phoneNumber,
-              `We're sorry — your appointment on ${dateStr} has been cancelled due to a schedule change. Please contact us to rebook.`,
+              i18n.booking_cancelled_schedule[custLang](dateStr),
             ).catch(() => { /* non-fatal */ })
           }
-        }
 
-        // Mark bookings as cancelled
-        for (const booking of affected) {
           await db
             .update(bookings)
-            .set({ state: 'cancelled', cancellationReason: p.reason ?? 'Business schedule change', cancelledByRole: 'manager', updatedAt: new Date() })
+            .set({
+              state: 'cancelled',
+              cancellationReason: p.reason ?? 'Business schedule change',
+              cancelledByRole: 'manager',
+              rebookingRequested: false,
+              updatedAt: new Date(),
+            })
             .where(eq(bookings.id, booking.id))
         }
       }
@@ -188,7 +230,7 @@ async function applyAvailabilityChange(
           reason: p.reason ?? 'Vacation / temporary closure',
         }).onConflictDoNothing()
       }
-      return { ok: true, confirmationMessage: `Closed from ${p.dateRangeStart} to ${p.dateRangeEnd}. ${p.reason ? `Reason: ${p.reason}.` : ''}` }
+      return { ok: true, confirmationMessage: i18n.apply_bulk_close[lang](p.dateRangeStart, p.dateRangeEnd) }
     }
 
     await db.insert(availability).values({
@@ -200,8 +242,8 @@ async function applyAvailabilityChange(
       isBlocked: true,
       reason: p.reason ?? null,
     })
-    const label = p.specificDate ?? dayName(p.dayOfWeek)
-    return { ok: true, confirmationMessage: `Got it — ${label} is blocked.` }
+    const label = p.specificDate ?? dayName(p.dayOfWeek, lang)
+    return { ok: true, confirmationMessage: i18n.apply_blocked[lang](label) }
   }
 
   if (p.action === 'unblock') {
@@ -214,13 +256,13 @@ async function applyAvailabilityChange(
         .delete(availability)
         .where(and(eq(availability.businessId, businessId), eq(availability.dayOfWeek, p.dayOfWeek), eq(availability.isBlocked, true)))
     }
-    const label = p.specificDate ?? dayName(p.dayOfWeek)
-    return { ok: true, confirmationMessage: `Got it — ${label} is unblocked.` }
+    const label = p.specificDate ?? dayName(p.dayOfWeek, lang)
+    return { ok: true, confirmationMessage: i18n.apply_unblocked[lang](label) }
   }
 
   // set_hours — check for bookings outside the new hours on the affected date/day
   if (!p.openTime || !p.closeTime) {
-    return { ok: false, reason: 'set_hours requires openTime and closeTime' }
+    return { ok: false, reason: t('apply_set_hours_requires_times', lang) }
   }
 
   if (p.specificDate) {
@@ -248,7 +290,7 @@ async function applyAvailabilityChange(
     if (outsideHours.length > 0) {
       return {
         ok: false,
-        reason: `Cannot set hours — ${outsideHours.length} confirmed booking(s) fall outside the new hours on ${p.specificDate}. Cancel them first.`,
+        reason: i18n.apply_hours_conflict[lang](outsideHours.length, p.specificDate!),
       }
     }
   }
@@ -265,11 +307,10 @@ async function applyAvailabilityChange(
         isBlocked: false,
       })
       .onConflictDoNothing()
-    return { ok: true, confirmationMessage: `Hours set for ${p.specificDate}: ${p.openTime}–${p.closeTime}.` }
+    return { ok: true, confirmationMessage: i18n.apply_hours_set[lang](p.specificDate, p.openTime, p.closeTime) }
   }
 
   if (p.dayOfWeek !== null && p.dayOfWeek !== undefined) {
-    // Upsert by deleting and re-inserting for the day
     await db
       .delete(availability)
       .where(and(eq(availability.businessId, businessId), eq(availability.dayOfWeek, p.dayOfWeek), eq(availability.isBlocked, false)))
@@ -281,10 +322,10 @@ async function applyAvailabilityChange(
       closeTime: p.closeTime,
       isBlocked: false,
     })
-    return { ok: true, confirmationMessage: `Hours updated for ${dayName(p.dayOfWeek)}: ${p.openTime}–${p.closeTime}.` }
+    return { ok: true, confirmationMessage: i18n.apply_hours_set[lang](dayName(p.dayOfWeek, lang), p.openTime, p.closeTime) }
   }
 
-  return { ok: false, reason: 'set_hours requires either dayOfWeek or specificDate' }
+  return { ok: false, reason: t('apply_set_hours_requires_target', lang) }
 }
 
 // ── Service change ────────────────────────────────────────────────────────────
@@ -294,6 +335,7 @@ async function applyServiceChange(
   businessId: string,
   actorId: string,
   params: Record<string, unknown>,
+  lang: Lang = 'he',
 ): Promise<ApplyResult> {
   const parsed = serviceChangeSchema.safeParse(params)
   if (!parsed.success) {
@@ -304,7 +346,7 @@ async function applyServiceChange(
 
   if (p.action === 'create') {
     if (!p.durationMinutes) {
-      return { ok: false, reason: 'create requires durationMinutes' }
+      return { ok: false, reason: lang === 'he' ? 'create דורש durationMinutes.' : 'create requires durationMinutes.' }
     }
     const hasPrice = p.paymentAmount != null && p.paymentAmount > 0
     const maxParticipants = p.maxParticipants ?? 1
@@ -320,25 +362,39 @@ async function applyServiceChange(
       isActive: true,
     })
     const priceStr = hasPrice ? `, ${p.paymentAmount}` : ''
-    const typeStr = maxParticipants > 1 ? ` (group class, up to ${maxParticipants})` : ''
-    return { ok: true, confirmationMessage: `Service "${p.name}" created (${p.durationMinutes} min${priceStr}${typeStr}).` }
+    const typeStr = maxParticipants > 1
+      ? (lang === 'he' ? `, קבוצה עד ${maxParticipants}` : `, group up to ${maxParticipants}`)
+      : ''
+    return { ok: true, confirmationMessage: i18n.apply_service_created[lang](p.name, p.durationMinutes, priceStr + typeStr) }
   }
 
   if (p.action === 'deactivate') {
+    const safety = await checkServiceDeactivationSafety(db, businessId, p.name)
+    if (!safety.safe) {
+      const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+      const dateStr = safety.earliestDate
+        ? safety.earliestDate.toLocaleDateString(locale, { weekday: 'short', day: 'numeric', month: 'short' })
+        : (lang === 'he' ? 'בקרוב' : 'soon')
+      return {
+        ok: false,
+        reason: i18n.apply_service_blocked[lang](p.name, safety.blockingCount, dateStr),
+      }
+    }
+
     const [existing] = await db
       .select({ id: serviceTypes.id })
       .from(serviceTypes)
       .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.name, p.name)))
       .limit(1)
 
-    if (!existing) return { ok: false, reason: `Service "${p.name}" not found` }
+    if (!existing) return { ok: false, reason: i18n.apply_service_not_found[lang](p.name) }
 
     await db
       .update(serviceTypes)
       .set({ isActive: false })
       .where(eq(serviceTypes.id, existing.id))
 
-    return { ok: true, confirmationMessage: `Service "${p.name}" deactivated.` }
+    return { ok: true, confirmationMessage: i18n.apply_service_deactivated[lang](p.name) }
   }
 
   // update
@@ -348,7 +404,7 @@ async function applyServiceChange(
     .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.name, p.name)))
     .limit(1)
 
-  if (!existing) return { ok: false, reason: `Service "${p.name}" not found` }
+  if (!existing) return { ok: false, reason: i18n.apply_service_not_found[lang](p.name) }
 
   const updates: Partial<typeof serviceTypes.$inferInsert> = {}
   if (p.durationMinutes !== undefined) updates.durationMinutes = p.durationMinutes
@@ -366,7 +422,7 @@ async function applyServiceChange(
     await db.update(serviceTypes).set(updates).where(eq(serviceTypes.id, existing.id))
   }
 
-  return { ok: true, confirmationMessage: `Service "${p.name}" updated.` }
+  return { ok: true, confirmationMessage: i18n.apply_service_updated[lang](p.name) }
 }
 
 // ── Permission change ─────────────────────────────────────────────────────────
@@ -376,6 +432,7 @@ async function applyPermissionChange(
   businessId: string,
   actorId: string,
   params: Record<string, unknown>,
+  lang: Lang = 'he',
 ): Promise<ApplyResult> {
   const parsed = permissionChangeSchema.safeParse(params)
   if (!parsed.success) {
@@ -396,7 +453,7 @@ async function applyPermissionChange(
         grantedAt: new Date(),
       })
       .onConflictDoNothing()
-    return { ok: true, confirmationMessage: `${p.displayName ?? p.phoneNumber} granted delegated access.` }
+    return { ok: true, confirmationMessage: i18n.apply_permission_granted[lang](p.displayName ?? p.phoneNumber) }
   }
 
   // revoke
@@ -406,28 +463,37 @@ async function applyPermissionChange(
     .where(and(eq(identities.businessId, businessId), eq(identities.phoneNumber, p.phoneNumber)))
     .limit(1)
 
-  if (!target) return { ok: false, reason: `No identity found for ${p.phoneNumber}` }
+  if (!target) return { ok: false, reason: i18n.apply_permission_not_found[lang](p.phoneNumber) }
 
   await db
     .update(identities)
     .set({ revokedAt: new Date() })
     .where(eq(identities.id, target.id))
 
-  return { ok: true, confirmationMessage: `Access revoked for ${p.displayName ?? p.phoneNumber}.` }
+  return { ok: true, confirmationMessage: i18n.apply_permission_revoked[lang](p.displayName ?? p.phoneNumber) }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // ── STATUS ────────────────────────────────────────────────────────────────────
 
-export async function buildStatusReport(db: Db, businessId: string): Promise<string> {
+export async function buildStatusReport(db: Db, businessId: string, lang: Lang = 'he'): Promise<string> {
   const [business] = await db
-    .select({ googleRefreshToken: businesses.googleRefreshToken, whatsappNumber: businesses.whatsappNumber })
+    .select({
+      googleRefreshToken: businesses.googleRefreshToken,
+      whatsappNumber: businesses.whatsappNumber,
+      calendarMode: businesses.calendarMode,
+      paused: businesses.paused,
+      confirmationGate: businesses.confirmationGate,
+      paymentMethod: businesses.paymentMethod,
+    })
     .from(businesses)
     .where(eq(businesses.id, businessId))
     .limit(1)
 
-  const calendarStatus = business?.googleRefreshToken ? '✅ Connected' : '❌ Not connected'
+  const calendarStatus = business?.calendarMode === 'internal'
+    ? t('status_cal_internal', lang)
+    : business?.googleRefreshToken ? t('status_cal_ok', lang) : t('status_cal_missing', lang)
 
   const [customerRow] = await db
     .select({ total: count() })
@@ -435,7 +501,7 @@ export async function buildStatusReport(db: Db, businessId: string): Promise<str
     .where(and(eq(identities.businessId, businessId), eq(identities.role, 'customer')))
 
   const [lastBooking] = await db
-    .select({ slotStart: bookings.slotStart, state: bookings.state })
+    .select({ slotStart: bookings.slotStart })
     .from(bookings)
     .where(and(eq(bookings.businessId, businessId), eq(bookings.state, 'confirmed')))
     .orderBy(desc(bookings.slotStart))
@@ -448,30 +514,150 @@ export async function buildStatusReport(db: Db, businessId: string): Promise<str
     .orderBy(desc(processedMessages.processedAt))
     .limit(1)
 
+  const paused = business?.paused ?? false
+  const statusLine = paused ? t('status_paused', lang) : t('status_live', lang)
   const customerCount = customerRow?.total ?? 0
+  const noneStr = t('status_none', lang)
   const lastBookingStr = lastBooking
-    ? lastBooking.slotStart.toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })
-    : 'None'
-  const lastMsgStr = lastMessage
-    ? `${Math.round((Date.now() - lastMessage.processedAt.getTime()) / 60_000)} min ago`
-    : 'Unknown'
+    ? lastBooking.slotStart.toLocaleString(lang === 'he' ? 'he-IL' : 'en-GB', { dateStyle: 'medium', timeStyle: 'short' })
+    : noneStr
+  const minAgo = lastMessage ? Math.round((Date.now() - lastMessage.processedAt.getTime()) / 60_000) : null
+  const lastMsgStr = minAgo !== null ? i18n.status_min_ago[lang](minAgo) : t('status_unknown', lang)
+  const paymentStr = business?.confirmationGate === 'post_payment'
+    ? i18n.status_payment_post[lang](business.paymentMethod ?? noneStr)
+    : t('status_payment_immediate', lang)
 
   return [
-    '✅ PA is live',
-    `📅 Calendar: ${calendarStatus}`,
-    `👥 Customers: ${customerCount}`,
-    `📋 Last confirmed booking: ${lastBookingStr}`,
-    `🕐 Last message processed: ${lastMsgStr}`,
+    statusLine,
+    `📅 ${lang === 'he' ? 'לוח שנה' : 'Calendar'}: ${calendarStatus}`,
+    `💰 ${lang === 'he' ? 'אישור' : 'Confirmation'}: ${paymentStr}`,
+    `${t('status_customers', lang)}: ${customerCount}`,
+    `${t('status_last_booking', lang)}: ${lastBookingStr}`,
+    `${t('status_last_msg', lang)}: ${lastMsgStr}`,
+    ...(paused ? ['', t('status_resume_hint', lang)] : []),
   ].join('\n')
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── PAUSE / RESUME ────────────────────────────────────────────────────────────
 
-function dayName(dayOfWeek: number | null | undefined): string {
-  if (dayOfWeek === null || dayOfWeek === undefined) return 'that day'
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
-  return days[dayOfWeek] ?? 'that day'
+export async function pausePA(db: Db, businessId: string, lang: Lang = 'he'): Promise<string> {
+  await db.update(businesses).set({ paused: true }).where(eq(businesses.id, businessId))
+  return t('pause_confirm', lang)
 }
+
+export async function resumePA(db: Db, businessId: string, lang: Lang = 'he'): Promise<string> {
+  await db.update(businesses).set({ paused: false }).where(eq(businesses.id, businessId))
+  return t('resume_confirm', lang)
+}
+
+// ── UPCOMING / BOOKINGS [date] ────────────────────────────────────────────────
+
+export async function buildUpcomingReport(db: Db, businessId: string, forDate?: string, lang: Lang = 'he'): Promise<string> {
+  let query = db
+    .select({
+      id: bookings.id,
+      slotStart: bookings.slotStart,
+      slotEnd: bookings.slotEnd,
+      state: bookings.state,
+      customerId: bookings.customerId,
+      serviceTypeId: bookings.serviceTypeId,
+    })
+    .from(bookings)
+    .where(and(eq(bookings.businessId, businessId), eq(bookings.state, 'confirmed')))
+    .$dynamic()
+
+  if (forDate) {
+    const dayStart = new Date(`${forDate}T00:00:00Z`)
+    const dayEnd = new Date(`${forDate}T23:59:59Z`)
+    query = query.where(and(
+      eq(bookings.businessId, businessId),
+      eq(bookings.state, 'confirmed'),
+      gte(bookings.slotStart, dayStart),
+      lte(bookings.slotStart, dayEnd),
+    ))
+  } else {
+    query = query.where(and(
+      eq(bookings.businessId, businessId),
+      eq(bookings.state, 'confirmed'),
+      gt(bookings.slotStart, new Date()),
+    ))
+  }
+
+  const upcoming = await query.orderBy(bookings.slotStart).limit(15)
+
+  if (upcoming.length === 0) {
+    return i18n.upcoming_none[lang](forDate)
+  }
+
+  const label = forDate ? i18n.upcoming_label_date[lang](forDate) : t('upcoming_label_all', lang)
+  const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+  const lines = [i18n.upcoming_header[lang](label, upcoming.length), '']
+  for (const b of upcoming) {
+    const [customer] = await db
+      .select({ displayName: identities.displayName, phoneNumber: identities.phoneNumber })
+      .from(identities).where(eq(identities.id, b.customerId)).limit(1)
+    const [service] = await db
+      .select({ name: serviceTypes.name })
+      .from(serviceTypes).where(eq(serviceTypes.id, b.serviceTypeId)).limit(1)
+
+    const time = b.slotStart.toLocaleString(locale, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+    const who = customer?.displayName ?? customer?.phoneNumber ?? t('status_unknown', lang)
+    lines.push(`• ${time} — ${service?.name ?? (lang === 'he' ? 'תור' : 'Appointment')} — ${who}`)
+  }
+
+  return lines.join('\n')
+}
+
+// ── HANDLED / RESUME (escalation management) ─────────────────────────────────
+
+export async function markEscalationHandled(db: Db, businessId: string, customerPhone: string, lang: Lang = 'he'): Promise<string> {
+  const { escalatedTasks } = await import('../../db/schema.js')
+  const { isNull } = await import('drizzle-orm')
+  await db
+    .update(escalatedTasks)
+    .set({ resolvedAt: new Date() })
+    .where(and(eq(escalatedTasks.businessId, businessId), eq(escalatedTasks.customerPhone, customerPhone), isNull(escalatedTasks.resolvedAt)))
+  return i18n.escalation_handled[lang](customerPhone)
+}
+
+// ── Service deactivation safety check ────────────────────────────────────────
+
+export async function checkServiceDeactivationSafety(
+  db: Db,
+  businessId: string,
+  serviceName: string,
+): Promise<{ safe: boolean; blockingCount: number; earliestDate: Date | null }> {
+  const [service] = await db
+    .select({ id: serviceTypes.id })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.name, serviceName)))
+    .limit(1)
+
+  if (!service) return { safe: true, blockingCount: 0, earliestDate: null }
+
+  const futureBookings = await db
+    .select({ id: bookings.id, slotStart: bookings.slotStart })
+    .from(bookings)
+    .where(
+      and(
+        eq(bookings.businessId, businessId),
+        eq(bookings.serviceTypeId, service.id),
+        or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held'), eq(bookings.state, 'pending_payment')),
+        gt(bookings.slotStart, new Date()),
+      ),
+    )
+    .orderBy(bookings.slotStart)
+
+  if (futureBookings.length === 0) return { safe: true, blockingCount: 0, earliestDate: null }
+
+  return {
+    safe: false,
+    blockingCount: futureBookings.length,
+    earliestDate: futureBookings[0]!.slotStart,
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function timeToMs(time: string): number {
   const [h = '0', m = '0'] = time.split(':')
