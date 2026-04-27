@@ -48,7 +48,7 @@ steps:
       - '--vpc-connector=pa-connector'
       - '--vpc-egress=private-ranges-only'
       - '--set-secrets=DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,WHATSAPP_ACCESS_TOKEN=wa-access-token:latest,WHATSAPP_PHONE_NUMBER_ID=wa-phone-number-id:latest,WHATSAPP_WEBHOOK_VERIFY_TOKEN=wa-verify-token:latest,WHATSAPP_APP_SECRET=wa-app-secret:latest,GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,GOOGLE_REDIRECT_URI=GOOGLE_REDIRECT_URI:latest,PROVIDER_WA_PHONE_NUMBER_ID=provider-wa-phone-number-id:latest,PROVIDER_WA_ACCESS_TOKEN=provider-wa-access-token:latest'
-      - '--set-env-vars=GOOGLE_CLOUD_PROJECT=deepr-490316,VERTEX_AI_LOCATION=us-central1,NODE_ENV=production,SESSION_EXPIRY_MINUTES=30,HOLD_EXPIRY_MINUTES=15,PROVIDER_WA_NUMBER=${_PROVIDER_WA_NUMBER},PUBLIC_BASE_URL=${_PUBLIC_BASE_URL},OPERATOR_PHONE=${_OPERATOR_PHONE}'
+      - '--set-env-vars=GOOGLE_CLOUD_PROJECT=deepr-490316,VERTEX_AI_LOCATION=us-central1,NODE_ENV=production,SESSION_EXPIRY_MINUTES=30,HOLD_EXPIRY_MINUTES=15,PROVIDER_WA_NUMBER=+15551946756,PUBLIC_BASE_URL=https://pa-backend-d5jzekc5da-ey.a.run.app,OPERATOR_PHONE=+972543503704'
       - '--min-instances=1'
       - '--allow-unauthenticated'
       - '--quiet'
@@ -63,9 +63,6 @@ substitutions:
   _REPO: pa-images
   _SERVICE: pa-backend
   _INSTANCE: deepr-490316:europe-west3:deepr-project
-  _PROVIDER_WA_NUMBER: '+15551946756'
-  _PUBLIC_BASE_URL: 'https://pa-backend-d5jzekc5da-ey.a.run.app'
-  _OPERATOR_PHONE: '+972543503704'
 
 images:
   - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA'
