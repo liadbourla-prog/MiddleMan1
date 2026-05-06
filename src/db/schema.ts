@@ -350,7 +350,7 @@ export const providerOnboardingSessions = pgTable('provider_onboarding_sessions'
   id: uuid('id').primaryKey().defaultRandom(),
   managerPhone: text('manager_phone').notNull().unique(),
   step: text('step', {
-    enum: ['business_name', 'timezone', 'calendar', 'credentials'],
+    enum: ['business_name', 'timezone', 'calendar', 'services', 'credentials'],
   }).notNull().default('business_name'),
   collectedData: jsonb('collected_data').notNull().default({}),
   completedAt: timestamp('completed_at', { withTimezone: true }),

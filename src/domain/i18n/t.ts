@@ -19,9 +19,21 @@ const strings = {
     he: `לא הצלחתי לזהות את אזור הזמן. נסו שם IANA, למשל:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
     en: `I didn't recognise that timezone. Please use an IANA name, for example:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
   },
+  mm_ask_calendar_mode: {
+    he: `לניהול יומן התורים — עדיף להשתמש ביומן Google קיים, אבל אפשר גם להתחיל עם יומן פנימי ולחבר Google מאוחר יותר.\n\nשלחו *1* להתחיל עם יומן פנימי\nשלחו *2* לחבר Google Calendar עכשיו`,
+    en: `For managing bookings, you can use an existing Google Calendar or start with the built-in calendar and connect Google later.\n\nSend *1* to use the built-in calendar\nSend *2* to connect Google Calendar now`,
+  },
   mm_ask_calendar: {
-    he: `כמעט סיימנו! מה ה-Google Calendar ID שלכם?\n\n(Google Calendar → הגדרות → הלוח שלכם → Calendar ID — בדרך כלל נראה כמו כתובת האימייל.)\n\nאמרו "דלג" לטיפול בזה אחר כך.`,
-    en: `Almost there! What's your Google Calendar ID?\n\n(Google Calendar → Settings → your calendar → Calendar ID — usually looks like your email.)\n\nSay "skip" to handle it later during full setup.`,
+    he: `מה ה-Google Calendar ID שלכם?\n\n(Google Calendar → הגדרות → הלוח שלכם → Calendar ID — בדרך כלל נראה כמו כתובת האימייל.)`,
+    en: `What's your Google Calendar ID?\n\n(Google Calendar → Settings → your calendar → Calendar ID — usually looks like your email.)`,
+  },
+  mm_ask_services: {
+    he: `מה השירות העיקרי שאתם מציעים? שלחו את שם השירות ומשך הזמן שלו.\nלמשל: *תספורת, 30 דקות*\n\nאפשר להוסיף עוד שירותים דרך הסוכן שלכם לאחר ההפעלה.`,
+    en: `What's your main service? Send the service name and its duration.\nFor example: *Haircut, 30 minutes*\n\nYou can add more services through your PA after it's live.`,
+  },
+  mm_bad_services: {
+    he: `לא הצלחתי לפענח. נסו שוב — למשל: *תספורת, 30 דקות*`,
+    en: `I didn't catch that. Please try again — for example: *Haircut, 30 minutes*`,
   },
   mm_ask_credentials: {
     he: `דבר אחרון — שלחו את פרטי ה-WhatsApp Business API מ-Meta Business Manager:\n\n• *Phone Number ID* — WhatsApp → Phone Numbers\n• *Access Token* — System User token קבוע\n\nשלחו כך:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,

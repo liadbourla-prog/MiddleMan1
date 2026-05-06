@@ -3,7 +3,7 @@
  *
  * Runs exclusively on the central provider number (PROVIDER_WA_NUMBER).
  * - If sender is OPERATOR_PHONE → routes to operator admin handler.
- * - Otherwise → new business owner onboarding (4-step conversation).
+ * - Otherwise → new business owner onboarding (5-step conversation).
  *
  * On onboarding completion, their WABA number is registered and they
  * are told to text their PA number directly — this number is never needed again.
@@ -11,10 +11,11 @@
 
 import { eq } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { providerOnboardingSessions, businesses, identities } from '../../db/schema.js'
+import { providerOnboardingSessions, businesses, identities, serviceTypes } from '../../db/schema.js'
 import type { ProviderOnboardingSession } from '../../db/schema.js'
 import { handleOperatorMessage } from './operator.js'
 import { i18n, detectLang, type Lang } from '../i18n/t.js'
+import { sendMessage } from '../../adapters/whatsapp/sender.js'
 
 export interface ProviderOnboardingResult {
   reply: string
@@ -25,7 +26,10 @@ type Step = ProviderOnboardingSession['step']
 type CollectedData = {
   businessName?: string
   timezone?: string
+  calendarMode?: 'internal' | 'google'
   calendarId?: string | null
+  services?: Array<{ name: string; durationMinutes: number }>
+  _serviceFailCount?: number
   phoneNumberId?: string
   accessToken?: string
   paPhoneNumber?: string
@@ -74,6 +78,10 @@ async function handleStep(
 
   switch (session.step) {
     case 'business_name': {
+      // Treat casual greetings as a re-ask rather than accepting as the business name
+      if (/^(שלום|היי|הי|אהלן|hello|hi|hey)\b/i.test(text)) {
+        return { reply: `מה שם העסק שלכם? / What's the name of your business?` }
+      }
       const name = text.slice(0, 100)
       const detectedLang = detectLang(text)
       await advance(db, session.managerPhone, 'timezone', { ...data, businessName: name, language: detectedLang })
@@ -87,12 +95,61 @@ async function handleStep(
         return { reply: i18n.mm_bad_timezone[lang] }
       }
       await advance(db, session.managerPhone, 'calendar', { ...data, timezone: tz })
-      return { reply: i18n.mm_ask_calendar[lang] }
+      return { reply: i18n.mm_ask_calendar_mode[lang] }
     }
 
     case 'calendar': {
-      const calendarId = text.toLowerCase() === 'skip' ? null : text.trim()
-      await advance(db, session.managerPhone, 'credentials', { ...data, calendarId })
+      if (!data.calendarMode) {
+        // Awaiting the initial choice between internal and Google Calendar
+        const choice = text.trim()
+        if (choice === '1') {
+          await advance(db, session.managerPhone, 'services', { ...data, calendarMode: 'internal', calendarId: null })
+          return { reply: i18n.mm_ask_services[lang] }
+        }
+        if (choice === '2') {
+          // Store mode choice but stay on this step to collect the Calendar ID next
+          await db
+            .update(providerOnboardingSessions)
+            .set({ collectedData: { ...data, calendarMode: 'google' } as Record<string, unknown>, updatedAt: new Date() })
+            .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+          return { reply: i18n.mm_ask_calendar[lang] }
+        }
+        return { reply: i18n.mm_ask_calendar_mode[lang] }
+      }
+
+      // calendarMode is 'google' — next input is the Google Calendar ID
+      const calendarId = text.trim()
+      await advance(db, session.managerPhone, 'services', { ...data, calendarId })
+      return { reply: i18n.mm_ask_services[lang] }
+    }
+
+    case 'services': {
+      const parsed = parseService(text)
+      const failCount = data._serviceFailCount ?? 0
+
+      if (!parsed) {
+        if (failCount >= 1) {
+          // Second failure — accept as-is with 30-minute default
+          const fallback = { name: text.trim().slice(0, 100), durationMinutes: 30 }
+          const { _serviceFailCount: _, ...cleanData } = data
+          await advance(db, session.managerPhone, 'credentials', {
+            ...cleanData,
+            services: [fallback],
+          })
+          return { reply: i18n.mm_ask_credentials[lang] }
+        }
+        await db
+          .update(providerOnboardingSessions)
+          .set({
+            collectedData: { ...data, _serviceFailCount: failCount + 1 } as Record<string, unknown>,
+            updatedAt: new Date(),
+          })
+          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+        return { reply: i18n.mm_bad_services[lang] }
+      }
+
+      const { _serviceFailCount: _, ...cleanData } = data
+      await advance(db, session.managerPhone, 'credentials', { ...cleanData, services: [parsed] })
       return { reply: i18n.mm_ask_credentials[lang] }
     }
 
@@ -130,6 +187,20 @@ async function handleStep(
         .set({ completedAt: new Date(), collectedData: fullData as Record<string, unknown>, updatedAt: new Date() })
         .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
 
+      // Kick off BK Setup on the PA — send the opening prompt from the manager's PA to themselves
+      // TODO: when BK setup skill exposes a constant, replace the string below with that import
+      //       see src/skills/business-knowledge-setup/index.ts — 'brand-voice' step Q function
+      const bkOpeningPrompt = lang === 'he'
+        ? `לפני שהלקוחות מגיעים, בואנו נלמד על *${fullData.businessName}* כדי שאוכל לייצג אתכם הכי טוב.\n\nאיך היית מתאר/ת את *${fullData.businessName}*? מה הרגש שאתה/את רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?\n\n(ככל שתשתף/י יותר, כך אדבר טוב יותר בשמך)`
+        : `Before customers arrive, let me get to know *${fullData.businessName}* so I can represent you well.\n\nHow would you describe *${fullData.businessName}*? What feeling do you want customers to walk away with? What makes you stand out?\n\n(The more detail you share, the better I'll speak in your voice)`
+
+      await sendMessage(
+        { toNumber: session.managerPhone, body: bkOpeningPrompt },
+        { accessToken: fullData.accessToken!, phoneNumberId: fullData.phoneNumberId! },
+      ).catch(() => {
+        // BK setup kickoff is best-effort — provisioning already succeeded
+      })
+
       return { reply: i18n.mm_done[lang](paPhoneNumber) }
     }
   }
@@ -142,7 +213,7 @@ async function provisionBusiness(
   managerPhone: string,
   data: CollectedData,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const { businessName, timezone, calendarId, phoneNumberId, accessToken, paPhoneNumber } = data
+  const { businessName, timezone, calendarMode, calendarId, services, phoneNumberId, accessToken, paPhoneNumber } = data
 
   if (!businessName || !timezone || !phoneNumberId || !accessToken || !paPhoneNumber) {
     return { ok: false, error: 'Missing required fields' }
@@ -157,6 +228,8 @@ async function provisionBusiness(
 
   if (existing) return { ok: true }
 
+  const resolvedCalendarMode = calendarMode ?? 'google'
+
   const [business] = await db
     .insert(businesses)
     .values({
@@ -164,9 +237,11 @@ async function provisionBusiness(
       whatsappNumber: paPhoneNumber,
       whatsappPhoneNumberId: phoneNumberId,
       whatsappAccessToken: accessToken,
-      googleCalendarId: calendarId ?? paPhoneNumber,
+      // For internal mode, use the PA number as a placeholder; real Calendar ID only for google mode
+      googleCalendarId: resolvedCalendarMode === 'google' && calendarId ? calendarId : paPhoneNumber,
+      calendarMode: resolvedCalendarMode,
       timezone,
-      onboardingStep: 'business_name',
+      onboardingStep: null,
     })
     .returning({ id: businesses.id })
 
@@ -178,6 +253,16 @@ async function provisionBusiness(
     role: 'manager',
     displayName: 'Owner',
   })
+
+  if (services && services.length > 0) {
+    await db.insert(serviceTypes).values(
+      services.map((s) => ({
+        businessId: business.id,
+        name: s.name,
+        durationMinutes: s.durationMinutes,
+      })),
+    )
+  }
 
   return { ok: true }
 }
@@ -265,27 +350,54 @@ function parseCredentials(text: string): { phoneNumberId: string; accessToken: s
   return null
 }
 
+function parseService(text: string): { name: string; durationMinutes: number } | null {
+  const durationMatch = text.match(/(\d+)\s*(?:דקות?|min(?:utes?)?)/i)
+  if (!durationMatch) return null
+  const durationMinutes = parseInt(durationMatch[1]!, 10)
+  if (isNaN(durationMinutes) || durationMinutes <= 0) return null
+
+  const name = text.replace(/[,،\s]*\d+\s*(?:דקות?|min(?:utes?)?)/i, '').trim()
+  if (!name) return null
+
+  return { name: name.slice(0, 100), durationMinutes }
+}
+
 function resolveTimezone(input: string): string | null {
   const cleaned = input.trim()
   // Try as-is first (IANA format)
   if (isValidIANA(cleaned)) return cleaned
 
-  // Common shorthand map
+  // Common shorthand map — English and Hebrew city/country names
   const shortcuts: Record<string, string> = {
+    // Hebrew
+    'ישראל': 'Asia/Jerusalem',
+    'תל אביב': 'Asia/Jerusalem',
+    'ירושלים': 'Asia/Jerusalem',
+    'חיפה': 'Asia/Jerusalem',
+    'לונדון': 'Europe/London',
+    'פריז': 'Europe/Paris',
+    'דובאי': 'Asia/Dubai',
+    'ניו יורק': 'America/New_York',
+    // English
     'tel aviv': 'Asia/Jerusalem',
-    israel: 'Asia/Jerusalem',
-    jerusalem: 'Asia/Jerusalem',
+    'israel': 'Asia/Jerusalem',
+    'il': 'Asia/Jerusalem',
+    'jerusalem': 'Asia/Jerusalem',
+    'haifa': 'Asia/Jerusalem',
     'new york': 'America/New_York',
     'new york city': 'America/New_York',
-    nyc: 'America/New_York',
-    london: 'Europe/London',
-    uk: 'Europe/London',
-    paris: 'Europe/Paris',
-    dubai: 'Asia/Dubai',
-    utc: 'UTC',
+    'nyc': 'America/New_York',
+    'us': 'America/New_York',
+    'london': 'Europe/London',
+    'uk': 'Europe/London',
+    'paris': 'Europe/Paris',
+    'fr': 'Europe/Paris',
+    'dubai': 'Asia/Dubai',
+    'ae': 'Asia/Dubai',
+    'utc': 'UTC',
   }
 
-  const mapped = shortcuts[cleaned.toLowerCase()]
+  const mapped = shortcuts[cleaned.toLowerCase()] ?? shortcuts[cleaned]
   if (mapped) return mapped
 
   // Try capitalising as continent/city (e.g. "america/new_york" → "America/New_York")
@@ -306,4 +418,3 @@ function isValidIANA(tz: string): boolean {
     return false
   }
 }
-
