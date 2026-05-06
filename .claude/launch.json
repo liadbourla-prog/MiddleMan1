@@ -6,6 +6,12 @@
       "runtimeExecutable": "npx",
       "runtimeArgs": ["serve", "website", "-p", "4321", "--no-clipboard"],
       "port": 4321
+    },
+    {
+      "name": "middleman-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "/tmp/middleman-preview", "-p", "4322", "--no-clipboard"],
+      "port": 4322
     }
   ]
 }

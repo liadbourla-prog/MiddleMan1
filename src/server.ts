@@ -4,6 +4,7 @@ import rateLimit from '@fastify/rate-limit'
 import { webhookRoutes } from './routes/webhook.js'
 import { oauthRoutes } from './routes/oauth.js'
 import { importRoutes } from './routes/import.js'
+import { buildSiteRoutes } from './routes/build-site/index.js'
 import { startHoldExpiryWorker, scheduleHoldExpiryJob } from './workers/hold-expiry.js'
 import { startMessageRetryWorker } from './workers/message-retry.js'
 import { startSessionExpiryWorker } from './workers/session-expiry.js'
@@ -55,6 +56,12 @@ app.addContentTypeParser(
 await app.register(webhookRoutes)
 await app.register(oauthRoutes)
 await app.register(importRoutes)
+await app.register(buildSiteRoutes)
+
+if (isDev) {
+  const { simulateRoutes } = await import('./routes/simulate.js')
+  await app.register(simulateRoutes)
+}
 
 app.get('/health', async () => ({ status: 'ok' }))
 

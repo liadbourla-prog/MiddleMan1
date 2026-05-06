@@ -1,0 +1,9 @@
+# Developer A owns everything by default.
+*                   @liadbourla-prog
+
+# Developer B owns the skills directory — no approval needed from A for changes here.
+# Replace DEVELOPER_B_GITHUB_USERNAME once you have it.
+src/skills/         @harelyagen-0
+
+# The shared contract is co-owned — both must approve changes to it.
+src/shared/         @liadbourla-prog @harelyagen-0

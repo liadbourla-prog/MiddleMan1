@@ -68,13 +68,21 @@ Secret name mapping:
 ### Provision new business ("provision", "new business", "add business")
 Add a new business to the system without redeploying code:
 1. Start Cloud SQL proxy locally: `./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &`
-2. Run: `DATABASE_URL="postgres://pa_user:150404@127.0.0.1:5433/pa4business" PROVISION_WA_NUMBER="..." PROVISION_MANAGER_PHONE="..." PROVISION_BUSINESS_NAME="..." PROVISION_CALENDAR_ID="..." PROVISION_TIMEZONE="..." npm run provision`
-3. Ask the user for any missing provision values before running
+2. Ask the user for any missing provision values, then run:
+   ```bash
+   LOCAL_DB_URL="postgres://pa_user:$(gcloud secrets versions access latest --secret=db-user-password --project=deepr-490316 2>/dev/null || read -s -p 'DB password: ' P && echo $P)@127.0.0.1:5433/pa4business"
+   DATABASE_URL="$LOCAL_DB_URL" PROVISION_WA_NUMBER="..." PROVISION_MANAGER_PHONE="..." PROVISION_BUSINESS_NAME="..." PROVISION_CALENDAR_ID="..." PROVISION_TIMEZONE="..." npm run provision
+   ```
+   If the `db-user-password` secret doesn't exist in Secret Manager, prompt the user for the password.
 
 ### Migrations only ("migrate", "migrations")
 1. Start Cloud SQL proxy: `./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &`
 2. Wait for "Listening" confirmation
-3. Run: `DATABASE_URL="postgres://pa_user:150404@127.0.0.1:5433/pa4business" npm run db:migrate`
+3. Run:
+   ```bash
+   LOCAL_DB_URL="postgres://pa_user:$(gcloud secrets versions access latest --secret=db-user-password --project=deepr-490316 2>/dev/null || read -s -p 'DB password: ' P && echo $P)@127.0.0.1:5433/pa4business"
+   DATABASE_URL="$LOCAL_DB_URL" npm run db:migrate
+   ```
 4. **Always run migration verification after** (see below)
 
 ### Change MiddleMan's number ("middleman number", "central number")
@@ -90,12 +98,13 @@ MiddleMan's WhatsApp number is a plain env var (not a secret). To change it:
 `npm run db:migrate` can report "applied successfully" while silently skipping new migrations (journal hash mismatch). Always verify by checking a key new column:
 
 ```bash
+LOCAL_DB_URL="postgres://pa_user:$(gcloud secrets versions access latest --secret=db-user-password --project=deepr-490316 2>/dev/null || read -s -p 'DB password: ' P && echo $P)@127.0.0.1:5433/pa4business"
 ./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &
 sleep 4
-node --input-type=module <<'EOF'
+node --input-type=module <<EOF
 import postgres from './node_modules/postgres/src/index.js';
-const sql = postgres('postgres://pa_user:150404@127.0.0.1:5433/pa4business', { max: 1 });
-const cols = await sql`SELECT column_name FROM information_schema.columns WHERE table_name='businesses' ORDER BY column_name`;
+const sql = postgres('$LOCAL_DB_URL', { max: 1 });
+const cols = await sql\`SELECT column_name FROM information_schema.columns WHERE table_name='businesses' ORDER BY column_name\`;
 console.log('businesses columns:', cols.map(c => c.column_name).join(', '));
 await sql.end();
 EOF

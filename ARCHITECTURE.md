@@ -1,6 +1,6 @@
 # PA_4_Business — System Architecture
 **Status: Active — updated to reflect implemented system.**
-**Last updated: 2026-04-23**
+**Last updated: 2026-04-30**
 
 ---
 
@@ -212,6 +212,33 @@ before_state              # JSON snapshot
 after_state               # JSON snapshot
 metadata                  # JSON — any additional context
 created_at
+```
+
+#### SkillWorkflow
+Durable state for Workflow Skills — multi-step operations that span multiple sessions (e.g. building a website). One active row per business × identity × skill at a time.
+```
+id
+business_id
+identity_id
+skill_name                # stable kebab-case skill identifier
+step                      # current step name within the workflow
+state                     # JSON — accumulated workflow data (inputs, outputs, decisions)
+status                    # enum: active | paused | completed | failed
+version                   # integer, increments on every write — used for optimistic locking
+created_at
+updated_at
+```
+
+#### BusinessFAQ
+Manager-defined FAQ entries for the business. Resolved into `SkillContext.businessKnowledge.faqs` at dispatch time.
+```
+id
+business_id
+question
+answer
+is_active
+created_at
+updated_at
 ```
 
 ---
@@ -527,12 +554,15 @@ The following are explicitly **out of scope for V1** and must not be partially i
 - Live CRM sync (HubSpot, Salesforce, etc.) — V1 supports one-time CSV import only
 - Provisioning a new WhatsApp Business API number for a business — V1 requires the business to bring their own existing WABA number
 - Inbound calls or media messages
+- All skills listed in Part 15 (website builder, AEO optimizer, FAQ responder, campaigns, analytics, review collector, intake form, social content, upsell) — these are V2 scope built on the skills layer
 
 When a customer requests an out-of-scope feature, the system responds that it is not available.
 
 ---
 
 ## Part 10 — Database Schema (V1, PostgreSQL)
+
+`src/db/schema.ts` is the authoritative source of truth. This section mirrors it for reference — if there is ever a discrepancy, the Drizzle schema wins.
 
 ```sql
 -- Businesses
@@ -548,8 +578,17 @@ CREATE TABLE businesses (
   min_booking_buffer_minutes INT NOT NULL DEFAULT 30,
   max_booking_days_ahead INT NOT NULL DEFAULT 365,
   cancellation_cutoff_minutes INT NOT NULL DEFAULT 0,
-  bot_persona TEXT NOT NULL DEFAULT 'neutral',
-  onboarding_step TEXT,                        -- null when onboarding complete
+  currency TEXT NOT NULL DEFAULT 'ILS',
+  bot_persona TEXT NOT NULL DEFAULT 'neutral' CHECK (bot_persona IN ('female','male','neutral')),
+  brand_voice TEXT,                              -- free-text tone descriptor surfaced in SkillContext.businessKnowledge
+  confirmation_gate TEXT NOT NULL DEFAULT 'immediate' CHECK (confirmation_gate IN ('immediate','post_payment')),
+  payment_method TEXT,
+  available_247 BOOLEAN NOT NULL DEFAULT TRUE,
+  calendar_mode TEXT NOT NULL DEFAULT 'google' CHECK (calendar_mode IN ('google','internal')),
+  paused BOOLEAN NOT NULL DEFAULT FALSE,
+  default_language TEXT NOT NULL DEFAULT 'he' CHECK (default_language IN ('he','en')),
+  escalation_rules JSONB NOT NULL DEFAULT '[]',  -- [{trigger, value?, threshold?, customerMessage, customText?}]
+  onboarding_step TEXT,                          -- null when onboarding complete
   onboarding_completed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -585,6 +624,8 @@ CREATE TABLE identities (
   granted_by UUID REFERENCES identities(id),
   granted_at TIMESTAMPTZ,
   revoked_at TIMESTAMPTZ,
+  messaging_opt_out BOOLEAN NOT NULL DEFAULT FALSE,
+  preferred_language TEXT CHECK (preferred_language IN ('he','en')),  -- null = use business default
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (business_id, phone_number)
 );
@@ -596,10 +637,26 @@ CREATE TABLE service_types (
   name TEXT NOT NULL,
   duration_minutes INT NOT NULL,
   buffer_minutes INT NOT NULL DEFAULT 0,
+  category TEXT,
+  max_participants INT NOT NULL DEFAULT 1,
   requires_payment BOOLEAN NOT NULL DEFAULT FALSE,
   payment_amount NUMERIC(10,2),
+  color_id INT,                                  -- Google Calendar colorId (1–11) or null for default
+  intake_required BOOLEAN NOT NULL DEFAULT FALSE, -- if true, intake-form skill runs before booking confirms
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  deactivated_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Provider assignments (which staff handle which service types)
+CREATE TABLE provider_assignments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  identity_id UUID NOT NULL REFERENCES identities(id),
+  service_type_id UUID NOT NULL REFERENCES service_types(id),
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (identity_id, service_type_id)
 );
 
 -- Availability rules
@@ -639,7 +696,10 @@ CREATE TABLE bookings (
     'not_required','pending','paid','failed'
   )),
   cancellation_reason TEXT,
+  cancelled_by_role TEXT CHECK (cancelled_by_role IN ('customer','manager','system')),
+  slot_tz_at_creation TEXT,                      -- timezone at booking time (for display)
   rescheduled_from UUID REFERENCES bookings(id),
+  rebooking_requested BOOLEAN NOT NULL DEFAULT FALSE,  -- set when manager bulk-cancels and agrees to help rebook
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -650,11 +710,11 @@ CREATE TABLE conversation_sessions (
   business_id UUID NOT NULL REFERENCES businesses(id),
   identity_id UUID NOT NULL REFERENCES identities(id),
   intent TEXT CHECK (intent IN (
-    'booking','rescheduling','cancellation','inquiry',
+    'booking','rescheduling','cancellation','inquiry','list_bookings',
     'manager_instruction','unknown'
   )),
   state TEXT NOT NULL CHECK (state IN (
-    'active','waiting_confirmation','waiting_clarification',
+    'active','waiting_confirmation','waiting_clarification','waiting_language_confirmation',
     'completed','expired','failed'
   )),
   context JSONB NOT NULL DEFAULT '{}',
@@ -696,6 +756,54 @@ CREATE TABLE audit_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Customer profiles (enriched summary per customer per business)
+CREATE TABLE customer_profiles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  identity_id UUID NOT NULL UNIQUE REFERENCES identities(id),
+  display_name TEXT,
+  preferred_service_type_id UUID REFERENCES service_types(id),
+  last_booking_id UUID,
+  last_booking_at TIMESTAMPTZ,
+  total_bookings INT NOT NULL DEFAULT 0,
+  notes TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Conversation messages (per-session message log)
+CREATE TABLE conversation_messages (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id UUID NOT NULL REFERENCES conversation_sessions(id),
+  role TEXT NOT NULL CHECK (role IN ('customer','assistant')),
+  text TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Reminders (sent before/after bookings)
+CREATE TABLE reminders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  booking_id UUID NOT NULL REFERENCES bookings(id),
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('24h','1h','confirmation','cancellation')),
+  sent_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (booking_id, trigger_type)
+);
+
+-- Waitlist
+CREATE TABLE waitlist (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  service_type_id UUID NOT NULL REFERENCES service_types(id),
+  slot_start TIMESTAMPTZ NOT NULL,
+  slot_end TIMESTAMPTZ NOT NULL,
+  customer_id UUID NOT NULL REFERENCES identities(id),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','offered','accepted','expired')),
+  offered_at TIMESTAMPTZ,
+  offer_expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (business_id, slot_start, customer_id)
+);
+
 -- Deduplication table for inbound WhatsApp messages
 CREATE TABLE processed_messages (
   message_id TEXT PRIMARY KEY,
@@ -703,11 +811,79 @@ CREATE TABLE processed_messages (
   processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Tasks escalated to the operator when a customer asks something no PA handles
+CREATE TABLE escalated_tasks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  customer_phone TEXT NOT NULL,
+  message_body TEXT NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL,
+  escalation_type TEXT NOT NULL CHECK (escalation_type IN ('platform','owner_rule')),
+  trigger_rule TEXT,
+  forwarded_at TIMESTAMPTZ,
+  resolved_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Business FAQ entries (surfaced in SkillContext.businessKnowledge.faqs)
+CREATE TABLE business_faqs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  question TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Skill workflow state (durable multi-step operations spanning multiple sessions)
+CREATE TABLE skill_workflows (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  identity_id UUID NOT NULL REFERENCES identities(id),
+  skill_name TEXT NOT NULL,
+  step TEXT NOT NULL,
+  state JSONB NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL CHECK (status IN ('active','paused','completed','failed')),
+  version INT NOT NULL DEFAULT 1,              -- optimistic locking: increment on every write
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (identity_id, skill_name, status) -- enforced at app level: only one active per identity per skill
+);
+
+-- Per-step audit trail for workflow debugging and replay
+CREATE TABLE workflow_step_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workflow_id UUID NOT NULL REFERENCES skill_workflows(id),
+  step_name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('SUCCESS','RETRYABLE','FATAL','PAUSED')),
+  input_snapshot JSONB,                        -- capped at ~10KB; large payloads stored as summary
+  output_snapshot JSONB,
+  latency_ms INT,
+  retry_count INT NOT NULL DEFAULT 0,
+  error_context JSONB,                         -- {code, message, recoverable} on failure
+  tokens_used INT,                             -- LLM token count for cost tracking, null if no LLM call
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Log of operator-triggered bulk updates pushed to all agents
+CREATE TABLE agent_update_log (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  update_type TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  applied_to_count INT NOT NULL DEFAULT 0
+);
+
 -- Indexes
 CREATE INDEX idx_bookings_business_state ON bookings(business_id, state);
 CREATE INDEX idx_bookings_slot ON bookings(business_id, slot_start, slot_end);
 CREATE INDEX idx_bookings_hold_expires ON bookings(hold_expires_at) WHERE state = 'held';
 CREATE INDEX idx_sessions_identity ON conversation_sessions(identity_id, state);
+CREATE INDEX idx_messages_session ON conversation_messages(session_id, created_at);
+CREATE INDEX idx_provider_assignments_business ON provider_assignments(business_id, is_active);
+CREATE INDEX idx_waitlist_status ON waitlist(business_id, status);
+CREATE INDEX idx_escalated_tasks_business ON escalated_tasks(business_id, resolved_at);
 CREATE INDEX idx_audit_entity ON audit_log(entity_type, entity_id);
 ```
 
@@ -751,9 +927,11 @@ CREATE INDEX idx_audit_entity ON audit_log(entity_type, entity_id);
 
 ---
 
-## Part 13 — First Implementation Milestones
+## Part 13 — Implementation Milestones
 
-**M1 — Foundation (no external integrations)**
+**All milestones through M8 are complete and live in v1.0.0.**
+
+**M1 — Foundation** ✅
 - Database schema applied and migrated
 - Identity resolution logic + role table
 - WhatsApp webhook receiver (signature verification + deduplication)
@@ -761,47 +939,244 @@ CREATE INDEX idx_audit_entity ON audit_log(entity_type, entity_id);
 - ConversationSession create/load/expire
 - Audit log writer
 
-**M2 — Booking engine (no Calendar yet)**
+**M2 — Booking engine** ✅
 - ServiceType CRUD (manager-only)
 - Availability rule CRUD (manager-only)
 - Booking state machine (all transitions, tested in isolation)
 - Authorization check function
-- Availability query against internal rules (without Calendar)
+- Availability query against internal rules
 
-**M3 — Calendar integration**
+**M3 — Calendar integration** ✅
 - Calendar Adapter with typed result model
 - Hold placement and release
 - Event confirmation and deletion
 - Failure handling for all Calendar error cases
 - Booking engine wired to Calendar Adapter
 
-**M4 — WhatsApp message flows**
+**M4 — WhatsApp message flows** ✅
 - LLM adapter with schema validation
 - Customer intent extraction
 - Booking flow end-to-end (inquiry → held → confirmed)
 - Cancellation flow
 - Clarification loop
 
-**M5 — Manager instruction handling**
+**M5 — Manager instruction handling** ✅
 - Manager instruction handler
 - LLM classification
 - Ambiguity detection and clarification path
 - Apply to availability, policy, service types
 - Raw message ledger
 
-**M6 — Hardening**
+**M6 — Hardening** ✅
 - Hold expiry background job
 - Retry queues for outbound messages
 - End-to-end integration tests for all core flows
 - Failure scenario tests (Calendar down, LLM invalid output, duplicate message)
 
-**M7 — Business onboarding (implemented)**
+**M7 — Business onboarding** ✅
 - Provider number (Step 0): 4-step WhatsApp conversation, WABA credential validation via Meta API, automatic phone number fetch, Business + Identity provisioning
 - Business onboarding (Steps 1–6): guided WhatsApp flow for name, services, hours, Calendar OAuth, optional CSV import, verification
 - `npm run provision` CLI as fallback for direct provisioning
 - STATUS command (on-demand PA health report)
 - Error alerts pushed to manager on unhandled failures
 - Per-business WhatsApp credentials (overrides global env vars)
+
+**M8 — v1.0.0 Production Feature Set** ✅
+- Escalation engine (platform escalations + owner-defined trigger rules)
+- Business hours gate (PA pauses outside configured hours)
+- i18n: Hebrew and English, per-customer language preference, bot persona
+- Provider/staff assignments (which staff handle which service types)
+- Reminder worker (24h + 1h pre-booking reminders, confirmation and cancellation notices)
+- Queued messages worker (deferred outbound delivery with retry)
+- Waitlist engine
+- Conversation message log (`conversation_messages` table)
+- Customer profiles (`customer_profiles` table)
+- GCP Cloud Run deployment with Cloud Build CI/CD pipeline
+
+**M9 — Skills Layer Foundation** ✅
+- `src/shared/skill-types.ts` — typed contract (`SkillContext`, `SkillOutcome`, `Skill`)
+- `src/skills/index.ts` — registry + `dispatchSkill()`
+- ESLint import boundary enforcement
+- GitHub Actions CI (tsc + lint + vitest on every PR)
+- CODEOWNERS enforcing Developer A / Developer B split
+- `website-builder` skill skeleton
+
+**Next: First business provisioning, then skills infrastructure (M10), then first production skill.**
+
+---
+
+## Part 14 — Skills Layer
+
+### What Skills Are
+
+Skills are self-contained feature modules that extend the PA's capabilities beyond the V1 booking core. Where the core handles booking, scheduling, and calendar management deterministically, skills handle open-ended or feature-rich conversations that require their own logic, LLM calls, and multi-turn state.
+
+Skills are built by Developer B and live exclusively in `src/skills/`. Developer A owns the interface contract they implement. Neither party may change `src/shared/skill-types.ts` without the other's review.
+
+### Runtime Position
+
+Skills are dispatched at the entry point of the Customer Flow Handler, before LLM intent extraction. The sequence for every inbound customer message is:
+
+1. Identity resolution (standard)
+2. Business knowledge resolution — `businessKnowledge` fields loaded from DB and added to context
+3. Active workflow lookup — if a `skill_workflows` row with `status = 'active'` exists for this identity, `workflowState` is added to context
+4. **`dispatchSkill(ctx)`** — each registered skill's `canHandle(ctx)` is evaluated in order. If any returns `true`, that skill handles the message entirely. The standard pipeline does not run.
+5. If no skill claims the message → LLM intent extraction → booking engine (standard)
+
+Skills are first-class handlers, not a fallback path. A skill that claims a message owns it completely — including any LLM calls, state management, and reply construction.
+
+### Two Skill Types
+
+**Simple Skills** handle a single intent within a session. They are stateless beyond the `conversationHistory` passed in `SkillContext`. `sessionComplete: true` is returned when done.
+
+**Workflow Skills** handle multi-step operations that span multiple sessions and potentially days (e.g. building a website). They use the `skill_workflows` table as their durable state store. On each incoming message:
+- `canHandle` returns `true` if the message matches the skill's trigger OR if `ctx.workflowState?.skillName === this.name` (active workflow resumes)
+- `handle` loads the current step from `workflowState`, executes the step's logic, advances or completes the workflow, and persists the new state to `skill_workflows`
+- Each step is deterministic TypeScript code. LLM calls happen *within* steps (for interpretation or content generation), never *between* steps (for routing or sequencing)
+- If a step fails, the workflow remains at that step and resumes on the next message
+- Only one active workflow per identity per skill at a time
+
+The booking engine is not a skill and is never replaced by a skill. Skills that need booking data read it from `SkillContext`. Skills must never directly trigger bookings — if a skill requires booking initiation as part of its flow, Developer A must provide a typed callback in `SkillContext`.
+
+### The Contract
+
+Defined in `src/shared/skill-types.ts`.
+
+#### StepResult — what a Workflow Skill returns per step internally
+
+```ts
+type StepStatus = 'SUCCESS' | 'RETRYABLE' | 'FATAL' | 'PAUSED'
+
+interface StepResult {
+  status: StepStatus
+  retryCount?: number
+  errorContext?: { code: string; message: string; recoverable: boolean }
+}
+```
+
+- `SUCCESS` — step completed; advance to next step
+- `RETRYABLE` — transient external failure; retry up to 3× with exponential backoff; surface to user as "still working on it"
+- `FATAL` — unrecoverable; mark workflow `failed`, store error in `state.error`, notify manager
+- `PAUSED` — awaiting user input; workflow stays at current step until next message
+
+This is an internal type used within Workflow Skill step logic. It does not appear in `SkillOutcome`.
+
+#### SkillContext — what every skill receives
+
+| Field | Type | Contents |
+|---|---|---|
+| `business.id` | `string` | Business UUID |
+| `business.name` | `string` | Display name |
+| `business.timezone` | `string` | IANA timezone |
+| `business.defaultLanguage` | `'he' \| 'en'` | Fallback language |
+| `business.botPersona` | `'female' \| 'male' \| 'neutral'` | Reply tone |
+| `business.currency` | `string` | e.g. `'ILS'` |
+| `caller.id` | `string` | Identity UUID |
+| `caller.phoneNumber` | `string` | E.164 |
+| `caller.role` | `'manager' \| 'delegated_user' \| 'customer'` | Authorization reference |
+| `caller.displayName` | `string \| null` | |
+| `caller.preferredLanguage` | `'he' \| 'en' \| null` | null = use business default |
+| `message.text` | `string` | Raw inbound message text |
+| `message.receivedAt` | `Date` | |
+| `conversationHistory` | `SkillConversationTurn[]` | Last N turns `[{role, text}]` |
+| `language` | `'he' \| 'en'` | Pre-resolved reply language — skills always use this field |
+| `sessionId` | `string` | Current session UUID |
+| `businessKnowledge.services` | `ServiceSummary[]` | Active service types: name, duration, price |
+| `businessKnowledge.policies` | `PolicySummary` | Booking policy fields (buffer, cutoff, max days ahead) |
+| `businessKnowledge.faqs` | `FAQ[]` | Manager-defined FAQ entries from `business_faqs` |
+| `businessKnowledge.brandVoice` | `string \| null` | Free-text brand voice from `businesses.brand_voice` |
+| `workflowState` | `WorkflowState \| null` | Active `skill_workflows` row for this identity, or null |
+| `workflow.advance` | `(step, state) => Promise<void>` | Present only when `workflowState` is non-null. Advances step with optimistic lock. |
+| `workflow.complete` | `() => Promise<void>` | Marks workflow `completed`. |
+| `workflow.fail` | `(error) => Promise<void>` | Marks workflow `failed`, stores error, notifies manager. |
+| `workflow.create` | `(skillName, firstStep) => Promise<WorkflowState>` | Creates a new workflow row. Present only when `workflowState` is null. |
+| `recentCompletedBooking` | `CompletedBookingSummary \| null` | Most recently completed booking for this identity (needed by review-collector) |
+| `customerSegmentQuery` | `(filter) => Promise<CustomerSummary[]>` | Manager-only: returns customers matching a segment filter (needed by campaign-sender) |
+
+Skills receive a sanitized bundle. No DB handles, no access tokens, no internal engine state. Workflow callbacks (`workflow.*`) are implemented by the core and injected at dispatch time — skills call them without importing anything from `src/domain/`.
+
+#### SkillOutcome — what every skill must return
+
+```ts
+// Skill handled the message:
+{ handled: true;  reply: string; sessionComplete: boolean; skillName: string }
+
+// Skill does not handle this message — pass through:
+{ handled: false; skillName: string }
+```
+
+The core engine reads `handled`. If `true`, the reply is sent and the session is updated per `sessionComplete`. If `false`, the next registered skill is tried, then the standard pipeline runs.
+
+### Import Boundary
+
+Files under `src/skills/**` may only import from `src/shared/`. Importing from `src/domain/`, `src/adapters/`, `src/db/`, `src/workers/`, or `src/routes/` is a lint error that blocks CI.
+
+Skills interact with the outside world through two mechanisms only:
+1. The `SkillContext` bundle provided by the core engine
+2. Direct external HTTP calls to third-party APIs within the skill
+
+If a skill needs data not in `SkillContext`, the correct path is to extend `src/shared/skill-types.ts` (requires Developer A's review) — not to import from core.
+
+### Skill Registry
+
+Skills call `registerSkill(skill)` from `src/skills/index.ts`. The core engine calls `dispatchSkill(ctx)` once per inbound customer message. Skills are evaluated in registration order — first match wins.
+
+### Component Boundary Additions (extends Part 4)
+
+- **Skills:** no DB access, no Calendar access, no WhatsApp send, no LLM client from `src/adapters/`
+- **Workflow Skills:** read/write `skill_workflows` table exclusively through a typed helper provided by Developer A — never raw DB queries
+- **Core Customer Flow Handler:** calls `dispatchSkill` before LLM extraction; treats `SkillOutcome` as opaque — never inspects skill internals
+- **Booking engine:** not a skill, not callable by skills — remains fully deterministic and unchanged
+
+---
+
+## Part 15 — Skills Roadmap (V2)
+
+### Architecture note
+
+All PA capabilities beyond the V1 booking core are implemented as **skills** — not as separate LLM agents. There is no Operations Agent, no Scheduling Agent, no Knowledge Agent as distinct processes. The existing system IS the orchestrator. Business knowledge is resolved from the DB at dispatch time and passed in `SkillContext.businessKnowledge`. Complex multi-step operations are implemented as Workflow Skills with deterministic step sequences.
+
+### Infrastructure prerequisites (Developer A, lands before any V2 skill)
+
+| Item | What it is |
+|---|---|
+| `businessKnowledge` in SkillContext | Resolved at dispatch time: services, policies, FAQs, brand voice |
+| `workflowState` in SkillContext | Active `skill_workflows` row for the identity, or null |
+| `skill_workflows` table | Durable state store for Workflow Skills |
+| Workflow helper | Typed `loadWorkflow` / `saveWorkflow` / `advanceWorkflow` functions exposed to skills via `src/shared/` |
+
+### Simple Skills
+
+| Skill | Caller | Description |
+|---|---|---|
+| `faq-responder` | Customer | Answers questions about services, prices, policies, hours using `businessKnowledge` |
+| `business-analytics` | Manager | Booking counts, revenue, top customers, busiest periods — formatted summary from DB data |
+| `review-collector` | System / Manager | Post-appointment Google review request; manager can also trigger manually |
+| `campaign-sender` | Manager | WhatsApp broadcast to a customer segment; LLM drafts, manager confirms before send |
+| `intake-form` | Customer | Pre-appointment questions defined per service type; answers stored for manager |
+| `upsell-assistant` | Customer | Suggests complementary service after booking confirmation |
+
+### Workflow Skills
+
+| Skill | Description |
+|---|---|
+| `website-builder` | E2E website creation: requirements → structure confirmation → content generation → AEO pass → manager review → domain registration → deployment → handoff |
+| `aeo-optimizer` | Standalone AEO pass against an existing site URL; produces structured improvement report and optionally applies changes to PA-deployed sites |
+| `social-content-generator` | Multi-turn content creation for social posts; output is text for manager to copy — no posting API in V1 of this skill |
+
+### Build order
+
+| Priority | Skill | Type | Dependency |
+|---|---|---|---|
+| 1 | `faq-responder` | Simple | `businessKnowledge` in SkillContext |
+| 2 | `business-analytics` | Simple | SkillContext segment extension (Developer A) |
+| 3 | `website-builder` | Workflow | Full infra prereqs + external APIs (domain registrar, hosting) |
+| 4 | `aeo-optimizer` | Simple/Workflow | Shares AEO logic with `website-builder` Step 4 |
+| 5 | `review-collector` | Simple | `recentCompletedBooking` SkillContext extension |
+| 6 | `campaign-sender` | Simple | Customer segment query extension |
+| 7 | `intake-form` | Simple | `intake_required` flag on service_types schema |
+| 8 | `social-content-generator` | Workflow | None beyond base infra |
+| 9 | `upsell-assistant` | Simple | Booking event hook from Developer A |
 
 ---
 

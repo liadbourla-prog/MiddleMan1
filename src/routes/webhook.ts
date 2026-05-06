@@ -40,6 +40,10 @@ import { checkBusinessHours, computeNextOpenMs } from '../domain/hours/gate.js'
 import { queueMessageForLater } from '../workers/queued-messages.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
+import { dispatchSkill } from '../skills/index.js'
+import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
+import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
+import { buildSkillContext } from '../domain/skills/context-builder.js'
 
 export async function webhookRoutes(app: FastifyInstance) {
   // Webhook verification handshake (GET)
@@ -87,7 +91,7 @@ export async function webhookRoutes(app: FastifyInstance) {
 
 const PROVIDER_WA_NUMBER = process.env['PROVIDER_WA_NUMBER'] ?? ''
 
-async function processInboundMessage(msg: InboundMessage, app: FastifyInstance) {
+export async function processInboundMessage(msg: InboundMessage, app: FastifyInstance) {
   // Step 0 — provider onboarding (central number, no business context)
   if (PROVIDER_WA_NUMBER && msg.toNumber === PROVIDER_WA_NUMBER) {
     const result = await handleProviderOnboarding(db, msg.fromNumber, msg.body)
@@ -188,9 +192,10 @@ async function notifyManagerOfError(msg: InboundMessage, errorMsg: string, app: 
     ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
     : undefined
 
+  const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
   await sendMessage({
     toNumber: managerIdentity.phoneNumber,
-    body: `⚠️ A message from ${msg.fromNumber} could not be processed.\nError: ${errorMsg.slice(0, 200)}\n\nPlease follow up with the customer directly.`,
+    body: i18n.manager_process_error[lang](msg.fromNumber, errorMsg.slice(0, 200)),
   }, waCredentials)
 }
 
@@ -258,6 +263,7 @@ async function routeCustomerMessage(
     calendarId: business.googleCalendarId,
     businessId: business.id,
     calendarMode: business.calendarMode,
+    lang,
     ...(managerIdentity ? { managerPhoneNumber: managerIdentity.phoneNumber } : {}),
   })
 
@@ -266,6 +272,36 @@ async function routeCustomerMessage(
     app.log.warn({ err }, 'Failed to save inbound message to transcript')
   })
   const transcript = await loadTranscript(db, session.id, 8).catch(() => [])
+
+  // Skills dispatch — runs before booking engine; first matching skill short-circuits
+  const [businessKnowledge, workflowState] = await Promise.all([
+    loadBusinessKnowledge(db, business.id, business.currency),
+    loadActiveWorkflow(db, identity.id),
+  ])
+  const skillCtx = await buildSkillContext({
+    db,
+    business,
+    identity,
+    session,
+    messageText: msg.body,
+    conversationHistory: transcript,
+    language: lang,
+    workflowState,
+    businessKnowledge,
+    ...(managerIdentity?.phoneNumber ? { managerPhone: managerIdentity.phoneNumber } : {}),
+    ...(business.whatsappPhoneNumberId && business.whatsappAccessToken
+      ? { waCredentials: { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId } }
+      : {}),
+  })
+  const skillOutcome = await dispatchSkill(skillCtx)
+  if (skillOutcome?.handled) {
+    await saveMessage(db, session.id, 'assistant', skillOutcome.reply).catch((err) => {
+      app.log.warn({ err }, 'Failed to save skill reply to transcript')
+    })
+    await sendMessage({ toNumber: msg.fromNumber, body: skillOutcome.reply })
+    if (skillOutcome.sessionComplete) await completeSession(db, session.id)
+    return
+  }
 
   const result = await handleBookingFlow(
     db,
@@ -312,7 +348,7 @@ async function routeCustomerMessage(
     }
   }
 
-  if (result.sessionComplete) {
+  if (result.sessionComplete && !result.sessionFailed) {
     await completeSession(db, session.id)
   }
 }
@@ -395,10 +431,38 @@ async function routeManagerMessage(
     return
   }
 
+  // Skills dispatch for manager — runs before LLM instruction classifier
+  {
+    const [mgBusinessKnowledge, mgWorkflowState] = await Promise.all([
+      loadBusinessKnowledge(db, business.id, business.currency),
+      loadActiveWorkflow(db, identity.id),
+    ])
+    const mgSkillCtx = await buildSkillContext({
+      db,
+      business,
+      identity,
+      session: null,
+      messageText: msg.body,
+      conversationHistory: [],
+      language: lang,
+      workflowState: mgWorkflowState,
+      businessKnowledge: mgBusinessKnowledge,
+      managerPhone: identity.phoneNumber,
+      ...(business.whatsappPhoneNumberId && business.whatsappAccessToken
+        ? { waCredentials: { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId } }
+        : {}),
+    })
+    const mgSkillOutcome = await dispatchSkill(mgSkillCtx)
+    if (mgSkillOutcome?.handled) {
+      await sendMessage({ toNumber: msg.fromNumber, body: mgSkillOutcome.reply }, waCredentials)
+      return
+    }
+  }
+
   const classifyResult = await classifyManagerInstruction(msg.body, {
     businessId: business.id,
     timezone: business.timezone,
-  })
+  }, lang)
 
   if (!classifyResult.ok) {
     app.log.error({ error: classifyResult.error }, 'LLM manager classification failed')

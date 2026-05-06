@@ -1,6 +1,6 @@
 # PA_4_Business — Development Operating Model
 **Status: Active**
-**Last updated: 2026-04-23**
+**Last updated: 2026-04-30**
 
 ---
 
@@ -12,25 +12,64 @@ This document covers how we build — team/agent roles, development workflows, t
 
 ## Part 1 — Development Roles
 
-These are roles in the build process, not runtime system components.
+Roles fall into two categories: **human developers** who own parts of the codebase long-term, and **Claude agents** that assist within development sessions.
 
-### Implementation Planner
+---
+
+### Human Developers
+
+#### Developer A — System Architect
+Owns the core engine, infrastructure, and the interface contract between core and skills.
+
+**Primary ownership:**
+- `src/domain/` — booking engine, session management, identity, authorization, flows
+- `src/adapters/` — WhatsApp, Google Calendar, LLM
+- `src/workers/` — all background jobs
+- `src/db/` — schema, migrations, DB client
+- `src/routes/` — HTTP routes
+- `src/server.ts`, `src/redis.ts`
+- `src/shared/skill-types.ts` — the skills contract (co-owned, Developer A has final say)
+- All deployment, CI/CD, and environment configuration
+- Everything outside `src/skills/`
+
+**Review responsibility:** Must approve any PR touching files outside `src/skills/`. Has final say on `src/shared/` changes. Reviews skill PRs with the Skills Validator for contract compliance.
+
+**Branch prefix:** `dev/system/*`
+
+#### Developer B — Skills Engineer
+Builds the feature capabilities that differentiate the PA beyond V1 booking.
+
+**Primary ownership:**
+- `src/skills/**` — all skill modules
+
+**Constraints:**
+- Cannot merge to `main` without Developer A's approval for any file outside `src/skills/`
+- Changes to `src/shared/skill-types.ts` require co-review from Developer A
+- Skills must implement the `Skill` interface and pass CI (TypeScript + ESLint boundary + Vitest)
+
+**Branch prefix:** `dev/skills/*`
+
+---
+
+### Claude Agents
+
+#### Implementation Planner
 - Translates user requests into scoped development tasks
 - Checks alignment with ARCHITECTURE.md before proposing work
 - Identifies missing constraints or underspecified behavior
 - Asks only necessary clarifying questions before defining a task
 
-### Backend Architect
-Owns:
-- Domain model and database schema
+#### Backend Architect
+Owns during a session:
+- Domain model and database schema changes
 - Booking engine and state machine
 - Manager rule and policy systems
 - Permission model
 - Calendar Adapter
 - Background job design
 
-### Messaging Systems Architect
-Owns:
+#### Messaging Systems Architect
+Owns during a session:
 - WhatsApp Adapter (inbound and outbound)
 - Message normalization and deduplication
 - Identity resolution
@@ -38,12 +77,64 @@ Owns:
 - LLM Adapter (intent extraction, structured output)
 - Customer and manager flow handlers
 
-### Verifier
-Owns:
-- Invariant definitions (drawn from ARCHITECTURE.md Layer 6)
+#### Verifier
+Owns during a session:
+- Invariant definitions (drawn from ARCHITECTURE.md and Part 6 below)
 - Test coverage for booking logic, authorization, calendar integration, and core flows
 - Edge case identification
 - Regression prevention — every bug fix ships with a test
+
+#### Skills Validator
+Reviews every PR touching `src/skills/` for technical correctness and production readiness. Supplements CI (which catches type errors and import violations) with semantic review.
+
+**Terminology note:** What the product calls "agents" (website builder, analytics, etc.) are implemented as skills in this codebase — either Simple Skills or Workflow Skills. There is no separate agent runtime. See ARCHITECTURE.md Part 15.
+
+**Triggers on:** Any PR where changed files include `src/skills/**`
+
+**Reviews:**
+
+1. **Interface compliance** — Skill correctly implements `Skill`: `name` is a stable string constant (not dynamic), `canHandle` is synchronous and free of side effects, `handle` returns a valid `SkillOutcome` in all code paths including error paths.
+
+2. **`canHandle` precision** — Trigger patterns are specific. Flags patterns that: match booking-intent words (`book`, `cancel`, `reschedule`, `appointment`, `available`, `time`, `slot`), overlap with any existing skill's triggers, or are broad enough to fire on unrelated input. Evaluates whether the pattern produces false positives on real booking messages. For Workflow Skills: also verifies that `canHandle` correctly resumes an active workflow via `ctx.workflowState`.
+
+3. **`SkillResult` semantics** — `sessionComplete` is set with intent (not blindly `false`). `skillName` matches `this.name`. Multi-turn skills correctly re-claim follow-up messages via `canHandle`.
+
+4. **Workflow Skill correctness** (Workflow Skills only) — Each step is deterministic code; LLM calls appear only within steps, not between them. Workflow state is read/written exclusively through the typed helper from `src/shared/`. On step failure the workflow stays at the current step and does not advance. Only one active workflow per identity per skill at a time is enforced.
+
+5. **LLM call hygiene** — All LLM responses are schema-validated before use. Raw LLM text never flows into logic. Invalid output is handled with an explicit user-facing fallback, not silently swallowed.
+
+6. **Error handling** — `handle()` does not throw unhandled exceptions. Every `catch` block either recovers with a reply or returns `{ handled: false }`.
+
+7. **Import boundary** — No imports from `src/domain/`, `src/adapters/`, `src/db/`, `src/workers/`, or `src/routes/`, including transitive imports.
+
+8. **Test coverage** — Test file exists and covers: `canHandle` returning `true` for intended triggers, `canHandle` returning `false` for booking phrases, `handle` returning a well-formed `SkillOutcome`.
+
+9. **Production readiness** — No `console.log`, no un-localized hardcoded strings, no `// TODO` left in merged code, no stub implementations returning placeholder values.
+
+**Output:** Structured review with PASS / FLAG / BLOCK per item. BLOCK = must fix before merge. FLAG = requires Developer A's explicit sign-off.
+
+#### Product Reviewer
+Evaluates proposed skills before development begins. Works from product goals defined by the product owner, the scope constraints in ARCHITECTURE.md, and the technical capabilities of the skills layer. Translates a feature idea into a precise, buildable skill specification that serves the product's strategic goals efficiently.
+
+**Triggers on:** A new skill idea or feature request, before any code is written.
+
+**Reviews:**
+
+1. **Product fit** — Does the skill align with the product's positioning (WhatsApp-native PA for local businesses)? Checks against V1 scope boundaries in ARCHITECTURE.md Part 9. Recommends scope adjustments rather than rejecting — the question is "what is the right version of this" not "should this exist."
+
+2. **Goal decomposition** — Given the desired feature goals and target user outcomes provided by the product owner, breaks the skill into: the core happy path, edge cases that must be handled at launch, cases that are explicitly deferred with rationale.
+
+3. **Trigger design** — Proposes the `canHandle` logic: specific trigger patterns that match real user messages without false positives against booking flows. Identifies ambiguous phrases that need special handling.
+
+4. **`SkillContext` sufficiency** — Identifies which fields of the current `SkillContext` the skill needs. Flags any required data point missing from the contract and proposes the minimal extension to `src/shared/skill-types.ts`, justified by the skill's needs.
+
+5. **LLM interaction design** — If the skill requires LLM calls: proposes the structured output schema, what context to pass, expected number of turns, how to validate output and handle failure. Flags skills that can be implemented without LLM (simpler and more reliable).
+
+6. **Conflict detection** — Checks whether trigger patterns or functionality overlap with core booking flows or existing skills. Proposes resolution.
+
+7. **Scope and effort** — Rough estimate: single-file skill or multi-file feature? External APIs or credentials needed? New shared types required from Developer A first?
+
+8. **Specification output** — Produces a concise skill spec: trigger patterns, expected inputs and outputs per scenario, `SkillContext` fields used, external dependencies, test cases to cover. Developer B uses this as the build contract. Developer A reviews the spec before code is written.
 
 ---
 
@@ -198,6 +289,53 @@ These must never be broken. A failing test for any of these is a blocker.
 - An import token can only be used once; a second upload attempt with the same token is rejected
 - An import token cannot be used after `expires_at`
 - Step 0 credential validation must call the Meta API before creating any DB rows — invalid credentials must not result in a Business record
+
+### Skills invariants
+- A skill's `canHandle` must never return `true` for messages that match core booking intent patterns (`book`, `cancel`, `reschedule`, `appointment`, `available`, `slot`)
+- A `SkillResult` with `handled: true` must always include a non-empty `reply`
+- `sessionComplete: true` must not be returned while a multi-turn flow is still in progress
+- A skill that returns `{ handled: false }` must leave no side effects (no DB writes, no external calls, no state mutation)
+- No skill may directly write to the database, send WhatsApp messages through adapters, or modify Calendar events
+
+---
+
+## Part 7 — Branch and PR Workflow
+
+### Branch Conventions
+
+| Developer | Prefix | Example |
+|---|---|---|
+| Developer A | `dev/system/*` | `dev/system/skills-dispatch-wiring` |
+| Developer B | `dev/skills/*` | `dev/skills/website-builder` |
+
+Both developers merge to `main` exclusively via pull requests. Direct pushes to `main` are blocked by branch protection.
+
+### PR Review Requirements
+
+| PR touches | Required approvals |
+|---|---|
+| Only `src/skills/` | Developer B can merge after CI passes + Skills Validator review |
+| `src/shared/` | Both Developer A and Developer B must approve |
+| Anything outside `src/skills/` | Developer A must approve |
+| `src/db/schema.ts` or any migration file | Developer A must approve; treat as a breaking-change checklist |
+
+### CI Gates
+
+Every PR to `main` must pass all three:
+1. `npm run build` — TypeScript compilation, zero errors
+2. `npm run lint` — ESLint import boundary (enforced on `src/skills/**`)
+3. `npm test` — Vitest unit tests
+
+Failing CI blocks merge regardless of approvals.
+
+### Proposing a New Skill (Developer B workflow)
+
+1. Describe the skill idea and desired user outcome to Developer A
+2. Product Reviewer agent produces a skill spec
+3. Developer A reviews the spec and approves or requests changes
+4. Developer B builds from the approved spec on a `dev/skills/*` branch
+5. Skills Validator reviews the PR
+6. Developer B merges after CI passes (no Developer A approval needed if PR only touches `src/skills/`)
 
 ---
 

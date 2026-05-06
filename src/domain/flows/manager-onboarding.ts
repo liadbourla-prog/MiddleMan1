@@ -9,6 +9,7 @@ import { classifyManagerInstruction } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
+import { createWorkflow } from '../skills/workflow-helpers.js'
 
 export interface OnboardingResult {
   reply: string
@@ -83,6 +84,7 @@ async function handleServiceStep(
       log.info({ businessId: business.id }, 'Onboarding: services step complete')
       return { reply: `${confirmationMessage}\n\n${getPrompt('hours', lang)}` }
     },
+    lang,
   )
 }
 
@@ -96,6 +98,8 @@ async function handleHoursStep(
 ): Promise<OnboardingResult> {
   const body = msg.body.trim().toLowerCase()
   const is247 = body === '24/7' || body === 'always open' || body === 'always' || body.includes('24/7')
+    || body.includes('תמיד פתוח') || body.includes('פתוח כל הזמן') || body === 'תמיד'
+    || body.includes('24 שעות') || body.includes('פתוח 24')
 
   if (is247) {
     await db.update(businesses)
@@ -116,6 +120,7 @@ async function handleHoursStep(
       log.info({ businessId: business.id }, 'Onboarding: hours step complete')
       return { reply: `${confirmationMessage}\n\n${getPrompt('cancellation_policy', lang)}` }
     },
+    lang,
   )
 }
 
@@ -271,14 +276,24 @@ async function handleVerifyStep(
       .set({ onboardingCompletedAt: new Date(), onboardingStep: null })
       .where(eq(businesses.id, business.id))
     log.info({ businessId: business.id }, 'Onboarding: complete via GO')
-    return { reply: i18n.ob_complete[lang](business.whatsappNumber) }
+
+    // Auto-start the business knowledge interview workflow
+    await createWorkflow(db, business.id, identity.id, 'business-knowledge-setup', 'brand-voice').catch((err) => {
+      log.warn({ err, businessId: business.id }, 'Failed to create business-knowledge-setup workflow after onboarding')
+    })
+
+    const completionMsg = i18n.ob_complete[lang](business.whatsappNumber)
+    const interviewPrompt = lang === 'he'
+      ? '\n\nלפני שהלקוחות מגיעים, בואי נלמד קצת על העסק שלך. איך היית מתארת את *[שם העסק]* — מה הרגש שאת רוצה שלקוחות יקבלו?'
+      : '\n\nBefore customers arrive, let me learn about your business. How would you describe *[business name]* — what feeling do you want customers to have?'
+    return { reply: completionMsg + interviewPrompt.replace('[שם העסק]', business.name).replace('[business name]', business.name) }
   }
 
   // Not GO — treat as a correction to apply
   const classifyResult = await classifyManagerInstruction(body, {
     businessId: business.id,
     timezone: business.timezone,
-  })
+  }, lang)
 
   if (!classifyResult.ok || classifyResult.data.ambiguous) {
     const clarification = classifyResult.ok ? classifyResult.data.clarificationNeeded : null
@@ -402,11 +417,12 @@ async function applyOnboardingInstruction(
   expectedType: string,
   retryPrompt: string,
   onSuccess: (confirmationMessage: string) => Promise<OnboardingResult>,
+  lang?: Lang,
 ): Promise<OnboardingResult> {
   const classifyResult = await classifyManagerInstruction(msg.body, {
     businessId: business.id,
     timezone: business.timezone,
-  })
+  }, lang)
 
   if (!classifyResult.ok || classifyResult.data.instructionType !== expectedType) {
     return { reply: retryPrompt }

@@ -31,7 +31,7 @@ const TIME_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/
 
 const availabilityChangeSchema = z.object({
   action: z.enum(['set_hours', 'block', 'unblock', 'bulk_close']),
-  dayOfWeek: z.number().int().min(0).max(6).nullable().optional(),
+  dayOfWeek: z.coerce.number().int().min(0).max(6).nullable().optional(),
   specificDate: z.string().nullable().optional(),
   dateRangeStart: z.string().nullable().optional(),
   dateRangeEnd: z.string().nullable().optional(),
@@ -44,12 +44,12 @@ const availabilityChangeSchema = z.object({
 const serviceChangeSchema = z.object({
   action: z.enum(['create', 'update', 'deactivate']),
   name: z.string(),
-  durationMinutes: z.number().int().positive().optional(),
-  bufferMinutes: z.number().int().min(0).optional(),
-  paymentAmount: z.number().nonnegative().nullable().optional(),
+  durationMinutes: z.coerce.number().int().positive().optional(),
+  bufferMinutes: z.coerce.number().int().min(0).optional(),
+  paymentAmount: z.coerce.number().nonnegative().nullable().optional(),
   requiresPayment: z.boolean().nullable().optional(),
   category: z.string().nullable().optional(),
-  maxParticipants: z.number().int().positive().nullable().optional(),
+  maxParticipants: z.coerce.number().int().positive().nullable().optional(),
 })
 
 const permissionChangeSchema = z.object({

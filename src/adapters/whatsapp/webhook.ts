@@ -1,5 +1,6 @@
 import crypto from 'crypto'
 import type { InboundMessage, WhatsAppWebhookPayload } from './types.js'
+import { i18n } from '../../domain/i18n/t.js'
 
 const APP_SECRET = process.env['WHATSAPP_APP_SECRET'] ?? ''
 const VERIFY_TOKEN = process.env['WHATSAPP_WEBHOOK_VERIFY_TOKEN'] ?? ''
@@ -23,9 +24,6 @@ export function verifyWebhookChallenge(
   return null
 }
 
-const NON_TEXT_REPLY = "I can only understand text messages. Please send your request as a text message."
-const NON_TEXT_REPLY_HE = "אני מבין רק הודעות טקסט. אנא שלח את בקשתך כהודעת טקסט."
-
 export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
   messages: InboundMessage[]
   nonTextReplies: Array<{ toNumber: string; body: string }>
@@ -47,7 +45,7 @@ export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
         if (msg.type !== 'text' || !msg.text) {
           // Sticker, image, voice note, video, etc. — reply with guidance
           if (fromNumber && toNumber) {
-            nonTextReplies.push({ toNumber: fromNumber, body: NON_TEXT_REPLY })
+            nonTextReplies.push({ toNumber: fromNumber, body: i18n.non_text_reply.he })
           }
           continue
         }

@@ -5,6 +5,8 @@ import { bookings, businesses, identities } from '../db/schema.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { redisConnection } from '../redis.js'
+import { enqueueMessage } from './message-retry.js'
+import { t } from '../domain/i18n/t.js'
 
 const QUEUE_NAME = 'hold-expiry'
 const REPEAT_EVERY_MS = 60_000
@@ -15,7 +17,7 @@ const GRACE_PERIOD_SECONDS = parseInt(process.env['HOLD_GRACE_PERIOD_SECONDS'] ?
 
 export const holdExpiryQueue = new Queue(QUEUE_NAME, { connection: redisConnection })
 
-async function expireHeldBookings() {
+export async function expireHeldBookings() {
   const cutoff = new Date(Date.now() - GRACE_PERIOD_SECONDS * 1000)
 
   const expiredRows = await db
@@ -23,6 +25,7 @@ async function expireHeldBookings() {
       id: bookings.id,
       businessId: bookings.businessId,
       calendarEventId: bookings.calendarEventId,
+      customerId: bookings.customerId,
     })
     .from(bookings)
     .where(and(eq(bookings.state, 'held'), lt(bookings.holdExpiresAt, cutoff)))
@@ -32,6 +35,7 @@ async function expireHeldBookings() {
       .select({
         googleRefreshToken: businesses.googleRefreshToken,
         googleCalendarId: businesses.googleCalendarId,
+        defaultLanguage: businesses.defaultLanguage,
       })
       .from(businesses)
       .where(eq(businesses.id, booking.businessId))
@@ -79,6 +83,19 @@ async function expireHeldBookings() {
       afterState: { state: 'expired' },
       metadata: { triggeredBy: 'hold-expiry-worker' },
     })
+
+    if (business) {
+      const [customer] = await db
+        .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
+        .from(identities)
+        .where(eq(identities.id, booking.customerId))
+        .limit(1)
+
+      if (customer) {
+        const lang = customer.preferredLanguage ?? business.defaultLanguage
+        await enqueueMessage(customer.phoneNumber, t('hold_expired', lang))
+      }
+    }
   }
 
   return expiredRows.length

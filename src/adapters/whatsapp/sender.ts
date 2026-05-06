@@ -1,4 +1,9 @@
+import { AsyncLocalStorage } from 'async_hooks'
 import type { OutboundMessage, SendResult } from './types.js'
+
+// When set, sendMessage captures replies into the array instead of posting to WA.
+// Used by the /simulate route and integration tests.
+export const replyCapture = new AsyncLocalStorage<string[]>()
 
 const WA_USER_OPT_OUT_CODE = 131026
 
@@ -20,6 +25,12 @@ export async function sendMessage(
   message: OutboundMessage,
   credentials?: WaCredentials,
 ): Promise<SendResultWithOptOut> {
+  const capture = replyCapture.getStore()
+  if (capture !== undefined) {
+    capture.push(message.body)
+    return { ok: true, whatsappMessageId: 'sim-captured' }
+  }
+
   const { accessToken, phoneNumberId } = resolveCredentials(credentials)
   const apiUrl = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`
 

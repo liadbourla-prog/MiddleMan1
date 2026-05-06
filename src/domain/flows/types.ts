@@ -1,16 +1,17 @@
 export interface FlowResult {
   reply: string
   sessionComplete: boolean
+  sessionFailed?: boolean
   escalated?: boolean
 }
 
 export type ConfirmationParse = 'yes' | 'no' | 'unclear'
 
 const YES_PATTERNS =
-  /^\s*(yes|confirm|ok|okay|sure|yep|yeah|do it|book it|go ahead|כן|אוקיי|אישור|בסדר|בוא נעשה|קדימה|אשר)\s*[.!]?\s*$/i
+  /^\s*(yes|confirm|ok|okay|sure|yep|yeah|do it|book it|go ahead|כן|אוקיי|אישור|בסדר|בוא נעשה|קדימה|אשר|טוב|בהחלט|יאללה|נשמע טוב|כל הכבוד)\s*[.!]?\s*$/i
 
 const NO_PATTERNS =
-  /^\s*(no|nope|cancel|stop|don't|dont|nevermind|never mind|לא|בטל|עצור|בטלו|אל תזמין|לבטל)\s*[.!]?\s*$/i
+  /^\s*(no|nope|cancel|stop|don't|dont|nevermind|never mind|לא|בטל|עצור|בטלו|אל תזמין|לבטל|סגור|אל כן|סליחה לא)\s*[.!]?\s*$/i
 
 export function parseConfirmation(text: string): ConfirmationParse {
   if (YES_PATTERNS.test(text)) return 'yes'
@@ -27,6 +28,7 @@ export interface BookingFlowContext {
   cancellationCandidates?: string[]
   rescheduledFrom?: string
   clarificationAttempts?: number
+  isReschedulingFlow?: boolean
   botPersona?: 'female' | 'male' | 'neutral'
   sessionUnknownCount?: number
   // Language switch offer

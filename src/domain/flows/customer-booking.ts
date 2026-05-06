@@ -78,8 +78,9 @@ export async function handleBookingFlow(
   const defaultLang: 'he' | 'en' = businessDefaultLanguage ?? 'he'
   const lang: 'he' | 'en' = (ctx.languageOverride ?? ctx.detectedLanguage) ?? defaultLang
 
-  // ── REBOOK shortcut — treat as fresh booking intent ──────────────────────
-  if (messageText.trim().toUpperCase() === 'REBOOK') {
+  // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
+  const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
+  if (rebookVariants.test(messageText.trim())) {
     await updateSessionContext(db, session.id, { ...ctx, detectedLanguage: lang }, 'active')
     const reply = await generateCustomerReply({
       businessName,
@@ -160,7 +161,7 @@ export async function handleBookingFlow(
       const quotaReply = lang === 'he'
         ? 'אנחנו עסוקים כרגע. אנא נסה שוב בעוד מספר דקות.'
         : "We're a bit busy right now. Please try again in a few minutes."
-      return { reply: quotaReply, sessionComplete: true }
+      return { reply: quotaReply, sessionComplete: true, sessionFailed: true }
     }
     const reply = await generateCustomerReply({
       businessName,
@@ -170,7 +171,7 @@ export async function handleBookingFlow(
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     })
-    return { reply, sessionComplete: true }
+    return { reply, sessionComplete: true, sessionFailed: true }
   }
 
   const intent = intentResult.data
@@ -193,7 +194,7 @@ export async function handleBookingFlow(
     // Ask bilingually so the customer understands regardless of language
     const offerMsg = defaultLang === 'he'
       ? `שים לב: הפאזל מגיב בעברית כברירת מחדל. האם להמשיך באנגלית? (כן / לא)\nNote: the assistant replies in Hebrew by default. Would you like to continue in English? (YES / NO)`
-      : `Note: the assistant replies in English by default. האם להמשיך בעברית? (YES / NO)`
+      : `Note: the assistant replies in English by default. Would you like to continue in Hebrew? (YES / NO)\nשים לב: הפאזל מגיב באנגלית כברירת מחדל. האם להמשיך בעברית? (כן / לא)`
     return { reply: offerMsg, sessionComplete: false }
   }
 
@@ -283,7 +284,7 @@ async function handleBookingIntent(
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     })
-    return { reply, sessionComplete: true }
+    return { reply, sessionComplete: true, sessionFailed: true }
   }
 
   // Vague slot — ask for clarification
@@ -295,23 +296,6 @@ async function handleBookingIntent(
       businessName,
       language: lang,
       situation: `Booking intent detected but the ${missing} is missing or vague. Ask for a specific ${missing}.`,
-      transcript,
-      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
-    })
-    return { reply, sessionComplete: false }
-  }
-
-  // Ambiguous relative date — ask for explicit confirmation of which date
-  if ((slot.dateAmbiguous ?? false) && slot.resolvedStart) {
-    const candidate = new Date(slot.resolvedStart)
-    const altDate = new Date(candidate.getTime() + 7 * 24 * 60 * 60 * 1000)
-    const fmt = (d: Date) => formatSlotDate(d, businessTimezone)
-    await updateSessionContext(db, session.id, { ...ctx, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
-    const reply = await generateCustomerReply({
-      businessName,
-      language: lang,
-      situation: `Customer used a relative date that could refer to either ${fmt(candidate)} or ${fmt(altDate)}. Ask which specific date they mean — ${fmt(candidate)} or ${fmt(altDate)}?`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -531,7 +515,7 @@ async function handleHoldConfirmation(
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     })
-    return { reply, sessionComplete: true }
+    return { reply, sessionComplete: true, sessionFailed: true }
   }
 
   const result = await requestBooking(db, calendar, identity, {
@@ -613,7 +597,12 @@ async function handleClarification(
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
 
-  const updatedContext = { ...ctx, clarificationReply: messageText }
+  // Include recent transcript in context so the LLM can combine partial info
+  // (e.g. date from one turn + time from next turn) during clarification
+  const recentMessages = transcript
+    .slice(-8)
+    .map((t) => `${t.role === 'customer' ? 'Customer' : 'Assistant'}: ${t.text}`)
+  const updatedContext = { ...ctx, clarificationReply: messageText, recentMessages }
   const intentResult = await extractCustomerIntent(
     messageText,
     updatedContext,
@@ -726,6 +715,7 @@ async function enterCancellationSelection(
     ...ctx,
     cancellationCandidates: candidates,
     awaitingConfirmationFor: 'cancellation_selection',
+    isReschedulingFlow: isRescheduling,
   }
   await updateSessionContext(db, session.id, newCtx, 'waiting_clarification')
 
@@ -835,13 +825,13 @@ async function handleCancellationConfirmation(
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     })
-    return { reply, sessionComplete: true }
+    return { reply, sessionComplete: true, sessionFailed: true }
   }
 
   const result = await cancelBooking(db, calendar, identity, bookingId, 'Customer requested via WhatsApp')
-  await completeSession(db, session.id)
 
   if (!result.ok) {
+    await completeSession(db, session.id)
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
@@ -853,6 +843,22 @@ async function handleCancellationConfirmation(
     return { reply, sessionComplete: true }
   }
 
+  // B1 fix: if this cancellation was part of a reschedule flow, continue to booking
+  if (ctx.isReschedulingFlow) {
+    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, ...rest } = ctx
+    const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: bookingId }
+    await updateSessionContext(db, session.id, newCtx, 'active')
+    const reply = await generateCustomerReply({
+      businessName,
+      language: lang,
+      situation: 'Old booking successfully cancelled as part of reschedule. Ask the customer what date and time they would like for their new appointment.',
+      transcript,
+      customerMemory: extractMemory(ctx),
+    })
+    return { reply, sessionComplete: false }
+  }
+
+  await completeSession(db, session.id)
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
@@ -945,12 +951,10 @@ async function handleLanguageSwitchConfirmation(
     ? (defaultLang === 'he' ? 'en' : 'he')
     : defaultLang
 
-  // Persist the preference on the identity so future sessions remember it
-  await db
-    .update(identities)
-    .set({ preferredLanguage: chosenLang })
-    .where(eq(identities.id, identity.id))
-    .catch(() => { /* non-fatal */ })
+  // Persist the preference on the identity so future sessions remember it (non-fatal)
+  try {
+    await db.update(identities).set({ preferredLanguage: chosenLang }).where(eq(identities.id, identity.id))
+  } catch { /* non-fatal */ }
 
   const { bufferedMessage: _dropped, ...ctxWithoutBuffer } = ctx
   const newCtx: BookingFlowContext = {

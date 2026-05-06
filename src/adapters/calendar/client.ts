@@ -8,6 +8,7 @@ import type {
   DeleteResult,
 } from './types.js'
 import { sendMessage } from '../whatsapp/sender.js'
+import { i18n, type Lang } from '../../domain/i18n/t.js'
 
 const HOLD_PREFIX = '[HOLD]'
 const HOLD_COLOR_ID = '5' // banana — visually distinct in Google Calendar
@@ -29,6 +30,7 @@ interface CalendarClientOptions {
   calendarMode?: 'google' | 'internal'
   colorId?: number | null
   managerPhoneNumber?: string | undefined
+  lang?: Lang
 }
 
 // ── Internal DB calendar (no Google) ─────────────────────────────────────────
@@ -132,9 +134,10 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
         return await fn()
       } catch (refreshErr) {
         if (options.managerPhoneNumber) {
+          const lang: Lang = options.lang ?? 'he'
           await sendMessage({
             toNumber: options.managerPhoneNumber,
-            body: 'Your Google Calendar connection has expired and could not be refreshed automatically. Please reconnect your calendar.',
+            body: i18n.calendar_auth_expired[lang],
           }).catch(() => { /* non-fatal */ })
         }
         throw refreshErr

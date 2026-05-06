@@ -25,6 +25,7 @@ export async function loadActiveSession(
           eq(conversationSessions.state, 'active'),
           eq(conversationSessions.state, 'waiting_confirmation'),
           eq(conversationSessions.state, 'waiting_clarification'),
+          eq(conversationSessions.state, 'waiting_language_confirmation'),
         ),
       ),
     )
@@ -133,6 +134,7 @@ export async function expireOldSessions(db: Db): Promise<number> {
           eq(conversationSessions.state, 'active'),
           eq(conversationSessions.state, 'waiting_confirmation'),
           eq(conversationSessions.state, 'waiting_clarification'),
+          eq(conversationSessions.state, 'waiting_language_confirmation'),
         ),
       ),
     )

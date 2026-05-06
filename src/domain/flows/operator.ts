@@ -13,9 +13,15 @@ import {
   managerInstructions,
   escalatedTasks,
   agentUpdateLog,
+  skillWorkflows,
+  businessFaqs,
+  deferredFeatureRequests,
 } from '../../db/schema.js'
 import { classifyManagerInstruction } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
+import { createWorkflow } from '../skills/workflow-helpers.js'
+import { operatorCapabilityRegistry } from './operator-capability-registry.js'
+import { detectLang, i18n, type Lang } from '../i18n/t.js'
 
 export interface OperatorResult {
   reply: string
@@ -27,39 +33,74 @@ export async function handleOperatorMessage(
 ): Promise<OperatorResult> {
   const text = body.trim()
   const upper = text.toUpperCase()
+  const lang = detectLang(body)
 
-  if (upper === 'STATUS ALL' || upper === 'STATUS') {
-    return handleStatusAll(db)
+  // ── Exact keyword matches (English & Hebrew aliases) ─────────────────────────
+
+  if (
+    upper === 'STATUS ALL' || upper === 'STATUS' ||
+    /^סטטוס הכל$/.test(text) || /^סטטוס$/.test(text) ||
+    /^הכל$/.test(text) || /^כל העסקים$/.test(text)
+  ) {
+    return handleStatusAll(db, lang)
   }
 
-  const statusMatch = text.match(/^STATUS\s+(.+)$/i)
+  const statusMatch = text.match(/^STATUS\s+(.+)$/i) ?? text.match(/^סטטוס\s+(.+)$/)
   if (statusMatch) {
-    return handleStatusOne(db, statusMatch[1]!.trim())
+    return handleStatusOne(db, statusMatch[1]!.trim(), lang)
   }
 
-  if (upper === 'ESCALATIONS') {
-    return handleEscalations(db)
+  if (
+    upper === 'ESCALATIONS' || upper === 'ESCALATION' ||
+    text === 'פניות' || text === 'פניה'
+  ) {
+    return handleEscalations(db, lang)
   }
 
-  const updateMatch = text.match(/^UPDATE ALL:\s*(.+)$/is)
+  const updateMatch =
+    text.match(/^UPDATE ALL:\s*(.+)$/is) ??
+    text.match(/^עדכן הכל:\s*(.+)$/is) ??
+    text.match(/^עדכן את כולם:\s*(.+)$/is)
   if (updateMatch) {
-    return handleUpdateAll(db, updateMatch[1]!.trim())
+    return handleUpdateAll(db, updateMatch[1]!.trim(), lang)
   }
 
-  return {
-    reply: [
-      '🤖 *MiddleMan Operator Console*',
-      '',
-      'Commands:',
-      '• `STATUS ALL` — health of all live businesses',
-      '• `STATUS [name]` — detailed report for one business',
-      '• `ESCALATIONS` — last 10 unresolved customer escalations',
-      '• `UPDATE ALL: [instruction]` — push a change to every live agent',
-    ].join('\n'),
+  const skillsMatch = text.match(/^SKILLS\s+(.+)$/i) ?? text.match(/^מיומנויות\s+(.+)$/)
+  if (skillsMatch) {
+    return handleSkillsOne(db, skillsMatch[1]!.trim(), lang)
   }
+
+  if (upper === 'FEATURES' || upper === 'FEATURE' || text === 'פיצ\'רים' || text === 'פיצרים') {
+    return handleFeatures(db, lang)
+  }
+
+  const retriggerMatch = text.match(/^RETRIGGER\s+(.+)$/i) ?? text.match(/^הפעל מחדש\s+(.+)$/)
+  if (retriggerMatch) {
+    const raw = retriggerMatch[1]!.trim()
+    const tokens = raw.split(/\s+/)
+    const lastToken = tokens[tokens.length - 1] ?? ''
+    // Skill names are always lowercase kebab-case — safe to distinguish from business names/phones
+    const looksLikeSkillName = /^[a-z][a-z0-9-]+$/.test(lastToken) && tokens.length > 1
+    const skillArg = looksLikeSkillName ? lastToken : null
+    const businessArg = looksLikeSkillName ? tokens.slice(0, -1).join(' ') : raw
+    return handleRetrigger(db, businessArg, skillArg, lang)
+  }
+
+  // ── Natural language fallback — keyword extraction (zero-latency, no LLM) ────
+
+  if (/\bstatus\b/i.test(text) || /סטטוס/.test(text) || /\ball businesses\b/i.test(text)) {
+    return handleStatusAll(db, lang)
+  }
+  if (/\bescalation/i.test(text) || /פניות/.test(text)) {
+    return handleEscalations(db, lang)
+  }
+
+  // ── Default: help menu ────────────────────────────────────────────────────────
+
+  return { reply: i18n.op_help[lang] }
 }
 
-async function handleStatusAll(db: Db): Promise<OperatorResult> {
+async function handleStatusAll(db: Db, lang: Lang): Promise<OperatorResult> {
   const allBusinesses = await db
     .select({
       id: businesses.id,
@@ -74,14 +115,13 @@ async function handleStatusAll(db: Db): Promise<OperatorResult> {
     .orderBy(businesses.createdAt)
 
   if (allBusinesses.length === 0) {
-    return { reply: 'No businesses registered yet.' }
+    return { reply: i18n.op_status_no_businesses[lang] }
   }
 
-  const lines: string[] = [`📊 *All Businesses (${allBusinesses.length})*`, '']
+  const lines: string[] = [i18n.op_status_header[lang](allBusinesses.length), '']
 
   for (const biz of allBusinesses) {
     const live = !!biz.onboardingCompletedAt
-    const paused = biz.paused
     const calOk = biz.calendarMode === 'internal' || !!biz.googleRefreshToken
 
     const [lastMsg] = await db
@@ -91,19 +131,27 @@ async function handleStatusAll(db: Db): Promise<OperatorResult> {
       .orderBy(desc(processedMessages.processedAt))
       .limit(1)
 
-    const lastMsgStr = lastMsg
-      ? `${Math.round((Date.now() - lastMsg.processedAt.getTime()) / 60_000)}m ago`
-      : 'never'
+    const minutesAgo = lastMsg
+      ? Math.round((Date.now() - lastMsg.processedAt.getTime()) / 60_000)
+      : null
+    const lastMsgStr = minutesAgo !== null
+      ? i18n.status_min_ago[lang](minutesAgo)
+      : (lang === 'he' ? 'אף פעם' : 'never')
 
-    const status = !live ? '⏳ onboarding' : paused ? '⏸ paused' : '✅ live'
-    const cal = calOk ? '📅' : '❌ no cal'
-    lines.push(`${status} *${biz.name}* (${biz.whatsappNumber}) ${cal} · last msg: ${lastMsgStr}`)
+    const statusLabel = !live
+      ? i18n.op_status_onboarding[lang]
+      : biz.paused
+        ? i18n.op_status_paused[lang]
+        : i18n.op_status_live[lang]
+
+    const cal = calOk ? '📅' : '❌'
+    lines.push(`${statusLabel} *${biz.name}* (${biz.whatsappNumber}) ${cal} · ${lastMsgStr}`)
   }
 
   return { reply: lines.join('\n') }
 }
 
-async function handleStatusOne(db: Db, nameOrNumber: string): Promise<OperatorResult> {
+async function handleStatusOne(db: Db, nameOrNumber: string, lang: Lang): Promise<OperatorResult> {
   const [biz] = await db
     .select()
     .from(businesses)
@@ -116,7 +164,7 @@ async function handleStatusOne(db: Db, nameOrNumber: string): Promise<OperatorRe
     .then((all) => all.find((b) => b.name.toLowerCase().includes(nameOrNumber.toLowerCase())))
 
   if (!found) {
-    return { reply: `No business found matching "${nameOrNumber}".` }
+    return { reply: i18n.op_status_not_found[lang](nameOrNumber) }
   }
 
   const [customerRow] = await db
@@ -148,27 +196,69 @@ async function handleStatusOne(db: Db, nameOrNumber: string): Promise<OperatorRe
     .from(escalatedTasks)
     .where(and(eq(escalatedTasks.businessId, found.id), isNull(escalatedTasks.resolvedAt)))
 
+  const [knowledgeWorkflow] = await db
+    .select({ status: skillWorkflows.status })
+    .from(skillWorkflows)
+    .where(and(eq(skillWorkflows.businessId, found.id), eq(skillWorkflows.skillName, 'business-knowledge-setup')))
+    .orderBy(desc(skillWorkflows.updatedAt))
+    .limit(1)
+
   const calStatus = found.calendarMode === 'internal'
-    ? '📅 Internal (DB)'
-    : found.googleRefreshToken ? '📅 Google ✅' : '❌ Not connected'
+    ? i18n.status_cal_internal[lang]
+    : found.googleRefreshToken
+      ? i18n.status_cal_ok[lang]
+      : i18n.status_cal_missing[lang]
+
+  const confirmStatus = found.confirmationGate === 'post_payment'
+    ? i18n.status_payment_post[lang](found.paymentMethod ?? (lang === 'he' ? 'לא הוגדר' : 'not set'))
+    : i18n.status_payment_immediate[lang]
+
+  const never = lang === 'he' ? 'אף פעם' : 'never'
+
+  const lastBookingStr = lastBooking
+    ? lastBooking.slotStart.toLocaleString(lang === 'he' ? 'he-IL' : 'en-GB', { dateStyle: 'medium', timeStyle: 'short' })
+    : never
+
+  const lastMsgStr = lastMsg
+    ? i18n.status_min_ago[lang](Math.round((Date.now() - lastMsg.processedAt.getTime()) / 60_000))
+    : never
+
+  const statusLabel = !found.onboardingCompletedAt
+    ? i18n.op_status_onboarding[lang]
+    : found.paused
+      ? i18n.op_status_paused[lang]
+      : i18n.op_status_live[lang]
+
+  const knowledgeStatus = !knowledgeWorkflow
+    ? i18n.op_knowledge_none[lang]
+    : knowledgeWorkflow.status === 'completed'
+      ? i18n.op_knowledge_completed[lang]
+      : knowledgeWorkflow.status === 'active'
+        ? i18n.op_knowledge_active[lang]
+        : i18n.op_knowledge_failed[lang]
+
+  const L = lang === 'he'
+    ? { number: 'מספר', status: 'סטטוס', calendar: 'לוח שנה', confirm: 'אישור', customers: 'לקוחות', lastBooking: 'תור אחרון', lastMsg: 'הודעה אחרונה', pending: 'הנחיות ממתינות', openEsc: 'פניות פתוחות', knowledge: i18n.op_knowledge_label.he }
+    : { number: 'Number', status: 'Status', calendar: 'Calendar', confirm: 'Confirmation', customers: 'Customers', lastBooking: 'Last booking', lastMsg: 'Last message', pending: 'Pending instructions', openEsc: 'Open escalations', knowledge: i18n.op_knowledge_label.en }
 
   return {
     reply: [
       `📋 *${found.name}*`,
-      `Number: ${found.whatsappNumber}`,
-      `Status: ${!found.onboardingCompletedAt ? '⏳ Onboarding' : found.paused ? '⏸ Paused' : '✅ Live'}`,
-      `Calendar: ${calStatus}`,
-      `Confirmation: ${found.confirmationGate === 'post_payment' ? `💳 Post-payment (${found.paymentMethod ?? 'method not set'})` : '⚡ Immediate'}`,
-      `Customers: ${customerRow?.total ?? 0}`,
-      `Last booking: ${lastBooking ? lastBooking.slotStart.toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' }) : 'none'}`,
-      `Last message: ${lastMsg ? `${Math.round((Date.now() - lastMsg.processedAt.getTime()) / 60_000)}m ago` : 'never'}`,
-      `Pending instructions: ${pendingInstructions?.total ?? 0}`,
-      `Open escalations: ${openEscalations?.total ?? 0}`,
+      `${L.number}: ${found.whatsappNumber}`,
+      `${L.status}: ${statusLabel}`,
+      `${L.calendar}: ${calStatus}`,
+      `${L.confirm}: ${confirmStatus}`,
+      `${L.customers}: ${customerRow?.total ?? 0}`,
+      `${L.lastBooking}: ${lastBookingStr}`,
+      `${L.lastMsg}: ${lastMsgStr}`,
+      `${L.pending}: ${pendingInstructions?.total ?? 0}`,
+      `${L.openEsc}: ${openEscalations?.total ?? 0}`,
+      `${L.knowledge}: ${knowledgeStatus}`,
     ].join('\n'),
   }
 }
 
-async function handleEscalations(db: Db): Promise<OperatorResult> {
+async function handleEscalations(db: Db, lang: Lang): Promise<OperatorResult> {
   const tasks = await db
     .select({
       id: escalatedTasks.id,
@@ -185,18 +275,10 @@ async function handleEscalations(db: Db): Promise<OperatorResult> {
     .limit(10)
 
   if (tasks.length === 0) {
-    return { reply: '✅ No open escalations.' }
+    return { reply: i18n.op_escalations_none[lang] }
   }
 
-  const bizIds = [...new Set(tasks.map((t) => t.businessId))]
-  const bizRows = await db
-    .select({ id: businesses.id, name: businesses.name })
-    .from(businesses)
-    .where(eq(businesses.id, bizIds[0]!))
-
-  // Build a quick id→name map (good enough for ≤10 results)
   const bizMap = new Map<string, string>()
-  for (const b of bizRows) bizMap.set(b.id, b.name)
   for (const t of tasks) {
     if (!bizMap.has(t.businessId)) {
       const [b] = await db.select({ name: businesses.name }).from(businesses).where(eq(businesses.id, t.businessId)).limit(1)
@@ -204,10 +286,10 @@ async function handleEscalations(db: Db): Promise<OperatorResult> {
     }
   }
 
-  const lines = [`⚠️ *Open Escalations (${tasks.length})*`, '']
+  const lines = [i18n.op_escalations_header[lang](tasks.length), '']
   for (const t of tasks) {
     const bizName = bizMap.get(t.businessId) ?? t.businessId
-    const when = `${Math.round((Date.now() - t.receivedAt.getTime()) / 60_000)}m ago`
+    const when = i18n.status_min_ago[lang](Math.round((Date.now() - t.receivedAt.getTime()) / 60_000))
     const rule = t.triggerRule ? ` [${t.triggerRule}]` : ''
     lines.push(`• *${bizName}* — ${t.customerPhone}${rule} (${when})`)
     lines.push(`  "${t.messageBody.slice(0, 120)}"`)
@@ -216,29 +298,27 @@ async function handleEscalations(db: Db): Promise<OperatorResult> {
   return { reply: lines.join('\n') }
 }
 
-async function handleUpdateAll(db: Db, instruction: string): Promise<OperatorResult> {
+async function handleUpdateAll(db: Db, instruction: string, lang: Lang): Promise<OperatorResult> {
   const liveBizRows = await db
     .select({ id: businesses.id, name: businesses.name, timezone: businesses.timezone })
     .from(businesses)
     .where(isNotNull(businesses.onboardingCompletedAt))
 
   if (liveBizRows.length === 0) {
-    return { reply: 'No live businesses to update.' }
+    return { reply: i18n.op_update_none[lang] }
   }
 
-  // Get a system actor id — use the first manager of the first business as proxy
-  // (audit log requires an actorId; operator updates are sourced from us)
   const classifyResult = await classifyManagerInstruction(instruction, {
     timezone: 'UTC',
     updateAll: true,
-  })
+  }, lang)
 
   if (!classifyResult.ok || classifyResult.data.ambiguous) {
     const clarification = classifyResult.ok ? classifyResult.data.clarificationNeeded : null
     return {
       reply: clarification
-        ? `Clarification needed before applying to all agents: ${clarification}`
-        : "Couldn't classify that instruction. Please rephrase.",
+        ? i18n.op_update_clarify[lang](clarification)
+        : i18n.op_update_classify_fail[lang],
     }
   }
 
@@ -247,7 +327,6 @@ async function handleUpdateAll(db: Db, instruction: string): Promise<OperatorRes
   const failures: string[] = []
 
   for (const biz of liveBizRows) {
-    // Find manager identity to use as actor
     const [manager] = await db
       .select({ id: identities.id })
       .from(identities)
@@ -256,7 +335,6 @@ async function handleUpdateAll(db: Db, instruction: string): Promise<OperatorRes
 
     if (!manager) continue
 
-    // Insert instruction record
     const [saved] = await db
       .insert(managerInstructions)
       .values({
@@ -279,6 +357,7 @@ async function handleUpdateAll(db: Db, instruction: string): Promise<OperatorRes
       manager.id,
       instructionData.instructionType,
       instructionData.structuredParams as Record<string, unknown>,
+      lang,
     )
 
     if (result.ok) {
@@ -288,7 +367,6 @@ async function handleUpdateAll(db: Db, instruction: string): Promise<OperatorRes
     }
   }
 
-  // Log the update
   await db.insert(agentUpdateLog).values({
     updateType: instructionData.instructionType,
     payload: instructionData as unknown as Record<string, unknown>,
@@ -296,10 +374,183 @@ async function handleUpdateAll(db: Db, instruction: string): Promise<OperatorRes
   })
 
   const failureNote = failures.length > 0
-    ? `\n\n⚠️ Failed on ${failures.length}:\n${failures.slice(0, 5).join('\n')}`
+    ? `\n\n⚠️ ${lang === 'he' ? `נכשל ב-${failures.length}` : `Failed on ${failures.length}`}:\n${failures.slice(0, 5).join('\n')}`
     : ''
 
   return {
-    reply: `✅ Update applied to ${applied}/${liveBizRows.length} businesses.${failureNote}`,
+    reply: `${i18n.op_update_ok[lang](applied, liveBizRows.length)}${failureNote}`,
   }
+}
+
+async function handleSkillsOne(db: Db, nameOrNumber: string, lang: Lang): Promise<OperatorResult> {
+  const [biz] = await db
+    .select()
+    .from(businesses)
+    .where(eq(businesses.whatsappNumber, nameOrNumber))
+    .limit(1)
+
+  const found = biz ?? await db
+    .select()
+    .from(businesses)
+    .then((all) => all.find((b) => b.name.toLowerCase().includes(nameOrNumber.toLowerCase())))
+
+  if (!found) {
+    return { reply: i18n.op_status_not_found[lang](nameOrNumber) }
+  }
+
+  const [workflows, faqRow, deferredRow, websiteRow] = await Promise.all([
+    db
+      .select({
+        skillName: skillWorkflows.skillName,
+        status: skillWorkflows.status,
+        step: skillWorkflows.step,
+        updatedAt: skillWorkflows.updatedAt,
+      })
+      .from(skillWorkflows)
+      .where(eq(skillWorkflows.businessId, found.id))
+      .orderBy(desc(skillWorkflows.updatedAt))
+      .limit(20),
+    db
+      .select({ total: count() })
+      .from(businessFaqs)
+      .where(and(eq(businessFaqs.businessId, found.id), eq(businessFaqs.isActive, true))),
+    db
+      .select({ total: count() })
+      .from(deferredFeatureRequests)
+      .where(eq(deferredFeatureRequests.businessId, found.id)),
+    db
+      .select({ websitePreviewUrl: businesses.websitePreviewUrl, websiteUrl: businesses.websiteUrl })
+      .from(businesses)
+      .where(eq(businesses.id, found.id))
+      .limit(1),
+  ])
+
+  const lines: string[] = [i18n.op_skills_header[lang](found.name), '']
+
+  if (workflows.length === 0) {
+    lines.push(i18n.op_skills_none[lang])
+  } else {
+    for (const wf of workflows) {
+      const emoji = wf.status === 'completed' ? '✅' : wf.status === 'active' ? '🔄' : wf.status === 'failed' ? '❌' : '⏸'
+      const when = i18n.status_min_ago[lang](Math.round((Date.now() - wf.updatedAt.getTime()) / 60_000))
+      let line = `${emoji} *${wf.skillName}* · ${wf.step} (${when})`
+      if (wf.skillName === 'website-builder' && wf.status === 'completed') {
+        const siteUrl = websiteRow[0]?.websiteUrl ?? websiteRow[0]?.websitePreviewUrl ?? null
+        if (siteUrl) line += `\n   🌐 ${siteUrl}`
+      }
+      lines.push(line)
+    }
+  }
+
+  lines.push('')
+  lines.push(i18n.op_skills_faqs[lang](faqRow?.[0]?.total ?? 0))
+  lines.push(i18n.op_skills_deferred[lang](deferredRow?.[0]?.total ?? 0))
+
+  return { reply: lines.join('\n') }
+}
+
+async function handleFeatures(db: Db, lang: Lang): Promise<OperatorResult> {
+  const requests = await db
+    .select({
+      id: deferredFeatureRequests.id,
+      businessId: deferredFeatureRequests.businessId,
+      rawText: deferredFeatureRequests.rawText,
+      createdAt: deferredFeatureRequests.createdAt,
+    })
+    .from(deferredFeatureRequests)
+    .orderBy(desc(deferredFeatureRequests.createdAt))
+    .limit(15)
+
+  if (requests.length === 0) {
+    return { reply: i18n.op_features_none[lang] }
+  }
+
+  const bizIds = [...new Set(requests.map((r) => r.businessId))]
+  const bizRows = await db
+    .select({ id: businesses.id, name: businesses.name })
+    .from(businesses)
+    .where(eq(businesses.id, bizIds[0]!))
+
+  const bizMap = new Map<string, string>()
+  for (const b of bizRows) bizMap.set(b.id, b.name)
+  for (const r of requests) {
+    if (!bizMap.has(r.businessId)) {
+      const [b] = await db.select({ name: businesses.name }).from(businesses).where(eq(businesses.id, r.businessId)).limit(1)
+      if (b) bizMap.set(r.businessId, b.name)
+    }
+  }
+
+  const lines = [i18n.op_features_header[lang](requests.length), '']
+  for (const r of requests) {
+    const bizName = bizMap.get(r.businessId) ?? r.businessId
+    const when = i18n.status_min_ago[lang](Math.round((Date.now() - r.createdAt.getTime()) / 60_000))
+    lines.push(`• *${bizName}* (${when})`)
+    lines.push(`  "${r.rawText.slice(0, 140)}"`)
+  }
+
+  return { reply: lines.join('\n') }
+}
+
+async function handleRetrigger(db: Db, nameOrNumber: string, skillName: string | null, lang: Lang): Promise<OperatorResult> {
+  const [biz] = await db
+    .select()
+    .from(businesses)
+    .where(eq(businesses.whatsappNumber, nameOrNumber))
+    .limit(1)
+
+  const found = biz ?? await db
+    .select()
+    .from(businesses)
+    .then((all) => all.find((b) => b.name.toLowerCase().includes(nameOrNumber.toLowerCase())))
+
+  if (!found) {
+    return { reply: i18n.op_status_not_found[lang](nameOrNumber) }
+  }
+
+  if (!found.onboardingCompletedAt) {
+    return { reply: i18n.op_retrigger_not_live[lang](found.name) }
+  }
+
+  // No skill specified — list all retriggerable skills from the registry
+  if (!skillName) {
+    const retriggerable = operatorCapabilityRegistry.filter((c) => c.retriggerable)
+    const list = retriggerable.map((c) => `• \`${c.skillName}\``).join('\n')
+    return { reply: i18n.op_retrigger_list[lang](found.name, list) }
+  }
+
+  // Validate against registry
+  const capability = operatorCapabilityRegistry.find((c) => c.skillName === skillName && c.retriggerable)
+  if (!capability?.retriggersFirstStep) {
+    return { reply: i18n.op_retrigger_skill_unknown[lang](skillName) }
+  }
+
+  const [activeWorkflow] = await db
+    .select({ id: skillWorkflows.id })
+    .from(skillWorkflows)
+    .where(and(
+      eq(skillWorkflows.businessId, found.id),
+      eq(skillWorkflows.skillName, skillName),
+      eq(skillWorkflows.status, 'active'),
+    ))
+    .limit(1)
+
+  if (activeWorkflow) {
+    return { reply: i18n.op_retrigger_already_active[lang](found.name, skillName) }
+  }
+
+  const [manager] = await db
+    .select({ id: identities.id })
+    .from(identities)
+    .where(and(eq(identities.businessId, found.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+
+  if (!manager) {
+    return { reply: i18n.op_retrigger_no_manager[lang](found.name) }
+  }
+
+  // Creates a skill_workflows row — does not touch the businesses table.
+  // Operator channel is permitted to write to skill_workflows (see DEV_OPERATING_MODEL invariant note).
+  await createWorkflow(db, found.id, manager.id, skillName, capability.retriggersFirstStep)
+
+  return { reply: i18n.op_retrigger_ok[lang](found.name, skillName) }
 }

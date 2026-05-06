@@ -40,8 +40,8 @@ const strings = {
     en: (err: string) => `Setup failed: ${err}. Please try again or contact support.`,
   },
   mm_done: {
-    he: (phone: string) => `✅ ה-PA שלכם מוכן!\n\nמספר ה-PA: *${phone}*\n\nעכשיו שלחו הודעה למספר הזה מה-WhatsApp האישי שלכם להשלמת ההגדרה (שירותים, שעות, חיבור לוח שנה).\n\nלא תצטרכו את המספר הזה שוב — הכל מנוהל דרך מספר ה-PA.`,
-    en: (phone: string) => `✅ Your PA is ready!\n\nPA number: *${phone}*\n\nNow text that number from your personal WhatsApp to complete setup (services, hours, calendar connection).\n\nYou won't need this number again — everything from here is managed through your PA number.`,
+    he: (phone: string) => `✅ ה-PA שלכם מוכן!\n\nמספר ה-PA: *${phone}*\n\nעכשיו שלחו הודעה למספר הזה מה-WhatsApp האישי שלכם להשלמת ההגדרה (שירותים, שעות, חיבור לוח שנה).\n\nמיד לאחר ההגדרה תתחיל שיחת היכרות קצרה — ה-PA ישאל כמה שאלות על העסק כדי לדעת איך לייצג אתכם.\n\nלא תצטרכו את המספר הזה שוב — הכל מנוהל דרך מספר ה-PA.`,
+    en: (phone: string) => `✅ Your PA is ready!\n\nPA number: *${phone}*\n\nNow text that number from your personal WhatsApp to complete setup (services, hours, calendar connection).\n\nRight after setup, a short onboarding interview will begin — your PA will ask a few questions about your business to learn how to represent you.\n\nYou won't need this number again — everything from here is managed through your PA number.`,
   },
   mm_already_done: {
     he: `ה-PA שלכם כבר מוגדר! 🎉 לשינויים, שלחו הודעה למספר ה-PA שלכם ישירות.`,
@@ -422,6 +422,131 @@ const strings = {
       `✅ ה${service} שלכם ב-${biz} אושר ל-${date} בשעה ${time}. להתראות!`,
     en: (service: string, biz: string, date: string, time: string) =>
       `✅ Your ${service} at ${biz} is confirmed for ${date} at ${time}. See you then!`,
+  },
+
+  // ── Operator console ─────────────────────────────────────────────────────────
+  op_help: {
+    he: `🤖 *MiddleMan Operator Console*\n\nפקודות:\n• \`סטטוס הכל\` — מצב כל העסקים הפעילים\n• \`סטטוס [שם]\` — דוח מפורט לעסק אחד\n• \`מיומנויות [שם]\` — מצב זרימות המיומנויות לעסק\n• \`פניות\` — 10 פניות פתוחות אחרונות\n• \`פיצ'רים\` — בקשות פיצ'רים נדחות\n• \`הפעל מחדש [שם]\` — רשימת סקילים שניתן להפעיל מחדש\n• \`הפעל מחדש [שם] [סקיל]\` — הפעלת סקיל ספציפי מחדש\n• \`עדכן הכל: [הנחיה]\` — דחוף שינוי לכל הסוכנים`,
+    en: `🤖 *MiddleMan Operator Console*\n\nCommands:\n• \`STATUS ALL\` — health of all live businesses\n• \`STATUS [name]\` — detailed report for one business\n• \`SKILLS [name]\` — skill workflow state for one business\n• \`ESCALATIONS\` — last 10 unresolved customer escalations\n• \`FEATURES\` — deferred feature requests queue\n• \`RETRIGGER [name]\` — list retriggerable skills for a business\n• \`RETRIGGER [name] [skill]\` — re-create a specific skill workflow\n• \`UPDATE ALL: [instruction]\` — push a change to every live agent`,
+  },
+  op_status_no_businesses: {
+    he: `לא נרשמו עסקים עדיין.`,
+    en: `No businesses registered yet.`,
+  },
+  op_status_header: {
+    he: (n: number) => `📊 *כל העסקים (${n})*`,
+    en: (n: number) => `📊 *All Businesses (${n})*`,
+  },
+  op_status_onboarding: { he: `⏳ בהגדרה`, en: `⏳ onboarding` },
+  op_status_paused: { he: `⏸ מושהה`, en: `⏸ paused` },
+  op_status_live: { he: `✅ פעיל`, en: `✅ live` },
+  op_status_not_found: {
+    he: (q: string) => `לא נמצא עסק התואם "${q}".`,
+    en: (q: string) => `No business found matching "${q}".`,
+  },
+  op_escalations_none: {
+    he: `✅ אין פניות פתוחות.`,
+    en: `✅ No open escalations.`,
+  },
+  op_escalations_header: {
+    he: (n: number) => `⚠️ *פניות פתוחות (${n})*`,
+    en: (n: number) => `⚠️ *Open Escalations (${n})*`,
+  },
+  op_update_none: {
+    he: `אין עסקים פעילים לעדכון.`,
+    en: `No live businesses to update.`,
+  },
+  op_update_ok: {
+    he: (applied: number, total: number) => `✅ העדכון הוחל על ${applied}/${total} עסקים.`,
+    en: (applied: number, total: number) => `✅ Update applied to ${applied}/${total} businesses.`,
+  },
+  op_update_clarify: {
+    he: (msg: string) => `נדרשת הבהרה לפני הפצה לכל הסוכנים: ${msg}`,
+    en: (msg: string) => `Clarification needed before applying to all agents: ${msg}`,
+  },
+  op_update_classify_fail: {
+    he: `לא הצלחתי לסווג את ההנחיה. נסו לנסח מחדש.`,
+    en: `Couldn't classify that instruction. Please rephrase.`,
+  },
+
+  // ── Operator — knowledge setup status ────────────────────────────────────────
+  op_knowledge_label: { he: `הגדרת ידע`, en: `Knowledge setup` },
+  op_knowledge_none: { he: `⚠️ לא החל`, en: `⚠️ Not started` },
+  op_knowledge_active: { he: `🔄 בתהליך`, en: `🔄 In progress` },
+  op_knowledge_completed: { he: `✅ הושלם`, en: `✅ Completed` },
+  op_knowledge_failed: { he: `❌ נכשל`, en: `❌ Failed` },
+
+  // ── Operator — SKILLS command ─────────────────────────────────────────────────
+  op_skills_header: {
+    he: (name: string) => `🧠 *מיומנויות — ${name}*`,
+    en: (name: string) => `🧠 *Skills — ${name}*`,
+  },
+  op_skills_none: {
+    he: `לא נמצאו זרימות עבודה.`,
+    en: `No skill workflows found.`,
+  },
+  op_skills_faqs: {
+    he: (n: number) => `שאלות נפוצות פעילות: ${n}`,
+    en: (n: number) => `Active FAQs: ${n}`,
+  },
+  op_skills_deferred: {
+    he: (n: number) => `בקשות פיצ'רים נדחות: ${n}`,
+    en: (n: number) => `Deferred feature requests: ${n}`,
+  },
+
+  // ── Operator — FEATURES command ───────────────────────────────────────────────
+  op_features_none: {
+    he: `✅ אין בקשות פיצ'רים נדחות.`,
+    en: `✅ No deferred feature requests.`,
+  },
+  op_features_header: {
+    he: (n: number) => `💡 *בקשות פיצ'רים נדחות (${n})*`,
+    en: (n: number) => `💡 *Deferred Feature Requests (${n})*`,
+  },
+
+  // ── Operator — RETRIGGER command ──────────────────────────────────────────────
+  op_retrigger_not_live: {
+    he: (name: string) => `"${name}" עדיין בהגדרה — לא ניתן להפעיל מחדש.`,
+    en: (name: string) => `"${name}" hasn't completed onboarding — cannot retrigger.`,
+  },
+  op_retrigger_already_active: {
+    he: (name: string, skill: string) => `זרימת "${skill}" עבור ${name} כבר פעילה.`,
+    en: (name: string, skill: string) => `"${skill}" workflow for ${name} is already active.`,
+  },
+  op_retrigger_no_manager: {
+    he: (name: string) => `לא נמצא מנהל פעיל עבור ${name}.`,
+    en: (name: string) => `No active manager found for ${name}.`,
+  },
+  op_retrigger_ok: {
+    he: (name: string, skill: string) => `✅ זרימת "${skill}" הופעלה מחדש עבור ${name}.`,
+    en: (name: string, skill: string) => `✅ "${skill}" workflow re-created for ${name}.`,
+  },
+  op_retrigger_skill_unknown: {
+    he: (skill: string) => `"${skill}" אינו סקיל שניתן להפעיל מחדש. בדקו את רשימת הסקילים בפקודה \`הפעל מחדש [עסק]\`.`,
+    en: (skill: string) => `"${skill}" is not a retriggerable skill. Check available skills with \`RETRIGGER [business]\`.`,
+  },
+  op_retrigger_list: {
+    he: (name: string, list: string) => `סקילים שניתן להפעיל מחדש עבור ${name}:\n\n${list}\n\nשלחו \`הפעל מחדש ${name} [שם-סקיל]\`.`,
+    en: (name: string, list: string) => `Retriggerable skills for ${name}:\n\n${list}\n\nSend \`RETRIGGER ${name} [skill-name]\`.`,
+  },
+
+  // ── System / adapter messages ─────────────────────────────────────────────────
+  // Bilingual single-line — used when no language context is available (non-text messages)
+  non_text_reply: {
+    he: `אני מבין רק הודעות טקסט. / I can only understand text messages.`,
+    en: `אני מבין רק הודעות טקסט. / I can only understand text messages.`,
+  },
+  manager_process_error: {
+    he: (phone: string, err: string) => `⚠️ הודעה מ-${phone} לא עובדה.\nשגיאה: ${err}\n\nאנא פנו ללקוח ישירות.`,
+    en: (phone: string, err: string) => `⚠️ A message from ${phone} could not be processed.\nError: ${err}\n\nPlease follow up with the customer directly.`,
+  },
+  calendar_auth_expired: {
+    he: `חיבור Google Calendar פג תוקף ולא ניתן לחדשו אוטומטית. אנא חיברו מחדש את לוח השנה.`,
+    en: `Your Google Calendar connection has expired and could not be refreshed automatically. Please reconnect your calendar.`,
+  },
+  hold_expired: {
+    he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
+    en: `Your booking hold has expired because it wasn't confirmed in time. Feel free to book again whenever you're ready.`,
   },
 } as const
 

@@ -409,6 +409,7 @@ async function requestGroupClassBooking(
   })
 
   await recordCompletedBooking(db, actor.businessId, actor.id, txResult.bookingId, request.serviceTypeId)
+    .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (group):', err))
   await scheduleReminders(actor.businessId, actor.id, txResult.bookingId, request.serviceTypeId, request.slotStart).catch(() => { /* non-fatal */ })
 
   const spotsLeft = maxParticipants - txResult.currentCount - 1
@@ -483,6 +484,7 @@ export async function confirmBooking(
   })
 
   await recordCompletedBooking(db, actor.businessId, actor.id, bookingId, booking.serviceTypeId)
+    .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (confirm):', err))
   await scheduleReminders(actor.businessId, actor.id, bookingId, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
 
   return { ok: true, bookingId, message: 'Booking confirmed.' }
@@ -676,6 +678,7 @@ export async function confirmPaymentReceived(
   })
 
   await recordCompletedBooking(db, businessId, customer.id, booking.id, booking.serviceTypeId)
+    .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (paid):', err))
   await scheduleReminders(businessId, customer.id, booking.id, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
 
   // Send confirmation to the customer

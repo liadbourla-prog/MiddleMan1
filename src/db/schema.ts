@@ -48,6 +48,20 @@ export const businesses = pgTable('businesses', {
   }).default('business_name'),
   onboardingCompletedAt: timestamp('onboarding_completed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  // Skills layer
+  brandVoice: text('brand_voice'),
+  googleReviewUrl: text('google_review_url'),
+  communicationStyle: jsonb('communication_style'),
+  notificationPreferences: jsonb('notification_preferences'),
+  handoffBehavior: jsonb('handoff_behavior'),
+  automatedMessagesConfig: jsonb('automated_messages_config'),
+  bookingEdgeCases: jsonb('booking_edge_cases'),
+  cancellationFeeAmount: numeric('cancellation_fee_amount', { precision: 10, scale: 2 }),
+  cancellationFeeCurrency: text('cancellation_fee_currency'),
+  // Website builder
+  websiteJson: jsonb('website_json'),
+  websitePreviewUrl: text('website_preview_url'),
+  websiteUrl: text('website_url'),
 })
 
 export const identities = pgTable(
@@ -88,6 +102,10 @@ export const serviceTypes = pgTable('service_types', {
   isActive: boolean('is_active').notNull().default(true),
   deactivatedAt: timestamp('deactivated_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  // Skills layer
+  narrative: text('narrative'),
+  intakeRequired: boolean('intake_required').notNull().default(false),
+  intakeNotes: text('intake_notes'),
 })
 
 export const availability = pgTable(
@@ -383,6 +401,67 @@ export const agentUpdateLog = pgTable('agent_update_log', {
   appliedToCount: integer('applied_to_count').notNull().default(0),
 })
 
+export const businessFaqs = pgTable('business_faqs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  businessId: uuid('business_id')
+    .notNull()
+    .references(() => businesses.id),
+  question: text('question').notNull(),
+  answer: text('answer').notNull(),
+  isActive: boolean('is_active').notNull().default(true),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+})
+
+export const skillWorkflows = pgTable(
+  'skill_workflows',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    identityId: uuid('identity_id')
+      .notNull()
+      .references(() => identities.id),
+    skillName: text('skill_name').notNull(),
+    step: text('step').notNull(),
+    state: jsonb('state').notNull().default({}),
+    status: text('status', { enum: ['active', 'paused', 'completed', 'failed'] }).notNull(),
+    version: integer('version').notNull().default(1),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // Partial unique index: one active workflow per identity per skill
+    index('idx_skill_workflows_active').on(t.identityId, t.skillName).where(sql`${t.status} = 'active'`),
+  ],
+)
+
+export const deferredFeatureRequests = pgTable('deferred_feature_requests', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  businessId: uuid('business_id')
+    .notNull()
+    .references(() => businesses.id),
+  rawText: text('raw_text').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+})
+
+export const workflowStepLogs = pgTable('workflow_step_logs', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  workflowId: uuid('workflow_id')
+    .notNull()
+    .references(() => skillWorkflows.id),
+  stepName: text('step_name').notNull(),
+  status: text('status', { enum: ['SUCCESS', 'RETRYABLE', 'FATAL', 'PAUSED'] }).notNull(),
+  inputSnapshot: jsonb('input_snapshot'),
+  outputSnapshot: jsonb('output_snapshot'),
+  latencyMs: integer('latency_ms'),
+  retryCount: integer('retry_count').notNull().default(0),
+  errorContext: jsonb('error_context'),
+  tokensUsed: integer('tokens_used'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+})
+
 // ── Type exports ──────────────────────────────────────────────────────────────
 
 export type Business = typeof businesses.$inferSelect
@@ -402,6 +481,10 @@ export type ImportToken = typeof importTokens.$inferSelect
 export type ProviderOnboardingSession = typeof providerOnboardingSessions.$inferSelect
 export type EscalatedTask = typeof escalatedTasks.$inferSelect
 export type AgentUpdateLog = typeof agentUpdateLog.$inferSelect
+export type BusinessFaq = typeof businessFaqs.$inferSelect
+export type SkillWorkflow = typeof skillWorkflows.$inferSelect
+export type WorkflowStepLog = typeof workflowStepLogs.$inferSelect
+export type DeferredFeatureRequest = typeof deferredFeatureRequests.$inferSelect
 
 export type BookingState = Booking['state']
 export type IdentityRole = Identity['role']

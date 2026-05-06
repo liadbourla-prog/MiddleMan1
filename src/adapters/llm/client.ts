@@ -1,53 +1,35 @@
-import { VertexAI } from '@google-cloud/vertexai'
+import { GoogleGenAI } from '@google/genai'
 import { z } from 'zod'
 import type { CustomerIntentOutput, ManagerInstructionOutput, LlmResult, GenerateReplyInput } from './types.js'
 
-const PROJECT_ID = process.env['GOOGLE_CLOUD_PROJECT']
-if (!PROJECT_ID) throw new Error('GOOGLE_CLOUD_PROJECT is required')
+const LLM_API_KEY = process.env['LLM_API_KEY']
+if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
 
-const LOCATION = process.env['VERTEX_AI_LOCATION'] ?? 'us-central1'
-const MODEL = 'gemini-2.0-flash'
+const MODEL = 'gemini-2.5-flash'
 
-const vertexai = new VertexAI({ project: PROJECT_ID, location: LOCATION })
-
-// Extraction model — deterministic structured output
-const generativeModel = vertexai.getGenerativeModel({
-  model: MODEL,
-  generationConfig: {
-    responseMimeType: 'application/json',
-    maxOutputTokens: 512,
-    temperature: 0,
-  },
-})
-
-// Reply model — free-text conversational output
-const replyModel = vertexai.getGenerativeModel({
-  model: MODEL,
-  generationConfig: {
-    maxOutputTokens: 1024,
-    temperature: 0.3,
-  },
-})
+const ai = new GoogleGenAI({ apiKey: LLM_API_KEY, apiVersion: 'v1beta' })
 
 const customerIntentSchema = z.object({
-  intent: z.enum(['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'unknown']),
+  intent: z.enum(['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'unknown']).catch('unknown'),
   slotRequest: z
     .object({
-      hasSpecificDate: z.boolean(),
-      hasSpecificTime: z.boolean(),
-      resolvedStart: z.string().nullable(),
-      resolvedEnd: z.string().nullable(),
-      dateHint: z.string().nullable(),
-      timeHint: z.string().nullable(),
-      dateAmbiguous: z.boolean().default(false),
+      hasSpecificDate: z.boolean().catch(false),
+      hasSpecificTime: z.boolean().catch(false),
+      resolvedStart: z.string().nullable().catch(null),
+      resolvedEnd: z.string().nullable().catch(null),
+      dateHint: z.string().nullable().catch(null),
+      timeHint: z.string().nullable().catch(null),
+      dateAmbiguous: z.boolean().default(false).catch(false),
     })
-    .nullable(),
-  serviceTypeHint: z.string().nullable(),
-  // Name of a specific staff member / instructor the customer requested
+    .nullable()
+    .catch(null),
+  serviceTypeHint: z.string().nullable().catch(null),
   providerHint: z.string().nullable().catch(null),
-  summary: z.string().nullable(),
-  rawEntities: z.record(z.string()),
-  detectedLanguage: z.enum(['he', 'en']),
+  summary: z.string().nullable().catch(null),
+  rawEntities: z.record(z.unknown()).transform((v) =>
+    Object.fromEntries(Object.entries(v).map(([k, val]) => [k, String(val)])),
+  ).catch({}),
+  detectedLanguage: z.enum(['he', 'en']).catch('he'),
 })
 
 const managerInstructionSchema = z.object({
@@ -77,16 +59,35 @@ Business timezone: ${businessTimezone}. Today's date and time (UTC): ${new Date(
 Available services: ${availableServices.length > 0 ? availableServices.join(', ') : 'general appointment'}.
 Conversation so far: ${JSON.stringify(sessionContext)}.
 
-Extract the customer's intent. Rules:
-- intent: "booking" | "rescheduling" | "cancellation" | "inquiry" | "list_bookings" | "unknown".
-  - Use "list_bookings" when the customer asks to see their appointments (e.g. "what are my bookings?", "show my appointments", "מה התורים שלי").
-- If they want to book and give a specific date AND time, set resolvedStart/resolvedEnd as ISO 8601 in the business timezone, using the service duration from context if available, otherwise 60 minutes.
-- If date or time is vague (e.g. "sometime next week", "morning"), set hasSpecificDate/hasSpecificTime to false and resolvedStart/resolvedEnd to null.
-- dateAmbiguous: true if the date expression is relative and could refer to two different calendar dates (e.g. "next Wednesday" could mean this coming Wednesday or the one after). Set resolvedStart to the nearest candidate when ambiguous.
-- providerHint: if the customer names a specific staff member or instructor (e.g. "with Daniel", "by Efrat"), extract that name. Otherwise null.
-- summary: one short sentence confirming what you understood (e.g. "Haircut with Daniel on Tuesday 3 May at 3:00 PM"), or null if unclear.
-- detectedLanguage: "he" if the message is in Hebrew, "en" for English or any other language.
-- Respond only with valid JSON. No explanation.`
+Return a JSON object with EXACTLY this structure (all fields required):
+{
+  "intent": "booking" | "rescheduling" | "cancellation" | "inquiry" | "list_bookings" | "unknown",
+  "slotRequest": {
+    "hasSpecificDate": boolean,
+    "hasSpecificTime": boolean,
+    "resolvedStart": "ISO8601 datetime in business timezone" | null,
+    "resolvedEnd": "ISO8601 datetime in business timezone" | null,
+    "dateHint": "original date text" | null,
+    "timeHint": "original time text" | null,
+    "dateAmbiguous": boolean
+  } | null,
+  "serviceTypeHint": "service name from message" | null,
+  "providerHint": "staff name from message" | null,
+  "summary": "one sentence summary" | null,
+  "rawEntities": {},
+  "detectedLanguage": "he" | "en"
+}
+
+Rules:
+- intent: use "list_bookings" when the customer asks to see their appointments (e.g. "what are my bookings?", "מה התורים שלי").
+- slotRequest: set to an object when a booking date/time is mentioned; set to null for non-booking intents.
+  - hasSpecificDate: true if a specific calendar date is given (e.g. "May 2", "2 במאי", "Tuesday the 5th"). false for vague ("sometime next week").
+  - hasSpecificTime: true if a specific time is given (e.g. "10:00", "3pm", "10:00"). false for vague ("morning").
+  - resolvedStart/resolvedEnd: ISO 8601 in business timezone when both date AND time are specific. Null otherwise. Use service duration (default 60 min) for resolvedEnd.
+  - dateAmbiguous: true ONLY for purely relative expressions that could match two weeks (e.g. "next Wednesday"). Explicit day+month dates like "May 2", "2 במאי", "ב-2 למאי" are NEVER ambiguous — set false.
+- serviceTypeHint: extract the service name the customer mentions (e.g. "תספורת" → "תספורת", "haircut" → "Haircut"). null if none.
+- detectedLanguage: "he" if message is in Hebrew; "en" for English or any other language.
+- Respond only with valid JSON matching the structure above. No explanation.`
 
   return callWithSchema(systemPrompt, safeMessage, customerIntentSchema) as Promise<LlmResult<CustomerIntentOutput>>
 }
@@ -94,9 +95,15 @@ Extract the customer's intent. Rules:
 export async function classifyManagerInstruction(
   message: string,
   businessContext: Record<string, unknown>,
+  language?: 'he' | 'en',
 ): Promise<LlmResult<ManagerInstructionOutput>> {
+  const langInstruction = language === 'he'
+    ? 'IMPORTANT: the clarificationNeeded field must be written in Hebrew (עברית).'
+    : 'IMPORTANT: the clarificationNeeded field must be written in English.'
+
   const systemPrompt = `You are parsing a WhatsApp message from a business manager giving operational instructions.
 Business context: ${JSON.stringify(businessContext)}.
+${langInstruction}
 
 Classify the instruction and set structuredParams according to the type:
 
@@ -190,12 +197,17 @@ ${transcriptText}
 Customer profile: ${memoryText}`
 
   try {
-    const result = await replyModel.generateContent({
-      systemInstruction: systemPrompt,
-      contents: [{ role: 'user' as const, parts: [{ text: userTurn }] }],
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: userTurn,
+      config: {
+        systemInstruction: systemPrompt,
+        maxOutputTokens: 1024,
+        temperature: 0.3,
+      },
     })
 
-    const text = result.response.candidates?.[0]?.content?.parts?.[0]?.text?.trim()
+    const text = result.text?.trim()
     if (text) return text
   } catch {
     // fall through to fallback
@@ -220,34 +232,55 @@ async function callWithSchema<T>(
   userMessage: string,
   schema: z.ZodType<T>,
 ): Promise<LlmResult<T>> {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const MAX_ATTEMPTS = 4
+  let lastError = ''
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      const result = await generativeModel.generateContent({
-        systemInstruction: systemPrompt,
-        contents: [{ role: 'user' as const, parts: [{ text: userMessage }] }],
+      const result = await ai.models.generateContent({
+        model: MODEL,
+        contents: userMessage,
+        config: {
+          systemInstruction: systemPrompt,
+          maxOutputTokens: 1024,
+          temperature: 0,
+          responseMimeType: 'application/json',
+        },
       })
 
-      const text = result.response.candidates?.[0]?.content?.parts?.[0]?.text
-      if (!text) continue
+      const text = result.text
+      if (!text) {
+        lastError = 'empty response'
+        if (process.env['LLM_DEBUG']) console.error('[LLM] empty response')
+        continue
+      }
 
       let parsed: unknown
       try {
-        parsed = JSON.parse(text)
+        // Strip markdown code fences if present
+        const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
+        parsed = JSON.parse(jsonText)
       } catch {
+        lastError = 'invalid JSON'
+        if (process.env['LLM_DEBUG']) console.error('[LLM] invalid JSON, raw:', text.slice(0, 200))
         continue
       }
 
       const validation = schema.safeParse(parsed)
       if (validation.success) return { ok: true, data: validation.data }
+      lastError = validation.error.message
+      if (process.env['LLM_DEBUG']) console.error('[LLM] schema validation failed:', validation.error.issues, 'raw:', text.slice(0, 200))
     } catch (err) {
       if (isQuotaError(err)) {
         return { ok: false, error: 'quota_exceeded' }
       }
-      if (attempt === 1) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      lastError = err instanceof Error ? err.message : String(err)
+      if (process.env['LLM_DEBUG']) console.error(`[LLM] attempt ${attempt} threw:`, lastError)
+      if (attempt === MAX_ATTEMPTS - 1) {
+        return { ok: false, error: lastError }
       }
     }
   }
 
-  return { ok: false, error: 'LLM returned invalid structured output after 2 attempts' }
+  return { ok: false, error: `LLM returned invalid structured output after ${MAX_ATTEMPTS} attempts: ${lastError}` }
 }

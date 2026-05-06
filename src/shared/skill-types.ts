@@ -1,0 +1,222 @@
+// Typed contract between the core engine (Developer A) and skills (Developer B).
+// Developer A owns this file. Skills may only import from src/shared/.
+
+export interface SkillBusiness {
+  id: string
+  name: string
+  timezone: string
+  defaultLanguage: 'he' | 'en'
+  botPersona: 'female' | 'male' | 'neutral'
+  currency: string
+}
+
+export interface SkillCaller {
+  id: string
+  phoneNumber: string
+  role: 'manager' | 'delegated_user' | 'customer'
+  displayName: string | null
+  preferredLanguage: 'he' | 'en' | null
+}
+
+export interface SkillMessage {
+  text: string
+  receivedAt: Date
+}
+
+export interface SkillConversationTurn {
+  role: 'customer' | 'assistant'
+  text: string
+}
+
+export interface ServiceSummary {
+  id: string
+  name: string
+  durationMinutes: number
+  price: number | null
+  currency: string
+  narrative: string | null
+}
+
+export interface PolicySummary {
+  minBufferMinutes: number
+  maxDaysAhead: number
+  cancellationCutoffMinutes: number
+}
+
+export interface FAQ {
+  id: string
+  question: string
+  answer: string
+}
+
+export interface CommunicationStyle {
+  formality: 'formal' | 'casual'
+  emojiUse: 'none' | 'occasional' | 'frequent'
+  useCustomerName: boolean
+  humor: boolean
+  phrasesToAvoid: string[]
+  phrasesToUse: string[]
+  rudeCustHandling: 'firm' | 'soft' | 'redirect'
+  offLimitTopics: string[]
+  fallbackPhrase: string
+}
+
+export interface NotificationPreferences {
+  newBooking: boolean
+  firstTimeCustomer: boolean
+  cancellation: boolean
+  reschedule: boolean
+  noShow: boolean
+  upsetLanguage: boolean
+}
+
+export interface HandoffBehavior {
+  scenarios: string[]
+  handoffPhrase: string
+  alternateContact: string | null
+}
+
+export interface AutomatedMessageTemplate {
+  enabled: boolean
+  body: string
+  delayMinutes?: number
+}
+
+export interface AutomatedMessagesConfig {
+  booking_confirmation: AutomatedMessageTemplate
+  reminder_24h: AutomatedMessageTemplate
+  reminder_1h: AutomatedMessageTemplate
+  post_appointment: AutomatedMessageTemplate
+  no_show: AutomatedMessageTemplate
+  cancellation_ack: AutomatedMessageTemplate
+  first_booking_welcome: AutomatedMessageTemplate
+  waitlist_offer: AutomatedMessageTemplate
+  review_request: AutomatedMessageTemplate
+  rescheduled_confirmation: AutomatedMessageTemplate
+  payment_request: AutomatedMessageTemplate
+}
+
+export interface BookingEdgeCases {
+  sameDayAllowed: boolean
+  sameDayCutoffHour: number | null
+  walkInsAccepted: boolean
+  backToBackAllowed: boolean
+  pricingCommunication: 'state' | 'hide' | 'on_request'
+  depositInfo: string | null
+}
+
+export interface BusinessKnowledge {
+  services: ServiceSummary[]
+  policies: PolicySummary
+  faqs: FAQ[]
+  brandVoice: string | null
+  communicationStyle: CommunicationStyle | null
+  notificationPreferences: NotificationPreferences | null
+  handoffBehavior: HandoffBehavior | null
+  automatedMessagesConfig: AutomatedMessagesConfig | null
+  confirmationGate: 'immediate' | 'post_payment'
+  paymentMethod: string | null
+  cancellationFeeAmount: number | null
+  cancellationFeeCurrency: string | null
+  // Website builder
+  websiteJson: Record<string, unknown> | null      // stored SiteSchema — non-null = site exists, seed for content-patch
+  websitePreviewUrl: string | null                  // preview URL — non-null triggers update flow
+  websiteUrl: string | null                         // production URL once live
+}
+
+export interface WorkflowState {
+  id: string
+  skillName: string
+  step: string
+  state: Record<string, unknown>
+  version: number
+}
+
+export interface WorkflowCallbacks {
+  advance(step: string, state: Record<string, unknown>): Promise<void>
+  complete(): Promise<void>
+  fail(error: { code: string; message: string; recoverable: boolean }): Promise<void>
+  create(skillName: string, firstStep: string, initialState?: Record<string, unknown>): Promise<WorkflowState>
+}
+
+export interface CompletedBookingSummary {
+  bookingId: string
+  serviceName: string
+  slotStart: Date
+  customerName: string | null
+}
+
+export interface CustomerSummary {
+  identityId: string
+  phoneNumber: string
+  displayName: string | null
+  totalBookings: number
+  lastBookingAt: Date | null
+}
+
+export interface SegmentFilter {
+  serviceTypeId?: string
+  inactiveSinceDays?: number
+  hasBooking?: boolean
+}
+
+export type StepStatus = 'SUCCESS' | 'RETRYABLE' | 'FATAL' | 'PAUSED'
+
+export interface StepResult {
+  status: StepStatus
+  retryCount?: number
+  errorContext?: { code: string; message: string; recoverable: boolean }
+}
+
+/** Everything a skill receives. No DB handles, no tokens, no internal engine state. */
+export interface SkillContext {
+  business: SkillBusiness
+  caller: SkillCaller
+  message: SkillMessage
+  conversationHistory: SkillConversationTurn[]
+  language: 'he' | 'en'
+  sessionId: string
+  businessKnowledge: BusinessKnowledge
+  workflowState: WorkflowState | null
+  workflow: WorkflowCallbacks
+  recentCompletedBooking: CompletedBookingSummary | null
+  customerSegmentQuery: (filter: SegmentFilter) => Promise<CustomerSummary[]>
+  saveFAQs: (faqs: Array<{ question: string; answer: string }>) => Promise<void>
+  saveServiceNarrative: (serviceTypeId: string, narrative: string) => Promise<void>
+  saveBrandVoice: (brandVoice: string) => Promise<void>
+  saveCommunicationStyle: (style: CommunicationStyle) => Promise<void>
+  saveNotificationPreferences: (prefs: NotificationPreferences) => Promise<void>
+  saveHandoffBehavior: (behavior: HandoffBehavior) => Promise<void>
+  saveAutomatedMessagesConfig: (config: AutomatedMessagesConfig) => Promise<void>
+  saveBookingEdgeCases: (cases: BookingEdgeCases) => Promise<void>
+  saveServiceIntakeNotes: (serviceTypeId: string, notes: string) => Promise<void>
+  saveCancellationFee: (amount: number | null, currency: string) => Promise<void>
+  saveCancellationCutoffMinutes: (minutes: number) => Promise<void>
+  deferFeatureRequest: (text: string) => Promise<void>
+  // Website builder — writes website_json + website_preview_url to businesses table
+  saveWebsiteConfig: (schema: Record<string, unknown>, previewUrl: string) => Promise<void>
+}
+
+/** Everything a skill may return. The core engine decides what to do with it. */
+export interface SkillResult {
+  /** The skill handled this message and produced a reply. */
+  handled: true
+  reply: string
+  sessionComplete: boolean
+  skillName: string
+}
+
+/** A skill that cannot handle the message passes through. */
+export interface SkillPassthrough {
+  handled: false
+  skillName: string
+}
+
+export type SkillOutcome = SkillResult | SkillPassthrough
+
+export interface Skill {
+  readonly name: string
+  /** Fast synchronous check — return true only if this skill owns this message. */
+  canHandle(ctx: SkillContext): boolean
+  handle(ctx: SkillContext): Promise<SkillOutcome>
+}

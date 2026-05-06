@@ -19,6 +19,9 @@ dist/
 .vscode/
 .idea/
 
+# Claude Code — local machine config only, never commit
+.claude/settings.local.json
+
 # Logs
 *.log
 npm-debug.log*
