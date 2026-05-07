@@ -32,6 +32,19 @@ export type LlmResult<T> =
   | { ok: true; data: T }
   | { ok: false; error: string }
 
+export type ParseableOnboardingStep = 'cancellation_policy' | 'payment' | 'escalation_policy'
+
+export type OnboardingAnswerOutput =
+  | { step: 'cancellation_policy'; hours: number }
+  | { step: 'payment'; requiresPayment: boolean; paymentMethod: string | null }
+  | {
+      step: 'escalation_policy'
+      triggers: string[]
+      minimalEscalation: boolean
+      customerMessage: 'silent' | 'passed_to_owner' | 'owner_callback' | 'custom'
+      customText: string | null
+    }
+
 export interface TranscriptTurn {
   role: 'customer' | 'assistant'
   text: string

@@ -5,7 +5,7 @@ import { businesses, importTokens, managerInstructions, serviceTypes, availabili
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
 import type { ResolvedIdentity } from '../identity/types.js'
-import { classifyManagerInstruction } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, generateOnboardingReply, parseOnboardingAnswer } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
@@ -38,7 +38,7 @@ export async function handleOnboardingMessage(
     case 'payment':
       return handlePaymentStep(db, msg, business, lang, log)
     case 'escalation_policy':
-      return handleEscalationPolicyStep(db, msg, business, lang, log)
+      return handleEscalationPolicyStep(db, msg, business, baseUrl, lang, log)
     case 'calendar':
       return handleCalendarStepWithBody(db, business, baseUrl, msg.body, lang)
     case 'customer_import':
@@ -46,6 +46,31 @@ export async function handleOnboardingMessage(
     case 'verify':
       return handleVerifyStep(db, msg, identity, business, lang, log)
   }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function buildCalendarLink(business: Business, baseUrl: string): string {
+  const base = baseUrl || process.env['PUBLIC_BASE_URL'] || 'https://your-domain.com'
+  return `${base}/oauth/google?businessId=${business.id}`
+}
+
+async function onboardingQuestion(
+  step: string,
+  businessName: string,
+  lang: Lang,
+  opts: { justConfirmed?: string; collectedSummary?: string; isRetry?: boolean; extraContext?: string } = {},
+): Promise<string> {
+  const q = await generateOnboardingReply({
+    step,
+    businessName,
+    lang,
+    isRetry: opts.isRetry ?? false,
+    ...(opts.justConfirmed !== undefined ? { justConfirmed: opts.justConfirmed } : {}),
+    ...(opts.collectedSummary !== undefined ? { collectedSummary: opts.collectedSummary } : {}),
+    ...(opts.extraContext !== undefined ? { extraContext: opts.extraContext } : {}),
+  })
+  return q || getPrompt(step as OnboardingStep, lang)
 }
 
 // ── Step handlers ─────────────────────────────────────────────────────────────
@@ -63,8 +88,11 @@ async function handleBusinessNameStep(
     .set({ name: displayName, onboardingStep: 'services' })
     .where(eq(businesses.id, business.id))
   log.info({ businessId: business.id, displayName }, 'Onboarding: business name set')
-  const confirm = lang === 'he' ? `מצוין — "${displayName}"! 🎉` : `Got it — "${displayName}"! 🎉`
-  return { reply: `${confirm}\n\n${getPrompt('services', lang)}` }
+
+  const nextQ = await onboardingQuestion('services', displayName, lang, {
+    justConfirmed: displayName,
+  })
+  return { reply: nextQ }
 }
 
 async function handleServiceStep(
@@ -75,14 +103,19 @@ async function handleServiceStep(
   lang: Lang,
   log: FastifyBaseLogger,
 ): Promise<OnboardingResult> {
+  const retryPrompt = await onboardingQuestion('services', business.name, lang, { isRetry: true })
+
   return applyOnboardingInstruction(
     db, msg, identity, business,
     'service_change',
-    getRetryPrompt('services', lang) ?? getPrompt('services', lang),
+    retryPrompt,
     async (confirmationMessage) => {
       await db.update(businesses).set({ onboardingStep: 'hours' }).where(eq(businesses.id, business.id))
       log.info({ businessId: business.id }, 'Onboarding: services step complete')
-      return { reply: `${confirmationMessage}\n\n${getPrompt('hours', lang)}` }
+      const nextQ = await onboardingQuestion('hours', business.name, lang, {
+        justConfirmed: confirmationMessage,
+      })
+      return { reply: nextQ }
     },
     lang,
   )
@@ -106,19 +139,27 @@ async function handleHoursStep(
       .set({ onboardingStep: 'cancellation_policy', available247: true })
       .where(eq(businesses.id, business.id))
     log.info({ businessId: business.id }, 'Onboarding: hours step complete (24/7)')
-    return { reply: `${i18n.ob_247[lang]}\n\n${getPrompt('cancellation_policy', lang)}` }
+    const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, {
+      justConfirmed: lang === 'he' ? '24/7' : '24/7',
+    })
+    return { reply: nextQ }
   }
+
+  const retryPrompt = await onboardingQuestion('hours', business.name, lang, { isRetry: true })
 
   return applyOnboardingInstruction(
     db, msg, identity, business,
     'availability_change',
-    getRetryPrompt('hours', lang) ?? getPrompt('hours', lang),
+    retryPrompt,
     async (confirmationMessage) => {
       await db.update(businesses)
         .set({ onboardingStep: 'cancellation_policy', available247: false })
         .where(eq(businesses.id, business.id))
       log.info({ businessId: business.id }, 'Onboarding: hours step complete')
-      return { reply: `${confirmationMessage}\n\n${getPrompt('cancellation_policy', lang)}` }
+      const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, {
+        justConfirmed: confirmationMessage,
+      })
+      return { reply: nextQ }
     },
     lang,
   )
@@ -132,10 +173,20 @@ async function handleCancellationPolicyStep(
   log: FastifyBaseLogger,
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
-  const hours = parseInt(body.replace(/\D/g, ''), 10)
 
-  if (isNaN(hours) || hours < 0) {
-    return { reply: getRetryPrompt('cancellation_policy', lang) ?? getPrompt('cancellation_policy', lang) }
+  // Try LLM extraction first, fall back to plain integer parse
+  let hours: number | null = null
+  const parsed = await parseOnboardingAnswer('cancellation_policy', body, lang)
+  if (parsed.ok && parsed.data.step === 'cancellation_policy') {
+    hours = parsed.data.hours
+  } else {
+    const n = parseInt(body.replace(/\D/g, ''), 10)
+    if (!isNaN(n) && n >= 0) hours = n
+  }
+
+  if (hours === null) {
+    const retryQ = await onboardingQuestion('cancellation_policy', business.name, lang, { isRetry: true })
+    return { reply: retryQ }
   }
 
   await db.update(businesses)
@@ -147,7 +198,10 @@ async function handleCancellationPolicyStep(
     ? i18n.ob_cancellation_confirm_none[lang]
     : i18n.ob_cancellation_confirm[lang](hours)
 
-  return { reply: `✅ ${confirmation}\n\n${getPrompt('payment', lang)}` }
+  const nextQ = await onboardingQuestion('payment', business.name, lang, {
+    justConfirmed: confirmation,
+  })
+  return { reply: nextQ }
 }
 
 async function handlePaymentStep(
@@ -159,59 +213,131 @@ async function handlePaymentStep(
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
 
-  // First message in this step: yes/no for payment required
-  if (!business.paymentMethod && (isAffirmative(body) || isNegative(body))) {
-    if (isNegative(body)) {
-      await db.update(businesses)
-        .set({ onboardingStep: 'escalation_policy', confirmationGate: 'immediate' })
-        .where(eq(businesses.id, business.id))
-      log.info({ businessId: business.id }, 'Onboarding: payment gate = immediate')
-      return { reply: `${i18n.ob_payment_immediate[lang]}\n\n${getPrompt('escalation_policy', lang)}` }
-    }
-
-    // Yes — ask for payment method (store 'pending' as sentinel to know we're in sub-step)
-    await db.update(businesses)
-      .set({ confirmationGate: 'post_payment', paymentMethod: 'pending' })
-      .where(eq(businesses.id, business.id))
-    return { reply: i18n.ob_payment_method_ask[lang] }
-  }
-
-  // Second message in this step: the payment method string
+  // Sub-step: waiting for payment method after "yes" without method
   if (business.paymentMethod === 'pending' || (business.confirmationGate === 'post_payment' && !business.paymentMethod?.trim())) {
     const method = body.slice(0, 100)
     await db.update(businesses)
       .set({ onboardingStep: 'escalation_policy', paymentMethod: method })
       .where(eq(businesses.id, business.id))
-    log.info({ businessId: business.id, method }, 'Onboarding: payment method set')
-    return { reply: `${i18n.ob_payment_method_confirm[lang](method)}\n\n${getPrompt('escalation_policy', lang)}` }
+    log.info({ businessId: business.id, method }, 'Onboarding: payment method set (sub-step)')
+    const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
+      justConfirmed: i18n.ob_payment_method_confirm[lang](method),
+    })
+    return { reply: nextQ }
   }
 
-  return { reply: getRetryPrompt('payment', lang) ?? getPrompt('payment', lang) }
+  // First message: try LLM to extract both requiresPayment + method in one shot
+  let requiresPayment: boolean | null = null
+  let paymentMethod: string | null = null
+
+  const parsed = await parseOnboardingAnswer('payment', body, lang)
+  if (parsed.ok && parsed.data.step === 'payment') {
+    requiresPayment = parsed.data.requiresPayment
+    paymentMethod = parsed.data.paymentMethod
+  } else {
+    // Fallback: simple keyword detection
+    if (isNegative(body)) requiresPayment = false
+    else if (isAffirmative(body)) requiresPayment = true
+  }
+
+  if (requiresPayment === null) {
+    const retryQ = await onboardingQuestion('payment', business.name, lang, { isRetry: true })
+    return { reply: retryQ }
+  }
+
+  if (!requiresPayment) {
+    await db.update(businesses)
+      .set({ onboardingStep: 'escalation_policy', confirmationGate: 'immediate' })
+      .where(eq(businesses.id, business.id))
+    log.info({ businessId: business.id }, 'Onboarding: payment gate = immediate')
+    const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
+      justConfirmed: i18n.ob_payment_immediate[lang],
+    })
+    return { reply: nextQ }
+  }
+
+  // Requires payment — did they also give us the method in one shot?
+  if (paymentMethod) {
+    await db.update(businesses)
+      .set({ onboardingStep: 'escalation_policy', confirmationGate: 'post_payment', paymentMethod })
+      .where(eq(businesses.id, business.id))
+    log.info({ businessId: business.id, paymentMethod }, 'Onboarding: payment step complete (one shot)')
+    const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
+      justConfirmed: i18n.ob_payment_method_confirm[lang](paymentMethod),
+    })
+    return { reply: nextQ }
+  }
+
+  // Yes but no method — store sentinel and ask for method
+  await db.update(businesses)
+    .set({ confirmationGate: 'post_payment', paymentMethod: 'pending' })
+    .where(eq(businesses.id, business.id))
+  const methodQ = await onboardingQuestion('payment_method', business.name, lang)
+  return { reply: methodQ }
 }
 
 async function handleEscalationPolicyStep(
   db: Db,
   msg: InboundMessage,
   business: Business,
+  baseUrl: string,
   lang: Lang,
   log: FastifyBaseLogger,
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
 
-  // Parse what the manager said into escalation rules
-  const rules = parseEscalationPolicy(body, business.name)
+  // Try LLM extraction, fall back to regex
+  let rules: EscalationRule[]
+  const parsed = await parseOnboardingAnswer('escalation_policy', body, lang)
+
+  if (parsed.ok && parsed.data.step === 'escalation_policy') {
+    const d = parsed.data
+    const customerMsg = d.customerMessage as EscalationRule['customerMessage']
+    const extra = d.customText ? { customText: d.customText } : {}
+
+    rules = d.minimalEscalation
+      ? [{ trigger: 'unknown_intent', threshold: 2, customerMessage: customerMsg, ...extra }]
+      : [
+          ...d.triggers.map((kw) => ({
+            trigger: 'keyword' as const,
+            value: kw,
+            customerMessage: customerMsg,
+            ...extra,
+          })),
+          { trigger: 'unknown_intent' as const, threshold: 2, customerMessage: customerMsg, ...extra },
+        ]
+  } else {
+    rules = parseEscalationPolicyFallback(body)
+  }
 
   await db.update(businesses)
     .set({ onboardingStep: 'calendar', escalationRules: rules as unknown as Record<string, unknown>[] })
     .where(eq(businesses.id, business.id))
   log.info({ businessId: business.id, ruleCount: rules.length }, 'Onboarding: escalation policy set')
 
-  const triggerList = rules.filter((r) => r.trigger !== 'unknown_intent').map((r) => r.trigger === 'keyword' ? `"${r.value}"` : r.trigger).join(', ')
+  const triggerList = rules
+    .filter((r) => r.trigger !== 'unknown_intent')
+    .map((r) => r.trigger === 'keyword' ? `"${r.value}"` : r.trigger)
+    .join(', ')
   const summary = triggerList.length === 0
     ? i18n.ob_escalation_confirm_none[lang]
     : i18n.ob_escalation_confirm[lang](triggerList)
 
-  return { reply: `✅ ${summary}\n\n${getPrompt('calendar', lang)}` }
+  // Build real OAuth link for the calendar step question
+  const calendarLink = buildCalendarLink(business, baseUrl)
+  const calendarTemplate = getPrompt('calendar', lang).replace('{{OAUTH_LINK}}', calendarLink)
+
+  const nextQ = await onboardingQuestion('calendar', business.name, lang, {
+    justConfirmed: summary,
+    extraContext: `OAuth link for Google Calendar: ${calendarLink}`,
+  })
+
+  // Calendar step must include the actual clickable link — append it if LLM didn't include it
+  const reply = nextQ.includes(calendarLink)
+    ? nextQ
+    : `${nextQ}\n\n${calendarLink}`
+
+  return { reply: `✅ ${summary}\n\n${reply}` }
 }
 
 export async function handleCalendarStepWithBody(
@@ -221,16 +347,19 @@ export async function handleCalendarStepWithBody(
   body: string,
   lang: Lang = 'he',
 ): Promise<OnboardingResult> {
-  if (body.trim().toLowerCase() === 'internal') {
+  if (body.trim().toLowerCase() === 'internal' || body.trim() === 'פנימי') {
     await db.update(businesses)
       .set({ onboardingStep: 'customer_import', calendarMode: 'internal' })
       .where(eq(businesses.id, business.id))
-    return { reply: `${i18n.ob_calendar_internal[lang]}\n\n${getPrompt('customer_import', lang)}` }
+    const nextQ = await onboardingQuestion('customer_import', business.name, lang, {
+      justConfirmed: i18n.ob_calendar_internal[lang],
+    })
+    return { reply: nextQ }
   }
 
-  // Step advances via OAuth callback — just resend the link
-  const calendarLink = buildCalendarLink(business)
-  return { reply: i18n.ob_calendar_waiting[lang](getPrompt('calendar', lang).replace('{{OAUTH_LINK}}', calendarLink)) }
+  // Step advances via OAuth callback — resend the link with real URL
+  const calendarLink = buildCalendarLink(business, baseUrl)
+  return { reply: i18n.ob_calendar_waiting[lang](calendarLink) }
 }
 
 async function handleCustomerImportStep(
@@ -269,7 +398,6 @@ async function handleVerifyStep(
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
 
-  // GO (any case) → launch
   if (body.toUpperCase() === 'GO') {
     await db
       .update(businesses)
@@ -277,7 +405,6 @@ async function handleVerifyStep(
       .where(eq(businesses.id, business.id))
     log.info({ businessId: business.id }, 'Onboarding: complete via GO')
 
-    // Auto-start the business knowledge interview workflow
     await createWorkflow(db, business.id, identity.id, 'business-knowledge-setup', 'brand-voice').catch((err) => {
       log.warn({ err, businessId: business.id }, 'Failed to create business-knowledge-setup workflow after onboarding')
     })
@@ -289,7 +416,7 @@ async function handleVerifyStep(
     return { reply: completionMsg + interviewPrompt.replace('[שם העסק]', business.name).replace('[business name]', business.name) }
   }
 
-  // Not GO — treat as a correction to apply
+  // Not GO — treat as a correction
   const classifyResult = await classifyManagerInstruction(body, {
     businessId: business.id,
     timezone: business.timezone,
@@ -337,7 +464,6 @@ async function handleVerifyStep(
 // ── Verify summary builder (exported for import.ts and oauth.ts) ──────────────
 
 export async function buildVerifySummary(db: Db, business: Business, lang: Lang): Promise<string> {
-  // Services
   const services = await db
     .select({ name: serviceTypes.name, durationMinutes: serviceTypes.durationMinutes, maxParticipants: serviceTypes.maxParticipants })
     .from(serviceTypes)
@@ -351,7 +477,6 @@ export async function buildVerifySummary(db: Db, business: Business, lang: Lang)
       }).join(', ')
     : (lang === 'he' ? 'לא הוגדרו' : 'None set')
 
-  // Working hours
   let hoursStr: string
   if (business.available247) {
     hoursStr = t('ob_verify_hours_247', lang)
@@ -370,25 +495,21 @@ export async function buildVerifySummary(db: Db, business: Business, lang: Lang)
     hoursStr = formatted.length > 0 ? formatted.join(', ') : (lang === 'he' ? 'לא הוגדרו' : 'Not configured')
   }
 
-  // Cancellation
   const cutoffH = business.cancellationCutoffMinutes ? Math.round(business.cancellationCutoffMinutes / 60) : 0
   const cancellationStr = cutoffH === 0
     ? t('ob_verify_cancellation_none', lang)
     : i18n.ob_verify_cancellation_hours[lang](cutoffH)
 
-  // Payment
   const paymentStr = business.confirmationGate === 'post_payment' && business.paymentMethod
     ? i18n.ob_verify_payment_method[lang](business.paymentMethod)
     : t('ob_verify_payment_immediate', lang)
 
-  // Escalation
   const rules = (business.escalationRules ?? []) as EscalationRule[]
   const keywordTriggers = rules.filter((r) => r.trigger === 'keyword' && r.value).map((r) => `"${r.value}"`)
   const escalationStr = keywordTriggers.length > 0
     ? keywordTriggers.join(', ')
     : t('ob_verify_escalation_none', lang)
 
-  // Calendar
   const calStr = business.calendarMode === 'internal'
     ? t('ob_verify_calendar_internal', lang)
     : t('ob_verify_calendar_google', lang)
@@ -464,35 +585,31 @@ async function applyOnboardingInstruction(
   return onSuccess(applyResult.confirmationMessage)
 }
 
-// ── Escalation policy parser ──────────────────────────────────────────────────
+// ── Escalation policy fallback (regex) ────────────────────────────────────────
 
-function parseEscalationPolicy(body: string, businessName: string): EscalationRule[] {
+function parseEscalationPolicyFallback(body: string): EscalationRule[] {
   const lower = body.toLowerCase()
   const rules: EscalationRule[] = []
 
-  // Detect customerMessage preference from the numbered options
   let customerMessage: EscalationRule['customerMessage'] = 'passed_to_owner'
   let customText: string | undefined
 
-  if (lower.includes('nothing') || lower.includes('silent') || lower.match(/\b1\b/)) {
+  if (lower.includes('nothing') || lower.includes('silent') || lower.includes('שקט') || lower.match(/\b1\b/)) {
     customerMessage = 'silent'
-  } else if (lower.includes('call') || lower.match(/\b3\b/)) {
+  } else if (lower.includes('call') || lower.includes('callback') || lower.includes('יחזור') || lower.match(/\b3\b/)) {
     customerMessage = 'owner_callback'
   } else if (lower.match(/\b4\b/) || lower.includes('custom')) {
     customerMessage = 'custom'
-    // Try to extract quoted custom text
     const quoted = body.match(/"([^"]+)"/)
     customText = quoted?.[1]
   }
 
-  // "only unknown requests" — minimal escalation
-  if (lower.includes('only unknown') || lower.includes('minimal') || lower.includes('unrecogniz')) {
+  if (lower.includes('only unknown') || lower.includes('minimal') || lower.includes('unrecogniz') || lower.includes('רק בקשות')) {
     rules.push({ trigger: 'unknown_intent', threshold: 2, customerMessage, ...(customText ? { customText } : {}) })
     return rules
   }
 
-  // Extract keyword triggers from the text (words after "complaint", "refund", etc.)
-  const keywordMatches = body.match(/["']([^"']+)["']|complaints?|refunds?|pricing|price|payment|angry|upset|cancel.*policy|discount|urgent|emergency/gi)
+  const keywordMatches = body.match(/["']([^"']+)["']|complaints?|refunds?|pricing|price|payment|angry|upset|cancel.*policy|discount|urgent|emergency|תלונות?|החזר|תמחור|כועס/gi)
   if (keywordMatches) {
     for (const kw of keywordMatches) {
       const clean = kw.replace(/['"]/g, '').toLowerCase().trim()
@@ -502,15 +619,6 @@ function parseEscalationPolicy(body: string, businessName: string): EscalationRu
     }
   }
 
-  // Always add unknown_intent as a backstop
   rules.push({ trigger: 'unknown_intent', threshold: 2, customerMessage, ...(customText ? { customText } : {}) })
-
   return rules
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function buildCalendarLink(business: Business): string {
-  const base = process.env['PUBLIC_BASE_URL'] ?? 'https://your-domain.com'
-  return `${base}/oauth/google?businessId=${business.id}`
 }

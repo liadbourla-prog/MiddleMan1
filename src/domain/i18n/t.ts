@@ -20,16 +20,16 @@ const strings = {
     en: `I didn't recognise that timezone. Please use an IANA name, for example:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
   },
   mm_ask_calendar_mode: {
-    he: `לניהול יומן התורים — עדיף להשתמש ביומן Google קיים, אבל אפשר גם להתחיל עם יומן פנימי ולחבר Google מאוחר יותר.\n\nשלחו *1* להתחיל עם יומן פנימי\nשלחו *2* לחבר Google Calendar עכשיו`,
-    en: `For managing bookings, you can use an existing Google Calendar or start with the built-in calendar and connect Google later.\n\nSend *1* to use the built-in calendar\nSend *2* to connect Google Calendar now`,
+    he: `האם יש לכם Google Calendar שתרצו לחבר, או שנתחיל עם יומן פנימי בינתיים? (אפשר לחבר Google בכל עת מאוחר יותר)`,
+    en: `Do you have a Google Calendar you'd like to connect, or should I manage scheduling internally for now? (You can always connect Google Calendar later)`,
   },
   mm_ask_calendar: {
     he: `מה ה-Google Calendar ID שלכם?\n\n(Google Calendar → הגדרות → הלוח שלכם → Calendar ID — בדרך כלל נראה כמו כתובת האימייל.)`,
     en: `What's your Google Calendar ID?\n\n(Google Calendar → Settings → your calendar → Calendar ID — usually looks like your email.)`,
   },
   mm_ask_services: {
-    he: `מה השירות העיקרי שאתם מציעים? שלחו את שם השירות ומשך הזמן שלו.\nלמשל: *תספורת, 30 דקות*\n\nאפשר להוסיף עוד שירותים דרך הסוכן שלכם לאחר ההפעלה.`,
-    en: `What's your main service? Send the service name and its duration.\nFor example: *Haircut, 30 minutes*\n\nYou can add more services through your PA after it's live.`,
+    he: `מה השירות הראשי שלכם ואיך הוא נקרא? ספרו גם כמה זמן לוקח — למשל "תספורת, 30 דקות". אפשר לרשום כמה שירותים ביחד.`,
+    en: `What's your main service and what do you call it? Include how long it takes — like "Haircut, 30 minutes". You can list multiple services together.`,
   },
   mm_bad_services: {
     he: `לא הצלחתי לפענח. נסו שוב — למשל: *תספורת, 30 דקות*`,
@@ -66,16 +66,16 @@ const strings = {
     en: `Hi! I'm your new PA 👋 Let's get you set up — only takes a few minutes.\n\nWhat name should I show customers for your business? (e.g. "Liad's Barbershop")`,
   },
   ob_services: {
-    he: `נהדר! עכשיו אמרו לי על השירותים שלכם.\n\nשלחו ככה:\n"תספורת 30 דקות, תספורת זקן 20 דקות, גילוח מלא 60 דקות"\n\nלקבוצות הוסיפו קיבולת: "שיעור יוגה 60 דקות (מקס 12)"\nלשירות עם עובד ספציפי: "יוגה עם דניאל 60 דקות"\n\nתוכלו להוסיף ולשנות שירותים בכל עת.`,
-    en: `Great! Now tell me your services.\n\nSend them like this:\n"Haircut 30 min, Beard trim 20 min, Full grooming 60 min"\n\nFor group classes add capacity: "Yoga class 60 min (max 12)"\nFor staff-assigned services: "Yoga with Daniel 60 min"\n\nYou can always add or change services later.`,
+    he: `מה השירותים שאתם מציעים? שלחו שם ומשך לכל שירות — למשל "תספורת 30 דקות, תספורת זקן 20 דקות". לשיעור קבוצתי הוסיפו "(מקס 12)". אפשר לשנות בכל עת.`,
+    en: `What services do you offer? Send the name and duration for each — like "Haircut 30 min, Beard trim 20 min". For group classes add "(max 12)". You can always change these later.`,
   },
   ob_services_retry: {
     he: `לא הצלחתי לפענח את זה. רשמו את השירותים עם משך לכל אחד — למשל:\n"תספורת 30 דקות, תספורת זקן 20 דקות"`,
     en: `I didn't quite catch that. Please list your services with a duration for each — for example:\n"Haircut 30 min, Beard trim 20 min"`,
   },
   ob_hours: {
-    he: `מעולה! עכשיו קבעו את שעות הפעילות — או אמרו לי שאתם פתוחים 24/7.\n\nדוגמאות:\n• "ראשון-חמישי 9:00-19:00, שישי 9:00-14:00, שבת סגור"\n• "24/7" או "תמיד פתוח"\n\nתוכלו לשנות בכל עת.`,
-    en: `Perfect! Now set your working hours — or tell me you're open 24/7.\n\nExamples:\n• "Mon–Fri 9am to 7pm, Saturday 9am to 3pm, closed Sunday"\n• "24/7" or "always open"\n\nYou can change these at any time.`,
+    he: `מתי אתם פתוחים? שלחו ימים ושעות — למשל "ראשון-חמישי 9:00-19:00, שישי 9:00-14:00". אם תמיד פתוחים, פשוט אמרו "24/7".`,
+    en: `When are you open? Send your days and hours — like "Mon–Fri 9am–7pm, Saturday 9am–2pm, closed Sunday". If you're always open, just say "24/7".`,
   },
   ob_hours_retry: {
     he: `לא הצלחתי לפענח את השעות. נסו שוב — למשל:\n"א'-ה' 9:00–18:00, שישי 9:00–14:00, שבת סגור"\nאו פשוט "24/7" אם אתם תמיד פתוחים.`,
@@ -86,8 +86,8 @@ const strings = {
     en: `Got it — you're open 24/7 ⏰`,
   },
   ob_cancellation: {
-    he: `כמה שעות לפני תור לקוחות יכולים לבטל?\n\n• כתבו מספר, למשל "24" או "48"\n• כתבו "0" ללא הגבלה — לקוחות יכולים לבטל בכל עת`,
-    en: `How many hours before an appointment can customers cancel?\n\n• Reply a number, e.g. "24" or "48"\n• Reply "0" for no restriction — customers can cancel any time`,
+    he: `כמה שעות לפני תור לקוחות יכולים לבטל? כתבו מספר — למשל "24". אם אין הגבלה ולקוחות יכולים לבטל בכל עת, כתבו "0".`,
+    en: `How many hours before an appointment can customers cancel? Write a number — like "24". If there's no restriction and customers can cancel any time, write "0".`,
   },
   ob_cancellation_retry: {
     he: `אנא כתבו מספר שעות, למשל "24", "48", או "0" ללא הגבלה.`,
@@ -102,8 +102,8 @@ const strings = {
     en: (h: number) => `Cancellation cutoff set to ${h}h before the appointment.`,
   },
   ob_payment: {
-    he: `האם לקוחות צריכים לשלם לפני שהתור מאושר?\n\n• "כן" — אבקש מהם לשלם תחילה, ואז אאשר את הסלוט\n• "לא" — התור מאושר מיד כשהם מסכימים`,
-    en: `Do customers need to pay before their booking is confirmed?\n\n• "Yes" — I'll ask them to pay first, then lock in the slot\n• "No" — booking is confirmed immediately when they agree`,
+    he: `האם לקוחות צריכים לשלם לפני שאאשר את התור? אם כן — באיזו שיטה הם משלמים? (למשל: ביט, PayPal, העברה בנקאית)`,
+    en: `Do customers need to pay before I confirm their booking? If yes — what's the payment method? (e.g. Bit, PayPal, bank transfer)`,
   },
   ob_payment_retry: {
     he: `אנא ענו "כן" או "לא" — האם לקוחות צריכים לשלם לפני שאני מאשר את התור?`,
@@ -122,12 +122,12 @@ const strings = {
     en: (m: string) => `Got it — customers will pay via ${m} before their booking is confirmed. 💳`,
   },
   ob_escalation: {
-    he: `מתי אני צריך לעצור ולהעביר שיחה אליכם ישירות?\n\nדוגמאות: "תלונות", "בקשות החזר כספי", "שאלות תמחור", "לקוחות VIP"\n\nתוכלו גם לומר "רק בקשות לא מובנות" למינימום.\n\nכשאני מעביר, מה לומר ללקוח?\n1. כלום (להודיע לכם בשקט)\n2. "העברתי את זה ל[שם עסק] — ייצרו איתכם קשר"\n3. "הבעלים יחזור אליכם בקרוב"\n4. הודעה מותאמת (אמרו לי מה לכתוב)`,
-    en: `When should I stop and hand a conversation to you directly?\n\nExamples: "complaints", "refund requests", "pricing questions", "VIP customers"\n\nYou can also say "only unknown requests" to keep it minimal.\n\nWhen I hand off, what should I tell the customer?\n1. Nothing (notify you silently)\n2. "I've passed this to [your business name] — they'll be in touch"\n3. "The owner will call you back shortly"\n4. Custom message (tell me what to say)`,
+    he: `מתי אני צריך לעצור ולהעביר שיחה אליכם ישירות — אילו נושאים או מצבים? ומה לומר ללקוח ברגע כזה — שיצרו איתו קשר, שתתקשרו חזרה, או לא לומר כלום?`,
+    en: `When should I stop and hand a conversation to you directly — what topics or situations? And what should I tell the customer at that point — that someone will be in touch, that you'll call back, or nothing at all?`,
   },
   ob_escalation_retry: {
-    he: `אנא תארו מתי להעביר שיחות ובחרו 1–4 למה לומר ללקוח.`,
-    en: `Please describe when I should hand off conversations to you, and pick 1–4 for what to tell the customer.`,
+    he: `ספרו לי מתי להעביר שיחות אליכם, ומה לומר ללקוח כשאני מעביר.`,
+    en: `Tell me when I should hand off conversations to you, and what to say to the customer when I do.`,
   },
   ob_escalation_confirm_none: {
     he: `אין כללי העברה ידנית — אעביר רק בקשות שאני ממש לא מצליח להבין.`,
@@ -150,12 +150,12 @@ const strings = {
     en: (link: string) => `Waiting for calendar connection...\n\n${link}`,
   },
   ob_import: {
-    he: `כמעט סיימנו! יש לכם רשימת לקוחות קיימת, היסטוריית תורים או קטלוג שירותים לייבוא?\n\nענו "כן" לקישור העלאה מאובטח, או "דלג" להמשך בלי ייבוא.`,
-    en: `Almost done! Do you have an existing customer list, booking history, or service catalog to import?\n\nReply "Yes" to get a secure upload link, or "Skip" to continue without importing.`,
+    he: `כמעט סיימנו! יש לכם רשימת לקוחות, היסטוריית תורים או קטלוג שירותים לייבוא? ענו "כן" לקישור העלאה, או "דלג" להמשך.`,
+    en: `Almost done! Do you have an existing customer list, booking history, or service catalog to import? Reply "Yes" for an upload link, or "Skip" to continue.`,
   },
   ob_import_link: {
-    he: (url: string) => `הנה קישור ההעלאה המאובטח שלכם (תקף 30 דקות):\n${url}\n\nקבצים מתקבלים:\n• אנשי קשר CSV (שם, טלפון)\n• היסטוריית תורים CSV (שם, טלפון, תאריך, שירות)\n• קטלוג שירותים CSV (שם, משך_דקות, מחיר)\n\nהעלו אחד או יותר, ואז חזרו לכאן.`,
-    en: (url: string) => `Here's your secure upload link (valid 30 min):\n${url}\n\nAccepted files:\n• Contacts CSV (name, phone)\n• Booking history CSV (name, phone, date, service)\n• Service catalog CSV (name, duration_minutes, price)\n\nUpload one or more, then come back here.`,
+    he: (url: string) => `הנה קישור ההעלאה המאובטח שלכם (תקף 30 דקות):\n${url}\n\nמקבלים CSV של אנשי קשר (שם, טלפון), היסטוריית תורים (שם, טלפון, תאריך, שירות), או קטלוג שירותים (שם, משך_דקות, מחיר). העלו אחד או יותר ואז חזרו לכאן.`,
+    en: (url: string) => `Here's your secure upload link (valid 30 min):\n${url}\n\nAccepted: CSV of contacts (name, phone), booking history (name, phone, date, service), or service catalog (name, duration_minutes, price). Upload one or more, then come back here.`,
   },
   ob_import_skip: {
     he: `בסדר — תוכלו לייבא נתונים בכל עת בהמשך.`,

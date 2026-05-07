@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai'
 import { z } from 'zod'
-import type { CustomerIntentOutput, ManagerInstructionOutput, LlmResult, GenerateReplyInput } from './types.js'
+import type { CustomerIntentOutput, ManagerInstructionOutput, LlmResult, GenerateReplyInput, ParseableOnboardingStep, OnboardingAnswerOutput } from './types.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
@@ -214,6 +214,157 @@ Customer profile: ${memoryText}`
   }
 
   return FALLBACK_REPLIES[input.language]
+}
+
+// ── Onboarding: conversational question generator ─────────────────────────────
+
+const STEP_GOALS: Record<string, Record<'he' | 'en', string>> = {
+  business_name: {
+    he: 'שאל מה שם העסק שיוצג ללקוחות.',
+    en: 'Ask what display name customers will see for the business.',
+  },
+  services: {
+    he: 'שאל על השירות הראשי של העסק ומשך הזמן שלו — למשל "תספורת, 30 דקות". אפשר כמה שירותים ביחד.',
+    en: 'Ask about their main service and how long it takes — like "Haircut, 30 min". Multiple services are fine.',
+  },
+  hours: {
+    he: 'שאל מתי העסק פתוח — ימים ושעות. אם פתוח תמיד אפשר לומר 24/7.',
+    en: 'Ask when the business is open — days and hours. They can say 24/7 if always open.',
+  },
+  cancellation_policy: {
+    he: 'שאל כמה שעות לפני תור לקוחות יכולים לבטל. אם אין הגבלה — יכולים לומר "ללא הגבלה" או "0".',
+    en: 'Ask how many hours before an appointment customers can cancel. They can say "no restriction" for unrestricted.',
+  },
+  payment: {
+    he: 'שאל אם לקוחות צריכים לשלם לפני שהתור מאושר, ואם כן — באיזו שיטה (ביט, PayPal, העברה בנקאית וכו\'). שאלה אחת.',
+    en: "Ask if customers need to pay before their booking is confirmed. If yes, what's the payment method (Bit, PayPal, bank transfer, etc.). One question.",
+  },
+  payment_method: {
+    he: 'שאל רק מה שיטת התשלום — הם כבר אמרו שכן.',
+    en: 'Ask only for the payment method — they already said yes.',
+  },
+  escalation_policy: {
+    he: 'שאל מתי ה-PA צריך לעצור ולהעביר שיחה ישירות לבעל העסק — אילו נושאים או מצבים. גם שאל מה לומר ללקוח: שיצרו איתו קשר, שתתקשרו חזרה, או לא לומר כלום. בלי תפריט מספרים.',
+    en: 'Ask when the PA should stop and hand a conversation to them — what situations or topics. Also ask what to tell the customer: that someone will be in touch, that they\'ll call back, or say nothing. No numbered menus.',
+  },
+  customer_import: {
+    he: 'שאל אם יש להם רשימת לקוחות קיימת, היסטוריית תורים, או קטלוג שירותים לייבוא.',
+    en: 'Ask if they have an existing customer list, booking history, or service catalog to import.',
+  },
+}
+
+export async function generateOnboardingReply(input: {
+  step: string
+  businessName: string
+  collectedSummary?: string
+  justConfirmed?: string
+  isRetry: boolean
+  lang: 'he' | 'en'
+  extraContext?: string
+}): Promise<string> {
+  const stepGoal = STEP_GOALS[input.step]?.[input.lang] ?? STEP_GOALS[input.step]?.en ?? 'Ask for the next required piece of information.'
+
+  const ackLine = input.justConfirmed
+    ? (input.lang === 'he'
+      ? `התשובה האחרונה שלהם: "${input.justConfirmed}". התחל בהתייחסות קצרה וטבעית לתשובה הזו, ואז שאל את השאלה הבאה.`
+      : `Their last answer: "${input.justConfirmed}". Open with a brief natural acknowledgement of that, then ask the next question.`)
+    : ''
+
+  const retryNote = input.isRetry
+    ? (input.lang === 'he'
+      ? 'זהו ניסיון חוזר — הם לא ענו בצורה ברורה. נסח מחדש בסבלנות, מעט שונה.'
+      : "This is a retry — they didn't answer clearly. Rephrase patiently, slightly different wording.")
+    : ''
+
+  const systemPrompt = `You are helping "${input.businessName}" set up their WhatsApp PA. Guide them conversationally, like a real person texting — warm, direct, short.
+
+Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
+Rules:
+- 1–3 sentences maximum
+- No bullet points. No numbered lists. No markdown.
+- Ask exactly ONE thing per message
+- Sound like a real person, not a form or bot
+${ackLine}
+${retryNote}
+${input.collectedSummary ? `Already configured: ${input.collectedSummary}` : ''}
+${input.extraContext ? `Context: ${input.extraContext}` : ''}
+
+Current step task: ${stepGoal}
+
+Output: the message text ONLY. No quotes, no labels, no preamble.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: 'Generate the next onboarding message.',
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 200, temperature: 0.45 },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through — caller uses template fallback
+  }
+  return ''
+}
+
+// ── Onboarding: structured answer parser ─────────────────────────────────────
+
+const cancellationSchema = z.object({ hours: z.number().int().min(0) })
+const paymentSchema = z.object({
+  requiresPayment: z.boolean(),
+  paymentMethod: z.string().nullable(),
+})
+const escalationSchema = z.object({
+  triggers: z.array(z.string()),
+  minimalEscalation: z.boolean(),
+  customerMessage: z.enum(['silent', 'passed_to_owner', 'owner_callback', 'custom']),
+  customText: z.string().nullable(),
+})
+
+const PARSE_PROMPTS: Record<ParseableOnboardingStep, string> = {
+  cancellation_policy: `Extract how many hours before an appointment the customer wants to allow cancellations.
+If they say "any time", "no restriction", "ללא הגבלה", "כל עת", "0", "whenever", etc. → hours: 0.
+If they mention days (e.g. "two days") convert to hours (48).
+Return JSON: { "hours": number }`,
+
+  payment: `Extract whether customers must pay before their booking is confirmed, and if so what payment method.
+If they say "yes", "כן", "תשלום מראש", "pay first" etc. → requiresPayment: true.
+If they say "no", "לא", "immediately", "מיידי" etc. → requiresPayment: false, paymentMethod: null.
+Extract the payment method if mentioned (e.g. "Bit", "PayPal", "bank transfer", "ביט", "כרטיס אשראי").
+Return JSON: { "requiresPayment": boolean, "paymentMethod": string | null }`,
+
+  escalation_policy: `Extract when the PA should escalate/hand off a conversation to the business owner, and what to tell the customer.
+- triggers: list of topic keywords or situations to escalate (empty array if minimal escalation)
+- minimalEscalation: true if they want to escalate only truly unrecognizable requests
+- customerMessage: "silent" if notify owner silently, "passed_to_owner" if tell customer someone will be in touch, "owner_callback" if tell customer the owner will call back, "custom" if they specified custom wording
+- customText: their custom message text, or null
+Return JSON: { "triggers": string[], "minimalEscalation": boolean, "customerMessage": "silent"|"passed_to_owner"|"owner_callback"|"custom", "customText": string|null }`,
+}
+
+export async function parseOnboardingAnswer(
+  step: ParseableOnboardingStep,
+  message: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<OnboardingAnswerOutput>> {
+  const langNote = lang === 'he' ? 'The message is in Hebrew.' : 'The message is in English.'
+  const systemPrompt = `${langNote}\n\n${PARSE_PROMPTS[step]}`
+  const safeMessage = sanitizeUserInput(message)
+
+  // Call with the correct schema per step — avoids union type narrowing issue
+  if (step === 'cancellation_policy') {
+    const raw = await callWithSchema(systemPrompt, safeMessage, cancellationSchema)
+    if (!raw.ok) return raw
+    return { ok: true, data: { step: 'cancellation_policy', ...raw.data } }
+  }
+  if (step === 'payment') {
+    const raw = await callWithSchema(systemPrompt, safeMessage, paymentSchema)
+    if (!raw.ok) return raw
+    return { ok: true, data: { step: 'payment', ...raw.data } }
+  }
+  // escalation_policy
+  const raw = await callWithSchema(systemPrompt, safeMessage, escalationSchema)
+  if (!raw.ok) return raw
+  return { ok: true, data: { step: 'escalation_policy', ...raw.data } }
 }
 
 const QUOTA_ERROR_CODES = new Set([429, 503, 'RESOURCE_EXHAUSTED', 'UNAVAILABLE'])

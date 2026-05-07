@@ -100,13 +100,16 @@ async function handleStep(
 
     case 'calendar': {
       if (!data.calendarMode) {
-        // Awaiting the initial choice between internal and Google Calendar
-        const choice = text.trim()
-        if (choice === '1') {
-          await advance(db, session.managerPhone, 'services', { ...data, calendarMode: 'internal', calendarId: null })
-          return { reply: i18n.mm_ask_services[lang] }
-        }
-        if (choice === '2') {
+        // Parse natural language: does the user want Google or internal?
+        const lower = text.toLowerCase()
+        const wantsGoogle = lower.includes('google') || lower.includes('גוגל')
+          || lower.includes('2') || lower.includes('calendar') || lower.includes('יומן')
+        const wantsInternal = lower.includes('פנימי') || lower.includes('internal')
+          || lower.includes('later') || lower.includes('מאוחר') || lower.includes('אחרי')
+          || lower.includes('1') || lower.includes('לא') || lower.includes('no')
+          || lower.includes('without') || lower.includes('בלי')
+
+        if (wantsGoogle && !wantsInternal) {
           // Store mode choice but stay on this step to collect the Calendar ID next
           await db
             .update(providerOnboardingSessions)
@@ -114,6 +117,11 @@ async function handleStep(
             .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
           return { reply: i18n.mm_ask_calendar[lang] }
         }
+        if (wantsInternal && !wantsGoogle) {
+          await advance(db, session.managerPhone, 'services', { ...data, calendarMode: 'internal', calendarId: null })
+          return { reply: i18n.mm_ask_services[lang] }
+        }
+        // Ambiguous — re-ask with clearer question
         return { reply: i18n.mm_ask_calendar_mode[lang] }
       }
 
