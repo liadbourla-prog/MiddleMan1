@@ -205,7 +205,7 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
   }).join('')
 
   const servicesSection = `
-<section aria-labelledby="services-heading">
+<section class="section-surface" aria-labelledby="services-heading">
   <div class="container">
     <h2 id="services-heading">${e(servicesLabel)}</h2>
     <div class="services-grid">${serviceCards}</div>
@@ -231,7 +231,7 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
   }
 
   const trustSection = `
-<section aria-labelledby="trust-heading">
+<section class="section-light" aria-labelledby="trust-heading">
   <div class="container">
     <h2 id="trust-heading">${e(trustLabel)}</h2>
     <div class="trust-grid">
@@ -248,7 +248,7 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
 </div>`).join('')
 
   const faqSection = topFaqs.length > 0 ? `
-<section aria-labelledby="faq-heading">
+<section class="section-surface" aria-labelledby="faq-heading">
   <div class="container">
     <h2 id="faq-heading">${e(faqLabel)}</h2>
     <div class="faq-list">${faqHtml}</div>
@@ -258,7 +258,7 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
 
   const ctaLabel = isHe ? `איך מזמינים תור ב-${biz.name}?` : `How do I book at ${biz.name}?`
   const ctaSection = `
-<section class="cta-section" aria-labelledby="cta-heading">
+<section class="cta-section section-dark" aria-labelledby="cta-heading">
   <div class="container">
     <h2 id="cta-heading">${e(ctaLabel)}</h2>
     <p class="answer-block">${isHe ? `שלחו הודעה ל-${biz.name} דרך וואטסאפ — מענה מהיר, הזמנה קלה.` : `Send a message to ${biz.name} on WhatsApp — fast reply, easy booking.`}</p>
@@ -340,13 +340,13 @@ function renderServicesPage(schema: SiteSchema, siteUrl: string, css: string, di
   }).join('')
 
   const bodyContent = `
-<section style="padding-top:2.5rem;padding-bottom:1rem;">
+<section class="section-surface" style="padding-top:2.5rem;padding-bottom:1rem;">
   <div class="container">
     <h1>${isHe ? `השירותים של ${biz.name}` : `Services at ${biz.name}`}</h1>
     <div class="answer-block"><p>${e(description)}</p></div>
   </div>
 </section>
-<section>
+<section class="section-light">
   <div class="container">
     ${serviceBlocks}
   </div>
@@ -396,11 +396,13 @@ function renderFaqPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'r
   }
 
   let bodyFaqHtml = ''
+  let sectionIndex = 0
   for (const { key, label } of topics) {
     const group = allFaqs.filter((f) => f.topic === key)
     if (group.length === 0) continue
+    const sectionClass = sectionIndex % 2 === 0 ? 'section-surface' : 'section-light'
     bodyFaqHtml += `
-<section aria-labelledby="faq-${key}">
+<section class="${sectionClass}" aria-labelledby="faq-${key}">
   <div class="container">
     <h2 id="faq-${key}">${e(label)}</h2>
     <div class="faq-list">
@@ -412,17 +414,18 @@ function renderFaqPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'r
     </div>
   </div>
 </section>`
+    sectionIndex++
   }
 
   const bodyContent = `
-<section style="padding-top:2.5rem;padding-bottom:1rem;">
+<section class="section-surface" style="padding-top:2.5rem;padding-bottom:1rem;">
   <div class="container">
     <h1>${e(isHe ? `שאלות נפוצות — ${biz.name}` : `Frequently Asked Questions — ${biz.name}`)}</h1>
     <div class="answer-block"><p>${e(description)}</p></div>
   </div>
 </section>
 ${bodyFaqHtml}
-<section class="cta-section" aria-label="${isHe ? 'הזמנה' : 'Booking'}">
+<section class="cta-section section-dark" aria-label="${isHe ? 'הזמנה' : 'Booking'}">
   <div class="container">
     <h2>${isHe ? 'לא מצאתם תשובה?' : "Didn't find your answer?"}</h2>
     <p class="answer-block">${isHe ? 'שלחו הודעה ישירה בוואטסאפ ונענה בהקדם.' : 'Send us a direct WhatsApp message and we\'ll reply quickly.'}</p>
@@ -459,7 +462,7 @@ function renderContactPage(schema: SiteSchema, siteUrl: string, css: string, dir
   const canonical = siteUrl + '/contact/'
 
   const hoursHtml = biz.openingHours.length > 0 ? `
-<section aria-labelledby="hours-heading">
+<section class="section-surface" aria-labelledby="hours-heading">
   <div class="container">
     <h2 id="hours-heading">${isHe ? `מתי ${biz.name} פתוח?` : `When is ${biz.name} open?`}</h2>
     <div class="answer-block"><p>${isHe ? 'שעות הפעילות:' : 'Opening hours:'}</p></div>
@@ -476,7 +479,7 @@ function renderContactPage(schema: SiteSchema, siteUrl: string, css: string, dir
 </section>` : ''
 
   const locationHtml = (biz.address ?? biz.city) ? `
-<section aria-labelledby="location-heading">
+<section class="section-light" aria-labelledby="location-heading">
   <div class="container">
     <h2 id="location-heading">${isHe ? `איפה נמצא ${biz.name}?` : `Where is ${biz.name} located?`}</h2>
     <div class="contact-block">
@@ -491,12 +494,12 @@ function renderContactPage(schema: SiteSchema, siteUrl: string, css: string, dir
 </section>` : ''
 
   const bodyContent = `
-<section style="padding-top:2.5rem;padding-bottom:1rem;">
+<section class="section-surface" style="padding-top:2.5rem;padding-bottom:1rem;">
   <div class="container">
     <h1>${isHe ? `הזמנת תור ב-${biz.name}` : `Book an Appointment at ${biz.name}`}</h1>
   </div>
 </section>
-<section aria-labelledby="book-heading">
+<section class="section-light" aria-labelledby="book-heading">
   <div class="container">
     <h2 id="book-heading">${isHe ? `איך מזמינים תור ב-${biz.name}?` : `How do I book with ${biz.name}?`}</h2>
     <div class="answer-block">
@@ -549,7 +552,7 @@ function renderAboutPage(schema: SiteSchema, siteUrl: string, css: string, dir: 
 </ul>` : ''
 
   const bodyContent = `
-<section style="padding-top:2.5rem;">
+<section class="section-light" style="padding-top:2.5rem;">
   <div class="container">
     <h1>${isHe ? `אודות ${biz.practitionerName}` : `About ${biz.practitionerName}`}</h1>
     <div class="practitioner-card">
@@ -561,7 +564,7 @@ function renderAboutPage(schema: SiteSchema, siteUrl: string, css: string, dir: 
     </div>
   </div>
 </section>
-<section aria-label="${isHe ? 'הזמנה' : 'Booking'}">
+<section class="cta-section section-dark" aria-label="${isHe ? 'הזמנה' : 'Booking'}">
   <div class="container">
     <h2>${isHe ? `הזמינו תור עם ${biz.practitionerName}` : `Book with ${biz.practitionerName}`}</h2>
     <p class="answer-block">${isHe ? 'ניתן להזמין ישירות דרך וואטסאפ.' : 'Book directly via WhatsApp.'}</p>
