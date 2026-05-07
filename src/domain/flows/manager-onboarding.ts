@@ -272,8 +272,11 @@ async function handlePaymentStep(
   await db.update(businesses)
     .set({ confirmationGate: 'post_payment', paymentMethod: 'pending' })
     .where(eq(businesses.id, business.id))
+  const methodFallback = lang === 'he'
+    ? 'מעולה! איזו שיטת תשלום אתם מקבלים? (לדוגמה: העברה בנקאית, ביט, פייבוקס, מזומן)'
+    : 'Great! What payment method do you accept? (e.g. bank transfer, PayPal, credit card, cash)'
   const methodQ = await onboardingQuestion('payment_method', business.name, lang)
-  return { reply: methodQ }
+  return { reply: methodQ || methodFallback }
 }
 
 async function handleEscalationPolicyStep(

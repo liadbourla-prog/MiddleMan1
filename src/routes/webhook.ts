@@ -95,13 +95,16 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
   // Step 0 — provider onboarding (central number, no business context)
   if (PROVIDER_WA_NUMBER && msg.toNumber === PROVIDER_WA_NUMBER) {
     const result = await handleProviderOnboarding(db, msg.fromNumber, msg.body)
-    await sendMessage(
+    const providerSendResult = await sendMessage(
       { toNumber: msg.fromNumber, body: result.reply },
       {
         accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
         phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
       },
     )
+    if (!providerSendResult.ok) {
+      app.log.error({ error: providerSendResult.error, toNumber: msg.fromNumber }, 'Provider/operator send failed')
+    }
     return
   }
 
@@ -367,7 +370,10 @@ async function routeManagerMessage(
   if (!business.onboardingCompletedAt) {
     const baseUrl = process.env['PUBLIC_BASE_URL'] ?? 'https://your-domain.com'
     const result = await handleOnboardingMessage(db, msg, identity, business, baseUrl, app.log)
-    await sendMessage({ toNumber: msg.fromNumber, body: result.reply }, waCredentials)
+    const onboardingSendResult = await sendMessage({ toNumber: msg.fromNumber, body: result.reply }, waCredentials)
+    if (!onboardingSendResult.ok) {
+      app.log.error({ error: onboardingSendResult.error, toNumber: msg.fromNumber }, 'Manager onboarding send failed')
+    }
     return
   }
 
