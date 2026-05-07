@@ -141,10 +141,10 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
   if (!identityResult.found) {
     if (identityResult.reason === 'revoked') {
       const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
-      await sendMessage({
-        toNumber: msg.fromNumber,
-        body: i18n.revoked_access[lang],
-      })
+      const revokedCreds = business.whatsappPhoneNumberId && business.whatsappAccessToken
+        ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
+        : undefined
+      await sendMessage({ toNumber: msg.fromNumber, body: i18n.revoked_access[lang] }, revokedCreds)
       return
     }
     await registerCustomer(db, business.id, msg.fromNumber)
@@ -209,6 +209,9 @@ async function routeCustomerMessage(
   app: FastifyInstance,
 ) {
   const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const waCredentials = business.whatsappPhoneNumberId && business.whatsappAccessToken
+    ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
+    : undefined
 
   // Business hours gate — queue messages when closed; managers always pass through
   if (!business.available247) {
@@ -218,15 +221,9 @@ async function routeCustomerMessage(
       const opensAt = hoursCheck.opensAt ?? ''
       if (delayMs !== null && delayMs > 0) {
         await queueMessageForLater(business.id, msg.fromNumber, msg.toNumber, msg.body, delayMs)
-        await sendMessage({
-          toNumber: msg.fromNumber,
-          body: i18n.closed_queued[lang](business.name, opensAt),
-        })
+        await sendMessage({ toNumber: msg.fromNumber, body: i18n.closed_queued[lang](business.name, opensAt) }, waCredentials)
       } else {
-        await sendMessage({
-          toNumber: msg.fromNumber,
-          body: i18n.closed_drop[lang](business.name, opensAt),
-        })
+        await sendMessage({ toNumber: msg.fromNumber, body: i18n.closed_drop[lang](business.name, opensAt) }, waCredentials)
       }
       return
     }
@@ -234,10 +231,7 @@ async function routeCustomerMessage(
 
   // Paused gate — PA is silent when owner has manually paused it
   if (business.paused) {
-    await sendMessage({
-      toNumber: msg.fromNumber,
-      body: i18n.paused_msg[lang](business.name),
-    })
+    await sendMessage({ toNumber: msg.fromNumber, body: i18n.paused_msg[lang](business.name) }, waCredentials)
     return
   }
 
@@ -301,7 +295,7 @@ async function routeCustomerMessage(
     await saveMessage(db, session.id, 'assistant', skillOutcome.reply).catch((err) => {
       app.log.warn({ err }, 'Failed to save skill reply to transcript')
     })
-    await sendMessage({ toNumber: msg.fromNumber, body: skillOutcome.reply })
+    await sendMessage({ toNumber: msg.fromNumber, body: skillOutcome.reply }, waCredentials)
     if (skillOutcome.sessionComplete) await completeSession(db, session.id)
     return
   }
@@ -333,7 +327,7 @@ async function routeCustomerMessage(
     return
   }
 
-  const sendResult = await sendMessage({ toNumber: msg.fromNumber, body: result.reply })
+  const sendResult = await sendMessage({ toNumber: msg.fromNumber, body: result.reply }, waCredentials)
 
   if (!sendResult.ok) {
     if (sendResult.userOptedOut) {

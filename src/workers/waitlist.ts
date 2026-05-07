@@ -112,7 +112,7 @@ async function processJob(job: { data: WaitlistJob }) {
     .limit(1)
 
   const [biz] = await db
-    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage })
+    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken })
     .from(businesses)
     .where(eq(businesses.id, businessId))
     .limit(1)
@@ -128,10 +128,13 @@ async function processJob(job: { data: WaitlistJob }) {
       hour: '2-digit', minute: '2-digit', hour12: false,
     }).format(new Date(slotStart))
 
+    const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+      ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+      : undefined
     await sendMessage({
       toNumber: customer.phoneNumber,
       body: i18n.waitlist_offer[lang](biz.name, service?.name ?? (lang === 'he' ? 'תור' : 'appointment'), dateStr, OFFER_TTL_MINUTES),
-    }).catch(() => { /* retry queue handles failures */ })
+    }, waCredentials).catch(() => { /* retry queue handles failures */ })
   }
 
   // Schedule expiry job
