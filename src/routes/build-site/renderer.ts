@@ -20,6 +20,8 @@ export interface RenderedSite {
   'about/index.html'?: string
 }
 
+type NavLink = { href: string; label: string; path: string }
+
 const WA_ICON_SVG = `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/>
 </svg>`
@@ -47,14 +49,19 @@ function pageShell(params: {
   bodyContent: string
   dir: 'rtl' | 'ltr'
   lang: string
-  nav: string
+  navLinks: NavLink[]
   currentPath: string
 }): string {
-  const { title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, nav } = params
+  const { title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath } = params
   const biz = schema.business
   const ogImage = schema.style.heroImageUrl ?? ''
   const jsonLdHtml = jsonLdBlocks.map(serializeJsonLd).join('\n')
   const phone = biz.phone
+  const isHe = lang === 'he'
+
+  const navHtml = navLinks
+    .map((l) => `<a href="${e(l.href)}"${l.path === currentPath ? ' aria-current="page"' : ''}>${e(l.label)}</a>`)
+    .join('')
 
   const header = `
 <header>
@@ -64,27 +71,46 @@ function pageShell(params: {
         ${schema.style.logoUrl ? `<img src="${e(schema.style.logoUrl)}" alt="${e(biz.name)} logo" height="48" style="height:48px;width:auto;">` : `<span class="site-name">${e(biz.name)}</span>`}
         <p class="site-tagline">${e(biz.tagline)}</p>
       </div>
-      <nav aria-label="Main navigation">${nav}</nav>
+      <nav aria-label="Main navigation">${navHtml}</nav>
     </div>
   </div>
 </header>`
+
+  const copyrightYear = new Date(schema.generatedAt).getFullYear()
+
+  const footerHoursHtml = biz.openingHours.slice(0, 2).map((h) =>
+    `<p>${e(h.dayOfWeek.join(', '))}: ${e(h.opens)}–${e(h.closes)}</p>`
+  ).join('')
 
   const footer = `
 <footer>
   <div class="container">
     <div class="footer-inner">
-      <address>
-        <strong>${e(biz.name)}</strong><br>
-        ${biz.address ? e(biz.address) + ', ' : ''}${e(biz.city)}<br>
-        <a href="${waLink(phone)}">${e(phone)}</a>
-      </address>
-      <nav aria-label="Footer navigation">${nav}</nav>
+      <div class="footer-col">
+        <strong class="footer-brand">${e(biz.name)}</strong>
+        <address>
+          ${biz.address ? e(biz.address) + ', ' : ''}${e(biz.city)}<br>
+          <a href="${waLink(phone)}">${e(phone)}</a>
+        </address>
+      </div>
+      <div class="footer-col">
+        <p class="footer-col-label">${isHe ? 'ניווט' : 'Quick links'}</p>
+        <nav aria-label="Footer navigation">${navHtml}</nav>
+      </div>
+      ${biz.openingHours.length > 0 ? `
+      <div class="footer-col">
+        <p class="footer-col-label">${isHe ? 'שעות פעילות' : 'Opening hours'}</p>
+        <div class="footer-hours">${footerHoursHtml}</div>
+      </div>` : '<div class="footer-col"></div>'}
+    </div>
+    <div class="footer-bottom">
+      <p>© ${copyrightYear} ${e(biz.name)}</p>
     </div>
   </div>
 </footer>`
 
   const waBtn = `
-<a class="wa-cta" href="${waLink(phone)}" aria-label="${lang === 'he' ? 'שוחח איתנו בווטסאפ' : 'Chat with us on WhatsApp'}" rel="noopener">
+<a class="wa-cta" href="${waLink(phone)}" aria-label="${isHe ? 'שוחח איתנו בווטסאפ' : 'Chat with us on WhatsApp'}" rel="noopener">
   ${WA_ICON_SVG}
 </a>`
 
@@ -118,7 +144,7 @@ ${waBtn}
 
 // ── Homepage ──────────────────────────────────────────────────────────────────
 
-function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', nav: string): string {
+function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', navLinks: NavLink[]): string {
   const biz = schema.business
   const lang = schema.language
   const isHe = lang === 'he'
@@ -233,12 +259,12 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
     ...(topFaqs.length > 0 ? [buildFaqPageSchema(topFaqs)] : []),
   ]
 
-  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, nav, currentPath: '/' })
+  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath: '/' })
 }
 
 // ── Services page ─────────────────────────────────────────────────────────────
 
-function renderServicesPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', nav: string): string {
+function renderServicesPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', navLinks: NavLink[]): string {
   const biz = schema.business
   const lang = schema.language
   const isHe = lang === 'he'
@@ -316,12 +342,12 @@ function renderServicesPage(schema: SiteSchema, siteUrl: string, css: string, di
     ...serviceJsonLd,
   ]
 
-  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, nav, currentPath: '/services/' })
+  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath: '/services/' })
 }
 
 // ── FAQ page ──────────────────────────────────────────────────────────────────
 
-function renderFaqPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', nav: string): string {
+function renderFaqPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', navLinks: NavLink[]): string {
   const biz = schema.business
   const lang = schema.language
   const isHe = lang === 'he'
@@ -395,12 +421,12 @@ ${bodyFaqHtml}
     buildSpeakableSchema(),
   ]
 
-  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, nav, currentPath: '/faq/' })
+  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath: '/faq/' })
 }
 
 // ── Contact page ──────────────────────────────────────────────────────────────
 
-function renderContactPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', nav: string): string {
+function renderContactPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', navLinks: NavLink[]): string {
   const biz = schema.business
   const lang = schema.language
   const isHe = lang === 'he'
@@ -476,12 +502,12 @@ ${locationHtml}`
     buildSpeakableSchema(),
   ]
 
-  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, nav, currentPath: '/contact/' })
+  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath: '/contact/' })
 }
 
 // ── About page ────────────────────────────────────────────────────────────────
 
-function renderAboutPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', nav: string): string | null {
+function renderAboutPage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', navLinks: NavLink[]): string | null {
   const biz = schema.business
   const lang = schema.language
   const isHe = lang === 'he'
@@ -536,7 +562,7 @@ function renderAboutPage(schema: SiteSchema, siteUrl: string, css: string, dir: 
     ...(personSchema ? [personSchema] : []),
   ]
 
-  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, nav, currentPath: '/about/' })
+  return pageShell({ title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath: '/about/' })
 }
 
 // ── Main render entry point ───────────────────────────────────────────────────
@@ -547,23 +573,22 @@ export function renderSite(schema: SiteSchema, siteUrl: string): RenderedSite {
   const isHe = schema.language === 'he'
   const css = buildCSS(schema.style.variant, palette, dir)
 
-  const navLinks = [
-    { href: siteUrl + '/', label: isHe ? 'בית' : 'Home' },
-    { href: siteUrl + '/services/', label: isHe ? 'שירותים' : 'Services' },
-    { href: siteUrl + '/faq/', label: 'FAQ' },
-    ...(schema.business.practitionerName ? [{ href: siteUrl + '/about/', label: isHe ? 'אודות' : 'About' }] : []),
-    { href: siteUrl + '/contact/', label: isHe ? 'צור קשר' : 'Contact' },
+  const navLinks: NavLink[] = [
+    { href: siteUrl + '/', path: '/', label: isHe ? 'בית' : 'Home' },
+    { href: siteUrl + '/services/', path: '/services/', label: isHe ? 'שירותים' : 'Services' },
+    { href: siteUrl + '/faq/', path: '/faq/', label: 'FAQ' },
+    ...(schema.business.practitionerName ? [{ href: siteUrl + '/about/', path: '/about/', label: isHe ? 'אודות' : 'About' }] : []),
+    { href: siteUrl + '/contact/', path: '/contact/', label: isHe ? 'צור קשר' : 'Contact' },
   ]
-  const nav = navLinks.map((l) => `<a href="${e(l.href)}">${e(l.label)}</a>`).join('')
 
   const result: RenderedSite = {
-    'index.html': renderHomepage(schema, siteUrl, css, dir, nav),
-    'services/index.html': renderServicesPage(schema, siteUrl, css, dir, nav),
-    'faq/index.html': renderFaqPage(schema, siteUrl, css, dir, nav),
-    'contact/index.html': renderContactPage(schema, siteUrl, css, dir, nav),
+    'index.html': renderHomepage(schema, siteUrl, css, dir, navLinks),
+    'services/index.html': renderServicesPage(schema, siteUrl, css, dir, navLinks),
+    'faq/index.html': renderFaqPage(schema, siteUrl, css, dir, navLinks),
+    'contact/index.html': renderContactPage(schema, siteUrl, css, dir, navLinks),
   }
 
-  const aboutHtml = renderAboutPage(schema, siteUrl, css, dir, nav)
+  const aboutHtml = renderAboutPage(schema, siteUrl, css, dir, navLinks)
   if (aboutHtml) result['about/index.html'] = aboutHtml
 
   return result
