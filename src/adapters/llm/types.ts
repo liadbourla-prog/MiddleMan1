@@ -50,6 +50,23 @@ export interface TranscriptTurn {
   text: string
 }
 
+export interface OperatorActionOutput {
+  action:
+    | 'status_all'
+    | 'status_one'
+    | 'escalations'
+    | 'update_all'
+    | 'skills_one'
+    | 'features'
+    | 'retrigger'
+    | 'general_qa'
+    | 'help'
+  businessName: string | null
+  skillName: string | null
+  updateInstruction: string | null
+  freeformReply: string | null
+}
+
 export interface GenerateReplyInput {
   businessName: string
   language: 'he' | 'en'

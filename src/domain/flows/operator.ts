@@ -17,7 +17,7 @@ import {
   businessFaqs,
   deferredFeatureRequests,
 } from '../../db/schema.js'
-import { classifyManagerInstruction } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, classifyOperatorMessage } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
 import { operatorCapabilityRegistry } from './operator-capability-registry.js'
@@ -95,9 +95,23 @@ export async function handleOperatorMessage(
     return handleEscalations(db, lang)
   }
 
-  // ── Default: help menu ────────────────────────────────────────────────────────
+  // ── LLM fallback: classify intent and route, or answer conversationally ──────
 
-  return { reply: i18n.op_help[lang] }
+  const classified = await classifyOperatorMessage(text, lang)
+  if (!classified.ok) return { reply: i18n.op_help[lang] }
+
+  const op = classified.data
+  switch (op.action) {
+    case 'status_all':  return handleStatusAll(db, lang)
+    case 'status_one':  return op.businessName ? handleStatusOne(db, op.businessName, lang) : handleStatusAll(db, lang)
+    case 'escalations': return handleEscalations(db, lang)
+    case 'update_all':  return op.updateInstruction ? handleUpdateAll(db, op.updateInstruction, lang) : { reply: i18n.op_help[lang] }
+    case 'skills_one':  return op.businessName ? handleSkillsOne(db, op.businessName, lang) : handleStatusAll(db, lang)
+    case 'features':    return handleFeatures(db, lang)
+    case 'retrigger':   return op.businessName ? handleRetrigger(db, op.businessName, op.skillName, lang) : { reply: i18n.op_help[lang] }
+    case 'help':        return { reply: i18n.op_help[lang] }
+    case 'general_qa':  return { reply: op.freeformReply ?? i18n.op_help[lang] }
+  }
 }
 
 async function handleStatusAll(db: Db, lang: Lang): Promise<OperatorResult> {

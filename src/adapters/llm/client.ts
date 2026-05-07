@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai'
 import { z } from 'zod'
-import type { CustomerIntentOutput, ManagerInstructionOutput, LlmResult, GenerateReplyInput, ParseableOnboardingStep, OnboardingAnswerOutput } from './types.js'
+import type { CustomerIntentOutput, ManagerInstructionOutput, OperatorActionOutput, LlmResult, GenerateReplyInput, ParseableOnboardingStep, OnboardingAnswerOutput } from './types.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
@@ -127,6 +127,59 @@ If the instruction is ambiguous or missing required detail, set ambiguous=true a
 Respond only with valid JSON matching the schema. No explanation.`
 
   return callWithSchema(systemPrompt, message, managerInstructionSchema)
+}
+
+const operatorActionSchema = z.object({
+  action: z.enum([
+    'status_all', 'status_one', 'escalations', 'update_all',
+    'skills_one', 'features', 'retrigger', 'general_qa', 'help',
+  ]).catch('general_qa'),
+  businessName: z.string().nullable().catch(null),
+  skillName: z.string().nullable().catch(null),
+  updateInstruction: z.string().nullable().catch(null),
+  freeformReply: z.string().nullable().catch(null),
+})
+
+export async function classifyOperatorMessage(
+  message: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<OperatorActionOutput>> {
+  const safeMessage = sanitizeUserInput(message)
+
+  const systemPrompt = `You are the MiddleMan operator assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. The operator is the platform owner — they have admin access to all businesses.
+
+Classify the operator's message into one action and extract relevant parameters.
+
+Actions:
+- status_all: wants an overview of all businesses (or asks "all", "כולם", "עסקים")
+- status_one: asks about a specific business by name or phone number → set businessName
+- escalations: asks about open escalations or pending issues
+- update_all: wants to push an instruction/change to all live businesses → set updateInstruction
+- skills_one: asks about skills, workflows, or website for a specific business → set businessName
+- features: asks about deferred feature requests across all businesses
+- retrigger: wants to restart a skill workflow → set businessName and skillName (kebab-case, e.g. "website-builder")
+- general_qa: greeting, casual message, or question not covered by commands → write a warm 1-2 sentence reply in freeformReply
+- help: operator explicitly asks for help or a list of available commands
+
+Routing hints:
+- "website(s)", "site(s)" for a specific business → skills_one
+- "all websites", "websites status" with no specific business → status_all
+- "status of [name]", "how is [name]" → status_one
+- Greetings ("hi", "hello", "שלום", "היי"), casual questions → general_qa
+- "what can you do", "help me" → help
+
+Language rule for freeformReply: write in ${lang === 'he' ? 'Hebrew (עברית)' : 'English'}. Tone: direct and warm, like a competent admin assistant.
+
+Return JSON exactly:
+{
+  "action": string,
+  "businessName": string | null,
+  "skillName": string | null,
+  "updateInstruction": string | null,
+  "freeformReply": string | null
+}`
+
+  return callWithSchema(systemPrompt, safeMessage, operatorActionSchema) as Promise<LlmResult<OperatorActionOutput>>
 }
 
 function sanitizeUserInput(text: string): string {
