@@ -159,13 +159,32 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
   const heroHtml = `
 <section class="hero" aria-label="${isHe ? 'כותרת ראשית' : 'Hero'}">
   <div class="container">
-    ${schema.style.heroImageUrl ? `<img src="${e(schema.style.heroImageUrl)}" alt="${e(biz.name)}" style="max-height:320px;object-fit:cover;width:100%;border-radius:0.5rem;margin-bottom:2rem;">` : ''}
-    <h1>${e(title)}</h1>
-    <p class="lead answer-block">${e(biz.description)}</p>
-    <a class="cta-btn" href="${waLink(biz.phone)}" rel="noopener">
-      ${WA_ICON_SVG}
-      ${isHe ? 'הזמינו דרך וואטסאפ' : 'Book via WhatsApp'}
-    </a>
+    <div class="hero-inner">
+
+      <div class="hero-text">
+        <p class="hero-eyebrow">${e(biz.category)} · ${e(biz.city)}</p>
+        <h1>${e(biz.name)}</h1>
+        <p class="lead answer-block">${e(biz.description)}</p>
+        <a class="cta-btn" href="${waLink(biz.phone)}" rel="noopener">
+          ${WA_ICON_SVG}
+          ${isHe ? 'הזמינו דרך וואטסאפ' : 'Book via WhatsApp'}
+        </a>
+      </div>
+
+      <div class="hero-panel" aria-hidden="true">
+        ${schema.services.slice(0, 3).map((s) => {
+          const priceStr = s.price !== null
+            ? `${s.price} ${s.currency}`
+            : (isHe ? 'מחיר לפי בקשה' : 'Price on request')
+          return `
+        <div class="hero-service-card">
+          <span class="hero-service-name">${e(s.name)}</span>
+          <span class="hero-service-meta">${e(priceStr)}</span>
+        </div>`
+        }).join('')}
+      </div>
+
+    </div>
   </div>
 </section>`
 
