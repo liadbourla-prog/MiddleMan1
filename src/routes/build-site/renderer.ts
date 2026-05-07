@@ -142,6 +142,74 @@ ${waBtn}
 </html>`
 }
 
+const SERVICE_ICONS = ['📱', '🧠', '🌐', '✂️', '💆', '🏋️', '📸', '🎵']
+
+function renderServiceCards(
+  services: SiteSchema['services'],
+  variant: SiteSchema['style']['variant'],
+  isHe: boolean,
+  phone: string,
+): string {
+  const priceStr = (s: SiteSchema['services'][number]): string => {
+    if (s.price !== null) return `${s.price} ${s.currency}`
+    if (s.priceOnRequest) return isHe ? 'מחיר לפי בקשה' : 'Price on request'
+    return ''
+  }
+
+  if (variant === 'bold') {
+    const items = services.map((s, i) => {
+      const icon = SERVICE_ICONS[i % SERVICE_ICONS.length] ?? '✨'
+      const price = priceStr(s)
+      return `
+<article class="service-feature" style="--feature-icon: '${icon}'">
+  <div class="service-feature-header">
+    <span class="service-feature-icon" aria-hidden="true"></span>
+    <h3>${e(s.name)}</h3>
+  </div>
+  <p class="service-meta">${s.durationMinutes} ${isHe ? 'דקות' : 'min'}${price ? ' · ' + e(price) : ''}</p>
+  <div class="answer-block"><p>${e(s.description)}</p></div>
+  <a class="service-link" href="${waLink(phone)}">${isHe ? `הזמינו ${e(s.name)}` : `Book ${e(s.name)}`} →</a>
+</article>
+${i < services.length - 1 ? '<hr class="service-divider">' : ''}`
+    }).join('')
+    return `<div class="services-list">${items}</div>`
+  }
+
+  if (variant === 'professional') {
+    const cards = services.map((s) => {
+      const price = priceStr(s)
+      return `
+<article class="service-card-pro">
+  <div class="service-card-pro-header">
+    <h3>${e(s.name)}</h3>
+    <span class="service-meta">${e(price || (isHe ? 'מחיר לפי בקשה' : 'Price on request'))}</span>
+  </div>
+  <div class="service-card-pro-body">
+    <div class="answer-block"><p>${e(s.description)}</p></div>
+    <a class="service-link" href="${waLink(phone)}">${isHe ? 'הזמינו דרך וואטסאפ' : 'Book via WhatsApp'} →</a>
+  </div>
+</article>`
+    }).join('')
+    return `<div class="services-grid">${cards}</div>`
+  }
+
+  // minimal (default)
+  const cards = services.map((s) => {
+    const price = priceStr(s)
+    return `
+<article class="service-card">
+  <div class="service-card-header">
+    <h3>${e(s.name)}</h3>
+    <span class="service-tag">${e(price || (isHe ? 'מחיר לפי בקשה' : 'On request'))}</span>
+  </div>
+  <p class="service-meta">${s.durationMinutes} ${isHe ? 'דקות' : 'min'}</p>
+  <div class="answer-block"><p>${e(s.description)}</p></div>
+  <a class="service-link" href="${waLink(phone)}">${isHe ? 'לפרטים נוספים' : 'Learn more'} →</a>
+</article>`
+  }).join('')
+  return `<div class="services-grid">${cards}</div>`
+}
+
 // ── Homepage ──────────────────────────────────────────────────────────────────
 
 function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: 'rtl' | 'ltr', navLinks: NavLink[]): string {
@@ -189,26 +257,12 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
 </section>`
 
   const servicesLabel = isHe ? `אילו שירותים מציע ${biz.name}?` : `What services does ${biz.name} offer?`
-  const serviceCards = schema.services.map((s) => {
-    const priceStr = s.price !== null
-      ? `${s.price} ${s.currency}`
-      : s.priceOnRequest
-        ? (isHe ? 'מחיר לפי בקשה' : 'Price on request')
-        : ''
-    return `
-<article class="service-card">
-  <h3>${e(s.name)}</h3>
-  <p class="service-meta">${s.durationMinutes} ${isHe ? 'דקות' : 'min'}</p>
-  ${priceStr ? `<p class="service-price">${e(priceStr)}</p>` : ''}
-  <div class="answer-block"><p>${e(s.description)}</p></div>
-</article>`
-  }).join('')
 
   const servicesSection = `
 <section class="section-surface" aria-labelledby="services-heading">
   <div class="container">
     <h2 id="services-heading">${e(servicesLabel)}</h2>
-    <div class="services-grid">${serviceCards}</div>
+    ${renderServiceCards(schema.services, schema.style.variant, isHe, biz.phone)}
     <p style="margin-top:1.5rem">
       <a href="${siteUrl}/services/">${isHe ? 'לכל השירותים ←' : 'View all services →'}</a>
     </p>
@@ -216,18 +270,41 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
 </section>`
 
   const trustLabel = isHe ? `למה לבחור ב-${biz.name}?` : `Why choose ${biz.name}?`
+
   const trustItems: string[] = []
+
+  // Stat: years of experience
   if (biz.foundedYear) {
     const years = new Date().getFullYear() - biz.foundedYear
-    trustItems.push(isHe ? `${years}+ שנות ניסיון` : `${years}+ years of experience`)
+    trustItems.push(`
+<div class="trust-stat">
+  <span class="trust-stat-number">${years}+</span>
+  <span class="trust-stat-label">${isHe ? 'שנות ניסיון' : 'years of experience'}</span>
+</div>`)
   }
-  if (biz.credentials.length > 0) trustItems.push(...biz.credentials.slice(0, 3))
+
+  // Credentials as pills
+  if (biz.credentials.length > 0) {
+    const pills = biz.credentials.slice(0, 4).map((c) => `<span class="trust-pill">${e(c)}</span>`).join('')
+    trustItems.push(`<div class="trust-credentials">${pills}</div>`)
+  }
+
+  // Service area
   if (biz.serviceArea.length > 1) {
-    trustItems.push(isHe ? `שירות ב-${biz.serviceArea.join(', ')}` : `Serving ${biz.serviceArea.join(', ')}`)
+    trustItems.push(`
+<div class="trust-area">
+  <span class="trust-icon">📍</span>
+  <span>${isHe ? 'שירות ב-' : 'Serving '}${e(biz.serviceArea.join(', '))}</span>
+</div>`)
   }
+
+  // Fallback
   if (trustItems.length === 0) {
-    trustItems.push(isHe ? 'שירות מקצועי ואיכותי' : 'Professional quality service')
-    trustItems.push(isHe ? 'הזמנה קלה דרך וואטסאפ' : 'Easy booking via WhatsApp')
+    trustItems.push(`
+<div class="trust-credentials">
+  <span class="trust-pill">${isHe ? 'שירות מקצועי ואיכותי' : 'Professional quality service'}</span>
+  <span class="trust-pill">${isHe ? 'הזמנה קלה דרך וואטסאפ' : 'Easy booking via WhatsApp'}</span>
+</div>`)
   }
 
   const trustSection = `
@@ -235,7 +312,7 @@ function renderHomepage(schema: SiteSchema, siteUrl: string, css: string, dir: '
   <div class="container">
     <h2 id="trust-heading">${e(trustLabel)}</h2>
     <div class="trust-grid">
-      ${trustItems.map((t) => `<div class="trust-item"><span class="trust-icon">✓</span><span>${e(t)}</span></div>`).join('')}
+      ${trustItems.join('\n')}
     </div>
   </div>
 </section>`
