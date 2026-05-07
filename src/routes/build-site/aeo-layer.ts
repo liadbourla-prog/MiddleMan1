@@ -16,7 +16,7 @@ export function buildLocalBusinessSchema(schema: SiteSchema, siteUrl: string): o
   if (biz.googleBusinessProfileUrl) sameAs.push(biz.googleBusinessProfileUrl)
 
   const priceRange = schema.services.length > 0
-    ? buildPriceRange(schema.services, schema.business.city)
+    ? buildPriceRange(schema.services)
     : undefined
 
   return {
@@ -215,7 +215,7 @@ export function buildSitemapXml(pages: Array<{ url: string; lastmod: string }>):
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function buildPriceRange(services: ServiceEntry[], _city: string): string | undefined {
+function buildPriceRange(services: ServiceEntry[]): string | undefined {
   const prices = services.filter((s) => s.price !== null).map((s) => s.price as number)
   if (prices.length === 0) return undefined
   const min = Math.min(...prices)

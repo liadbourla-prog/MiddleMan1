@@ -53,7 +53,7 @@ export async function buildSiteRoutes(app: FastifyInstance): Promise<void> {
 
     // Upload to GCS if bucket is configured, otherwise respond with inline HTML
     const pages: Record<string, string> = {}
-    for (const [file, html] of Object.entries(renderedPages)) {
+    for (const [file] of Object.entries(renderedPages)) {
       pages[file] = `${siteUrl}/${file}`
     }
 

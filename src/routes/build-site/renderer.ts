@@ -52,7 +52,7 @@ function pageShell(params: {
   navLinks: NavLink[]
   currentPath: string
 }): string {
-  const { title, description, canonical, siteUrl, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath } = params
+  const { title, description, canonical, schema, css, jsonLdBlocks, bodyContent, dir, lang, navLinks, currentPath } = params
   const biz = schema.business
   const ogImage = schema.style.heroImageUrl ?? ''
   const jsonLdHtml = jsonLdBlocks.map(serializeJsonLd).join('\n')
