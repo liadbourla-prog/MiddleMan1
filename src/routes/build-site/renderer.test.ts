@@ -132,7 +132,7 @@ describe('AEO preservation', () => {
     const html = homepage()
     expect(html).toContain('class="faq-item"')
     expect(html).toContain('class="faq-question"')
-    expect(html).toContain('faq-answer')
+    expect(html).toContain('class="faq-answer')
   })
 
   it('FAQ page uses <h3 class="faq-question">', () => {
@@ -238,7 +238,7 @@ describe('variant service cards', () => {
   it('bold variant renders .services-list with .service-feature', () => {
     const html = homepage('bold')
     expect(html).toContain('class="services-list"')
-    expect(html).toContain('service-feature')
+    expect(html).toContain('class="service-feature')
   })
 
   it('minimal variant renders .services-grid with .service-card', () => {
@@ -250,7 +250,7 @@ describe('variant service cards', () => {
   it('professional variant renders .services-grid with .service-card-pro', () => {
     const html = homepage('professional')
     expect(html).toContain('class="services-grid"')
-    expect(html).toContain('service-card-pro')
+    expect(html).toContain('class="service-card-pro')
   })
 
   it('bold variant includes service icons via --feature-icon', () => {
