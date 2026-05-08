@@ -43,6 +43,10 @@ const strings = {
     he: `ננסה שוב — שלחו את הפרטים בפורמט הזה:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
     en: `Let's try that again — send your credentials in this format:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
   },
+  mm_credentials_help: {
+    he: `אין בעיה — הפרטים האלה מגיעים מ-Meta Business Manager, הם שונים לחלוטין מהמספר הטלפוני שלכם.\n\n*מה תצטרכו:*\n• *Phone Number ID* — מזהה מספרי ב-Meta (15 ספרות בערך, לא המספר הטלפוני שלכם)\n• *Access Token* — מפתח גישה שמאפשר ל-PA לשלוח הודעות בשמכם\n\n*איך מגיעים לזה:*\n1. נכנסים ל-business.facebook.com ← הגדרות עסק\n2. בצד שמאל: WhatsApp ← Phone Numbers — שם תמצאו את ה-*Phone Number ID*\n3. לטוקן: System Users ← בחרו משתמש ← Generate New Token ← סמנו whatsapp_business_messaging\n\nכשיהיו לכם הפרטים, שלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+    en: `No worries — these come from Meta Business Manager and are completely different from your regular phone number.\n\n*What you need:*\n• *Phone Number ID* — a numeric Meta ID (~15 digits, not your actual phone number)\n• *Access Token* — an access key that lets your PA send messages on your behalf\n\n*How to get them:*\n1. Go to business.facebook.com → Business Settings\n2. Left sidebar: WhatsApp → Phone Numbers — your *Phone Number ID* is listed there\n3. For the token: System Users → select a user → Generate New Token → check whatsapp_business_messaging\n\nWhen you have them, send:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+  },
   mm_credentials_error: {
     he: (err: string) => `לא הצלחתי לאמת את הפרטים (${err}).\n\nבדקו שה-Phone Number ID וה-Access Token נכונים ב-Meta Business Manager, ונסו שוב.`,
     en: (err: string) => `I couldn't validate those credentials (${err}).\n\nDouble-check your Phone Number ID and Access Token in Meta Business Manager, then try again.`,

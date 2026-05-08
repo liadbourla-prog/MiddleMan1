@@ -162,6 +162,11 @@ async function handleStep(
     }
 
     case 'credentials': {
+      // If message doesn't look like a credential attempt, give full guidance
+      if (!looksLikeCredentialAttempt(text)) {
+        return { reply: i18n.mm_credentials_help[lang] }
+      }
+
       const parsed = parseCredentials(text)
       if (!parsed) {
         return { reply: i18n.mm_retry_credentials[lang] }
@@ -334,6 +339,11 @@ async function advance(db: Db, managerPhone: string, nextStep: Step, data: Colle
 }
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
+
+function looksLikeCredentialAttempt(text: string): boolean {
+  // Must contain a long numeric ID or an EAA token — anything else is confusion, not an attempt
+  return /\d{10,20}/.test(text) || /EAA[A-Za-z0-9]{5,}/.test(text)
+}
 
 function parseCredentials(text: string): { phoneNumberId: string; accessToken: string } | null {
   // Accept flexible formats:
