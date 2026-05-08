@@ -1,6 +1,6 @@
-import { eq, and, or, gt } from 'drizzle-orm'
+import { eq, and, or, gt, isNull } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { serviceTypes, bookings, identities } from '../../db/schema.js'
+import { serviceTypes, bookings, identities, availability } from '../../db/schema.js'
 import type { Business } from '../../db/schema.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import type { ActiveSession } from '../session/types.js'
@@ -14,6 +14,7 @@ import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 import type { HydratedContext } from '../session/hydration.js'
 import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/engine.js'
+import type { BusinessKnowledge } from '../../shared/skill-types.js'
 
 type CustomerMemoryInput = {
   returningCustomer: boolean
@@ -58,6 +59,24 @@ function extractMemory(ctx: BookingFlowContext): CustomerMemoryInput {
   }
 }
 
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+async function loadHoursSummary(db: Db, businessId: string): Promise<string | null> {
+  const rows = await db
+    .select()
+    .from(availability)
+    .where(and(eq(availability.businessId, businessId), isNull(availability.specificDate), eq(availability.isBlocked, false)))
+    .orderBy(availability.dayOfWeek)
+
+  if (rows.length === 0) return null
+
+  const parts = rows
+    .filter((r) => r.dayOfWeek !== null && r.openTime && r.closeTime)
+    .map((r) => `${DAY_NAMES[r.dayOfWeek!] ?? r.dayOfWeek}: ${r.openTime}–${r.closeTime}`)
+
+  return parts.length > 0 ? `Business hours: ${parts.join(', ')}.` : null
+}
+
 export async function handleBookingFlow(
   db: Db,
   calendar: CalendarClient,
@@ -70,6 +89,7 @@ export async function handleBookingFlow(
   botPersona?: 'female' | 'male' | 'neutral',
   business?: Business,
   businessDefaultLanguage?: 'he' | 'en',
+  businessKnowledge?: BusinessKnowledge,
 ): Promise<FlowResult> {
   const ctx = {
     ...(session.context as BookingFlowContext),
@@ -100,7 +120,9 @@ export async function handleBookingFlow(
 
   // ── Owner-rule escalation check (runs before any intent logic) ────────────
   if (business) {
-    const unknownCount = (ctx.sessionUnknownCount as number | undefined) ?? 0
+    // +1 because sessionUnknownCount is the stored tally from prior turns;
+    // the current message will increment it if it resolves to unknown.
+    const unknownCount = ((ctx.sessionUnknownCount as number | undefined) ?? 0) + 1
     const ownerEscalation = await checkOwnerEscalationRules(
       db, business, identity.phoneNumber, messageText, 'unknown', unknownCount, lang,
     )
@@ -121,7 +143,7 @@ export async function handleBookingFlow(
 
   // ── Branch: waiting for hold confirmation ────────────────────────────────
   if (session.state === 'waiting_confirmation' && ctx.awaitingConfirmationFor === 'hold') {
-    return handleHoldConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript)
+    return handleHoldConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, business)
   }
 
   // ── Branch: waiting for cancellation confirmation ────────────────────────
@@ -148,9 +170,18 @@ export async function handleBookingFlow(
 
   const serviceNames = activeServices.map((s) => s.name)
 
+  const hoursForIntent = business ? await loadHoursSummary(db, business.id) : null
+
+  // Pass a clean transcript-based context instead of the raw internal state machine object
+  const intentContext: Record<string, unknown> = {
+    recentMessages: transcript.slice(-6).map((t) => `${t.role === 'customer' ? 'Customer' : 'Assistant'}: ${t.text}`),
+    sessionState: session.state,
+    ...(hoursForIntent ? { businessHours: hoursForIntent } : {}),
+  }
+
   const intentResult = await extractCustomerIntent(
     messageText,
-    session.context,
+    intentContext,
     businessTimezone,
     serviceNames,
   )
@@ -218,17 +249,25 @@ export async function handleBookingFlow(
       await completeSession(db, session.id)
       const serviceDescriptions = activeServices.map((s) => {
         const type = s.maxParticipants > 1 ? `group class, ${s.maxParticipants} spots` : 'private'
-        return `${s.name} (${s.durationMinutes} min, ${type})`
+        const price = businessKnowledge?.services.find((ks) => ks.id === s.id)?.price
+        const priceStr = price != null ? `, ${price} ${businessKnowledge?.services.find((ks) => ks.id === s.id)?.currency ?? ''}` : ''
+        return `${s.name} (${s.durationMinutes} min, ${type}${priceStr})`
       }).join('; ')
       const situation = activeServices.length > 0
-        ? `Customer asked about available services. List them: ${serviceDescriptions}. Invite them to book.`
-        : 'Customer asked about services but none are configured. Direct them to contact the business.'
+        ? `Customer asked a question about the business or services. Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above if relevant, then invite them to book.`
+        : 'Customer asked about the business. No services are configured yet. Direct them to contact the business directly.'
+      const knowledgeFields = businessKnowledge ? {
+        brandVoice: businessKnowledge.brandVoice,
+        ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
+        faqs: businessKnowledge.faqs,
+      } : {}
       const reply = await generateCustomerReply({
         businessName,
         language: detectedLanguage,
         situation,
         transcript,
         customerMemory: extractMemory(updatedCtx),
+        ...knowledgeFields,
       })
       return { reply, sessionComplete: true }
     }
@@ -243,12 +282,26 @@ export async function handleBookingFlow(
       }
 
       await updateSessionContext(db, session.id, ctxWithCount)
+
+      // If the business has FAQs, give the LLM a chance to answer before refusing.
+      // Without FAQs, fall back to the narrow-scope explanation.
+      const hasFaqs = (businessKnowledge?.faqs?.length ?? 0) > 0
+      const unknownSituation = hasFaqs
+        ? `Customer sent a message the system couldn't classify as booking, cancellation, or rescheduling. Their message: "${messageText}". Check the FAQs above — if one is relevant, answer it directly. If not, politely explain the assistant handles bookings and invite them to ask about that.`
+        : 'Message intent is unknown. Explain the assistant handles booking, cancellation, rescheduling, and service inquiries only. They can also ask "what are my bookings?" to see upcoming appointments.'
+
+      const unknownKnowledgeFields = businessKnowledge ? {
+        brandVoice: businessKnowledge.brandVoice,
+        ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
+        faqs: businessKnowledge.faqs,
+      } : {}
       const reply = await generateCustomerReply({
         businessName,
         language: detectedLanguage,
-        situation: 'Message intent is unknown. Explain the assistant handles booking, cancellation, rescheduling, and service inquiries only. They can also ask "what are my bookings?" to see upcoming appointments.',
+        situation: unknownSituation,
         transcript,
         customerMemory: extractMemory(updatedCtx),
+        ...unknownKnowledgeFields,
       })
       return { reply, sessionComplete: false }
     }
@@ -440,6 +493,7 @@ async function handleHoldConfirmation(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
   const confirmation = parseConfirmation(messageText)
@@ -527,10 +581,16 @@ async function handleHoldConfirmation(
 
   if (!result.ok) {
     await completeSession(db, session.id)
+    const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
+    const unavailSituation = [
+      `Slot is unavailable. Reason: ${result.reason}.`,
+      hoursSummary ?? '',
+      'Suggest the customer pick a different time that falls within business hours.',
+    ].filter(Boolean).join(' ')
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: `Slot is unavailable. Reason: ${result.reason}. Ask customer to choose another time.`,
+      situation: unavailSituation,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),

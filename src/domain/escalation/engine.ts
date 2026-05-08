@@ -37,6 +37,7 @@ export async function checkOwnerEscalationRules(
   if (rules.length === 0) return { escalated: false }
 
   const lowerBody = messageBody.toLowerCase()
+  const isEmotional = /frustrated|angry|upset|furious|ridiculous|unacceptable|terrible|horrible|awful|disgusting|hate|worst|never again|זועם|כועס|נורא|גרוע|מגעיל|שנוא|אף פעם|מאוכזב|מאוכזבת|לא מקובל|בושה|חרפה/i.test(messageBody)
   let matchedRule: EscalationRule | null = null
 
   for (const rule of rules) {
@@ -53,8 +54,7 @@ export async function checkOwnerEscalationRules(
         break
       }
     }
-    // 'emotional' trigger is set by caller if LLM flagged frustration
-    if (rule.trigger === 'emotional' && detectedIntent === 'emotional') {
+    if (rule.trigger === 'emotional' && (detectedIntent === 'emotional' || isEmotional)) {
       matchedRule = rule
       break
     }

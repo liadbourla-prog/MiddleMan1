@@ -312,6 +312,7 @@ async function routeCustomerMessage(
     business.botPersona,
     business,
     lang,
+    businessKnowledge,
   )
 
   // Save outbound reply — failure must not kill the flow
@@ -510,6 +511,11 @@ async function routeManagerMessage(
 
   if (!savedInstruction) {
     await sendMessage({ toNumber: msg.fromNumber, body: i18n.manager_save_error[lang] }, waCredentials)
+    return
+  }
+
+  if (instruction.instructionType === 'unknown') {
+    await sendMessage({ toNumber: msg.fromNumber, body: i18n.manager_unknown_instruction[lang] }, waCredentials)
     return
   }
 

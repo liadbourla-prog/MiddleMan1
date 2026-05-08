@@ -97,7 +97,16 @@ export async function handleOperatorMessage(
 
   // ── LLM fallback: classify intent and route, or answer conversationally ──────
 
-  const classified = await classifyOperatorMessage(text, lang)
+  const [bizCountRow, escCountRow] = await Promise.all([
+    db.select({ total: count() }).from(businesses).then((r) => r[0]),
+    db.select({ total: count() }).from(escalatedTasks).where(isNull(escalatedTasks.resolvedAt)).then((r) => r[0]),
+  ])
+  const liveStats = {
+    businessCount: bizCountRow?.total ?? 0,
+    openEscalations: escCountRow?.total ?? 0,
+  }
+
+  const classified = await classifyOperatorMessage(text, lang, liveStats)
   if (!classified.ok) return { reply: i18n.op_help[lang] }
 
   const op = classified.data

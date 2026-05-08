@@ -121,7 +121,23 @@ permission_change:
   { "action": "grant"|"revoke", "phoneNumber": "+E164", "displayName": string|null }
 
 policy_change:
-  { "description": string }
+  {
+    "subtype": "cancellation_cutoff" | "booking_buffer" | "max_days_ahead" | "cancellation_fee" | "other",
+    "valueHours": number | null,    // for cancellation_cutoff (hours before appt) and booking_buffer (hours in advance)
+    "valueDays": number | null,     // for max_days_ahead
+    "valueAmount": number | null,   // for cancellation_fee (monetary amount)
+    "description": string           // always fill — human-readable summary of what was requested
+  }
+
+  Subtype rules:
+  - cancellation_cutoff: manager wants to limit how far in advance customers can cancel (e.g. "cancel only 24h before", "no cancellations within 2 hours")
+  - booking_buffer: manager wants a minimum notice period before a booking (e.g. "don't accept same-day bookings", "require 2h notice")
+  - max_days_ahead: manager wants to cap how far into the future bookings can be made (e.g. "only 30 days ahead")
+  - cancellation_fee: manager wants to charge a fee for late cancellations (e.g. "charge 50 for cancellations")
+  - other: anything else — policy cannot be enforced automatically; set ambiguous=true and clarificationNeeded explaining what IS enforceable
+
+  For subtype "other", ALWAYS set ambiguous=true and clarificationNeeded to a message (in the manager's language) explaining:
+  "I can automatically enforce: cancellation notice periods, advance booking windows, booking buffer times, and cancellation fees. This request needs to be handled manually. What specifically would you like to change?"
 
 If the instruction is ambiguous or missing required detail, set ambiguous=true and clarificationNeeded to the exact question to ask back.
 Respond only with valid JSON matching the schema. No explanation.`
@@ -143,10 +159,15 @@ const operatorActionSchema = z.object({
 export async function classifyOperatorMessage(
   message: string,
   lang: 'he' | 'en',
+  liveStats?: { businessCount: number; openEscalations: number },
 ): Promise<LlmResult<OperatorActionOutput>> {
   const safeMessage = sanitizeUserInput(message)
 
-  const systemPrompt = `You are the MiddleMan operator assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. The operator is the platform owner — they have admin access to all businesses.
+  const statsLine = liveStats
+    ? `\nLive platform stats: ${liveStats.businessCount} businesses, ${liveStats.openEscalations} open escalation(s).`
+    : ''
+
+  const systemPrompt = `You are the MiddleMan operator assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. The operator is the platform owner — they have admin access to all businesses.${statsLine}
 
 Classify the operator's message into one action and extract relevant parameters.
 
@@ -220,6 +241,35 @@ const FALLBACK_REPLIES: Record<'he' | 'en', string> = {
   en: 'Something went wrong. Please try again.',
 }
 
+function buildKnowledgeAddendum(input: GenerateReplyInput): string {
+  const parts: string[] = []
+
+  if (input.brandVoice) {
+    parts.push(`BUSINESS VOICE (set by the business owner — speak in this spirit):\n${input.brandVoice}`)
+  }
+
+  if (input.communicationStyle) {
+    const cs = input.communicationStyle
+    const rules: string[] = [
+      `Formality: ${cs.formality === 'formal' ? 'formal — use respectful titles and complete sentences' : 'casual — friendly, first names, relaxed'}.`,
+      `Emoji: ${cs.emojiUse === 'none' ? 'never use emoji' : cs.emojiUse === 'frequent' ? 'use emoji freely' : 'use emoji sparingly (max 1 per message)'}.`,
+    ]
+    if (cs.useCustomerName) rules.push("Use the customer's first name when known.")
+    if (!cs.humor) rules.push('Keep tone professional — no jokes or playful language.')
+    if (cs.phrasesToUse.length > 0) rules.push(`Preferred phrases: ${cs.phrasesToUse.join(', ')}.`)
+    if (cs.phrasesToAvoid.length > 0) rules.push(`Never say: ${cs.phrasesToAvoid.join(', ')}.`)
+    if (cs.fallbackPhrase) rules.push(`Default fallback phrase: "${cs.fallbackPhrase}".`)
+    parts.push(`COMMUNICATION RULES (set by business owner — always follow):\n${rules.join('\n')}`)
+  }
+
+  if (input.faqs && input.faqs.length > 0) {
+    const faqText = input.faqs.map((f) => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n')
+    parts.push(`BUSINESS FAQs — answer customer questions directly from these:\n${faqText}`)
+  }
+
+  return parts.join('\n\n')
+}
+
 export async function generateCustomerReply(input: GenerateReplyInput): Promise<string> {
   const personaNotes = input.botPersona === 'female'
     ? 'Write in grammatically feminine form (Hebrew: use feminine verb conjugations and adjectives).'
@@ -227,7 +277,13 @@ export async function generateCustomerReply(input: GenerateReplyInput): Promise<
     ? 'Write in grammatically masculine form (Hebrew: use masculine verb conjugations and adjectives).'
     : ''
 
-  const systemPrompt = (PA_PERSONA_TEMPLATE + (personaNotes ? `\n\n${personaNotes}` : ''))
+  const knowledgeAddendum = buildKnowledgeAddendum(input)
+
+  const systemPrompt = (
+    PA_PERSONA_TEMPLATE
+    + (personaNotes ? `\n\n${personaNotes}` : '')
+    + (knowledgeAddendum ? `\n\n${knowledgeAddendum}` : '')
+  )
     .replace('{businessName}', input.businessName)
     .replace('{language}', input.language === 'he' ? 'he (Hebrew)' : 'en (English)')
 

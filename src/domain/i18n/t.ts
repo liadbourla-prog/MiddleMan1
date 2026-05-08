@@ -271,6 +271,10 @@ const strings = {
     he: `לא הצלחתי לשמור את ההנחיה. נסו שוב.`,
     en: `I couldn't save that instruction. Please try again.`,
   },
+  manager_unknown_instruction: {
+    he: `לא הצלחתי לזהות את סוג ההנחיה. ניתן לשלוח הנחיות בנושאים הבאים: שינוי שעות פתיחה, מדיניות ביטול, הוספה/הסרה של שירותים, הרשאות, ושאלות כלליות.`,
+    en: `I couldn't identify the instruction type. You can send instructions about: availability/hours changes, cancellation policy, adding or removing services, permissions, and general questions.`,
+  },
   revoked_access: {
     he: `הגישה שלך בוטלה. פנו לעסק ישירות.`,
     en: `Your access has been revoked. Please contact the business directly.`,
@@ -382,6 +386,26 @@ const strings = {
   apply_policy_noted: {
     he: `הנחיית מדיניות נשמרה.`,
     en: `Policy instruction noted and saved.`,
+  },
+  apply_policy_cancellation_cutoff: {
+    he: (hours: number) => `מדיניות ביטול עודכנה: ניתן לבטל עד ${hours} שעות לפני התור.`,
+    en: (hours: number) => `Cancellation policy updated: customers can cancel up to ${hours} hours before the appointment.`,
+  },
+  apply_policy_booking_buffer: {
+    he: (hours: number) => `זמן מינימלי להזמנה עודכן: ${hours} שעות מראש לפחות.`,
+    en: (hours: number) => `Minimum booking buffer updated: at least ${hours} hours in advance.`,
+  },
+  apply_policy_max_days: {
+    he: (days: number) => `טווח הזמנות עודכן: ניתן להזמין עד ${days} ימים קדימה.`,
+    en: (days: number) => `Booking window updated: customers can book up to ${days} days ahead.`,
+  },
+  apply_policy_cancellation_fee: {
+    he: (amount: number, currency: string) => `עמלת ביטול עודכנה: ${amount} ${currency}.`,
+    en: (amount: number, currency: string) => `Cancellation fee updated: ${amount} ${currency}.`,
+  },
+  apply_policy_unsupported: {
+    he: `הנחיה זו אינה ניתנת לביצוע אוטומטי. ניתן לעדכן: זמן ביטול, זמן הזמנה מינימלי, טווח הזמנות, עמלת ביטול.`,
+    en: `This policy cannot be applied automatically. Supported: cancellation cutoff, minimum booking buffer, booking window (days ahead), cancellation fee.`,
   },
   apply_unknown_type: {
     he: (type: string) => `סוג הנחיה לא מוכר: ${type}.`,

@@ -67,6 +67,16 @@ export interface OperatorActionOutput {
   freeformReply: string | null
 }
 
+export interface BusinessCommunicationStyle {
+  formality: 'formal' | 'casual'
+  emojiUse: 'none' | 'occasional' | 'frequent'
+  useCustomerName: boolean
+  humor: boolean
+  phrasesToAvoid: string[]
+  phrasesToUse: string[]
+  fallbackPhrase: string
+}
+
 export interface GenerateReplyInput {
   businessName: string
   language: 'he' | 'en'
@@ -78,4 +88,8 @@ export interface GenerateReplyInput {
     preferredServiceName: string | null
     displayName: string | null
   } | null
+  // Business knowledge — injected when available, absent for bootstrap/fallback paths
+  brandVoice?: string | null
+  communicationStyle?: BusinessCommunicationStyle | null
+  faqs?: Array<{ question: string; answer: string }>
 }

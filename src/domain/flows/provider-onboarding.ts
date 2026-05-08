@@ -162,6 +162,12 @@ async function handleStep(
     }
 
     case 'credentials': {
+      // Explicit confusion / absence signals always get the detailed help guide,
+      // even if the message incidentally contains digits (e.g. a pasted phone number).
+      if (isExpressingNoAccess(text) || isAskingForHelp(text)) {
+        return { reply: i18n.mm_credentials_help[lang] }
+      }
+
       // If message doesn't look like a credential attempt, give full guidance
       if (!looksLikeCredentialAttempt(text)) {
         return { reply: i18n.mm_credentials_help[lang] }
@@ -169,7 +175,9 @@ async function handleStep(
 
       const parsed = parseCredentials(text)
       if (!parsed) {
-        return { reply: i18n.mm_retry_credentials[lang] }
+        // Looked like a credential attempt but couldn't parse — give full guidance
+        // rather than just repeating the format, so the user understands what's needed.
+        return { reply: i18n.mm_credentials_help[lang] }
       }
 
       // Validate credentials + fetch the actual phone number from Meta
@@ -339,6 +347,14 @@ async function advance(db: Db, managerPhone: string, nextStep: Step, data: Colle
 }
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
+
+function isExpressingNoAccess(text: string): boolean {
+  return /(אין לי|אין לנו|don'?t have|do not have|i have no|no token|no id|no access|לא קיבלתי|לא מצאתי|לא יודע|לא יודעת|עדיין לא|haven'?t got|didn'?t get)/i.test(text)
+}
+
+function isAskingForHelp(text: string): boolean {
+  return /^(help|עזרה|מה זה|מה ה|what is|what'?s a|what are|how do|how to|איך|where|where do|איפה|explain|הסבר|לא מבין|לא מבינה|don'?t understand)/i.test(text.trim())
+}
 
 function looksLikeCredentialAttempt(text: string): boolean {
   // Must contain a long numeric ID or an EAA token — anything else is confusion, not an attempt

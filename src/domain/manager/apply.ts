@@ -82,7 +82,7 @@ export async function applyInstruction(
       result = await applyPermissionChange(db, businessId, actorId, structuredParams, lang)
       break
     case 'policy_change':
-      result = { ok: true, confirmationMessage: t('apply_policy_noted', lang) }
+      result = await applyPolicyChange(db, businessId, actorId, structuredParams, lang)
       break
     default:
       result = { ok: false, reason: i18n.apply_unknown_type[lang](instructionType) }
@@ -471,6 +471,80 @@ async function applyPermissionChange(
     .where(eq(identities.id, target.id))
 
   return { ok: true, confirmationMessage: i18n.apply_permission_revoked[lang](p.displayName ?? p.phoneNumber) }
+}
+
+// ── Policy change ─────────────────────────────────────────────────────────────
+
+const policyChangeSchema = z.object({
+  subtype: z.enum(['cancellation_cutoff', 'booking_buffer', 'max_days_ahead', 'cancellation_fee', 'other']),
+  valueHours: z.coerce.number().nonnegative().nullable().optional(),
+  valueDays: z.coerce.number().int().positive().nullable().optional(),
+  valueAmount: z.coerce.number().nonnegative().nullable().optional(),
+  description: z.string(),
+})
+
+async function applyPolicyChange(
+  db: Db,
+  businessId: string,
+  actorId: string,
+  params: Record<string, unknown>,
+  lang: Lang,
+): Promise<ApplyResult> {
+  const parsed = policyChangeSchema.safeParse(params)
+  if (!parsed.success) {
+    return { ok: false, reason: `Invalid policy params: ${parsed.error.message}` }
+  }
+
+  const p = parsed.data
+
+  switch (p.subtype) {
+    case 'cancellation_cutoff': {
+      const hours = p.valueHours ?? 0
+      await db
+        .update(businesses)
+        .set({ cancellationCutoffMinutes: Math.round(hours * 60) })
+        .where(eq(businesses.id, businessId))
+      await logAudit(db, { businessId, actorId, action: 'policy.cancellation_cutoff_updated', entityType: 'business', entityId: businessId, afterState: { cancellationCutoffMinutes: Math.round(hours * 60) } })
+      return { ok: true, confirmationMessage: i18n.apply_policy_cancellation_cutoff[lang](hours) }
+    }
+
+    case 'booking_buffer': {
+      const hours = p.valueHours ?? 0
+      await db
+        .update(businesses)
+        .set({ minBookingBufferMinutes: Math.round(hours * 60) })
+        .where(eq(businesses.id, businessId))
+      await logAudit(db, { businessId, actorId, action: 'policy.booking_buffer_updated', entityType: 'business', entityId: businessId, afterState: { minBookingBufferMinutes: Math.round(hours * 60) } })
+      return { ok: true, confirmationMessage: i18n.apply_policy_booking_buffer[lang](hours) }
+    }
+
+    case 'max_days_ahead': {
+      const days = p.valueDays ?? 365
+      await db
+        .update(businesses)
+        .set({ maxBookingDaysAhead: days })
+        .where(eq(businesses.id, businessId))
+      await logAudit(db, { businessId, actorId, action: 'policy.max_days_ahead_updated', entityType: 'business', entityId: businessId, afterState: { maxBookingDaysAhead: days } })
+      return { ok: true, confirmationMessage: i18n.apply_policy_max_days[lang](days) }
+    }
+
+    case 'cancellation_fee': {
+      const amount = p.valueAmount ?? 0
+      const [biz] = await db.select({ currency: businesses.currency }).from(businesses).where(eq(businesses.id, businessId)).limit(1)
+      const currency = biz?.currency ?? 'ILS'
+      await db
+        .update(businesses)
+        .set({ cancellationFeeAmount: String(amount), cancellationFeeCurrency: currency })
+        .where(eq(businesses.id, businessId))
+      await logAudit(db, { businessId, actorId, action: 'policy.cancellation_fee_updated', entityType: 'business', entityId: businessId, afterState: { cancellationFeeAmount: amount, cancellationFeeCurrency: currency } })
+      return { ok: true, confirmationMessage: i18n.apply_policy_cancellation_fee[lang](amount, currency) }
+    }
+
+    case 'other':
+      // Classifier already set ambiguous=true for this subtype — this path shouldn't be reached
+      // but handle gracefully in case it is.
+      return { ok: false, reason: i18n.apply_policy_unsupported[lang] }
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
