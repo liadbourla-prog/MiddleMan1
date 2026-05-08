@@ -45,6 +45,15 @@ export async function handleOperatorMessage(
     return handleStatusAll(db, lang)
   }
 
+  // Website-specific query — show which businesses have a live site
+  if (
+    upper === 'WEBSITES' || upper === 'WEBSITE' ||
+    /אתרים/.test(text) || /אתר/.test(text) ||
+    /\bsite[s]?\b/i.test(text)
+  ) {
+    return handleWebsitesAll(db, lang)
+  }
+
   const statusMatch = text.match(/^STATUS\s+(.+)$/i) ?? text.match(/^סטטוס\s+(.+)$/)
   if (statusMatch) {
     return handleStatusOne(db, statusMatch[1]!.trim(), lang)
@@ -576,4 +585,60 @@ async function handleRetrigger(db: Db, nameOrNumber: string, skillName: string |
   await createWorkflow(db, found.id, manager.id, skillName, capability.retriggersFirstStep)
 
   return { reply: i18n.op_retrigger_ok[lang](found.name, skillName) }
+}
+
+async function handleWebsitesAll(db: Db, lang: Lang): Promise<OperatorResult> {
+  const rows = await db
+    .select({
+      businessId: skillWorkflows.businessId,
+      status: skillWorkflows.status,
+      updatedAt: skillWorkflows.updatedAt,
+    })
+    .from(skillWorkflows)
+    .where(eq(skillWorkflows.skillName, 'website-builder'))
+    .orderBy(desc(skillWorkflows.updatedAt))
+
+  if (rows.length === 0) {
+    return { reply: lang === 'he' ? 'אין עסקים עם אתר אינטרנט עדיין.' : 'No businesses have a website yet.' }
+  }
+
+  const bizIds = [...new Set(rows.map((r) => r.businessId))]
+  const bizRows = await db
+    .select({ id: businesses.id, name: businesses.name, websiteUrl: businesses.websiteUrl, websitePreviewUrl: businesses.websitePreviewUrl })
+    .from(businesses)
+    .where(eq(businesses.id, bizIds[0]!))
+
+  const bizMap = new Map<string, { name: string; url: string | null }>()
+  for (const b of bizRows) bizMap.set(b.id, { name: b.name, url: b.websiteUrl ?? b.websitePreviewUrl ?? null })
+
+  for (const id of bizIds.slice(1)) {
+    if (!bizMap.has(id)) {
+      const [b] = await db.select({ id: businesses.id, name: businesses.name, websiteUrl: businesses.websiteUrl, websitePreviewUrl: businesses.websitePreviewUrl }).from(businesses).where(eq(businesses.id, id)).limit(1)
+      if (b) bizMap.set(b.id, { name: b.name, url: b.websiteUrl ?? b.websitePreviewUrl ?? null })
+    }
+  }
+
+  const completed = rows.filter((r) => r.status === 'completed')
+  const active = rows.filter((r) => r.status === 'active')
+  const failed = rows.filter((r) => r.status === 'failed')
+
+  const header = lang === 'he'
+    ? `🌐 *אתרי עסקים* — ${completed.length} פעיל, ${active.length} בבנייה, ${failed.length} נכשל`
+    : `🌐 *Business Websites* — ${completed.length} live, ${active.length} building, ${failed.length} failed`
+
+  const lines: string[] = [header, '']
+
+  for (const r of completed) {
+    const biz = bizMap.get(r.businessId)
+    const url = biz?.url ? `\n   🔗 ${biz.url}` : ''
+    lines.push(`✅ *${biz?.name ?? r.businessId}*${url}`)
+  }
+  for (const r of active) {
+    lines.push(`🔄 *${bizMap.get(r.businessId)?.name ?? r.businessId}* — ${lang === 'he' ? 'בבנייה' : 'building'}`)
+  }
+  for (const r of failed) {
+    lines.push(`❌ *${bizMap.get(r.businessId)?.name ?? r.businessId}* — ${lang === 'he' ? 'נכשל' : 'failed'}`)
+  }
+
+  return { reply: lines.join('\n') }
 }

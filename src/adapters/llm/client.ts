@@ -184,7 +184,7 @@ Actions:
 
 Routing hints:
 - "website(s)", "site(s)" for a specific business → skills_one
-- "all websites", "websites status" with no specific business → status_all
+- "all websites", "websites status", "אתרים", "אתר" with no specific business → skills_one (not status_all)
 - "status of [name]", "how is [name]" → status_one
 - Greetings ("hi", "hello", "שלום", "היי"), casual questions → general_qa
 - "what can you do", "help me" → help
