@@ -214,7 +214,7 @@ export const conversationSessions = pgTable(
       enum: ['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'manager_instruction', 'unknown'],
     }),
     state: text('state', {
-      enum: ['active', 'waiting_confirmation', 'waiting_clarification', 'waiting_language_confirmation', 'completed', 'expired', 'failed'],
+      enum: ['active', 'waiting_confirmation', 'waiting_clarification', 'completed', 'expired', 'failed'],
     }).notNull(),
     context: jsonb('context').notNull().default({}),
     lastMessageAt: timestamp('last_message_at', { withTimezone: true }).notNull(),

@@ -17,11 +17,13 @@ import {
   businessFaqs,
   deferredFeatureRequests,
 } from '../../db/schema.js'
-import { classifyManagerInstruction, classifyOperatorMessage } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, classifyOperatorMessage, generateOperatorReply } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
 import { operatorCapabilityRegistry } from './operator-capability-registry.js'
 import { detectLang, i18n, type Lang } from '../i18n/t.js'
+import { redis } from '../../redis.js'
+import { loadOperatorSession, appendOperatorTurn } from '../session/operator-session.js'
 
 export interface OperatorResult {
   reply: string
@@ -29,11 +31,16 @@ export interface OperatorResult {
 
 export async function handleOperatorMessage(
   db: Db,
+  fromNumber: string,
   body: string,
 ): Promise<OperatorResult> {
   const text = body.trim()
   const upper = text.toUpperCase()
   const lang = detectLang(body)
+
+  // Load session and record the inbound turn
+  const operatorSession = await loadOperatorSession(redis, fromNumber)
+  await appendOperatorTurn(redis, fromNumber, 'operator', text)
 
   // ── Exact keyword matches (English & Hebrew aliases) ─────────────────────────
 
@@ -119,17 +126,31 @@ export async function handleOperatorMessage(
   if (!classified.ok) return { reply: i18n.op_help[lang] }
 
   const op = classified.data
-  switch (op.action) {
-    case 'status_all':  return handleStatusAll(db, lang)
-    case 'status_one':  return op.businessName ? handleStatusOne(db, op.businessName, lang) : handleStatusAll(db, lang)
-    case 'escalations': return handleEscalations(db, lang)
-    case 'update_all':  return op.updateInstruction ? handleUpdateAll(db, op.updateInstruction, lang) : { reply: i18n.op_help[lang] }
-    case 'skills_one':  return op.businessName ? handleSkillsOne(db, op.businessName, lang) : handleStatusAll(db, lang)
-    case 'features':    return handleFeatures(db, lang)
-    case 'retrigger':   return op.businessName ? handleRetrigger(db, op.businessName, op.skillName, lang) : { reply: i18n.op_help[lang] }
-    case 'help':        return { reply: i18n.op_help[lang] }
-    case 'general_qa':  return { reply: op.freeformReply ?? i18n.op_help[lang] }
-  }
+
+  const dispatchedResult = await (async () => {
+    switch (op.action) {
+      case 'status_all':  return handleStatusAll(db, lang)
+      case 'status_one':  return op.businessName ? handleStatusOne(db, op.businessName, lang) : handleStatusAll(db, lang)
+      case 'escalations': return handleEscalations(db, lang)
+      case 'update_all':  return op.updateInstruction ? handleUpdateAll(db, op.updateInstruction, lang) : { reply: i18n.op_help[lang] }
+      case 'skills_one':  return op.businessName ? handleSkillsOne(db, op.businessName, lang) : handleStatusAll(db, lang)
+      case 'features':    return handleFeatures(db, lang)
+      case 'retrigger':   return op.businessName ? handleRetrigger(db, op.businessName, op.skillName, lang) : { reply: i18n.op_help[lang] }
+      case 'help':        return { reply: i18n.op_help[lang] }
+      case 'general_qa': {
+        const llmReply = await generateOperatorReply({
+          question: text,
+          transcript: operatorSession.transcript,
+          lang,
+          liveStats,
+        })
+        return { reply: llmReply || op.freeformReply || i18n.op_help[lang] }
+      }
+    }
+  })()
+
+  await appendOperatorTurn(redis, fromNumber, 'assistant', dispatchedResult.reply).catch(() => {/* best-effort */})
+  return dispatchedResult
 }
 
 async function handleStatusAll(db: Db, lang: Lang): Promise<OperatorResult> {

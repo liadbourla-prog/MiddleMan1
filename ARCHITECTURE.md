@@ -1180,4 +1180,160 @@ All PA capabilities beyond the V1 booking core are implemented as **skills** —
 
 ---
 
+---
+
+## Part 16 — Conversational Interface Architecture (The Four Chat Branches)
+
+Every inbound WhatsApp message in this system belongs to exactly one of four chat branches. Each branch has a distinct audience, LLM interaction model, and quality contract. This separation is architectural — not stylistic. Any session working on LLM behaviour, reply quality, or conversational experience must understand which branch it is operating in.
+
+### The Four Branches
+
+```
+PROVIDER_WA_NUMBER ──┬── sender = OPERATOR_PHONE  ──► Branch 1: Operator Channel
+                     └── sender ≠ OPERATOR_PHONE  ──► Branch 2: MiddleMan Onboarding
+
+ANY PA NUMBER ───────┬── identity.role = 'manager' ─► Branch 3: PA Manager Channel
+                     └── identity.role ≠ 'manager' ─► Branch 4: PA Customer Channel
+```
+
+---
+
+### Branch 1 — Operator Channel (MiddleMan → Platform Operator)
+
+**Audience:** The platform operator (us) only. One person, full system trust.
+
+**Entry point:** `src/domain/flows/operator.ts → handleOperatorMessage()`
+
+**Session model:** **True multi-turn session memory.** The operator's conversation with MiddleMan must maintain context across messages within a session window. References to "they", "that business", "the one we just discussed" must resolve correctly. The LLM receives the full session transcript and must reason over it.
+
+**LLM interaction model:**
+- Keyword / regex matching first (zero-latency commands: STATUS, ESCALATIONS, UPDATE ALL, etc.)
+- LLM classification (`classifyOperatorMessage`) as fallback for ambiguous or freeform input
+- LLM free-form conversation (`general_qa`) for anything that isn't a command — with full transcript context
+
+**Quality contract:** The operator can ask anything about the platform state, discuss a specific business across multiple turns, issue bulk instructions, and get intelligent conversational responses. The experience is closer to an admin assistant than a command line.
+
+**What the LLM must NOT do:** Mutate state. All state changes still go through the deterministic pipeline. The LLM can reason, explain, and discuss — it cannot apply instructions without the apply pipeline.
+
+---
+
+### Branch 2 — MiddleMan Onboarding Channel (MiddleMan → New Business Owner, Step 0)
+
+**Audience:** A new business owner going through their first contact with the platform. They may not know technical concepts (WhatsApp Business API, phone_number_id, access_token, Meta Business Suite).
+
+**Entry point:** `src/domain/flows/provider-onboarding.ts → handleProviderOnboarding()`
+
+**Session model:** Stateful step machine (`ProviderOnboardingSession`). Steps are sequential and must complete in order.
+
+**LLM interaction model:**
+- Onboarding question generation: `generateOnboardingReply()` — LLM phrases each step's ask conversationally
+- **Explanation mode:** When the current input reads as a question or expression of confusion (not an answer to the active step), the LLM must explain the concept being asked about (e.g. "what's a phone_number_id?", "where do I find my access token?", "what's a WhatsApp Business Account?"), then re-ask the step. Re-ask only when the person shows clear signs of understanding or provides a valid answer.
+- Parsing: regex for credentials, `classifyManagerInstruction` for services
+
+**Quality contract:** No business owner should ever be stuck because they didn't understand a technical term. The system must explain — clearly, in plain language — any concept it asks for. Explanations are not static strings; they are LLM-generated and contextual.
+
+**What the LLM must NOT do:** Accept a question as an answer to the current step. If the input is clearly a question or confusion, enter explanation mode — do not try to parse it as step data.
+
+---
+
+### Branch 3 — PA Manager Channel (PA → Business Owner, post-provisioning)
+
+**Audience:** The business owner managing their PA. They are trusted (role = `manager`) and operationally sophisticated, but they speak in natural language, not structured commands.
+
+**Entry point:** `src/domain/flows/manager-onboarding.ts` (during onboarding) → after onboarding: manager instruction handler in `src/routes/webhook.ts`
+
+**Session model:** Each message is classified independently by the instruction classifier. There is no persistent multi-turn session for the manager outside of onboarding. **This is a known gap to address.**
+
+**LLM interaction model:**
+- Primary path: `classifyManagerInstruction()` — intent classification → `applyInstruction()` — deterministic apply
+- **Conversational fallback:** When the classified instruction type is `unknown` OR when the manager's message is clearly a question (not a command), the LLM must respond conversationally. This includes:
+  - Questions about current settings ("what are my hours?", "what's my cancellation policy?")
+  - Questions about recent activity ("which customers cancelled this week?")
+  - How-to questions ("how do I change a service price?")
+  - Meta-questions ("what can you do?")
+- The conversational fallback must have access to the business's current state (services, hours, policy, recent bookings) to answer accurately.
+
+**Quality contract:** A manager must be able to use natural language for everything — commands and questions alike. The system handles commands with the deterministic apply pipeline and handles questions with intelligent, data-grounded conversation. The manager never needs to learn a command syntax.
+
+**What the LLM must NOT do:** Apply changes based on conversational replies without going through `classifyManagerInstruction` → `applyInstruction`. Conversation and command-execution are separate paths.
+
+---
+
+### Branch 4 — PA Customer Channel (PA → End Customer)
+
+**Audience:** Members of the public contacting a business to book, reschedule, cancel, or ask questions.
+
+**Entry point:** `src/domain/flows/customer-booking.ts → handleBookingFlow()`
+
+**Session model:** `ConversationSession` in DB. Full transcript stored in `conversation_messages`. The LLM receives the last N turns.
+
+**LLM interaction model — the split:**
+
+This branch uses a strict two-layer model:
+
+**Layer A — Transactional replies** (booking, cancellation, reschedule, hold confirmation, slot unavailability, listing bookings):
+- The deterministic state machine runs first and produces a factual `situation` string describing exactly what happened.
+- The LLM's job is **phrasing only** — it takes the situation and produces a natural reply. It does not reason about availability, policy, or booking state.
+- Situation strings must never contain internal implementation language (error codes, field names, engine reasons). They must be customer-facing descriptions.
+
+**Layer B — Conversational replies** (unknown intents, FAQ answers, first-message welcome for new customers, meta-questions about the business, explanations, follow-ups):
+- The LLM reasons freely over the full session transcript + business knowledge (FAQs, services, policies, brand voice).
+- There is no situation string — the LLM receives the raw message and context and generates a response.
+- The LLM may ask clarifying questions, make suggestions, or answer questions about the business.
+
+**Quality contract:** Transactional replies are always factually correct (guaranteed by the deterministic core). Conversational replies are contextually intelligent (handled by the LLM with full context). The customer never receives a reply that exposes internal system state or error language. A new customer's first message always receives a warm, oriented welcome.
+
+**What the LLM must NOT do in Layer A:** Make any claim about availability, booking state, or policy beyond what the `situation` string provides. **What the LLM must NOT do in Layer B:** Make any transactional claim (confirm, cancel, check availability) — if a conversational turn leads to a transactional intent, it re-enters the standard intent-extraction pipeline.
+
+---
+
+### Locked design decisions (applicable across branches)
+
+#### First-message welcome (Branch 4)
+
+When a customer sends their **first message** in a session:
+- **Targeted intent** (e.g. "book a haircut for Tuesday at 3pm"): do not interrupt with a welcome. The reply must include a natural greeting before getting to the point ("Hi! Let me check that for you…"), then proceed immediately with the response.
+- **Generic or ambiguous first message** (e.g. "hi", "hello", "I need help", "מה שעות הפתיחה?"): send a warm welcome message introducing the PA and the business, then ask a single clarifying question.
+
+The distinction is made by intent extraction. A resolved booking/cancellation/rescheduling/list-bookings intent → targeted. `unknown` or `inquiry` without a specific question → generic.
+
+#### Session memory and expiry by branch
+
+All branches that require conversational memory use the same `ConversationSession` infrastructure and `conversation_messages` log. Session expiry is branch-specific:
+
+| Branch | Expiry | Rationale |
+|---|---|---|
+| 1 — Operator | 24 hours from last message | Operator works across a full day; context must survive breaks |
+| 2 — MM Onboarding | Step-scoped (no session; `ProviderOnboardingSession` drives state) | Linear flow, no free-form memory needed |
+| 3 — PA Manager | 4 hours from last message | Non-continuous interaction pattern; commands within a work window should share context |
+| 4 — PA Customer | 30 minutes from last message | Active booking flows are short; stale context causes confusion |
+
+#### Situation string sanitisation (Branch 4 — Layer A)
+
+All booking engine reasons and system error codes must be mapped to human-readable, customer-safe descriptions **before** they are passed to the LLM as `situation` strings. Engine codes (`past_slot`, `outside_hours`, `calendar_error`, `policy_violation`, etc.) are never passed raw. A mapping table lives in the customer flow handler. The LLM never sees an internal identifier.
+
+#### Language detection and switch UX (Branches 3 and 4)
+
+When an incoming message is in a **different language than the session's current language**:
+1. The PA replies **entirely in the detected language** — no interruption, no bilingual offer, no state change yet.
+2. At the **end of that reply**, the PA adds a brief inline question asking whether the user wants to continue in the new language (e.g. "Want me to continue in English going forward?").
+3. If the user confirms → the language preference is persisted on the `identities` row as `preferredLanguage`, and all subsequent session replies use the new language.
+4. If the user declines → the language reverts to the session default on the next turn.
+5. If the user ignores the question and continues in the new language → the question is asked again at the end of the next reply (maximum once per turn, not every turn).
+
+This replaces the current bilingual-offer mechanism entirely. The current `waiting_language_confirmation` session state and `bufferedMessage` context field are superseded by this inline approach.
+
+---
+
+### Cross-branch invariants
+
+These apply to all four branches:
+
+1. **The LLM never directly mutates state.** In every branch, state changes go through the deterministic pipeline. The LLM proposes, informs, and phrases — it never applies.
+2. **Situation strings passed to the LLM must be customer/operator-safe.** No internal field names, error codes, or engine messages.
+3. **Language is always resolved before the LLM is called.** The branch resolves the reply language; the LLM enforces it strictly.
+4. **Every LLM call has a defined fallback.** Schema validation failures and API errors always fall back gracefully — never to a blank reply or an exposed error.
+
+---
+
 *This document reflects the implemented system. Changes to scope or architecture require explicit decision and a version bump.*

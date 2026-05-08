@@ -73,6 +73,26 @@ If a skill needs data not currently in `SkillContext`, the correct path is to ex
 
 ---
 
+## The Four Chat Branches
+
+Every inbound WhatsApp message routes into exactly one of four branches. **Any work on LLM behaviour, reply quality, or conversational experience must identify which branch it targets.** See ARCHITECTURE.md Part 16 for the full specification.
+
+| # | Name | Number | Sender | Entry point |
+|---|---|---|---|---|
+| 1 | **Operator Channel** | `PROVIDER_WA_NUMBER` | `OPERATOR_PHONE` | `flows/operator.ts` |
+| 2 | **MiddleMan Onboarding** | `PROVIDER_WA_NUMBER` | anyone else | `flows/provider-onboarding.ts` |
+| 3 | **PA Manager Channel** | any PA number | `role = manager` | `flows/manager-onboarding.ts` / manager handler |
+| 4 | **PA Customer Channel** | any PA number | `role = customer` | `flows/customer-booking.ts` |
+
+Key design decisions locked in:
+- **Branch 1:** True multi-turn session memory. LLM reasons over full transcript across turns.
+- **Branch 2:** Explanation mode when user shows confusion — LLM explains technical concepts in plain language, then re-asks when understanding shows. Never parses a question as an answer.
+- **Branch 3:** Free-form conversational PA. Natural language for both commands and questions. Full session memory (4h expiry). Deterministic apply pipeline still enforced for state changes.
+- **Branch 4:** Two-layer model. Transactional = LLM phrases only (sanitised situation string → wording, no raw engine codes). Conversational = LLM reasons freely with full context. First message: greeting inline for targeted intents, welcome + clarification for generic/ambiguous.
+- **Language switch (Branches 3 & 4):** Reply immediately in detected language, add inline switch-offer at the end. No bilingual interruption. Confirmed preference persists to `identities.preferredLanguage`. Replaces `waiting_language_confirmation` state.
+
+---
+
 ## Current State
 
 - v1.0.0 is live. All V1 milestones complete.

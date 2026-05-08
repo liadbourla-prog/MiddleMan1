@@ -31,9 +31,8 @@ export interface BookingFlowContext {
   isReschedulingFlow?: boolean
   botPersona?: 'female' | 'male' | 'neutral'
   sessionUnknownCount?: number
-  // Language switch offer
-  languageSwitchOffered?: boolean
+  // Language: override locks the language for the session; offerPending means the inline offer was appended last turn
   languageOverride?: 'he' | 'en'
-  bufferedMessage?: string
+  languageSwitchOfferPending?: boolean
   [key: string]: unknown
 }

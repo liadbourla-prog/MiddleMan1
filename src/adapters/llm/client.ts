@@ -416,6 +416,154 @@ Output: the message text ONLY. No quotes, no labels, no preamble.`
   return ''
 }
 
+// ── Manager: conversational fallback reply ────────────────────────────────────
+
+export interface ManagerBusinessState {
+  businessName: string
+  timezone: string
+  isPaused: boolean
+  defaultLanguage: string
+}
+
+export async function generateManagerReply(input: {
+  businessName: string
+  language: 'he' | 'en'
+  question: string
+  transcript: Array<{ role: 'customer' | 'assistant'; text: string }>
+  businessState: ManagerBusinessState
+}): Promise<string> {
+  const safeQuestion = sanitizeUserInput(input.question)
+  const transcriptText = input.transcript.length > 0
+    ? input.transcript.map((t) => `${t.role === 'customer' ? 'Manager' : 'Assistant'}: ${t.text}`).join('\n')
+    : '(no prior messages this session)'
+
+  const systemPrompt = `You are the admin assistant for "${input.businessName}" on the MiddleMan platform. The manager is texting you on WhatsApp.
+
+Business state:
+- Timezone: ${input.businessState.timezone}
+- PA status: ${input.businessState.isPaused ? 'paused (not accepting bookings)' : 'active'}
+- Default language: ${input.businessState.defaultLanguage}
+
+Language: reply ENTIRELY in ${input.language === 'he' ? 'Hebrew (עברית)' : 'English'}.
+
+Tone: direct and warm — like a competent admin assistant, not a bot.
+- 1–3 sentences. Never pad with filler.
+- If you can answer the question from the business state above, answer it directly.
+- If the question is about something you don't know (e.g. specific booking counts, customer data), say so honestly and suggest they use STATUS or UPCOMING commands.
+- Never make up facts.
+- Do not expose internal system details or raw field names.
+
+Recent conversation:
+${transcriptText}
+
+Output: reply text ONLY. No preamble, no quotes.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: safeQuestion,
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 400, temperature: 0.35 },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through to empty — caller uses i18n fallback
+  }
+  return ''
+}
+
+// ── Operator: conversational reply ───────────────────────────────────────────
+
+export async function generateOperatorReply(input: {
+  question: string
+  transcript: Array<{ role: 'operator' | 'assistant'; text: string }>
+  lang: 'he' | 'en'
+  liveStats?: { businessCount: number; openEscalations: number }
+}): Promise<string> {
+  const safeQuestion = sanitizeUserInput(input.question)
+  const statsLine = input.liveStats
+    ? `Live platform stats: ${input.liveStats.businessCount} businesses, ${input.liveStats.openEscalations} open escalation(s).`
+    : ''
+
+  const transcriptText = input.transcript.length > 0
+    ? input.transcript.map((t) => `${t.role === 'operator' ? 'Operator' : 'Assistant'}: ${t.text}`).join('\n')
+    : '(start of session)'
+
+  const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. The operator (platform owner) is texting you on WhatsApp.
+${statsLine ? `\n${statsLine}` : ''}
+Language: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
+Tone: direct and warm — like a competent admin assistant. 1–3 sentences. No filler.
+
+Available commands the operator can use (mention only if directly relevant):
+- STATUS / STATUS [business name] — business status
+- ESCALATIONS — open escalations
+- UPDATE ALL: [instruction] — push change to all businesses
+- FEATURES — deferred feature requests
+- RETRIGGER [business] [skill] — restart a skill workflow
+
+Recent conversation:
+${transcriptText}
+
+Output: reply text ONLY. No preamble, no quotes.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: safeQuestion,
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 300, temperature: 0.35 },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through — caller uses static fallback
+  }
+  return ''
+}
+
+// ── Onboarding: concept explainer ────────────────────────────────────────────
+
+const CONCEPT_CONTEXT: Record<string, string> = {
+  timezone: "The timezone for this business. Accepts an IANA timezone name (e.g. 'Asia/Jerusalem', 'America/New_York') or a city/country like 'Tel Aviv', 'London', 'Israel'.",
+  calendar: "Whether to connect Google Calendar or use the built-in calendar. Google Calendar keeps existing appointments in sync automatically. The internal option is fully managed by the PA. Either works — it can be changed later.",
+  services: "The service(s) this business offers and how long each takes. Just say the service name and its duration, e.g. 'Haircut, 30 min' or 'Massage, 60 minutes'.",
+  credentials: "Two values from Meta (WhatsApp Business API): a Phone Number ID (a long number) and an Access Token (starts with EAA). Both are found in the Meta Business Suite under the WhatsApp section.",
+}
+
+export async function explainOnboardingConcept(input: {
+  concept: string
+  userMessage: string
+  step: string
+  lang: 'he' | 'en'
+}): Promise<string> {
+  const context = CONCEPT_CONTEXT[input.step] ?? input.concept
+
+  const systemPrompt = `You are helping a business owner set up their WhatsApp PA. They seem confused or are asking a question at the "${input.step}" step.
+
+Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
+Rules:
+- 2–4 sentences maximum
+- Plain language — no jargon, no markdown, no bullet points
+- Explain the concept clearly, then end with a gentle re-ask of what you need from them
+- Sound like a helpful human, not a bot
+
+The concept to explain: ${context}
+
+Output: the explanation message ONLY. No quotes, no labels, no preamble.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: `User message: "${input.userMessage}"`,
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 300, temperature: 0.4 },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through — caller uses static fallback
+  }
+  return ''
+}
+
 // ── Onboarding: structured answer parser ─────────────────────────────────────
 
 const cancellationSchema = z.object({ hours: z.number().int().min(0) })

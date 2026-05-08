@@ -16,11 +16,12 @@ import {
   loadActiveSession,
   createSession,
   completeSession,
+  SESSION_EXPIRY,
 } from '../domain/session/manager.js'
 import { handleBookingFlow } from '../domain/flows/customer-booking.js'
 import { handleOnboardingMessage } from '../domain/flows/manager-onboarding.js'
 import { handleProviderOnboarding } from '../domain/flows/provider-onboarding.js'
-import { classifyManagerInstruction } from '../adapters/llm/client.js'
+import { classifyManagerInstruction, generateManagerReply } from '../adapters/llm/client.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
 import {
@@ -237,7 +238,9 @@ async function routeCustomerMessage(
 
   // Load or create session — hydrate new sessions with customer memory
   let session = await loadActiveSession(db, identity.id)
+  let isFirstMessage = false
   if (!session) {
+    isFirstMessage = true
     const memory = await loadCustomerMemory(db, identity.id)
     const hydratedContext = await buildHydratedContext(db, identity.id, business.id, memory)
     session = await createSession(db, business.id, identity.id, 'booking')
@@ -313,6 +316,7 @@ async function routeCustomerMessage(
     business,
     lang,
     businessKnowledge,
+    isFirstMessage,
   )
 
   // Save outbound reply — failure must not kill the flow
@@ -432,6 +436,16 @@ async function routeManagerMessage(
     return
   }
 
+  // Load or create 4h manager session for transcript continuity
+  let mgSession = await loadActiveSession(db, identity.id)
+  if (!mgSession) {
+    mgSession = await createSession(db, business.id, identity.id, 'manager_instruction', SESSION_EXPIRY.manager)
+  }
+  await saveMessage(db, mgSession.id, 'customer', msg.body).catch((err) => {
+    app.log.warn({ err }, 'Failed to save manager inbound message to transcript')
+  })
+  const mgTranscript = await loadTranscript(db, mgSession.id, 8).catch(() => [])
+
   // Skills dispatch for manager — runs before LLM instruction classifier
   {
     const [mgBusinessKnowledge, mgWorkflowState] = await Promise.all([
@@ -442,9 +456,9 @@ async function routeManagerMessage(
       db,
       business,
       identity,
-      session: null,
+      session: mgSession,
       messageText: msg.body,
-      conversationHistory: [],
+      conversationHistory: mgTranscript,
       language: lang,
       workflowState: mgWorkflowState,
       businessKnowledge: mgBusinessKnowledge,
@@ -455,6 +469,9 @@ async function routeManagerMessage(
     })
     const mgSkillOutcome = await dispatchSkill(mgSkillCtx)
     if (mgSkillOutcome?.handled) {
+      await saveMessage(db, mgSession.id, 'assistant', mgSkillOutcome.reply).catch((err) => {
+        app.log.warn({ err }, 'Failed to save manager skill reply to transcript')
+      })
       await sendMessage({ toNumber: msg.fromNumber, body: mgSkillOutcome.reply }, waCredentials)
       return
     }
@@ -515,7 +532,23 @@ async function routeManagerMessage(
   }
 
   if (instruction.instructionType === 'unknown') {
-    await sendMessage({ toNumber: msg.fromNumber, body: i18n.manager_unknown_instruction[lang] }, waCredentials)
+    const llmReply = await generateManagerReply({
+      businessName: business.name,
+      language: lang,
+      question: msg.body,
+      transcript: mgTranscript,
+      businessState: {
+        businessName: business.name,
+        timezone: business.timezone,
+        isPaused: business.paused,
+        defaultLanguage: business.defaultLanguage ?? lang,
+      },
+    })
+    const unknownReply = llmReply || i18n.manager_unknown_instruction[lang]
+    await saveMessage(db, mgSession.id, 'assistant', unknownReply).catch((err) => {
+      app.log.warn({ err }, 'Failed to save manager unknown reply to transcript')
+    })
+    await sendMessage({ toNumber: msg.fromNumber, body: unknownReply }, waCredentials)
     return
   }
 
@@ -533,5 +566,8 @@ async function routeManagerMessage(
     ? applyResult.confirmationMessage
     : i18n.manager_apply_error[lang](applyResult.reason)
 
+  await saveMessage(db, mgSession.id, 'assistant', reply).catch((err) => {
+    app.log.warn({ err }, 'Failed to save manager reply to transcript')
+  })
   await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
 }

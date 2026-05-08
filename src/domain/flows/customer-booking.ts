@@ -22,6 +22,26 @@ type CustomerMemoryInput = {
   displayName: string | null
 } | null
 
+const REASON_MAP: Record<string, string> = {
+  past_slot: 'the requested time has already passed',
+  outside_hours: 'the requested time is outside business hours',
+  calendar_error: 'the calendar is temporarily unavailable',
+  policy_violation: 'the request does not meet the booking policy',
+  already_cancelled: 'this booking has already been cancelled',
+  hold_conflict: 'another customer just took that slot',
+  not_found: 'the booking could not be found',
+  not_authorized: 'this action is not permitted',
+  slot_conflict: 'that slot is no longer available',
+  cutoff_passed: 'the cancellation window has already closed',
+  max_days_ahead: 'the requested date is too far in advance',
+  min_buffer: 'bookings require more advance notice',
+}
+
+function sanitiseReason(reason: string | undefined | null): string {
+  if (!reason) return 'an unexpected issue occurred'
+  return REASON_MAP[reason] ?? reason.replace(/_/g, ' ').toLowerCase()
+}
+
 function formatSlotDate(date: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, weekday: 'long', day: 'numeric', month: 'long',
@@ -90,6 +110,7 @@ export async function handleBookingFlow(
   business?: Business,
   businessDefaultLanguage?: 'he' | 'en',
   businessKnowledge?: BusinessKnowledge,
+  isFirstMessage?: boolean,
 ): Promise<FlowResult> {
   const ctx = {
     ...(session.context as BookingFlowContext),
@@ -113,9 +134,34 @@ export async function handleBookingFlow(
     return { reply, sessionComplete: false }
   }
 
-  // ── Language switch confirmation branch ───────────────────────────────────
-  if (session.state === 'waiting_language_confirmation') {
-    return handleLanguageSwitchConfirmation(db, identity, session, ctx, messageText, businessTimezone, businessName, transcript, calendar, business, defaultLang)
+  // ── Language switch: handle YES/NO response to a pending inline offer ───────
+  if (ctx.languageSwitchOfferPending && !ctx.languageOverride) {
+    const switchAnswer = parseConfirmation(messageText)
+    if (switchAnswer === 'yes') {
+      const chosenLang: 'he' | 'en' = lang === defaultLang
+        ? (defaultLang === 'he' ? 'en' : 'he')
+        : lang
+      try {
+        await db.update(identities).set({ preferredLanguage: chosenLang }).where(eq(identities.id, identity.id))
+      } catch { /* non-fatal */ }
+      const newCtx: BookingFlowContext = { ...ctx, languageOverride: chosenLang, languageSwitchOfferPending: false }
+      await updateSessionContext(db, session.id, newCtx, 'active')
+      const reply = await generateCustomerReply({
+        businessName,
+        language: chosenLang,
+        situation: 'Language preference saved. Acknowledge briefly and ask how you can help.',
+        transcript,
+        ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+        customerMemory: extractMemory(newCtx),
+      })
+      return { reply, sessionComplete: false }
+    }
+    if (switchAnswer === 'no') {
+      const newCtx: BookingFlowContext = { ...ctx, languageOverride: defaultLang, languageSwitchOfferPending: false }
+      await updateSessionContext(db, session.id, newCtx, 'active')
+      // Re-process the original message in the default language
+    }
+    // 'unclear' — fall through and re-process; offer will be appended again
   }
 
   // ── Owner-rule escalation check (runs before any intent logic) ────────────
@@ -208,104 +254,109 @@ export async function handleBookingFlow(
   const intent = intentResult.data
   const detectedLanguage = intent.detectedLanguage
 
-  // ── Language switch offer (once per customer, if they write in a different language) ──
-  // Only offer if: no override yet, not already offered, and detected language differs from business default
-  if (
-    !ctx.languageOverride &&
-    !ctx.languageSwitchOffered &&
-    detectedLanguage !== defaultLang
-  ) {
-    const switchCtx: BookingFlowContext = {
-      ...ctx,
-      detectedLanguage,
-      languageSwitchOffered: true,
-      bufferedMessage: messageText,
-    }
-    await updateSessionContext(db, session.id, switchCtx, 'waiting_language_confirmation')
-    // Ask bilingually so the customer understands regardless of language
-    const offerMsg = defaultLang === 'he'
-      ? `שים לב: הפאזל מגיב בעברית כברירת מחדל. האם להמשיך באנגלית? (כן / לא)\nNote: the assistant replies in Hebrew by default. Would you like to continue in English? (YES / NO)`
-      : `Note: the assistant replies in English by default. Would you like to continue in Hebrew? (YES / NO)\nשים לב: הפאזל מגיב באנגלית כברירת מחדל. האם להמשיך בעברית? (כן / לא)`
-    return { reply: offerMsg, sessionComplete: false }
-  }
+  // Determine whether to append an inline language switch offer after this reply.
+  // Offer when: detected language differs from default, no override locked yet.
+  const shouldOfferSwitch = !ctx.languageOverride && detectedLanguage !== defaultLang
 
   // Persist language detection into context so all subsequent branches use it
-  const updatedCtx: BookingFlowContext = { ...ctx, detectedLanguage }
+  const updatedCtx: BookingFlowContext = {
+    ...ctx,
+    detectedLanguage,
+    ...(shouldOfferSwitch ? { languageSwitchOfferPending: true } : {}),
+  }
 
-  switch (intent.intent) {
-    case 'booking':
-      return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript)
+  // Prefix injected into situation strings for first-message targeted intents
+  const firstMsgPrefix = isFirstMessage
+    ? 'This is the customer\'s first message — include a brief warm greeting before addressing their request. '
+    : ''
 
-    case 'rescheduling':
-      return handleReschedulingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript)
+  const intentResult2 = await (async (): Promise<FlowResult> => {
+    switch (intent.intent) {
+      case 'booking':
+        return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, firstMsgPrefix)
 
-    case 'cancellation':
-      return handleCancellationIntent(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript)
+      case 'rescheduling':
+        return handleReschedulingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript)
 
-    case 'list_bookings':
-      return handleListBookings(db, identity, session, updatedCtx, businessTimezone, businessName, transcript)
+      case 'cancellation':
+        return handleCancellationIntent(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript)
 
-    case 'inquiry': {
-      await completeSession(db, session.id)
-      const serviceDescriptions = activeServices.map((s) => {
-        const type = s.maxParticipants > 1 ? `group class, ${s.maxParticipants} spots` : 'private'
-        const price = businessKnowledge?.services.find((ks) => ks.id === s.id)?.price
-        const priceStr = price != null ? `, ${price} ${businessKnowledge?.services.find((ks) => ks.id === s.id)?.currency ?? ''}` : ''
-        return `${s.name} (${s.durationMinutes} min, ${type}${priceStr})`
-      }).join('; ')
-      const situation = activeServices.length > 0
-        ? `Customer asked a question about the business or services. Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above if relevant, then invite them to book.`
-        : 'Customer asked about the business. No services are configured yet. Direct them to contact the business directly.'
-      const knowledgeFields = businessKnowledge ? {
-        brandVoice: businessKnowledge.brandVoice,
-        ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
-        faqs: businessKnowledge.faqs,
-      } : {}
-      const reply = await generateCustomerReply({
-        businessName,
-        language: detectedLanguage,
-        situation,
-        transcript,
-        customerMemory: extractMemory(updatedCtx),
-        ...knowledgeFields,
-      })
-      return { reply, sessionComplete: true }
-    }
+      case 'list_bookings':
+        return handleListBookings(db, identity, session, updatedCtx, businessTimezone, businessName, transcript)
 
-    default: {
-      const unknownCount = ((updatedCtx.sessionUnknownCount as number | undefined) ?? 0) + 1
-      const ctxWithCount: BookingFlowContext = { ...updatedCtx, sessionUnknownCount: unknownCount }
-
-      // Platform escalation: after 2 unknown messages, forward to operator
-      if (unknownCount >= 2 && business) {
-        await escalateToPlatform(db, business, identity.phoneNumber, messageText)
+      case 'inquiry': {
+        await completeSession(db, session.id)
+        const serviceDescriptions = activeServices.map((s) => {
+          const type = s.maxParticipants > 1 ? `group class, ${s.maxParticipants} spots` : 'private'
+          const price = businessKnowledge?.services.find((ks) => ks.id === s.id)?.price
+          const priceStr = price != null ? `, ${price} ${businessKnowledge?.services.find((ks) => ks.id === s.id)?.currency ?? ''}` : ''
+          return `${s.name} (${s.durationMinutes} min, ${type}${priceStr})`
+        }).join('; ')
+        const situation = activeServices.length > 0
+          ? `${firstMsgPrefix}Customer asked a question about the business or services. Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above if relevant, then invite them to book.`
+          : `${firstMsgPrefix}Customer asked about the business. No services are configured yet. Direct them to contact the business directly.`
+        const knowledgeFields = businessKnowledge ? {
+          brandVoice: businessKnowledge.brandVoice,
+          ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
+          faqs: businessKnowledge.faqs,
+        } : {}
+        const inquiryReply = await generateCustomerReply({
+          businessName,
+          language: detectedLanguage,
+          situation,
+          transcript,
+          customerMemory: extractMemory(updatedCtx),
+          ...knowledgeFields,
+        })
+        return { reply: inquiryReply, sessionComplete: true }
       }
 
-      await updateSessionContext(db, session.id, ctxWithCount)
+      default: {
+        const unknownCount = ((updatedCtx.sessionUnknownCount as number | undefined) ?? 0) + 1
+        const ctxWithCount: BookingFlowContext = { ...updatedCtx, sessionUnknownCount: unknownCount }
 
-      // If the business has FAQs, give the LLM a chance to answer before refusing.
-      // Without FAQs, fall back to the narrow-scope explanation.
-      const hasFaqs = (businessKnowledge?.faqs?.length ?? 0) > 0
-      const unknownSituation = hasFaqs
-        ? `Customer sent a message the system couldn't classify as booking, cancellation, or rescheduling. Their message: "${messageText}". Check the FAQs above — if one is relevant, answer it directly. If not, politely explain the assistant handles bookings and invite them to ask about that.`
-        : 'Message intent is unknown. Explain the assistant handles booking, cancellation, rescheduling, and service inquiries only. They can also ask "what are my bookings?" to see upcoming appointments.'
+        if (unknownCount >= 2 && business) {
+          await escalateToPlatform(db, business, identity.phoneNumber, messageText)
+        }
 
-      const unknownKnowledgeFields = businessKnowledge ? {
-        brandVoice: businessKnowledge.brandVoice,
-        ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
-        faqs: businessKnowledge.faqs,
-      } : {}
-      const reply = await generateCustomerReply({
-        businessName,
-        language: detectedLanguage,
-        situation: unknownSituation,
-        transcript,
-        customerMemory: extractMemory(updatedCtx),
-        ...unknownKnowledgeFields,
-      })
-      return { reply, sessionComplete: false }
+        await updateSessionContext(db, session.id, ctxWithCount)
+
+        const hasFaqs = (businessKnowledge?.faqs?.length ?? 0) > 0
+        // First-message generic/ambiguous: welcome + introduce the PA
+        const unknownSituation = isFirstMessage
+          ? `This is the customer's first message and it is unclear or generic. Welcome them warmly, introduce yourself as the booking assistant for ${businessName}, briefly explain what you can help with (booking, cancellations, rescheduling${hasFaqs ? ', and questions about the business' : ''}), and ask how you can help.`
+          : hasFaqs
+            ? `Customer sent a message the system couldn't classify as booking, cancellation, or rescheduling. Their message: "${messageText}". Check the FAQs above — if one is relevant, answer it directly. If not, politely explain the assistant handles bookings and invite them to ask about that.`
+            : 'Message intent is unknown. Explain the assistant handles booking, cancellation, rescheduling, and service inquiries only. They can also ask "what are my bookings?" to see upcoming appointments.'
+
+        const unknownKnowledgeFields = businessKnowledge ? {
+          brandVoice: businessKnowledge.brandVoice,
+          ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
+          faqs: businessKnowledge.faqs,
+        } : {}
+        const unknownReply = await generateCustomerReply({
+          businessName,
+          language: detectedLanguage,
+          situation: unknownSituation,
+          transcript,
+          customerMemory: extractMemory(updatedCtx),
+          ...unknownKnowledgeFields,
+        })
+        return { reply: unknownReply, sessionComplete: false }
+      }
     }
+  })()
+
+  // ── Inline language switch offer ─────────────────────────────────────────
+  // Append once per turn when we detected a different language and no override is set yet.
+  if (shouldOfferSwitch && intentResult2.reply && !intentResult2.sessionComplete) {
+    const offerSuffix = detectedLanguage === 'en'
+      ? '\n\nWould you like me to continue in English? (YES / NO)'
+      : '\n\nרוצה שאמשיך בעברית? (כן / לא)'
+    return { ...intentResult2, reply: intentResult2.reply + offerSuffix }
   }
+
+  return intentResult2
 }
 
 // ── Intent handlers ───────────────────────────────────────────────────────────
@@ -321,6 +372,7 @@ async function handleBookingIntent(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  firstMsgPrefix: string = '',
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
   const slot = intent.slotRequest
@@ -425,7 +477,7 @@ async function handleBookingIntent(
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
-    situation: `Customer wants to book: ${summary}. Ask them to confirm (YES) or decline (NO).`,
+    situation: `${firstMsgPrefix}Customer wants to book: ${summary}. Ask them to confirm (YES) or decline (NO).`,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -471,7 +523,7 @@ async function handleReschedulingIntent(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: `Could not cancel the existing booking in order to reschedule. Reason: ${cancelResult.reason}. Direct customer to contact the business.`,
+      situation: `Could not cancel the existing booking in order to reschedule because ${sanitiseReason(cancelResult.reason)}. Apologise and suggest they contact the business directly.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -535,7 +587,7 @@ async function handleHoldConfirmation(
       const reply = await generateCustomerReply({
         businessName,
         language: lang,
-        situation: `Booking confirmation failed. Reason: ${confirmResult.reason}. Ask customer to contact the business or try again.`,
+        situation: `The booking could not be finalised because ${sanitiseReason(confirmResult.reason)}. Apologise and suggest they try again or contact the business directly.`,
         transcript,
         ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -583,7 +635,7 @@ async function handleHoldConfirmation(
     await completeSession(db, session.id)
     const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
     const unavailSituation = [
-      `Slot is unavailable. Reason: ${result.reason}.`,
+      `The requested slot is unavailable because ${sanitiseReason(result.reason)}.`,
       hoursSummary ?? '',
       'Suggest the customer pick a different time that falls within business hours.',
     ].filter(Boolean).join(' ')
@@ -895,7 +947,7 @@ async function handleCancellationConfirmation(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: `Cancellation failed. Reason: ${result.reason}. Direct customer to contact the business directly.`,
+      situation: `The cancellation could not be completed because ${sanitiseReason(result.reason)}. Apologise and suggest they contact the business directly.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -980,67 +1032,6 @@ async function handleListBookings(
     customerMemory: extractMemory(ctx),
   })
   return { reply, sessionComplete: true }
-}
-
-// ── Language switch handler ───────────────────────────────────────────────────
-
-async function handleLanguageSwitchConfirmation(
-  db: Db,
-  identity: ResolvedIdentity,
-  session: ActiveSession,
-  ctx: BookingFlowContext,
-  messageText: string,
-  businessTimezone: string,
-  businessName: string,
-  transcript: TranscriptTurn[],
-  calendar: CalendarClient,
-  business: Business | undefined,
-  defaultLang: 'he' | 'en',
-): Promise<FlowResult> {
-  const confirmation = parseConfirmation(messageText)
-  const buffered = ctx.bufferedMessage ?? ''
-
-  if (confirmation === 'unclear') {
-    const offerMsg = defaultLang === 'he'
-      ? `האם להמשיך באנגלית? (כן / לא) / Continue in English? (YES / NO)`
-      : `Continue in Hebrew? (YES / NO) / להמשיך בעברית? (כן / לא)`
-    return { reply: offerMsg, sessionComplete: false }
-  }
-
-  const chosenLang: 'he' | 'en' = confirmation === 'yes'
-    ? (defaultLang === 'he' ? 'en' : 'he')
-    : defaultLang
-
-  // Persist the preference on the identity so future sessions remember it (non-fatal)
-  try {
-    await db.update(identities).set({ preferredLanguage: chosenLang }).where(eq(identities.id, identity.id))
-  } catch { /* non-fatal */ }
-
-  const { bufferedMessage: _dropped, ...ctxWithoutBuffer } = ctx
-  const newCtx: BookingFlowContext = {
-    ...ctxWithoutBuffer,
-    languageOverride: chosenLang,
-  }
-  await updateSessionContext(db, session.id, newCtx, 'active')
-
-  // Re-process the original message now that language is set
-  if (!buffered) {
-    const reply = await generateCustomerReply({
-      businessName,
-      language: chosenLang,
-      situation: 'Language preference set. Greet the customer and ask how you can help.',
-      transcript,
-      customerMemory: extractMemory(newCtx),
-    })
-    return { reply, sessionComplete: false }
-  }
-
-  return handleBookingFlow(
-    db, calendar, identity,
-    { ...session, state: 'active', context: newCtx },
-    buffered, businessTimezone, businessName, transcript,
-    ctx.botPersona, business, defaultLang,
-  )
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

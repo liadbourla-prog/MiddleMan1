@@ -3,10 +3,15 @@ import type { Db } from '../../db/client.js'
 import { conversationSessions } from '../../db/schema.js'
 import type { ActiveSession, SessionState, SessionIntent } from './types.js'
 
-const SESSION_EXPIRY_MINUTES = parseInt(process.env['SESSION_EXPIRY_MINUTES'] ?? '30', 10)
+const DEFAULT_SESSION_EXPIRY_MINUTES = parseInt(process.env['SESSION_EXPIRY_MINUTES'] ?? '30', 10)
 
-function expiryFromNow(): Date {
-  return new Date(Date.now() + SESSION_EXPIRY_MINUTES * 60 * 1000)
+export const SESSION_EXPIRY = {
+  customer: DEFAULT_SESSION_EXPIRY_MINUTES,
+  manager: 240,
+} as const
+
+function expiryFromNow(minutes: number = DEFAULT_SESSION_EXPIRY_MINUTES): Date {
+  return new Date(Date.now() + minutes * 60 * 1000)
 }
 
 export async function loadActiveSession(
@@ -25,7 +30,6 @@ export async function loadActiveSession(
           eq(conversationSessions.state, 'active'),
           eq(conversationSessions.state, 'waiting_confirmation'),
           eq(conversationSessions.state, 'waiting_clarification'),
-          eq(conversationSessions.state, 'waiting_language_confirmation'),
         ),
       ),
     )
@@ -54,9 +58,10 @@ export async function createSession(
   businessId: string,
   identityId: string,
   intent: SessionIntent,
+  expiryMinutes?: number,
 ): Promise<ActiveSession> {
   const now = new Date()
-  const expiresAt = expiryFromNow()
+  const expiresAt = expiryFromNow(expiryMinutes)
 
   const [row] = await db
     .insert(conversationSessions)
@@ -89,6 +94,7 @@ export async function updateSessionContext(
   sessionId: string,
   context: Record<string, unknown>,
   state?: SessionState,
+  expiryMinutes?: number,
 ): Promise<void> {
   await db
     .update(conversationSessions)
@@ -96,7 +102,7 @@ export async function updateSessionContext(
       context,
       ...(state !== undefined ? { state } : {}),
       lastMessageAt: new Date(),
-      expiresAt: expiryFromNow(),
+      expiresAt: expiryFromNow(expiryMinutes),
     })
     .where(eq(conversationSessions.id, sessionId))
 }
@@ -134,7 +140,6 @@ export async function expireOldSessions(db: Db): Promise<number> {
           eq(conversationSessions.state, 'active'),
           eq(conversationSessions.state, 'waiting_confirmation'),
           eq(conversationSessions.state, 'waiting_clarification'),
-          eq(conversationSessions.state, 'waiting_language_confirmation'),
         ),
       ),
     )

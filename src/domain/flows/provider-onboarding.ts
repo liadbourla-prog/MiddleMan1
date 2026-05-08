@@ -16,6 +16,7 @@ import type { ProviderOnboardingSession } from '../../db/schema.js'
 import { handleOperatorMessage } from './operator.js'
 import { i18n, detectLang, type Lang } from '../i18n/t.js'
 import { sendMessage } from '../../adapters/whatsapp/sender.js'
+import { explainOnboardingConcept } from '../../adapters/llm/client.js'
 
 export interface ProviderOnboardingResult {
   reply: string
@@ -46,7 +47,7 @@ export async function handleProviderOnboarding(
   // Operator admin channel — bypass onboarding entirely
   const operatorPhone = process.env['OPERATOR_PHONE']
   if (operatorPhone && fromNumber === operatorPhone) {
-    return handleOperatorMessage(db, body)
+    return handleOperatorMessage(db, fromNumber, body)
   }
 
   let session = await loadSession(db, fromNumber)
@@ -90,6 +91,10 @@ async function handleStep(
     }
 
     case 'timezone': {
+      if (detectsQuestion(text)) {
+        const explanation = await explainOnboardingConcept({ concept: 'timezone', userMessage: text, step: 'timezone', lang })
+        if (explanation) return { reply: explanation }
+      }
       const tz = resolveTimezone(text)
       if (!tz) {
         return { reply: i18n.mm_bad_timezone[lang] }
@@ -100,6 +105,10 @@ async function handleStep(
 
     case 'calendar': {
       if (!data.calendarMode) {
+        if (detectsQuestion(text)) {
+          const explanation = await explainOnboardingConcept({ concept: 'calendar', userMessage: text, step: 'calendar', lang })
+          if (explanation) return { reply: explanation }
+        }
         // Parse natural language: does the user want Google or internal?
         const lower = text.toLowerCase()
         const wantsGoogle = lower.includes('google') || lower.includes('גוגל')
@@ -132,6 +141,10 @@ async function handleStep(
     }
 
     case 'services': {
+      if (detectsQuestion(text)) {
+        const explanation = await explainOnboardingConcept({ concept: 'services', userMessage: text, step: 'services', lang })
+        if (explanation) return { reply: explanation }
+      }
       const parsed = parseService(text)
       const failCount = data._serviceFailCount ?? 0
 
@@ -162,6 +175,10 @@ async function handleStep(
     }
 
     case 'credentials': {
+      if (detectsQuestion(text) && !isExpressingNoAccess(text)) {
+        const explanation = await explainOnboardingConcept({ concept: 'credentials', userMessage: text, step: 'credentials', lang })
+        if (explanation) return { reply: explanation }
+      }
       // Explicit confusion / absence signals always get the detailed help guide,
       // even if the message incidentally contains digits (e.g. a pasted phone number).
       if (isExpressingNoAccess(text) || isAskingForHelp(text)) {
@@ -347,6 +364,14 @@ async function advance(db: Db, managerPhone: string, nextStep: Step, data: Colle
 }
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
+
+function detectsQuestion(text: string): boolean {
+  const t = text.trim()
+  return (
+    t.includes('?') ||
+    /^(what|how|why|where|when|who|can you|could you|please explain|מה|איך|למה|איפה|מתי|מי|תסביר|הסבר|לא מבין|לא מבינה)/i.test(t)
+  )
+}
 
 function isExpressingNoAccess(text: string): boolean {
   return /(אין לי|אין לנו|don'?t have|do not have|i have no|no token|no id|no access|לא קיבלתי|לא מצאתי|לא יודע|לא יודעת|עדיין לא|haven'?t got|didn'?t get)/i.test(text)
