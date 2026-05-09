@@ -315,6 +315,7 @@ Customer profile: ${memoryText}`
         systemInstruction: systemPrompt,
         maxOutputTokens: 1024,
         temperature: 0.3,
+        thinkingConfig: { thinkingBudget: 0 },
       },
     })
 
@@ -408,7 +409,7 @@ Output: the message text ONLY. No quotes, no labels, no preamble.`
     const result = await ai.models.generateContent({
       model: MODEL,
       contents: 'Generate the next onboarding message.',
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 200, temperature: 0.45 },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.45, thinkingConfig: { thinkingBudget: 0 } },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -464,7 +465,7 @@ Output: reply text ONLY. No preamble, no quotes.`
     const result = await ai.models.generateContent({
       model: MODEL,
       contents: safeQuestion,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 400, temperature: 0.35 },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.35, thinkingConfig: { thinkingBudget: 0 } },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -553,7 +554,7 @@ Output: reply text ONLY. No preamble, no quotes.`
     const result = await ai.models.generateContent({
       model: MODEL,
       contents: safeQuestion,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 400, temperature: 0.3 },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -605,7 +606,7 @@ Output: reply text ONLY. No preamble, no quotes.`
     const result = await ai.models.generateContent({
       model: MODEL,
       contents: safeQuestion,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 300, temperature: 0.35 },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.35, thinkingConfig: { thinkingBudget: 0 } },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -649,7 +650,7 @@ Output: the explanation message ONLY. No quotes, no labels, no preamble.`
     const result = await ai.models.generateContent({
       model: MODEL,
       contents: `User message: "${input.userMessage}"`,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 450, temperature: 0.4 },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
     })
     const text = result.text?.trim()
     if (text) return text
