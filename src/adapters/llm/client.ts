@@ -474,7 +474,96 @@ Output: reply text ONLY. No preamble, no quotes.`
   return ''
 }
 
-// ── Operator: conversational reply ───────────────────────────────────────────
+// ── Operator: data-augmented smart answer ────────────────────────────────────
+
+export interface CompactBusinessSummary {
+  name: string
+  phone: string
+  status: 'live' | 'setup' | 'paused'
+  calendarMode: 'google' | 'internal'
+  googleCalendarConnected: boolean
+  hasWebsite: boolean
+  openEscalations: number
+  minutesSinceLastMsg: number | null
+}
+
+export async function answerOperatorQuestion(input: {
+  question: string
+  transcript: Array<{ role: 'operator' | 'assistant'; text: string }>
+  lang: 'he' | 'en'
+  businesses: CompactBusinessSummary[]
+  openEscalationsTotal: number
+}): Promise<string> {
+  const safeQuestion = sanitizeUserInput(input.question)
+
+  const live = input.businesses.filter((b) => b.status === 'live').length
+  const setup = input.businesses.filter((b) => b.status === 'setup').length
+  const paused = input.businesses.filter((b) => b.status === 'paused').length
+  const withGcal = input.businesses.filter((b) => b.calendarMode === 'google' && b.googleCalendarConnected).length
+  const withInternal = input.businesses.filter((b) => b.calendarMode === 'internal').length
+  const withWebsite = input.businesses.filter((b) => b.hasWebsite).length
+
+  const bizListText = input.businesses
+    .map((b) => {
+      const cal = b.calendarMode === 'internal' ? 'internal cal' : b.googleCalendarConnected ? 'Google cal ✓' : 'Google cal ✗'
+      const site = b.hasWebsite ? ' | website' : ''
+      const esc = b.openEscalations > 0 ? ` | ${b.openEscalations} open escalation(s)` : ''
+      const lastMsg = b.minutesSinceLastMsg !== null ? ` | last msg ${b.minutesSinceLastMsg}m ago` : ' | never messaged'
+      return `• ${b.name} (${b.phone}) | ${b.status} | ${cal}${site}${esc}${lastMsg}`
+    })
+    .join('\n')
+
+  const statsLine =
+    `${input.businesses.length} businesses total: ${live} live, ${setup} in setup` +
+    (paused > 0 ? `, ${paused} paused` : '') +
+    ` | ${withGcal} with Google Calendar, ${withInternal} with internal calendar` +
+    ` | ${withWebsite} with website | ${input.openEscalationsTotal} open escalations`
+
+  const transcriptText =
+    input.transcript.length > 0
+      ? input.transcript.map((t) => `${t.role === 'operator' ? 'Operator' : 'Assistant'}: ${t.text}`).join('\n')
+      : '(start of session)'
+
+  const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. You have full real-time access to the platform data below.
+
+Platform stats: ${statsLine}
+
+Business list:
+${bizListText}
+
+Language: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
+Tone: direct, warm, competent — like an admin assistant who knows the platform data.
+
+Rules:
+- Answer directly using specific numbers and names from the data above
+- For "which businesses X" questions: list them by name (≤5: inline; more: bullet list)
+- For count questions ("how many"): give the exact count first, then names if ≤5
+- For yes/no questions: answer directly then add the relevant detail
+- Maximum 5 sentences. No filler. No "based on the data I can see..."
+- Never say you lack the data — you have full data above
+- Never expose internal field names or raw system values
+- Casual greetings: respond warmly and briefly, suggest a command
+
+Recent conversation:
+${transcriptText}
+
+Output: reply text ONLY. No preamble, no quotes.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: safeQuestion,
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 400, temperature: 0.3 },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through — caller uses static fallback
+  }
+  return ''
+}
+
+// ── Operator: legacy conversational reply (used as last-resort fallback) ──────
 
 export async function generateOperatorReply(input: {
   question: string

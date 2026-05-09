@@ -3,7 +3,7 @@
  * Gives the platform owner (us) cross-business visibility and bulk controls via WhatsApp.
  */
 
-import { eq, isNull, and, desc, isNotNull, count } from 'drizzle-orm'
+import { eq, isNull, and, desc, isNotNull, count, max } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import {
   businesses,
@@ -17,7 +17,7 @@ import {
   businessFaqs,
   deferredFeatureRequests,
 } from '../../db/schema.js'
-import { classifyManagerInstruction, classifyOperatorMessage, generateOperatorReply } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, classifyOperatorMessage, answerOperatorQuestion, type CompactBusinessSummary } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
 import { operatorCapabilityRegistry } from './operator-capability-registry.js'
@@ -117,57 +117,42 @@ async function routeOperatorMessage(
     return handleRetrigger(db, businessArg, skillArg, lang)
   }
 
-  // ── Natural language fallback — keyword extraction (zero-latency, no LLM) ────
+  // ── LLM path: fetch live business data, classify intent, answer smartly ──────
 
-  if (/\bstatus\b/i.test(text) || /סטטוס/.test(text) || /\ball businesses\b/i.test(text)) {
-    return handleStatusAll(db, lang)
-  }
-  if (/\bescalation/i.test(text) || /פניות/.test(text)) {
-    return handleEscalations(db, lang)
-  }
-
-  // Hebrew questions about business completion/state → status_all (has onboarding status for every business)
-  if (
-    /עסקים/.test(text) &&
-    /(?:סיימ|גמר|פעיל|קמ[ו]|הוגדר|הגדיר|ייצר|התחיל|חי[יה]|נכנס|הצטרף|עלה)/i.test(text)
-  ) {
-    return handleStatusAll(db, lang)
-  }
-
-  // ── LLM fallback: classify intent and route, or answer conversationally ──────
-
-  const [bizCountRow, escCountRow] = await Promise.all([
-    db.select({ total: count() }).from(businesses).then((r) => r[0]),
+  const [bizSummaries, escCountRow] = await Promise.all([
+    fetchBusinessSummaries(db),
     db.select({ total: count() }).from(escalatedTasks).where(isNull(escalatedTasks.resolvedAt)).then((r) => r[0]),
   ])
-  const liveStats = {
-    businessCount: bizCountRow?.total ?? 0,
-    openEscalations: escCountRow?.total ?? 0,
+
+  const openEscalationsTotal = Number(escCountRow?.total ?? 0)
+  const liveStats = { businessCount: bizSummaries.length, openEscalations: openEscalationsTotal }
+
+  async function smartAnswer(): Promise<OperatorResult> {
+    const reply = await answerOperatorQuestion({
+      question: text,
+      transcript: operatorSession.transcript,
+      lang,
+      businesses: bizSummaries,
+      openEscalationsTotal,
+    })
+    return { reply: reply || i18n.op_help[lang] }
   }
 
   const classified = await classifyOperatorMessage(text, lang, liveStats)
-  if (!classified.ok) return { reply: i18n.op_help[lang] }
+  if (!classified.ok) return smartAnswer()
 
   const op = classified.data
 
   switch (op.action) {
-    case 'status_all':  return handleStatusAll(db, lang)
-    case 'status_one':  return op.businessName ? handleStatusOne(db, op.businessName, lang) : handleStatusAll(db, lang)
-    case 'escalations': return handleEscalations(db, lang)
     case 'update_all':  return op.updateInstruction ? handleUpdateAll(db, op.updateInstruction, lang) : { reply: i18n.op_help[lang] }
-    case 'skills_one':  return op.businessName ? handleSkillsOne(db, op.businessName, lang) : handleStatusAll(db, lang)
+    case 'skills_one':  return op.businessName ? handleSkillsOne(db, op.businessName, lang) : smartAnswer()
     case 'features':    return handleFeatures(db, lang)
     case 'retrigger':   return op.businessName ? handleRetrigger(db, op.businessName, op.skillName, lang) : { reply: i18n.op_help[lang] }
+    case 'escalations': return handleEscalations(db, lang)
+    case 'status_one':  return op.businessName ? handleStatusOne(db, op.businessName, lang) : smartAnswer()
     case 'help':        return { reply: i18n.op_help[lang] }
-    case 'general_qa': {
-      const llmReply = await generateOperatorReply({
-        question: text,
-        transcript: operatorSession.transcript,
-        lang,
-        liveStats,
-      })
-      return { reply: llmReply || op.freeformReply || i18n.op_help[lang] }
-    }
+    // status_all, general_qa, and any unrecognised action → smart data-augmented answer
+    default:            return smartAnswer()
   }
 }
 
@@ -624,6 +609,58 @@ async function handleRetrigger(db: Db, nameOrNumber: string, skillName: string |
   await createWorkflow(db, found.id, manager.id, skillName, capability.retriggersFirstStep)
 
   return { reply: i18n.op_retrigger_ok[lang](found.name, skillName) }
+}
+
+async function fetchBusinessSummaries(db: Db): Promise<CompactBusinessSummary[]> {
+  const allBiz = await db
+    .select({
+      id: businesses.id,
+      name: businesses.name,
+      phone: businesses.whatsappNumber,
+      onboardingCompletedAt: businesses.onboardingCompletedAt,
+      isPaused: businesses.paused,
+      calendarMode: businesses.calendarMode,
+      googleRefreshToken: businesses.googleRefreshToken,
+    })
+    .from(businesses)
+    .orderBy(businesses.createdAt)
+
+  if (allBiz.length === 0) return []
+
+  const [escalationRows, websiteRows, lastMsgRows] = await Promise.all([
+    db
+      .select({ businessId: escalatedTasks.businessId, cnt: count() })
+      .from(escalatedTasks)
+      .where(isNull(escalatedTasks.resolvedAt))
+      .groupBy(escalatedTasks.businessId),
+    db
+      .select({ businessId: skillWorkflows.businessId })
+      .from(skillWorkflows)
+      .where(and(eq(skillWorkflows.skillName, 'website-builder'), eq(skillWorkflows.status, 'completed'))),
+    db
+      .select({ businessId: processedMessages.businessId, lastMsg: max(processedMessages.processedAt) })
+      .from(processedMessages)
+      .groupBy(processedMessages.businessId),
+  ])
+
+  const escalationMap = new Map(escalationRows.map((r) => [r.businessId, Number(r.cnt)]))
+  const websiteSet = new Set(websiteRows.map((r) => r.businessId))
+  const lastMsgMap = new Map(lastMsgRows.map((r) => [r.businessId, r.lastMsg]))
+
+  return allBiz.map((biz) => {
+    const lastMsg = lastMsgMap.get(biz.id)
+    const calendarMode = (biz.calendarMode ?? 'internal') as 'google' | 'internal'
+    return {
+      name: biz.name,
+      phone: biz.phone ?? '',
+      status: !biz.onboardingCompletedAt ? 'setup' : biz.isPaused ? 'paused' : 'live',
+      calendarMode,
+      googleCalendarConnected: calendarMode === 'internal' || !!biz.googleRefreshToken,
+      hasWebsite: websiteSet.has(biz.id),
+      openEscalations: escalationMap.get(biz.id) ?? 0,
+      minutesSinceLastMsg: lastMsg ? Math.round((Date.now() - lastMsg.getTime()) / 60_000) : null,
+    }
+  })
 }
 
 async function handleWebsitesAll(db: Db, lang: Lang): Promise<OperatorResult> {
