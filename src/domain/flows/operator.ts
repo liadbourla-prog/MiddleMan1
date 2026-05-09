@@ -126,6 +126,14 @@ async function routeOperatorMessage(
     return handleEscalations(db, lang)
   }
 
+  // Hebrew questions about business completion/state → status_all (has onboarding status for every business)
+  if (
+    /עסקים/.test(text) &&
+    /(?:סיימ|גמר|פעיל|קמ[ו]|הוגדר|הגדיר|ייצר|התחיל|חי[יה]|נכנס|הצטרף|עלה)/i.test(text)
+  ) {
+    return handleStatusAll(db, lang)
+  }
+
   // ── LLM fallback: classify intent and route, or answer conversationally ──────
 
   const [bizCountRow, escCountRow] = await Promise.all([

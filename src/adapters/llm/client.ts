@@ -186,6 +186,8 @@ Routing hints:
 - "website(s)", "site(s)" for a specific business → skills_one
 - "all websites", "websites status", "אתרים", "אתר" with no specific business → skills_one (not status_all)
 - "status of [name]", "how is [name]" → status_one
+- ANY question about which businesses finished setup, went live, completed registration, or are active → status_all (e.g. "יש עסקים שסיימו?", "which businesses are live?", "מי כבר פעיל?", "did any businesses finish?")
+- ANY question about business state, progress, or completion without a specific business name → status_all
 - Greetings ("hi", "hello", "שלום", "היי"), casual questions → general_qa
 - "what can you do", "help me" → help
 
