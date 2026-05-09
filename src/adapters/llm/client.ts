@@ -38,6 +38,7 @@ const managerInstructionSchema = z.object({
     'policy_change',
     'service_change',
     'permission_change',
+    'booking_cancellation',
     'unknown',
   ]),
   structuredParams: z.record(z.unknown()),
@@ -119,6 +120,11 @@ service_change:
 
 permission_change:
   { "action": "grant"|"revoke", "phoneNumber": "+E164", "displayName": string|null }
+
+booking_cancellation:
+  { "customerNameHint": string|null, "customerPhone": "+E164"|null, "slotDateHint": "YYYY-MM-DD or natural language date"|null, "bookingId": "uuid"|null, "reason": string|null }
+  Use when the manager explicitly asks to cancel a specific customer's booking (e.g. "cancel David's appointment tomorrow", "ביטול תור של שרה ב-15 למאי").
+  Do NOT use for policy changes about cancellation rules — use policy_change for those.
 
 policy_change:
   {
@@ -217,6 +223,15 @@ function sanitizeUserInput(text: string): string {
 const PA_PERSONA_TEMPLATE = `You are the booking assistant for {businessName}. You speak as the business — not as an AI, not as a bot, not as a third party.
 
 LANGUAGE RULE — strictly enforced: reply ENTIRELY in {language}. If {language} is "he", write only in Hebrew. If {language} is "en", write only in English. Never mix languages in one reply.
+
+WHATSAPP FORMATTING — strictly enforced:
+- Supported: *bold* for key info only (service name, time, price). Never bold entire sentences.
+- Bullet lists: use • (U+2022) with a space after. Never use -, *, or numbered lists.
+- URLs: place on their own line, never inside parentheses or as markdown [text](url).
+- No HTML tags, no markdown headers (#, ##), no tables.
+- Maximum one question per message — never stack two questions.
+- Confirmations and simple answers: 1–2 sentences. Complex explanations: up to 4 sentences. Never pad with filler.
+- Emoji: maximum one per message at a key moment (✅ confirmed, 📅 date info). None in questions or clarifications.
 
 Tone and voice:
 - Warm and direct. Think of the competent person at a business you trust — not a chatbot, not a call centre.
@@ -483,9 +498,11 @@ export interface CompactBusinessSummary {
   status: 'live' | 'setup' | 'paused'
   calendarMode: 'google' | 'internal'
   googleCalendarConnected: boolean
+  calendarTokenExpired: boolean
   hasWebsite: boolean
   openEscalations: number
   minutesSinceLastMsg: number | null
+  managerPhoneNumber: string | null
 }
 
 export async function answerOperatorQuestion(input: {
@@ -494,6 +511,7 @@ export async function answerOperatorQuestion(input: {
   lang: 'he' | 'en'
   businesses: CompactBusinessSummary[]
   openEscalationsTotal: number
+  sessionNotes?: string[]
 }): Promise<string> {
   const safeQuestion = sanitizeUserInput(input.question)
 
@@ -506,11 +524,13 @@ export async function answerOperatorQuestion(input: {
 
   const bizListText = input.businesses
     .map((b) => {
-      const cal = b.calendarMode === 'internal' ? 'internal cal' : b.googleCalendarConnected ? 'Google cal ✓' : 'Google cal ✗'
+      let cal = b.calendarMode === 'internal' ? 'internal cal' : b.googleCalendarConnected ? 'Google cal ✓' : 'Google cal ✗'
+      if (b.calendarTokenExpired) cal += ' (token expired)'
       const site = b.hasWebsite ? ' | website' : ''
       const esc = b.openEscalations > 0 ? ` | ${b.openEscalations} open escalation(s)` : ''
       const lastMsg = b.minutesSinceLastMsg !== null ? ` | last msg ${b.minutesSinceLastMsg}m ago` : ' | never messaged'
-      return `• ${b.name} (${b.phone}) | ${b.status} | ${cal}${site}${esc}${lastMsg}`
+      const mgr = b.managerPhoneNumber ? ` | manager: ${b.managerPhoneNumber}` : ''
+      return `• ${b.name} (${b.phone}) | ${b.status} | ${cal}${site}${esc}${lastMsg}${mgr}`
     })
     .join('\n')
 
@@ -525,15 +545,25 @@ export async function answerOperatorQuestion(input: {
       ? input.transcript.map((t) => `${t.role === 'operator' ? 'Operator' : 'Assistant'}: ${t.text}`).join('\n')
       : '(start of session)'
 
+  const notesBlock = input.sessionNotes && input.sessionNotes.length > 0
+    ? `\nCross-session context (previous operator sessions):\n${input.sessionNotes.map((s, i) => `[Session ${i + 1}] ${s}`).join('\n')}`
+    : ''
+
   const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. You have full real-time access to the platform data below.
 
 Platform stats: ${statsLine}
 
 Business list:
 ${bizListText}
-
+${notesBlock}
 Language: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
 Tone: direct, warm, competent — like an admin assistant who knows the platform data.
+
+WhatsApp formatting — strictly enforced:
+- No HTML tags. No markdown headers (#, ##). No markdown links [text](url).
+- Bullet lists: use • (U+2022), not -, *, or numbered lists unless order matters.
+- URLs: on their own line, never inline.
+- Maximum one question per message.
 
 Rules:
 - Answer directly using specific numbers and names from the data above

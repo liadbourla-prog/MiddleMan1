@@ -62,6 +62,9 @@ export const businesses = pgTable('businesses', {
   websiteJson: jsonb('website_json'),
   websitePreviewUrl: text('website_preview_url'),
   websiteUrl: text('website_url'),
+  // Daily briefing (opt-in manager summary)
+  dailyBriefingEnabled: boolean('daily_briefing_enabled').notNull().default(false),
+  dailyBriefingTime: text('daily_briefing_time').default('09:00'),
 })
 
 export const identities = pgTable(
@@ -235,7 +238,7 @@ export const managerInstructions = pgTable('manager_instructions', {
   rawMessage: text('raw_message').notNull(),
   receivedAt: timestamp('received_at', { withTimezone: true }).notNull(),
   classifiedAs: text('classified_as', {
-    enum: ['availability_change', 'policy_change', 'service_change', 'permission_change', 'unknown'],
+    enum: ['availability_change', 'policy_change', 'service_change', 'permission_change', 'booking_cancellation', 'unknown'],
   }),
   structuredOutput: jsonb('structured_output'),
   appliedAt: timestamp('applied_at', { withTimezone: true }),
@@ -462,6 +465,50 @@ export const workflowStepLogs = pgTable('workflow_step_logs', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
+// Cross-session manager conversation summaries (used by orchestrator system prompt)
+export const managerMemory = pgTable(
+  'manager_memory',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    identityId: uuid('identity_id').notNull().references(() => identities.id),
+    periodStart: timestamp('period_start', { withTimezone: true }).notNull(),
+    periodEnd: timestamp('period_end', { withTimezone: true }).notNull(),
+    summary: text('summary').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('manager_memory_identity_idx').on(t.identityId, t.createdAt)],
+)
+
+// Non-customer contacts: suppliers, partners, staff
+export const businessContacts = pgTable(
+  'business_contacts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    name: text('name').notNull(),
+    phoneNumber: text('phone_number'),
+    email: text('email'),
+    role: text('role'),
+    notes: text('notes'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('business_contacts_business_idx').on(t.businessId)],
+)
+
+// Cross-session operator notes for Branch 1 memory
+export const operatorSessionNotes = pgTable(
+  'operator_session_notes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    summary: text('summary').notNull(),
+    periodStart: timestamp('period_start', { withTimezone: true }).notNull(),
+    periodEnd: timestamp('period_end', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+)
+
 // ── Type exports ──────────────────────────────────────────────────────────────
 
 export type Business = typeof businesses.$inferSelect
@@ -485,6 +532,9 @@ export type BusinessFaq = typeof businessFaqs.$inferSelect
 export type SkillWorkflow = typeof skillWorkflows.$inferSelect
 export type WorkflowStepLog = typeof workflowStepLogs.$inferSelect
 export type DeferredFeatureRequest = typeof deferredFeatureRequests.$inferSelect
+export type ManagerMemory = typeof managerMemory.$inferSelect
+export type BusinessContact = typeof businessContacts.$inferSelect
+export type OperatorSessionNote = typeof operatorSessionNotes.$inferSelect
 
 export type BookingState = Booking['state']
 export type IdentityRole = Identity['role']

@@ -65,13 +65,14 @@ export async function importRoutes(app: FastifyInstance) {
         return reply.status(400).type('text/html').send(errorPage('No files received.'))
       }
 
-      const totalSummary = { contacts: 0, services: 0, bookingHistory: 0, errors: [] as string[] }
+      const totalSummary = { contacts: 0, services: 0, bookingHistory: 0, duplicatesSkipped: 0, errors: [] as string[] }
 
       for (const { filename, content } of files) {
         const summary = await processImportFile(db, record.businessId, filename, content)
         totalSummary.contacts += summary.contacts
         totalSummary.services += summary.services
         totalSummary.bookingHistory += summary.bookingHistory
+        totalSummary.duplicatesSkipped += summary.duplicatesSkipped
         totalSummary.errors.push(...summary.errors)
       }
 
@@ -93,29 +94,38 @@ export async function importRoutes(app: FastifyInstance) {
         ? { accessToken: advancedBusiness.whatsappAccessToken, phoneNumberId: advancedBusiness.whatsappPhoneNumberId }
         : undefined
 
-      const parts: string[] = []
-      if (totalSummary.contacts > 0) parts.push(i18n.ob_import_contacts[lang](totalSummary.contacts))
-      if (totalSummary.services > 0) parts.push(i18n.ob_import_services_count[lang](totalSummary.services))
-      if (totalSummary.bookingHistory > 0) parts.push(i18n.ob_import_history[lang](totalSummary.bookingHistory))
-      const imported = parts.length > 0 ? parts.join(', ') : i18n.ob_import_nothing[lang]
-      const errorNote = totalSummary.errors.length > 0
-        ? i18n.ob_import_skipped[lang](totalSummary.errors.length)
-        : ''
+      // Build a structured bullet-list WhatsApp message
+      const bulletLines: string[] = []
+      if (totalSummary.contacts > 0) bulletLines.push(i18n.ob_import_contacts[lang](totalSummary.contacts))
+      if (totalSummary.services > 0) bulletLines.push(i18n.ob_import_services_count[lang](totalSummary.services))
+      if (totalSummary.bookingHistory > 0) bulletLines.push(i18n.ob_import_history[lang](totalSummary.bookingHistory))
+      if (totalSummary.duplicatesSkipped > 0) {
+        bulletLines.push(lang === 'he'
+          ? `${totalSummary.duplicatesSkipped} כפילויות דולגו`
+          : `${totalSummary.duplicatesSkipped} duplicates skipped`)
+      }
+      if (totalSummary.errors.length > 0) bulletLines.push(i18n.ob_import_skipped[lang](totalSummary.errors.length))
 
-      const summary = await buildVerifySummary(db, advancedBusiness, lang).catch(() => '')
-      const importMsg = i18n.ob_import_complete_msg[lang](imported, errorNote)
+      const header = lang === 'he' ? '✅ הייבוא הושלם:' : '✅ Import complete:'
+      const nothing = i18n.ob_import_nothing[lang]
+      const importMsg = bulletLines.length > 0
+        ? `${header}\n${bulletLines.map((l) => `• ${l}`).join('\n')}`
+        : `${header} ${nothing}`
+
+      const verifySummary = await buildVerifySummary(db, advancedBusiness, lang).catch(() => '')
 
       await sendMessage(
         {
           toNumber: record.managerPhone,
-          body: summary ? `${importMsg}\n\n${summary}` : importMsg,
+          body: verifySummary ? `${importMsg}\n\n${verifySummary}` : importMsg,
         },
         waCredentials,
       ).catch(() => {/* non-fatal */})
 
       app.log.info({ businessId: record.businessId, totalSummary }, 'Import complete')
 
-      return reply.type('text/html').send(successPage(imported))
+      const importedSummary = bulletLines.length > 0 ? bulletLines.join(', ') : nothing
+      return reply.type('text/html').send(successPage(importedSummary))
     },
   )
 }

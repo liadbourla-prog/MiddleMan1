@@ -46,11 +46,12 @@ export async function buildSkillContext(params: {
   businessKnowledge: BusinessKnowledge
   managerPhone?: string
   waCredentials?: { accessToken: string; phoneNumberId: string }
+  managerMemorySummaries?: string[]
 }): Promise<SkillContext> {
   const {
     db: dbInst, business, identity, session, messageText,
     conversationHistory, language, workflowState, businessKnowledge,
-    managerPhone, waCredentials,
+    managerPhone, waCredentials, managerMemorySummaries,
   } = params
 
   const recentCompletedBooking = await loadRecentCompletedBooking(dbInst, identity.id)
@@ -103,6 +104,7 @@ export async function buildSkillContext(params: {
       },
     },
     recentCompletedBooking,
+    ...(managerMemorySummaries ? { managerMemorySummaries } : {}),
     customerSegmentQuery: async (filter: SegmentFilter): Promise<CustomerSummary[]> => {
       if (identity.role !== 'manager') return []
       return queryCustomerSegment(dbInst, business.id, filter)

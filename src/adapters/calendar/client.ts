@@ -6,6 +6,7 @@ import type {
   HoldResult,
   ConfirmResult,
   DeleteResult,
+  ListedEvent,
 } from './types.js'
 import { sendMessage } from '../whatsapp/sender.js'
 import { i18n, type Lang } from '../../domain/i18n/t.js'
@@ -104,7 +105,39 @@ function createInternalCalendarClient(options: CalendarClientOptions) {
     return { status: 'confirmed', eventId }
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent }
+  async function listEvents(from: Date, to: Date): Promise<ListedEvent[]> {
+    const { db } = await import('../../db/client.js')
+    const { bookings: bookingsTable, identities: identitiesTable } = await import('../../db/schema.js')
+    const rows = await db
+      .select({
+        id: bookingsTable.id,
+        slotStart: bookingsTable.slotStart,
+        slotEnd: bookingsTable.slotEnd,
+        state: bookingsTable.state,
+        customerName: identitiesTable.displayName,
+      })
+      .from(bookingsTable)
+      .leftJoin(identitiesTable, eq(bookingsTable.customerId, identitiesTable.id))
+      .where(and(
+        eq(bookingsTable.businessId, businessId),
+        gte(bookingsTable.slotStart, from),
+        lte(bookingsTable.slotStart, to),
+        or(eq(bookingsTable.state, 'confirmed'), eq(bookingsTable.state, 'held')),
+      ))
+    return rows.map((r) => ({
+      eventId: r.id,
+      title: r.customerName ? `Booking — ${r.customerName}` : 'Booking',
+      start: r.slotStart,
+      end: r.slotEnd,
+      isBooking: true,
+    }))
+  }
+
+  async function createPersonalEvent(slot: CalendarSlot, summary: string, description?: string): Promise<ConfirmResult> {
+    return createConfirmedEvent(slot, summary, description ?? '')
+  }
+
+  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent }
 }
 
 // ── Google Calendar ───────────────────────────────────────────────────────────
@@ -265,7 +298,36 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
     }
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent }
+  async function listEvents(from: Date, to: Date): Promise<ListedEvent[]> {
+    try {
+      const response = await withTokenRefresh(() =>
+        calendar.events.list({
+          calendarId,
+          timeMin: from.toISOString(),
+          timeMax: to.toISOString(),
+          singleEvents: true,
+          orderBy: 'startTime',
+          maxResults: 50,
+          fields: 'items(id,summary,start,end)',
+        }),
+      )
+      return (response.data.items ?? []).map((ev) => ({
+        eventId: ev.id ?? '',
+        title: ev.summary ?? '(no title)',
+        start: new Date(ev.start?.dateTime ?? ev.start?.date ?? ''),
+        end: new Date(ev.end?.dateTime ?? ev.end?.date ?? ''),
+        isBooking: (ev.summary ?? '').includes(HOLD_PREFIX) || false,
+      }))
+    } catch (err) {
+      throw new Error(`Calendar listEvents failed: ${extractErrorMessage(err)}`)
+    }
+  }
+
+  async function createPersonalEvent(slot: CalendarSlot, summary: string, description?: string): Promise<ConfirmResult> {
+    return createConfirmedEvent(slot, summary, description ?? '')
+  }
+
+  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────

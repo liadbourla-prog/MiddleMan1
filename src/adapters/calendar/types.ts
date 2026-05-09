@@ -22,6 +22,14 @@ export type DeleteResult =
   | { status: 'not_found' }
   | { status: 'error'; reason: string }
 
+export interface ListedEvent {
+  eventId: string
+  title: string
+  start: Date
+  end: Date
+  isBooking: boolean
+}
+
 export interface HoldEventMeta {
   eventId: string
   bookingId: string

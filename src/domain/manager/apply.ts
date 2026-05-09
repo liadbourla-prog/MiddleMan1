@@ -84,6 +84,9 @@ export async function applyInstruction(
     case 'policy_change':
       result = await applyPolicyChange(db, businessId, actorId, structuredParams, lang)
       break
+    case 'booking_cancellation':
+      result = await applyBookingCancellation(db, businessId, actorId, structuredParams, lang)
+      break
     default:
       result = { ok: false, reason: i18n.apply_unknown_type[lang](instructionType) }
   }
@@ -545,6 +548,161 @@ async function applyPolicyChange(
       // but handle gracefully in case it is.
       return { ok: false, reason: i18n.apply_policy_unsupported[lang] }
   }
+}
+
+// ── Booking cancellation ──────────────────────────────────────────────────────
+
+const bookingCancellationSchema = z.object({
+  customerNameHint: z.string().optional(),
+  customerPhone: z.string().optional(),
+  slotDateHint: z.string().optional(),
+  bookingId: z.string().uuid().optional(),
+  reason: z.string().optional(),
+})
+
+async function applyBookingCancellation(
+  db: Db,
+  businessId: string,
+  actorId: string,
+  params: Record<string, unknown>,
+  lang: Lang,
+): Promise<ApplyResult> {
+  const parsed = bookingCancellationSchema.safeParse(params)
+  if (!parsed.success) {
+    return { ok: false, reason: `Invalid booking_cancellation params: ${parsed.error.message}` }
+  }
+
+  const p = parsed.data
+
+  // Resolve the booking: prefer explicit bookingId, else search by customer hint + date
+  let bookingRow: { id: string; customerId: string; slotStart: Date; calendarEventId: string | null; serviceTypeId: string } | undefined
+
+  if (p.bookingId) {
+    const [row] = await db
+      .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId, serviceTypeId: bookings.serviceTypeId })
+      .from(bookings)
+      .where(and(eq(bookings.id, p.bookingId), eq(bookings.businessId, businessId), or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held'))))
+      .limit(1)
+    bookingRow = row
+  } else {
+    // Search by customer phone or name + optional date hint
+    let candidateIdentityId: string | undefined
+
+    if (p.customerPhone) {
+      const [id] = await db
+        .select({ id: identities.id })
+        .from(identities)
+        .where(and(eq(identities.businessId, businessId), eq(identities.phoneNumber, p.customerPhone)))
+        .limit(1)
+      candidateIdentityId = id?.id
+    } else if (p.customerNameHint) {
+      const matches = await db
+        .select({ id: identities.id, displayName: identities.displayName })
+        .from(identities)
+        .where(eq(identities.businessId, businessId))
+      const lower = p.customerNameHint.toLowerCase()
+      const match = matches.find((m) => m.displayName?.toLowerCase().includes(lower))
+      candidateIdentityId = match?.id
+    }
+
+    if (!candidateIdentityId) {
+      return { ok: false, reason: lang === 'he' ? 'לא נמצא לקוח תואם. ציין שם, טלפון, או מזהה תור.' : 'No matching customer found. Specify a name, phone number, or booking ID.' }
+    }
+
+    const baseWhere = and(
+      eq(bookings.businessId, businessId),
+      eq(bookings.customerId, candidateIdentityId),
+      or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held')),
+      gt(bookings.slotStart, new Date()),
+    )
+
+    let candidates = await db
+      .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId, serviceTypeId: bookings.serviceTypeId })
+      .from(bookings)
+      .where(baseWhere)
+      .orderBy(bookings.slotStart)
+      .limit(10)
+
+    if (p.slotDateHint) {
+      const hintLower = p.slotDateHint.toLowerCase()
+      const filtered = candidates.filter((b) => {
+        const dateStr = b.slotStart.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }).toLowerCase()
+        return dateStr.includes(hintLower) || b.slotStart.toISOString().startsWith(p.slotDateHint!)
+      })
+      if (filtered.length > 0) candidates = filtered
+    }
+
+    if (candidates.length === 0) {
+      return { ok: false, reason: lang === 'he' ? 'לא נמצא תור עתידי פעיל ללקוח זה.' : 'No active upcoming booking found for this customer.' }
+    }
+    if (candidates.length > 1) {
+      const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+      const list = candidates.slice(0, 5).map((b) =>
+        b.slotStart.toLocaleString(locale, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+      ).join(', ')
+      return { ok: false, reason: lang === 'he' ? `נמצאו ${candidates.length} תורים. ציין תאריך: ${list}` : `Found ${candidates.length} bookings. Specify a date: ${list}` }
+    }
+    bookingRow = candidates[0]
+  }
+
+  if (!bookingRow) {
+    return { ok: false, reason: lang === 'he' ? 'התור לא נמצא או כבר בוטל.' : 'Booking not found or already cancelled.' }
+  }
+
+  // Delete Google Calendar event
+  const [biz] = await db
+    .select({ googleRefreshToken: businesses.googleRefreshToken, googleCalendarId: businesses.googleCalendarId, calendarMode: businesses.calendarMode })
+    .from(businesses)
+    .where(eq(businesses.id, businessId))
+    .limit(1)
+
+  if (bookingRow.calendarEventId && biz?.calendarMode !== 'internal') {
+    const { createCalendarClient } = await import('../../adapters/calendar/client.js')
+    const cal = createCalendarClient({
+      accessToken: '',
+      refreshToken: biz?.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
+      calendarId: biz?.googleCalendarId ?? '',
+      businessId,
+      calendarMode: 'google',
+    })
+    await cal.deleteEvent(bookingRow.calendarEventId).catch(() => { /* non-fatal */ })
+  }
+
+  // Cancel the booking
+  await db.update(bookings)
+    .set({ state: 'cancelled', cancellationReason: p.reason ?? 'Cancelled by manager', cancelledByRole: 'manager', updatedAt: new Date() })
+    .where(eq(bookings.id, bookingRow.id))
+
+  // Notify the customer
+  const [customer] = await db
+    .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage, displayName: identities.displayName })
+    .from(identities)
+    .where(eq(identities.id, bookingRow.customerId))
+    .limit(1)
+
+  if (customer) {
+    const custLang: Lang = (customer.preferredLanguage as Lang | null | undefined) ?? lang
+    const locale = custLang === 'he' ? 'he-IL' : 'en-GB'
+    const dateStr = bookingRow.slotStart.toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })
+    await enqueueMessage(customer.phoneNumber, i18n.booking_cancelled_schedule[custLang](dateStr)).catch(() => { /* non-fatal */ })
+  }
+
+  await logAudit(db, {
+    businessId,
+    actorId,
+    action: 'booking.manager_cancelled',
+    entityType: 'booking',
+    entityId: bookingRow.id,
+    metadata: { reason: p.reason, customerNameHint: p.customerNameHint, slotDateHint: p.slotDateHint },
+  })
+
+  const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+  const slotStr = bookingRow.slotStart.toLocaleString(locale, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+  const who = customer?.displayName ?? customer?.phoneNumber ?? (lang === 'he' ? 'הלקוח' : 'the customer')
+  const msg = lang === 'he'
+    ? `✅ התור של ${who} ב-${slotStr} בוטל. הלקוח קיבל הודעה.`
+    : `✅ ${who}'s booking on ${slotStr} has been cancelled. The customer has been notified.`
+  return { ok: true, confirmationMessage: msg }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

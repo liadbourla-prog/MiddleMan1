@@ -180,6 +180,7 @@ export interface SkillContext {
   workflowState: WorkflowState | null
   workflow: WorkflowCallbacks
   recentCompletedBooking: CompletedBookingSummary | null
+  managerMemorySummaries?: string[]
   customerSegmentQuery: (filter: SegmentFilter) => Promise<CustomerSummary[]>
   saveFAQs: (faqs: Array<{ question: string; answer: string }>) => Promise<void>
   saveServiceNarrative: (serviceTypeId: string, narrative: string) => Promise<void>

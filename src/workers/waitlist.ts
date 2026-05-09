@@ -2,7 +2,7 @@ import { Worker, Queue } from 'bullmq'
 import { eq, and, asc, isNull } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { waitlist, identities, businesses, serviceTypes } from '../db/schema.js'
-import { sendMessage } from '../adapters/whatsapp/sender.js'
+import { sendMessage, canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
@@ -131,10 +131,30 @@ async function processJob(job: { data: WaitlistJob }) {
     const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
       ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
       : undefined
-    await sendMessage({
-      toNumber: customer.phoneNumber,
-      body: i18n.waitlist_offer[lang](biz.name, service?.name ?? (lang === 'he' ? 'תור' : 'appointment'), dateStr, OFFER_TTL_MINUTES),
-    }, waCredentials).catch(() => { /* retry queue handles failures */ })
+    const offerBody = i18n.waitlist_offer[lang](biz.name, service?.name ?? (lang === 'he' ? 'תור' : 'appointment'), dateStr, OFFER_TTL_MINUTES)
+
+    const freeFormAllowed = await canSendFreeForm(next.customerId)
+    if (freeFormAllowed) {
+      await sendMessage({ toNumber: customer.phoneNumber, body: offerBody }, waCredentials)
+        .catch(() => { /* retry queue handles failures */ })
+    } else {
+      await sendTemplateMessage({
+        toNumber: customer.phoneNumber,
+        templateName: 'waitlist_slot_offer',
+        languageCode: lang === 'he' ? 'he' : 'en',
+        components: [{
+          type: 'body',
+          parameters: [
+            { type: 'text', text: biz.name },
+            { type: 'text', text: service?.name ?? (lang === 'he' ? 'תור' : 'appointment') },
+            { type: 'text', text: dateStr },
+            { type: 'text', text: String(OFFER_TTL_MINUTES) },
+          ],
+        }],
+        bodyText: offerBody,
+        ...(waCredentials !== undefined && { credentials: waCredentials }),
+      }).catch(() => { /* retry queue handles failures */ })
+    }
   }
 
   // Schedule expiry job

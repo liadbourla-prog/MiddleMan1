@@ -11,6 +11,9 @@ import { startSessionExpiryWorker } from './workers/session-expiry.js'
 import { startWaitlistWorker } from './workers/waitlist.js'
 import { startReminderWorker } from './workers/reminder.js'
 import { startQueuedMessageWorker } from './workers/queued-messages.js'
+import { startManagerSummaryWorker } from './workers/generate-manager-summary.js'
+import { startOperatorSummaryWorker } from './workers/generate-operator-summary.js'
+import { startDailyBriefingWorker } from './workers/daily-briefing.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
@@ -74,5 +77,8 @@ startSessionExpiryWorker()
 startWaitlistWorker()
 startReminderWorker()
 startQueuedMessageWorker()
+startManagerSummaryWorker()
+startOperatorSummaryWorker()
+startDailyBriefingWorker()
 await scheduleHoldExpiryJob()
 app.log.info('Background workers started')

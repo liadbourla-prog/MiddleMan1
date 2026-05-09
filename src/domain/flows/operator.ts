@@ -16,6 +16,7 @@ import {
   skillWorkflows,
   businessFaqs,
   deferredFeatureRequests,
+  operatorSessionNotes,
 } from '../../db/schema.js'
 import { classifyManagerInstruction, classifyOperatorMessage, answerOperatorQuestion, type CompactBusinessSummary } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
@@ -24,6 +25,7 @@ import { operatorCapabilityRegistry } from './operator-capability-registry.js'
 import { detectLang, i18n, type Lang } from '../i18n/t.js'
 import { redis } from '../../redis.js'
 import { loadOperatorSession, appendOperatorTurn } from '../session/operator-session.js'
+import { enqueueOperatorSummary } from '../../workers/generate-operator-summary.js'
 
 export interface OperatorResult {
   reply: string
@@ -42,10 +44,31 @@ export async function handleOperatorMessage(
   const operatorSession = await loadOperatorSession(redis, fromNumber)
   await appendOperatorTurn(redis, fromNumber, 'operator', text)
 
+  // Load last 3 cross-session summaries for the operator
+  const sessionNoteRows = await db
+    .select({ summary: operatorSessionNotes.summary })
+    .from(operatorSessionNotes)
+    .orderBy(desc(operatorSessionNotes.createdAt))
+    .limit(3)
+  const sessionNotes = sessionNoteRows.map((r) => r.summary)
+
   // ── Route to a handler, then append assistant turn regardless of path ────────
 
-  const result = await routeOperatorMessage(db, text, upper, lang, fromNumber, operatorSession)
+  const result = await routeOperatorMessage(db, text, upper, lang, fromNumber, operatorSession, sessionNotes)
   await appendOperatorTurn(redis, fromNumber, 'assistant', result.reply).catch(() => {/* best-effort */})
+
+  // Enqueue a summary of the session so far (idempotent — deduped by period start)
+  const firstTurn = operatorSession.transcript[0]
+  if (firstTurn) {
+    const periodStart = new Date(firstTurn.ts)
+    const periodEnd = new Date()
+    const fullTranscript = [
+      ...operatorSession.transcript,
+      { role: 'assistant' as const, text: result.reply, ts: Date.now() },
+    ]
+    enqueueOperatorSummary(fullTranscript, periodStart, periodEnd).catch(() => {/* best-effort */})
+  }
+
   return result
 }
 
@@ -56,6 +79,7 @@ async function routeOperatorMessage(
   lang: Lang,
   fromNumber: string,
   operatorSession: Awaited<ReturnType<typeof loadOperatorSession>>,
+  sessionNotes: string[],
 ): Promise<OperatorResult> {
   // ── Exact keyword matches (English & Hebrew aliases) ─────────────────────────
 
@@ -134,6 +158,7 @@ async function routeOperatorMessage(
       lang,
       businesses: bizSummaries,
       openEscalationsTotal,
+      sessionNotes,
     })
     return { reply: reply || i18n.op_help[lang] }
   }
@@ -627,7 +652,7 @@ async function fetchBusinessSummaries(db: Db): Promise<CompactBusinessSummary[]>
 
   if (allBiz.length === 0) return []
 
-  const [escalationRows, websiteRows, lastMsgRows] = await Promise.all([
+  const [escalationRows, websiteRows, lastMsgRows, managerRows] = await Promise.all([
     db
       .select({ businessId: escalatedTasks.businessId, cnt: count() })
       .from(escalatedTasks)
@@ -641,11 +666,16 @@ async function fetchBusinessSummaries(db: Db): Promise<CompactBusinessSummary[]>
       .select({ businessId: processedMessages.businessId, lastMsg: max(processedMessages.processedAt) })
       .from(processedMessages)
       .groupBy(processedMessages.businessId),
+    db
+      .select({ businessId: identities.businessId, phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.role, 'manager'), isNull(identities.revokedAt))),
   ])
 
   const escalationMap = new Map(escalationRows.map((r) => [r.businessId, Number(r.cnt)]))
   const websiteSet = new Set(websiteRows.map((r) => r.businessId))
   const lastMsgMap = new Map(lastMsgRows.map((r) => [r.businessId, r.lastMsg]))
+  const managerPhoneMap = new Map(managerRows.map((r) => [r.businessId, r.phoneNumber]))
 
   return allBiz.map((biz) => {
     const lastMsg = lastMsgMap.get(biz.id)
@@ -656,9 +686,11 @@ async function fetchBusinessSummaries(db: Db): Promise<CompactBusinessSummary[]>
       status: !biz.onboardingCompletedAt ? 'setup' : biz.isPaused ? 'paused' : 'live',
       calendarMode,
       googleCalendarConnected: calendarMode === 'internal' || !!biz.googleRefreshToken,
+      calendarTokenExpired: false,
       hasWebsite: websiteSet.has(biz.id),
       openEscalations: escalationMap.get(biz.id) ?? 0,
       minutesSinceLastMsg: lastMsg ? Math.round((Date.now() - lastMsg.getTime()) / 60_000) : null,
+      managerPhoneNumber: managerPhoneMap.get(biz.id) ?? null,
     }
   })
 }

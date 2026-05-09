@@ -6,6 +6,7 @@ import { businesses, identities } from '../db/schema.js'
 import { sendMessage } from '../adapters/whatsapp/sender.js'
 import { getPrompt } from '../domain/onboarding/steps.js'
 import { t, type Lang } from '../domain/i18n/t.js'
+import { createCalendarClient } from '../adapters/calendar/client.js'
 
 function buildOAuth2Client() {
   return new google.auth.OAuth2(
@@ -132,10 +133,38 @@ export async function oauthRoutes(app: FastifyInstance) {
           ? { accessToken: updatedBusiness.whatsappAccessToken, phoneNumberId: updatedBusiness.whatsappPhoneNumberId }
           : undefined
 
+        // Fetch next 7 days of calendar events as a preview
+        let calendarPreview = ''
+        try {
+          const calClient = createCalendarClient({
+            accessToken: tokens.access_token ?? '',
+            refreshToken: tokens.refresh_token,
+            calendarId: updatedBusiness.googleCalendarId,
+            calendarMode: 'google',
+          })
+          const now = new Date()
+          const weekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60_000)
+          const events = await calClient.listEvents(now, weekAhead)
+          if (events.length > 0) {
+            const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+            const tz = updatedBusiness.timezone ?? 'UTC'
+            const lines = events.slice(0, 10).map((ev) => {
+              const dateStr = ev.start.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+              return `• ${ev.title} — ${dateStr}`
+            })
+            const header = lang === 'he'
+              ? `📅 האירועים הקרובים בלוח השנה שלך (7 ימים):`
+              : `📅 Your upcoming calendar events (next 7 days):`
+            calendarPreview = `\n\n${header}\n${lines.join('\n')}`
+          }
+        } catch {
+          // non-fatal — skip preview if calendar read fails
+        }
+
         await sendMessage(
           {
             toNumber: managerIdentity.phoneNumber,
-            body: `${t('ob_calendar_connected', lang)}\n\n${getPrompt('customer_import', lang)}`,
+            body: `${t('ob_calendar_connected', lang)}${calendarPreview}\n\n${getPrompt('customer_import', lang)}`,
           },
           waCredentials,
         ).catch((err) => app.log.warn({ err }, 'Failed to send calendar confirmation to manager'))

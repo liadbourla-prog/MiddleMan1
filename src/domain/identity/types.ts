@@ -7,6 +7,7 @@ export interface ResolvedIdentity {
   role: IdentityRole
   displayName: string | null
   messagingOptOut: boolean
+  preferredLanguage: 'he' | 'en' | null
 }
 
 export type ResolveResult =

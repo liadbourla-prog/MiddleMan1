@@ -1,8 +1,8 @@
 # PA_4_Business — V2 Skills Roadmap (MVP)
 
 **Status: Active**
-**Last updated: 2026-04-30**
-**Scope: V2 skills layer built on top of the live v1.0.0 system**
+**Last updated: 2026-05-09**
+**Scope: V2 skills layer built on top of the live v1.0.0 system + Branch 3 multi-agent orchestrator upgrade**
 
 ---
 
@@ -24,13 +24,15 @@ These are not open for re-discussion during V2 development. They are recorded he
 
 | Decision | What it means |
 |---|---|
-| No agent runtime | All product capabilities are skills — Simple Skills or Workflow Skills. No separate LLM-based orchestrator or coordinator process. |
-| Orchestrator = existing system | The current webhook → identity → router → dispatchSkill() pipeline is the orchestrator. It is not modified, only extended. |
+| Branch 3 uses a native function-calling orchestrator | Branch 3 (PA Manager post-onboarding) uses `runManagerOrchestratorLoop()` — a Gemini native function-calling loop in `src/adapters/llm/orchestrator.ts`. This is **not** a separate LLM agent process; it runs in-process within the same Cloud Run request. |
+| Skills run before the orchestrator | `dispatchSkill()` fires first for every Branch 3 message. If a skill claims it, the orchestrator is skipped. The skill boundary is unchanged. |
+| Branch 4 / all other branches unchanged | Branches 1, 2, and 4 do not use the orchestrator. Branch 4 retains the deterministic booking state machine. |
 | Booking engine is not a skill | Skills never trigger or modify bookings directly. If a skill needs booking initiation, Developer A provides a typed callback in SkillContext. |
-| Knowledge Agent = data layer | Business knowledge (services, policies, FAQs, brand voice) is resolved from the DB at dispatch time and passed in SkillContext.businessKnowledge. No LLM in the read path. |
+| Knowledge Agent = data layer | Business knowledge (services, policies, FAQs, brand voice) is resolved from the DB at dispatch time and passed in SkillContext.businessKnowledge and into the orchestrator system prompt. No LLM in the read path. |
 | Workflow coordination is deterministic | Multi-step operations are explicit TypeScript step machines. LLM calls happen within steps, never between them for routing. |
 | Inbound messages are not serialized per identity | Cloud Run processes webhook requests concurrently. The `skill_workflows` table uses optimistic locking (version column) to prevent race conditions. |
 | Workflow mutation is callback-only | Skills call `ctx.workflow.advance()` / `.complete()` / `.fail()`. They never import from `src/domain/` or write to the DB directly. |
+| `applyInstruction` boundary is inviolable | The orchestrator's `manageBusinessSettings` tool is the only path to business configuration changes. It wraps `classifyManagerInstruction → applyInstruction`. The LLM cannot bypass it. |
 
 ---
 

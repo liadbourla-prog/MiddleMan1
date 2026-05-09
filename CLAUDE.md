@@ -85,21 +85,28 @@ Every inbound WhatsApp message routes into exactly one of four branches. **Any w
 | 4 | **PA Customer Channel** | any PA number | `role = customer` | `flows/customer-booking.ts` |
 
 Key design decisions locked in:
-- **Branch 1:** True multi-turn session memory. LLM reasons over full transcript across turns.
-- **Branch 2:** Explanation mode when user shows confusion — LLM explains technical concepts in plain language, then re-asks when understanding shows. Never parses a question as an answer.
-- **Branch 3:** Free-form conversational PA. Natural language for both commands and questions. Full session memory (4h expiry). Deterministic apply pipeline still enforced for state changes.
+- **Branch 1:** True multi-turn session memory. LLM reasons over full transcript across turns. Cross-session operator memory via `operator_session_notes` table (last 3 summaries injected). Manager phone number surfaced in business summary data.
+- **Branch 2:** Explanation mode when user shows confusion — LLM explains technical concepts in plain language, then re-asks when understanding shows. Never parses a question as an answer. Calendar preview sent after OAuth connection. Richer import summary with duplicate count.
+- **Branch 3:** Gemini native function-calling orchestrator (`src/adapters/llm/orchestrator.ts`). Manager can use tools conversationally: calendar read/write/delete, web search, customer lookup, contact notes, business configuration. Deterministic apply pipeline enforced inside `manageBusinessSettings` tool. Full session memory (4h expiry) + last 3 cross-session summaries. See `MULTI_AGENT_DESIGN.md` and `CHAT_LEVEL_LAWBOOK.md`.
 - **Branch 4:** Two-layer model. Transactional = LLM phrases only (sanitised situation string → wording, no raw engine codes). Conversational = LLM reasons freely with full context. First message: greeting inline for targeted intents, welcome + clarification for generic/ambiguous.
 - **Language switch (Branches 3 & 4):** Reply immediately in detected language, add inline switch-offer at the end. No bilingual interruption. Confirmed preference persists to `identities.preferredLanguage`. Replaces `waiting_language_confirmation` state.
+- **WhatsApp formatting:** All formatting standards are defined in `CHAT_LEVEL_LAWBOOK.md`. Consult it when writing or modifying any LLM prompt.
 
 ---
 
 ## Current State
 
-- v1.0.0 is live. All V1 milestones complete.
+- v1.0.14 is live. All V1 milestones complete.
 - No businesses provisioned yet — first provisioning is the immediate next step.
 - Meta test number (+15551946756) is still the MiddleMan central number (V0.5 designation).
-- Skills layer foundation is in place; no production skills built yet.
-- V2 skills roadmap is locked — see ARCHITECTURE.md Part 15. All product capabilities beyond V1 booking are implemented as **skills** (Simple Skills or Workflow Skills). There is no separate agent runtime or LLM-based orchestration layer.
+- **Branch 3 multi-agent upgrade complete.** The old `classifyManagerInstruction → generateManagerReply` pipeline has been replaced with a Gemini native function-calling orchestrator (`src/adapters/llm/orchestrator.ts`). 7 tools implemented: calendar read/write/delete, web search (Tavily), customer lookup, contact notes, business settings.
+- **Branch 1 upgrade complete.** Operator cross-session memory via `operator_session_notes` table and `generate-operator-summary` worker. `managerPhoneNumber` surfaced in operator admin data.
+- **Branch 2 upgrade complete.** Calendar preview after OAuth, richer import summary with duplicate count.
+- **`CHAT_LEVEL_LAWBOOK.md` created** — authoritative WhatsApp formatting standards for all branches.
+- Two production skills built: `website-builder` (Workflow Skill), `business-knowledge-setup` (Workflow Skill).
+- V2 skills roadmap is active — see ROADMAP.md and ARCHITECTURE.md Part 15.
+- **6 known gaps before first provisioning** — see MULTI_AGENT_DESIGN.md implementation notes.
+- All formatting rules are defined in `CHAT_LEVEL_LAWBOOK.md`. Consult it when writing or modifying any LLM prompt.
 
 ---
 

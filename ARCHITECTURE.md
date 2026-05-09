@@ -421,9 +421,13 @@ All LLM calls use structured output (JSON schema enforced). The adapter must:
 - On invalid output: retry once, then fail the session with an explicit error
 - Never pass raw LLM text directly into business logic
 
-LLM call types in V1:
-- `extract_customer_intent` → `{ intent, slot_request, service_type, raw_entities }`
-- `classify_manager_instruction` → `{ instruction_type, structured_params, ambiguous, clarification_needed }`
+LLM call types in production (post-multi-agent upgrade):
+- `extractCustomerIntent` → `{ intent, slot_request, service_type, raw_entities }` — Branch 4 only
+- `classifyManagerInstruction` → `{ instruction_type, structured_params, ambiguous, clarification_needed }` — Branch 2 only (onboarding), and inside the `manageBusinessSettings` tool executor
+- `runManagerOrchestratorLoop` — Branch 3 post-onboarding: Gemini native function-calling loop with 7 tools, MAX_ITERATIONS=5
+- `answerOperatorQuestion` — Branch 1: data-augmented natural language answer with live business list
+- `generateCustomerReply` — Branch 4: phrasing-only LLM call for transactional and conversational replies
+- `generateOnboardingReply` / `parseOnboardingAnswer` / `explainOnboardingConcept` — Branch 2 onboarding steps
 
 ---
 
@@ -875,6 +879,40 @@ CREATE TABLE agent_update_log (
   applied_to_count INT NOT NULL DEFAULT 0
 );
 
+-- Cross-session manager memory (Branch 3 orchestrator — added post-V1)
+CREATE TABLE manager_memory (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  identity_id UUID NOT NULL REFERENCES identities(id),
+  period_start TIMESTAMPTZ NOT NULL,
+  period_end TIMESTAMPTZ NOT NULL,
+  summary TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX manager_memory_identity_idx ON manager_memory(identity_id, created_at);
+
+-- Non-customer business contacts directory (Contact sub-agent tool — added post-V1)
+CREATE TABLE business_contacts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID NOT NULL REFERENCES businesses(id),
+  name TEXT NOT NULL,
+  phone_number TEXT,
+  role TEXT,
+  notes TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX business_contacts_business_idx ON business_contacts(business_id);
+
+-- Cross-session operator memory summaries (Branch 1 upgrade — added post-V1)
+CREATE TABLE operator_session_notes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  summary TEXT NOT NULL,
+  period_start TIMESTAMPTZ NOT NULL,
+  period_end TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX idx_bookings_business_state ON bookings(business_id, state);
 CREATE INDEX idx_bookings_slot ON bookings(business_id, slot_start, slot_end);
@@ -1240,22 +1278,48 @@ ANY PA NUMBER ───────┬── identity.role = 'manager' ─► Br
 
 **Audience:** The business owner managing their PA. They are trusted (role = `manager`) and operationally sophisticated, but they speak in natural language, not structured commands.
 
-**Entry point:** `src/domain/flows/manager-onboarding.ts` (during onboarding) → after onboarding: manager instruction handler in `src/routes/webhook.ts`
+**Entry point:** `src/domain/flows/manager-onboarding.ts` (during onboarding) → after onboarding: `routeManagerMessage()` in `src/routes/webhook.ts`
 
-**Session model:** Each message is classified independently by the instruction classifier. There is no persistent multi-turn session for the manager outside of onboarding. **This is a known gap to address.**
+**Session model:** Full multi-turn session with 4-hour expiry (`conversationSessions` table). The orchestrator receives the last 20 conversation turns plus up to 3 cross-session memory summaries from the `manager_memory` table.
 
-**LLM interaction model:**
-- Primary path: `classifyManagerInstruction()` — intent classification → `applyInstruction()` — deterministic apply
-- **Conversational fallback:** When the classified instruction type is `unknown` OR when the manager's message is clearly a question (not a command), the LLM must respond conversationally. This includes:
-  - Questions about current settings ("what are my hours?", "what's my cancellation policy?")
-  - Questions about recent activity ("which customers cancelled this week?")
-  - How-to questions ("how do I change a service price?")
-  - Meta-questions ("what can you do?")
-- The conversational fallback must have access to the business's current state (services, hours, policy, recent bookings) to answer accurately.
+**LLM interaction model — Gemini native function-calling orchestrator:**
 
-**Quality contract:** A manager must be able to use natural language for everything — commands and questions alike. The system handles commands with the deterministic apply pipeline and handles questions with intelligent, data-grounded conversation. The manager never needs to learn a command syntax.
+The old `classifyManagerInstruction → applyInstruction → generateManagerReply` pipeline has been replaced with a native Gemini function-calling loop (`src/adapters/llm/orchestrator.ts`).
 
-**What the LLM must NOT do:** Apply changes based on conversational replies without going through `classifyManagerInstruction` → `applyInstruction`. Conversation and command-execution are separate paths.
+```
+WhatsApp webhook
+  → identity check → session hydration
+  → dispatchSkill()   ← skills run first; if a skill claims it, orchestrator is skipped
+  → runManagerOrchestratorLoop()
+      ├─ LLM receives: message + history (last 20) + manager memory summaries + available tools
+      ├─ LLM calls tool(s) in sequence (MAX_ITERATIONS = 5)
+      │     tool results returned to LLM, loop continues
+      └─ LLM produces final reply text → sendMessage
+```
+
+**Available tools (Branch 3 only):**
+
+| Tool | Level | Pipeline involvement |
+|------|-------|---------------------|
+| `listCalendarEvents` | 0 — read-only | None |
+| `searchWeb` | 0 — external API | None |
+| `lookupCustomer` | 0 — read-only | None |
+| `saveContactNote` | 1 — metadata write | Identity check (flow entry) |
+| `createCalendarEvent` | 2 — calendar write | Booking conflict check |
+| `deleteCalendarEvent` | 2 — calendar write | Customer booking guard |
+| `manageBusinessSettings` | 3 — config change | `classifyManagerInstruction → applyInstruction` |
+
+**Key invariant:** `applyInstruction` is still the only function that writes business configuration (hours, services, policies, staff permissions, booking cancellations). It lives inside the `manageBusinessSettings` tool executor — the LLM cannot bypass it.
+
+**Cross-session memory:** After each manager session expires, a BullMQ job (`generate-manager-summary` worker) generates a 2–3 sentence summary and writes it to the `manager_memory` table. The orchestrator injects the last 3 summaries into its system prompt.
+
+**Proactive behavior:** After completing an action with customer-facing effects, the orchestrator ends its reply with a brief offer to notify affected customers. It never sends messages to customers autonomously — manager confirmation is required.
+
+**WhatsApp formatting:** All formatting rules are defined in `CHAT_LEVEL_LAWBOOK.md`. The orchestrator system prompt enforces: no HTML, `*bold*` only, URLs on own line, reply entirely in the manager's language.
+
+**Quality contract:** A manager can use natural language for everything — commands, questions, and calendar operations. The deterministic apply pipeline is enforced for all configuration changes.
+
+**What the LLM must NOT do:** Bypass `manageBusinessSettings` for configuration changes. Notify customers without explicit manager confirmation. Produce HTML or markdown beyond `*bold*`.
 
 ---
 

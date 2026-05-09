@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'async_hooks'
 import type { OutboundMessage, SendResult } from './types.js'
+import { and, eq, gte } from 'drizzle-orm'
 
 // When set, sendMessage captures replies into the array instead of posting to WA.
 // Used by the /simulate route and integration tests.
@@ -18,6 +19,83 @@ function resolveCredentials(override?: WaCredentials): WaCredentials {
   return {
     accessToken: override?.accessToken ?? process.env['WHATSAPP_ACCESS_TOKEN'] ?? '',
     phoneNumberId: override?.phoneNumberId ?? process.env['WHATSAPP_PHONE_NUMBER_ID'] ?? '',
+  }
+}
+
+/**
+ * Returns true when we are inside WhatsApp's 24-hour customer service window for this identity.
+ * Outside the window, only Meta-approved template messages may be sent (use sendTemplateMessage).
+ */
+export async function canSendFreeForm(identityId: string): Promise<boolean> {
+  const { db } = await import('../../db/client.js')
+  const { conversationSessions } = await import('../../db/schema.js')
+  const cutoff = new Date(Date.now() - 24 * 60 * 60_000)
+  const [row] = await db
+    .select({ id: conversationSessions.id })
+    .from(conversationSessions)
+    .where(and(eq(conversationSessions.identityId, identityId), gte(conversationSessions.lastMessageAt, cutoff)))
+    .limit(1)
+  return !!row
+}
+
+/**
+ * Sends a pre-approved Meta template message.
+ * Template names must be approved in Meta Business Manager before use.
+ * Falls back to free-form text in the replyCapture (simulate) context.
+ */
+export async function sendTemplateMessage(params: {
+  toNumber: string
+  templateName: string
+  languageCode: string
+  components?: Array<{ type: string; parameters: Array<{ type: string; text: string }> }>
+  bodyText?: string
+  credentials?: WaCredentials
+}): Promise<SendResultWithOptOut> {
+  const capture = replyCapture.getStore()
+  if (capture !== undefined) {
+    capture.push(params.bodyText ?? `[template:${params.templateName}]`)
+    return { ok: true, whatsappMessageId: 'sim-captured' }
+  }
+
+  const { accessToken, phoneNumberId } = resolveCredentials(params.credentials)
+  const apiUrl = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: params.toNumber,
+        type: 'template',
+        template: {
+          name: params.templateName,
+          language: { code: params.languageCode },
+          ...(params.components ? { components: params.components } : {}),
+        },
+      }),
+    })
+
+    if (!response.ok) {
+      const text = await response.text()
+      let userOptedOut = false
+      try {
+        const parsed = JSON.parse(text) as { error?: { code?: number } }
+        if (parsed.error?.code === WA_USER_OPT_OUT_CODE) userOptedOut = true
+      } catch { /* ignore */ }
+      return { ok: false, error: `WA template API ${response.status}: ${text}`, userOptedOut }
+    }
+
+    const data = (await response.json()) as { messages: Array<{ id: string }> }
+    const id = data.messages[0]?.id
+    if (!id) return { ok: false, error: 'WA template API returned no message id' }
+    return { ok: true, whatsappMessageId: id }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
 }
 

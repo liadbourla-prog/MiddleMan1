@@ -3,6 +3,7 @@ import { eq, and } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { bookings, identities, serviceTypes, businesses } from '../db/schema.js'
 import { enqueueMessage } from './message-retry.js'
+import { canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
@@ -95,7 +96,7 @@ async function processReminder(job: { data: ReminderJob }) {
     .limit(1)
 
   const [biz] = await db
-    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage })
+    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken })
     .from(businesses)
     .where(eq(businesses.id, businessId))
     .limit(1)
@@ -128,7 +129,31 @@ async function processReminder(job: { data: ReminderJob }) {
     ? i18n.reminder_24h[lang](serviceName, biz.name, dateStr, timeStr)
     : i18n.reminder_1h[lang](serviceName, biz.name, timeStr)
 
-  await enqueueMessage(customer.phoneNumber, body)
+  const freeFormAllowed = await canSendFreeForm(customerId)
+  if (freeFormAllowed) {
+    await enqueueMessage(customer.phoneNumber, body)
+  } else {
+    // Customer has not messaged in 24h — use Meta-approved template
+    const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+      ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+      : undefined
+    const templateName = type === '24h' ? 'appointment_reminder_24h' : 'appointment_reminder_1h'
+    await sendTemplateMessage({
+      toNumber: customer.phoneNumber,
+      templateName,
+      languageCode: lang === 'he' ? 'he' : 'en',
+      components: [{
+        type: 'body',
+        parameters: [
+          { type: 'text', text: serviceName },
+          { type: 'text', text: biz.name },
+          { type: 'text', text: type === '24h' ? dateStr : timeStr },
+        ],
+      }],
+      bodyText: body,
+      ...(waCredentials !== undefined && { credentials: waCredentials }),
+    }).catch(() => { /* non-fatal — log below */ })
+  }
 
   await logAudit(db, {
     businessId,

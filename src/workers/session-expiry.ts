@@ -1,6 +1,9 @@
 import { Worker, Queue } from 'bullmq'
+import { and, eq, lt, or } from 'drizzle-orm'
 import { db } from '../db/client.js'
+import { conversationSessions, identities } from '../db/schema.js'
 import { expireOldSessions } from '../domain/session/manager.js'
+import { enqueueManagerSummary } from './generate-manager-summary.js'
 import { redisConnection } from '../redis.js'
 
 const QUEUE_NAME = 'session-expiry'
@@ -12,9 +15,43 @@ export function startSessionExpiryWorker() {
   const worker = new Worker(
     QUEUE_NAME,
     async () => {
+      // Find manager sessions that are about to expire — enqueue summaries before sweeping
+      const now = new Date()
+      const expiringSessions = await db
+        .select({
+          id: conversationSessions.id,
+          businessId: conversationSessions.businessId,
+          identityId: conversationSessions.identityId,
+          createdAt: conversationSessions.createdAt,
+          lastMessageAt: conversationSessions.lastMessageAt,
+        })
+        .from(conversationSessions)
+        .innerJoin(identities, eq(identities.id, conversationSessions.identityId))
+        .where(
+          and(
+            lt(conversationSessions.expiresAt, now),
+            or(
+              eq(conversationSessions.state, 'active'),
+              eq(conversationSessions.state, 'waiting_confirmation'),
+              eq(conversationSessions.state, 'waiting_clarification'),
+            ),
+            eq(identities.role, 'manager'),
+          ),
+        )
+
+      for (const session of expiringSessions) {
+        await enqueueManagerSummary(
+          session.id,
+          session.businessId,
+          session.identityId,
+          session.createdAt,
+          session.lastMessageAt,
+        ).catch((err) => console.warn('[session-expiry] Failed to enqueue summary', { sessionId: session.id, err }))
+      }
+
       const count = await expireOldSessions(db)
       if (count > 0) {
-        console.info(`[session-expiry] Expired ${count} stale session(s)`)
+        console.info(`[session-expiry] Expired ${count} stale session(s), enqueued ${expiringSessions.length} manager summary job(s)`)
       }
     },
     { connection: redisConnection },

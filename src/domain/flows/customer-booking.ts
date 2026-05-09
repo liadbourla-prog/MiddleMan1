@@ -1,4 +1,4 @@
-import { eq, and, or, gt, isNull } from 'drizzle-orm'
+import { eq, and, or, gt, gte, isNull, count } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { serviceTypes, bookings, identities, availability } from '../../db/schema.js'
 import type { Business } from '../../db/schema.js'
@@ -292,9 +292,42 @@ export async function handleBookingFlow(
           const priceStr = price != null ? `, ${price} ${businessKnowledge?.services.find((ks) => ks.id === s.id)?.currency ?? ''}` : ''
           return `${s.name} (${s.durationMinutes} min, ${type}${priceStr})`
         }).join('; ')
+
+        // Enrich inquiry context with recent booking count and next open window
+        const ninetyDaysAgo = new Date()
+        ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90)
+        const [countRow] = await db
+          .select({ total: count() })
+          .from(bookings)
+          .where(and(eq(bookings.customerId, identity.id), eq(bookings.state, 'confirmed'), gte(bookings.slotStart, ninetyDaysAgo)))
+        const recentBookingCount = Number(countRow?.total ?? 0)
+
+        const availRows = await db
+          .select({ dayOfWeek: availability.dayOfWeek, openTime: availability.openTime })
+          .from(availability)
+          .where(and(eq(availability.businessId, identity.businessId), isNull(availability.specificDate), eq(availability.isBlocked, false)))
+        let nextAvailableSlot: string | null = null
+        const now = new Date()
+        for (let i = 1; i <= 7; i++) {
+          const d = new Date(now)
+          d.setDate(d.getDate() + i)
+          const dow = d.getDay()
+          const dayAvail = availRows.find((r) => r.dayOfWeek === dow)
+          if (dayAvail) {
+            const dayLabel = formatSlotDate(d, businessTimezone)
+            nextAvailableSlot = dayAvail.openTime ? `${dayLabel} from ${dayAvail.openTime}` : dayLabel
+            break
+          }
+        }
+
+        const customerCtx = recentBookingCount > 0
+          ? `Returning customer with ${recentBookingCount} booking(s) in the last 90 days.`
+          : 'First-time or lapsed customer.'
+        const slotCtx = nextAvailableSlot ? ` Next open window: ${nextAvailableSlot}.` : ''
+
         const situation = activeServices.length > 0
-          ? `${firstMsgPrefix}Customer asked a question about the business or services. Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above if relevant, then invite them to book.`
-          : `${firstMsgPrefix}Customer asked about the business. No services are configured yet. Direct them to contact the business directly.`
+          ? `${firstMsgPrefix}Customer asked a question about the business or services. ${customerCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above if relevant, then invite them to book.`
+          : `${firstMsgPrefix}Customer asked about the business. ${customerCtx} No services are configured yet. Direct them to contact the business directly.`
         const knowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
           ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),

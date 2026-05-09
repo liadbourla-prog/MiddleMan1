@@ -34,6 +34,7 @@ export async function resolveIdentity(
       role: identity.role,
       displayName: identity.displayName,
       messagingOptOut: identity.messagingOptOut,
+      preferredLanguage: (identity.preferredLanguage as 'he' | 'en' | null) ?? null,
     },
   }
 }

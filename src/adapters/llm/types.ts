@@ -22,6 +22,7 @@ export interface ManagerInstructionOutput {
     | 'policy_change'
     | 'service_change'
     | 'permission_change'
+    | 'booking_cancellation'
     | 'unknown'
   structuredParams: Record<string, unknown>
   ambiguous: boolean

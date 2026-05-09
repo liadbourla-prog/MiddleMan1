@@ -439,7 +439,7 @@ async function handleVerifyStep(
       identityId: identity.id,
       rawMessage: body,
       receivedAt: msg.timestamp,
-      classifiedAs: instruction.instructionType as 'availability_change' | 'policy_change' | 'service_change' | 'permission_change' | 'unknown',
+      classifiedAs: instruction.instructionType as 'availability_change' | 'policy_change' | 'service_change' | 'permission_change' | 'booking_cancellation' | 'unknown',
       structuredOutput: instruction as unknown as Record<string, unknown>,
       applyStatus: 'pending',
     })
@@ -564,7 +564,7 @@ async function applyOnboardingInstruction(
       identityId: identity.id,
       rawMessage: msg.body,
       receivedAt: msg.timestamp,
-      classifiedAs: instruction.instructionType as 'availability_change' | 'policy_change' | 'service_change' | 'permission_change' | 'unknown',
+      classifiedAs: instruction.instructionType as 'availability_change' | 'policy_change' | 'service_change' | 'permission_change' | 'booking_cancellation' | 'unknown',
       structuredOutput: instruction as unknown as Record<string, unknown>,
       applyStatus: 'pending',
     })

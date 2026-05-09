@@ -6,6 +6,7 @@ export interface ImportSummary {
   contacts: number
   services: number
   bookingHistory: number
+  duplicatesSkipped: number
   errors: string[]
 }
 
@@ -15,7 +16,7 @@ export async function processImportFile(
   filename: string,
   csvText: string,
 ): Promise<ImportSummary> {
-  const summary: ImportSummary = { contacts: 0, services: 0, bookingHistory: 0, errors: [] }
+  const summary: ImportSummary = { contacts: 0, services: 0, bookingHistory: 0, duplicatesSkipped: 0, errors: [] }
   const rows = parseCsv(csvText)
   if (rows.length === 0) return summary
 
@@ -59,20 +60,20 @@ async function importContacts(
       let identityId: string
       if (existing) {
         identityId = existing.id
+        summary.duplicatesSkipped++
       } else {
         const [inserted] = await db
           .insert(identities)
           .values({ businessId, phoneNumber: phone, role: 'customer', displayName: name ?? null })
           .returning({ id: identities.id })
         identityId = inserted!.id
+        summary.contacts++
       }
 
       await db
         .insert(customerProfiles)
         .values({ businessId, identityId, displayName: name ?? null })
         .onConflictDoNothing()
-
-      summary.contacts++
     } catch {
       summary.errors.push(`Failed to import contact ${phone}`)
     }
@@ -113,6 +114,8 @@ async function importServices(
           paymentAmount: priceIdx >= 0 ? (row[priceIdx] ?? null) : null,
         })
         summary.services++
+      } else {
+        summary.duplicatesSkipped++
       }
     } catch {
       summary.errors.push(`Failed to import service "${name}"`)

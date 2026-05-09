@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-import { eq, and, isNull } from 'drizzle-orm'
+import { eq, and, isNull, desc } from 'drizzle-orm'
 import {
   verifySignature,
   verifyWebhookChallenge,
@@ -8,7 +8,7 @@ import {
 import { sendMessage } from '../adapters/whatsapp/sender.js'
 import type { WhatsAppWebhookPayload, InboundMessage } from '../adapters/whatsapp/types.js'
 import { db } from '../db/client.js'
-import { processedMessages, businesses, managerInstructions, identities } from '../db/schema.js'
+import { processedMessages, businesses, identities, managerMemory } from '../db/schema.js'
 import type { Business } from '../db/schema.js'
 import { resolveIdentity, registerCustomer } from '../domain/identity/resolver.js'
 import type { ResolvedIdentity } from '../domain/identity/types.js'
@@ -21,17 +21,15 @@ import {
 import { handleBookingFlow } from '../domain/flows/customer-booking.js'
 import { handleOnboardingMessage } from '../domain/flows/manager-onboarding.js'
 import { handleProviderOnboarding } from '../domain/flows/provider-onboarding.js'
-import { classifyManagerInstruction, generateManagerReply } from '../adapters/llm/client.js'
+import { runManagerOrchestratorLoop } from '../adapters/llm/orchestrator.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
 import {
-  applyInstruction,
   buildStatusReport,
   pausePA,
   resumePA,
   buildUpcomingReport,
   markEscalationHandled,
-  checkServiceDeactivationSafety,
 } from '../domain/manager/apply.js'
 import { confirmPaymentReceived } from '../domain/booking/engine.js'
 import { enqueueMessage } from '../workers/message-retry.js'
@@ -45,6 +43,7 @@ import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
+import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
 
 export async function webhookRoutes(app: FastifyInstance) {
   // Webhook verification handshake (GET)
@@ -209,7 +208,7 @@ async function routeCustomerMessage(
   business: Business,
   app: FastifyInstance,
 ) {
-  const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const lang: Lang = (identity.preferredLanguage ?? business.defaultLanguage as Lang | null | undefined) ?? 'he'
   const waCredentials = business.whatsappPhoneNumberId && business.whatsappAccessToken
     ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
     : undefined
@@ -444,14 +443,20 @@ async function routeManagerMessage(
   await saveMessage(db, mgSession.id, 'customer', msg.body).catch((err) => {
     app.log.warn({ err }, 'Failed to save manager inbound message to transcript')
   })
-  const mgTranscript = await loadTranscript(db, mgSession.id, 8).catch(() => [])
+  const mgTranscript = await loadTranscript(db, mgSession.id, 20).catch(() => [])
 
   // Skills dispatch for manager — runs before LLM instruction classifier
   {
-    const [mgBusinessKnowledge, mgWorkflowState] = await Promise.all([
+    const [mgBusinessKnowledge, mgWorkflowState, mgMemoryRows] = await Promise.all([
       loadBusinessKnowledge(db, business.id, business.currency),
       loadActiveWorkflow(db, identity.id),
+      db.select({ summary: managerMemory.summary })
+        .from(managerMemory)
+        .where(eq(managerMemory.identityId, identity.id))
+        .orderBy(desc(managerMemory.createdAt))
+        .limit(3),
     ])
+    const mgMemorySummaries = mgMemoryRows.map((r) => r.summary)
     const mgSkillCtx = await buildSkillContext({
       db,
       business,
@@ -466,6 +471,7 @@ async function routeManagerMessage(
       ...(business.whatsappPhoneNumberId && business.whatsappAccessToken
         ? { waCredentials: { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId } }
         : {}),
+      ...(mgMemorySummaries.length > 0 ? { managerMemorySummaries: mgMemorySummaries } : {}),
     })
     const mgSkillOutcome = await dispatchSkill(mgSkillCtx)
     if (mgSkillOutcome?.handled) {
@@ -477,97 +483,46 @@ async function routeManagerMessage(
     }
   }
 
-  const classifyResult = await classifyManagerInstruction(msg.body, {
+  // Load business knowledge for orchestrator system prompt injection
+  const [mgBusinessKnowledgeForOrchestrator] = await Promise.all([
+    loadBusinessKnowledge(db, business.id, business.currency),
+  ])
+
+  const calendar = createCalendarClient({
+    accessToken: '',
+    refreshToken: business.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
+    calendarId: business.googleCalendarId,
     businessId: business.id,
-    timezone: business.timezone,
-  }, lang)
-
-  if (!classifyResult.ok) {
-    app.log.error({ error: classifyResult.error }, 'LLM manager classification failed')
-    await sendMessage({ toNumber: msg.fromNumber, body: i18n.manager_classify_error[lang] }, waCredentials)
-    return
-  }
-
-  const instruction = classifyResult.data
-
-  await db.insert(managerInstructions).values({
-    businessId: business.id,
-    identityId: identity.id,
-    rawMessage: msg.body,
-    receivedAt: msg.timestamp,
-    classifiedAs: instruction.instructionType,
-    structuredOutput: instruction as unknown as Record<string, unknown>,
-    applyStatus: instruction.ambiguous ? 'requires_clarification' : 'pending',
-    clarificationRequest: instruction.clarificationNeeded,
-  })
-
-  await logAudit(db, {
-    businessId: business.id,
-    actorId: identity.id,
-    action: 'manager_instruction.received',
-    entityType: 'manager_instruction',
-    metadata: { type: instruction.instructionType, ambiguous: instruction.ambiguous },
-  })
-
-  if (instruction.ambiguous && instruction.clarificationNeeded) {
-    await sendMessage({ toNumber: msg.fromNumber, body: instruction.clarificationNeeded }, waCredentials)
-    return
-  }
-
-  const [savedInstruction] = await db
-    .select({ id: managerInstructions.id })
-    .from(managerInstructions)
-    .where(
-      and(
-        eq(managerInstructions.businessId, business.id),
-        eq(managerInstructions.identityId, identity.id),
-        eq(managerInstructions.receivedAt, msg.timestamp),
-      ),
-    )
-    .limit(1)
-
-  if (!savedInstruction) {
-    await sendMessage({ toNumber: msg.fromNumber, body: i18n.manager_save_error[lang] }, waCredentials)
-    return
-  }
-
-  if (instruction.instructionType === 'unknown') {
-    const llmReply = await generateManagerReply({
-      businessName: business.name,
-      language: lang,
-      question: msg.body,
-      transcript: mgTranscript,
-      businessState: {
-        businessName: business.name,
-        timezone: business.timezone,
-        isPaused: business.paused,
-        defaultLanguage: business.defaultLanguage ?? lang,
-      },
-    })
-    const unknownReply = llmReply || i18n.manager_unknown_instruction[lang]
-    await saveMessage(db, mgSession.id, 'assistant', unknownReply).catch((err) => {
-      app.log.warn({ err }, 'Failed to save manager unknown reply to transcript')
-    })
-    await sendMessage({ toNumber: msg.fromNumber, body: unknownReply }, waCredentials)
-    return
-  }
-
-  const applyResult = await applyInstruction(
-    db,
-    savedInstruction.id,
-    business.id,
-    identity.id,
-    instruction.instructionType,
-    instruction.structuredParams as Record<string, unknown>,
+    calendarMode: business.calendarMode,
     lang,
-  )
-
-  const reply = applyResult.ok
-    ? applyResult.confirmationMessage
-    : i18n.manager_apply_error[lang](applyResult.reason)
-
-  await saveMessage(db, mgSession.id, 'assistant', reply).catch((err) => {
-    app.log.warn({ err }, 'Failed to save manager reply to transcript')
   })
-  await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
+
+  const lockResult = await withBusinessLock(business.id, msg.messageId, async () => {
+    const reply = await runManagerOrchestratorLoop({
+      messageId: msg.messageId,
+      message: msg.body,
+      sessionId: mgSession.id,
+      businessId: business.id,
+      identityId: identity.id,
+      businessName: business.name,
+      timezone: business.timezone,
+      lang,
+      calendar,
+      transcript: mgTranscript,
+      businessKnowledge: mgBusinessKnowledgeForOrchestrator,
+    }).catch((err) => {
+      app.log.error({ err, businessId: business.id }, 'Orchestrator loop threw')
+      return i18n.manager_classify_error[lang]
+    })
+
+    await saveMessage(db, mgSession.id, 'assistant', reply).catch((err) => {
+      app.log.warn({ err }, 'Failed to save manager orchestrator reply to transcript')
+    })
+    await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
+  })
+
+  if (lockResult === null) {
+    // Message was queued behind an in-flight request for this business — silently drop
+    app.log.info({ businessId: business.id, messageId: msg.messageId }, 'Manager message queued by concurrency lock')
+  }
 }
