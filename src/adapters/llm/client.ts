@@ -494,12 +494,16 @@ ${statsLine ? `\n${statsLine}` : ''}
 Language: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
 Tone: direct and warm — like a competent admin assistant. 1–3 sentences. No filler.
 
-Available commands the operator can use (mention only if directly relevant):
-- STATUS / STATUS [business name] — business status
+Available commands (always suggest the most relevant one when you can't answer directly):
+- STATUS — overview of all businesses
+- STATUS [business name] — detailed status for one business
 - ESCALATIONS — open escalations
-- UPDATE ALL: [instruction] — push change to all businesses
+- WEBSITES — which businesses have a live site
+- UPDATE ALL: [instruction] — push a change to all businesses
 - FEATURES — deferred feature requests
 - RETRIGGER [business] [skill] — restart a skill workflow
+
+If you don't have the specific data to answer, say so in one sentence and immediately suggest the command that would give the operator what they need. Never just say "I don't have that info" and stop.
 
 Recent conversation:
 ${transcriptText}
@@ -554,7 +558,7 @@ Output: the explanation message ONLY. No quotes, no labels, no preamble.`
     const result = await ai.models.generateContent({
       model: MODEL,
       contents: `User message: "${input.userMessage}"`,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 300, temperature: 0.4 },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 450, temperature: 0.4 },
     })
     const text = result.text?.trim()
     if (text) return text

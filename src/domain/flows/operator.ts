@@ -42,6 +42,21 @@ export async function handleOperatorMessage(
   const operatorSession = await loadOperatorSession(redis, fromNumber)
   await appendOperatorTurn(redis, fromNumber, 'operator', text)
 
+  // ── Route to a handler, then append assistant turn regardless of path ────────
+
+  const result = await routeOperatorMessage(db, text, upper, lang, fromNumber, operatorSession)
+  await appendOperatorTurn(redis, fromNumber, 'assistant', result.reply).catch(() => {/* best-effort */})
+  return result
+}
+
+async function routeOperatorMessage(
+  db: Db,
+  text: string,
+  upper: string,
+  lang: Lang,
+  fromNumber: string,
+  operatorSession: Awaited<ReturnType<typeof loadOperatorSession>>,
+): Promise<OperatorResult> {
   // ── Exact keyword matches (English & Hebrew aliases) ─────────────────────────
 
   if (
@@ -127,30 +142,25 @@ export async function handleOperatorMessage(
 
   const op = classified.data
 
-  const dispatchedResult = await (async () => {
-    switch (op.action) {
-      case 'status_all':  return handleStatusAll(db, lang)
-      case 'status_one':  return op.businessName ? handleStatusOne(db, op.businessName, lang) : handleStatusAll(db, lang)
-      case 'escalations': return handleEscalations(db, lang)
-      case 'update_all':  return op.updateInstruction ? handleUpdateAll(db, op.updateInstruction, lang) : { reply: i18n.op_help[lang] }
-      case 'skills_one':  return op.businessName ? handleSkillsOne(db, op.businessName, lang) : handleStatusAll(db, lang)
-      case 'features':    return handleFeatures(db, lang)
-      case 'retrigger':   return op.businessName ? handleRetrigger(db, op.businessName, op.skillName, lang) : { reply: i18n.op_help[lang] }
-      case 'help':        return { reply: i18n.op_help[lang] }
-      case 'general_qa': {
-        const llmReply = await generateOperatorReply({
-          question: text,
-          transcript: operatorSession.transcript,
-          lang,
-          liveStats,
-        })
-        return { reply: llmReply || op.freeformReply || i18n.op_help[lang] }
-      }
+  switch (op.action) {
+    case 'status_all':  return handleStatusAll(db, lang)
+    case 'status_one':  return op.businessName ? handleStatusOne(db, op.businessName, lang) : handleStatusAll(db, lang)
+    case 'escalations': return handleEscalations(db, lang)
+    case 'update_all':  return op.updateInstruction ? handleUpdateAll(db, op.updateInstruction, lang) : { reply: i18n.op_help[lang] }
+    case 'skills_one':  return op.businessName ? handleSkillsOne(db, op.businessName, lang) : handleStatusAll(db, lang)
+    case 'features':    return handleFeatures(db, lang)
+    case 'retrigger':   return op.businessName ? handleRetrigger(db, op.businessName, op.skillName, lang) : { reply: i18n.op_help[lang] }
+    case 'help':        return { reply: i18n.op_help[lang] }
+    case 'general_qa': {
+      const llmReply = await generateOperatorReply({
+        question: text,
+        transcript: operatorSession.transcript,
+        lang,
+        liveStats,
+      })
+      return { reply: llmReply || op.freeformReply || i18n.op_help[lang] }
     }
-  })()
-
-  await appendOperatorTurn(redis, fromNumber, 'assistant', dispatchedResult.reply).catch(() => {/* best-effort */})
-  return dispatchedResult
+  }
 }
 
 async function handleStatusAll(db: Db, lang: Lang): Promise<OperatorResult> {
