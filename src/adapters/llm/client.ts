@@ -669,7 +669,7 @@ Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
 Rules:
 - 2–4 sentences maximum
 - Plain language — no jargon, no markdown, no bullet points
-- Explain the concept clearly, then end with a gentle re-ask of what you need from them
+- Explain the concept clearly, then end with a direct question asking them to provide the information (your last sentence MUST be a question ending with ?)
 - Sound like a helpful human, not a bot
 
 The concept to explain: ${context}

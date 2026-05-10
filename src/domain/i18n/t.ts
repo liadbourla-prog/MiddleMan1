@@ -47,6 +47,18 @@ const strings = {
     he: `אין בעיה — הפרטים האלה מגיעים מ-Meta Business Manager, הם שונים לחלוטין מהמספר הטלפוני שלכם.\n\n*מה תצטרכו:*\n• *Phone Number ID* — מזהה מספרי ב-Meta (15 ספרות בערך, לא המספר הטלפוני שלכם)\n• *Access Token* — מפתח גישה שמאפשר ל-PA לשלוח הודעות בשמכם\n\n*איך מגיעים לזה:*\n1. נכנסים ל-business.facebook.com ← הגדרות עסק\n2. בצד שמאל: WhatsApp ← Phone Numbers — שם תמצאו את ה-*Phone Number ID*\n3. לטוקן: System Users ← בחרו משתמש ← Generate New Token ← סמנו whatsapp_business_messaging\n\nכשיהיו לכם הפרטים, שלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
     en: `No worries — these come from Meta Business Manager and are completely different from your regular phone number.\n\n*What you need:*\n• *Phone Number ID* — a numeric Meta ID (~15 digits, not your actual phone number)\n• *Access Token* — an access key that lets your PA send messages on your behalf\n\n*How to get them:*\n1. Go to business.facebook.com → Business Settings\n2. Left sidebar: WhatsApp → Phone Numbers — your *Phone Number ID* is listed there\n3. For the token: System Users → select a user → Generate New Token → check whatsapp_business_messaging\n\nWhen you have them, send:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
   },
+  mm_credentials_partial_id: {
+    he: (id: string) => `קיבלתי את ה-ID (${id}) ✓\n\nעכשיו צריך את ה-Access Token — מחרוזת שמתחילה ב-EAA. שלחו:\n\`TOKEN: EAAxxxxxxxxx\``,
+    en: (id: string) => `Got the ID (${id}) ✓\n\nNow I need the Access Token — a string starting with EAA. Send:\n\`TOKEN: EAAxxxxxxxxx\``,
+  },
+  mm_credentials_partial_token: {
+    he: `קיבלתי את ה-Token ✓\n\nעכשיו צריך את ה-Phone Number ID — מספר של 15 ספרות בערך מ-Meta. שלחו:\n\`ID: 123456789012345\``,
+    en: `Got the Token ✓\n\nNow I need the Phone Number ID — a ~15-digit number from Meta. Send:\n\`ID: 123456789012345\``,
+  },
+  mm_credentials_stuck: {
+    he: `מובן שזה לא פשוט 🙏\n\nהפרטים האלה חיוניים כדי לחבר את ה-PA למספר ה-WhatsApp שלכם — אי אפשר להמשיך בלעדיהם.\n\nכשתהיו מוכנים, חזרו לכאן עם:\n• *Phone Number ID* מ-Meta → הגדרות עסק → WhatsApp → Phone Numbers\n• *Access Token* מ-System Users → Generate Token\n\nשלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+    en: `Totally understand — this part isn't easy 🙏\n\nThese credentials are required to connect your PA to your WhatsApp number — there's no way to proceed without them.\n\nWhen you're ready, come back here with:\n• *Phone Number ID* from Meta → Business Settings → WhatsApp → Phone Numbers\n• *Access Token* from System Users → Generate Token\n\nSend:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+  },
   mm_credentials_error: {
     he: (err: string) => `לא הצלחתי לאמת את הפרטים (${err}).\n\nבדקו שה-Phone Number ID וה-Access Token נכונים ב-Meta Business Manager, ונסו שוב.`,
     en: (err: string) => `I couldn't validate those credentials (${err}).\n\nDouble-check your Phone Number ID and Access Token in Meta Business Manager, then try again.`,

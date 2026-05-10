@@ -31,6 +31,7 @@ type CollectedData = {
   calendarId?: string | null
   services?: Array<{ name: string; durationMinutes: number }>
   _serviceFailCount?: number
+  _credentialHelpCount?: number
   phoneNumberId?: string
   accessToken?: string
   paPhoneNumber?: string
@@ -175,25 +176,48 @@ async function handleStep(
     }
 
     case 'credentials': {
+      const helpCount = data._credentialHelpCount ?? 0
+
+      // Partial credential detection: got one piece but not the other — be specific
+      const hasId = /\d{10,20}/.test(text)
+      const hasToken = /EAA[A-Za-z0-9]{5,}/.test(text)
+      if (hasId && !hasToken) {
+        const idMatch = text.match(/\d{10,20}/)!
+        await db.update(providerOnboardingSessions)
+          .set({ collectedData: { ...data, _credentialHelpCount: helpCount + 1 } as Record<string, unknown>, updatedAt: new Date() })
+          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+        return { reply: i18n.mm_credentials_partial_id[lang](idMatch[0]) }
+      }
+      if (hasToken && !hasId) {
+        await db.update(providerOnboardingSessions)
+          .set({ collectedData: { ...data, _credentialHelpCount: helpCount + 1 } as Record<string, unknown>, updatedAt: new Date() })
+          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+        return { reply: i18n.mm_credentials_partial_token[lang] }
+      }
+
       if (detectsQuestion(text) && !isExpressingNoAccess(text)) {
         const explanation = await explainOnboardingConcept({ concept: 'credentials', userMessage: text, step: 'credentials', lang })
         if (explanation) return { reply: explanation }
       }
-      // Explicit confusion / absence signals always get the detailed help guide,
-      // even if the message incidentally contains digits (e.g. a pasted phone number).
-      if (isExpressingNoAccess(text) || isAskingForHelp(text)) {
-        return { reply: i18n.mm_credentials_help[lang] }
-      }
 
-      // If message doesn't look like a credential attempt, give full guidance
-      if (!looksLikeCredentialAttempt(text)) {
+      // Confusion, help requests, or non-credential text — track repetitions
+      if (isExpressingNoAccess(text) || isAskingForHelp(text) || !looksLikeCredentialAttempt(text)) {
+        const newCount = helpCount + 1
+        await db.update(providerOnboardingSessions)
+          .set({ collectedData: { ...data, _credentialHelpCount: newCount } as Record<string, unknown>, updatedAt: new Date() })
+          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+        // After 3 non-productive exchanges, switch to the empathetic stuck message
+        if (newCount >= 3) return { reply: i18n.mm_credentials_stuck[lang] }
         return { reply: i18n.mm_credentials_help[lang] }
       }
 
       const parsed = parseCredentials(text)
       if (!parsed) {
-        // Looked like a credential attempt but couldn't parse — give full guidance
-        // rather than just repeating the format, so the user understands what's needed.
+        const newCount = helpCount + 1
+        await db.update(providerOnboardingSessions)
+          .set({ collectedData: { ...data, _credentialHelpCount: newCount } as Record<string, unknown>, updatedAt: new Date() })
+          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+        if (newCount >= 3) return { reply: i18n.mm_credentials_stuck[lang] }
         return { reply: i18n.mm_credentials_help[lang] }
       }
 
