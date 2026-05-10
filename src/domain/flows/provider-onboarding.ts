@@ -32,6 +32,8 @@ type CollectedData = {
   services?: Array<{ name: string; durationMinutes: number }>
   _serviceFailCount?: number
   _credentialHelpCount?: number
+  _pendingPhoneNumberId?: string
+  _pendingAccessToken?: string
   phoneNumberId?: string
   accessToken?: string
   paPhoneNumber?: string
@@ -178,92 +180,75 @@ async function handleStep(
     case 'credentials': {
       const helpCount = data._credentialHelpCount ?? 0
 
-      // Partial credential detection: got one piece but not the other — be specific
-      const hasId = /\d{10,20}/.test(text)
-      const hasToken = /EAA[A-Za-z0-9]{5,}/.test(text)
-      if (hasId && !hasToken) {
-        const idMatch = text.match(/\d{10,20}/)!
+      // Extract whatever the user just sent
+      const newId = text.match(/\d{10,20}/)?.[0] ?? null
+      const newToken = text.match(/EAA[A-Za-z0-9]+/)?.[0] ?? null
+
+      // Merge with anything stored from a previous partial message
+      const resolvedId = newId ?? data._pendingPhoneNumberId ?? null
+      const resolvedToken = newToken ?? data._pendingAccessToken ?? null
+
+      // Both pieces present — attempt validation and provisioning
+      if (resolvedId && resolvedToken) {
+        const metaResult = await fetchPhoneNumberFromMeta(resolvedId, resolvedToken)
+        if (!metaResult.ok) {
+          // Clear pending partials so user can retry fresh
+          await db.update(providerOnboardingSessions)
+            .set({ collectedData: { ...data, _pendingPhoneNumberId: undefined, _pendingAccessToken: undefined } as Record<string, unknown>, updatedAt: new Date() })
+            .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+          return { reply: `${i18n.mm_credentials_error[lang](metaResult.error)}\n\n${i18n.mm_retry_credentials[lang]}` }
+        }
+
+        const paPhoneNumber = metaResult.phoneNumber
+        const fullData: CollectedData = { ...data, phoneNumberId: resolvedId, accessToken: resolvedToken, paPhoneNumber }
+
+        const provisionResult = await provisionBusiness(db, session.managerPhone, fullData)
+        if (!provisionResult.ok) {
+          return { reply: i18n.mm_setup_failed[lang](provisionResult.error) }
+        }
+
         await db.update(providerOnboardingSessions)
-          .set({ collectedData: { ...data, _credentialHelpCount: helpCount + 1 } as Record<string, unknown>, updatedAt: new Date() })
+          .set({ completedAt: new Date(), collectedData: fullData as Record<string, unknown>, updatedAt: new Date() })
           .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
-        return { reply: i18n.mm_credentials_partial_id[lang](idMatch[0]) }
+
+        const bkOpeningPrompt = lang === 'he'
+          ? `לפני שהלקוחות מגיעים, בואנו נלמד על *${fullData.businessName}* כדי שאוכל לייצג אתכם הכי טוב.\n\nאיך היית מתאר/ת את *${fullData.businessName}*? מה הרגש שאתה/את רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?\n\n(ככל שתשתף/י יותר, כך אדבר טוב יותר בשמך)`
+          : `Before customers arrive, let me get to know *${fullData.businessName}* so I can represent you well.\n\nHow would you describe *${fullData.businessName}*? What feeling do you want customers to walk away with? What makes you stand out?\n\n(The more detail you share, the better I'll speak in your voice)`
+
+        await sendMessage(
+          { toNumber: session.managerPhone, body: bkOpeningPrompt },
+          { accessToken: fullData.accessToken!, phoneNumberId: fullData.phoneNumberId! },
+        ).catch(() => { /* BK setup kickoff is best-effort */ })
+
+        return { reply: i18n.mm_done[lang](paPhoneNumber) }
       }
-      if (hasToken && !hasId) {
+
+      // Only one piece — store it and ask for the missing one
+      if (resolvedId && !resolvedToken) {
         await db.update(providerOnboardingSessions)
-          .set({ collectedData: { ...data, _credentialHelpCount: helpCount + 1 } as Record<string, unknown>, updatedAt: new Date() })
+          .set({ collectedData: { ...data, _pendingPhoneNumberId: resolvedId } as Record<string, unknown>, updatedAt: new Date() })
+          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+        return { reply: i18n.mm_credentials_partial_id[lang](resolvedId) }
+      }
+      if (resolvedToken && !resolvedId) {
+        await db.update(providerOnboardingSessions)
+          .set({ collectedData: { ...data, _pendingAccessToken: resolvedToken } as Record<string, unknown>, updatedAt: new Date() })
           .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
         return { reply: i18n.mm_credentials_partial_token[lang] }
       }
 
+      // No credential content at all — handle confusion/questions
       if (detectsQuestion(text) && !isExpressingNoAccess(text)) {
         const explanation = await explainOnboardingConcept({ concept: 'credentials', userMessage: text, step: 'credentials', lang })
         if (explanation) return { reply: explanation }
       }
 
-      // Confusion, help requests, or non-credential text — track repetitions
-      if (isExpressingNoAccess(text) || isAskingForHelp(text) || !looksLikeCredentialAttempt(text)) {
-        const newCount = helpCount + 1
-        await db.update(providerOnboardingSessions)
-          .set({ collectedData: { ...data, _credentialHelpCount: newCount } as Record<string, unknown>, updatedAt: new Date() })
-          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
-        // After 3 non-productive exchanges, switch to the empathetic stuck message
-        if (newCount >= 3) return { reply: i18n.mm_credentials_stuck[lang] }
-        return { reply: i18n.mm_credentials_help[lang] }
-      }
-
-      const parsed = parseCredentials(text)
-      if (!parsed) {
-        const newCount = helpCount + 1
-        await db.update(providerOnboardingSessions)
-          .set({ collectedData: { ...data, _credentialHelpCount: newCount } as Record<string, unknown>, updatedAt: new Date() })
-          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
-        if (newCount >= 3) return { reply: i18n.mm_credentials_stuck[lang] }
-        return { reply: i18n.mm_credentials_help[lang] }
-      }
-
-      // Validate credentials + fetch the actual phone number from Meta
-      const metaResult = await fetchPhoneNumberFromMeta(parsed.phoneNumberId, parsed.accessToken)
-      if (!metaResult.ok) {
-        return {
-          reply: `${i18n.mm_credentials_error[lang](metaResult.error)}\n\n${i18n.mm_retry_credentials[lang]}`,
-        }
-      }
-
-      const paPhoneNumber = metaResult.phoneNumber
-      const fullData: CollectedData = {
-        ...data,
-        phoneNumberId: parsed.phoneNumberId,
-        accessToken: parsed.accessToken,
-        paPhoneNumber,
-      }
-
-      // Provision the business
-      const provisionResult = await provisionBusiness(db, session.managerPhone, fullData)
-      if (!provisionResult.ok) {
-        return { reply: i18n.mm_setup_failed[lang](provisionResult.error) }
-      }
-
-      // Mark session complete
-      await db
-        .update(providerOnboardingSessions)
-        .set({ completedAt: new Date(), collectedData: fullData as Record<string, unknown>, updatedAt: new Date() })
+      const newCount = helpCount + 1
+      await db.update(providerOnboardingSessions)
+        .set({ collectedData: { ...data, _credentialHelpCount: newCount } as Record<string, unknown>, updatedAt: new Date() })
         .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
-
-      // Kick off BK Setup on the PA — send the opening prompt from the manager's PA to themselves
-      // TODO: when BK setup skill exposes a constant, replace the string below with that import
-      //       see src/skills/business-knowledge-setup/index.ts — 'brand-voice' step Q function
-      const bkOpeningPrompt = lang === 'he'
-        ? `לפני שהלקוחות מגיעים, בואנו נלמד על *${fullData.businessName}* כדי שאוכל לייצג אתכם הכי טוב.\n\nאיך היית מתאר/ת את *${fullData.businessName}*? מה הרגש שאתה/את רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?\n\n(ככל שתשתף/י יותר, כך אדבר טוב יותר בשמך)`
-        : `Before customers arrive, let me get to know *${fullData.businessName}* so I can represent you well.\n\nHow would you describe *${fullData.businessName}*? What feeling do you want customers to walk away with? What makes you stand out?\n\n(The more detail you share, the better I'll speak in your voice)`
-
-      await sendMessage(
-        { toNumber: session.managerPhone, body: bkOpeningPrompt },
-        { accessToken: fullData.accessToken!, phoneNumberId: fullData.phoneNumberId! },
-      ).catch(() => {
-        // BK setup kickoff is best-effort — provisioning already succeeded
-      })
-
-      return { reply: i18n.mm_done[lang](paPhoneNumber) }
+      if (newCount >= 3) return { reply: i18n.mm_credentials_stuck[lang] }
+      return { reply: i18n.mm_credentials_help[lang] }
     }
   }
 }
