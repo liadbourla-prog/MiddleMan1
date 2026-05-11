@@ -21,6 +21,7 @@ export const businesses = pgTable('businesses', {
   whatsappNumber: text('whatsapp_number').notNull().unique(),
   whatsappPhoneNumberId: text('whatsapp_phone_number_id'),
   whatsappAccessToken: text('whatsapp_access_token'),
+  whatsappAppSecret: text('whatsapp_app_secret'),
   googleCalendarId: text('google_calendar_id').notNull(),
   googleRefreshToken: text('google_refresh_token'),
   timezone: text('timezone').notNull().default('UTC'),

@@ -43,6 +43,13 @@
       "when": 1745758800000,
       "tag": "0005_language_and_queuing",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1778488196049,
+      "tag": "0006_loving_vanisher",
+      "breakpoints": true
     }
   ]
 }

@@ -12,6 +12,8 @@
  * Optional (per-business WA API credentials — overrides global env vars):
  *   PROVISION_WA_PHONE_NUMBER_ID — WhatsApp Phone Number ID from Meta Business Manager
  *   PROVISION_WA_ACCESS_TOKEN    — System User access token from Meta Business Manager
+ *   PROVISION_WA_APP_SECRET      — Meta App Secret for webhook signature verification
+ *                                   (required when PA is in a different Meta app than the MiddleMan)
  */
 
 import 'dotenv/config'
@@ -27,6 +29,7 @@ const CALENDAR_ID = process.env['PROVISION_CALENDAR_ID'] ?? ''
 const TIMEZONE = process.env['PROVISION_TIMEZONE'] ?? 'UTC'
 const WA_PHONE_NUMBER_ID = process.env['PROVISION_WA_PHONE_NUMBER_ID'] ?? null
 const WA_ACCESS_TOKEN = process.env['PROVISION_WA_ACCESS_TOKEN'] ?? null
+const WA_APP_SECRET = process.env['PROVISION_WA_APP_SECRET'] ?? null
 
 if (!PA_NUMBER || !MANAGER_PHONE) {
   console.error('PROVISION_WA_NUMBER and PROVISION_MANAGER_PHONE are required')
@@ -67,6 +70,7 @@ if (!business) {
       whatsappNumber: PA_NUMBER,
       whatsappPhoneNumberId: WA_PHONE_NUMBER_ID,
       whatsappAccessToken: WA_ACCESS_TOKEN,
+      whatsappAppSecret: WA_APP_SECRET,
       googleCalendarId: CALENDAR_ID || PA_NUMBER,
       timezone: TIMEZONE,
       onboardingStep: 'business_name',
@@ -76,12 +80,13 @@ if (!business) {
   console.log('✅ Business created:', business!.id, business!.name)
 } else {
   // Update WA credentials if provided
-  if (WA_PHONE_NUMBER_ID || WA_ACCESS_TOKEN) {
+  if (WA_PHONE_NUMBER_ID || WA_ACCESS_TOKEN || WA_APP_SECRET) {
     await db
       .update(schema.businesses)
       .set({
         ...(WA_PHONE_NUMBER_ID ? { whatsappPhoneNumberId: WA_PHONE_NUMBER_ID } : {}),
         ...(WA_ACCESS_TOKEN ? { whatsappAccessToken: WA_ACCESS_TOKEN } : {}),
+        ...(WA_APP_SECRET ? { whatsappAppSecret: WA_APP_SECRET } : {}),
       })
       .where(eq(schema.businesses.id, business.id))
     console.log('✅ WA credentials updated for existing business:', business.id)

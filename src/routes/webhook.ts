@@ -67,7 +67,12 @@ export async function webhookRoutes(app: FastifyInstance) {
       const signature = (request.headers['x-hub-signature-256'] as string) ?? ''
       const rawBody = (request as unknown as { rawBody: string }).rawBody
 
-      if (!verifySignature(rawBody, signature)) {
+      // Resolve the app secret to use for signature verification.
+      // Different Meta apps (e.g. MiddleMan vs per-business PA numbers) have different
+      // App Secrets. Extract the phone_number_id from the payload to find the business's
+      // secret first; fall back to the global WHATSAPP_APP_SECRET (used by the MiddleMan).
+      const appSecret = await resolveAppSecret(request.body)
+      if (!verifySignature(rawBody, signature, appSecret)) {
         app.log.warn('WhatsApp webhook: invalid signature — dropping')
         return
       }
@@ -171,6 +176,35 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
     await routeManagerMessage(msg, identity, business, app)
   } else {
     await routeCustomerMessage(msg, identity, business, app)
+  }
+}
+
+/**
+ * Resolves the correct App Secret for signature verification.
+ * Different Meta apps (MiddleMan vs per-business PA numbers) have different App Secrets.
+ * We extract the phone_number_id from the raw payload to look up the business's secret.
+ * Falls back to the global WHATSAPP_APP_SECRET when no per-business secret is stored.
+ */
+async function resolveAppSecret(payload: WhatsAppWebhookPayload): Promise<string | undefined> {
+  const globalSecret = process.env['WHATSAPP_APP_SECRET']
+  try {
+    const phoneNumberId = payload?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id
+    if (!phoneNumberId) return globalSecret
+
+    // Check if the MiddleMan owns this phone number ID (fast path — no DB call)
+    const providerPhoneNumberId = process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? ''
+    if (phoneNumberId === providerPhoneNumberId) return globalSecret
+
+    // Look up per-business app secret
+    const [biz] = await db
+      .select({ waAppSecret: businesses.whatsappAppSecret })
+      .from(businesses)
+      .where(eq(businesses.whatsappPhoneNumberId, phoneNumberId))
+      .limit(1)
+
+    return biz?.waAppSecret ?? globalSecret
+  } catch {
+    return globalSecret
   }
 }
 

@@ -5,10 +5,12 @@ import { i18n } from '../../domain/i18n/t.js'
 const APP_SECRET = process.env['WHATSAPP_APP_SECRET'] ?? ''
 const VERIFY_TOKEN = process.env['WHATSAPP_WEBHOOK_VERIFY_TOKEN'] ?? ''
 
-export function verifySignature(rawBody: string, signature: string): boolean {
+export function verifySignature(rawBody: string, signature: string, appSecretOverride?: string): boolean {
   if (!signature.startsWith('sha256=')) return false
+  const secret = appSecretOverride ?? APP_SECRET
+  if (!secret) return false
   const expected = crypto
-    .createHmac('sha256', APP_SECRET)
+    .createHmac('sha256', secret)
     .update(rawBody, 'utf8')
     .digest('hex')
   const received = signature.slice('sha256='.length)
@@ -38,9 +40,9 @@ export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
 
       for (const msg of value.messages) {
         const fromNumber = msg.from.startsWith('+') ? msg.from : `+${msg.from}`
-        const toNumber = value.metadata.display_phone_number.startsWith('+')
-          ? value.metadata.display_phone_number
-          : `+${value.metadata.display_phone_number}`
+        // display_phone_number can come formatted e.g. "+1 555-631-3430" — normalise to E.164
+        const rawDisplayNumber = value.metadata.display_phone_number.replace(/[\s\-\(\)]/g, '')
+        const toNumber = rawDisplayNumber.startsWith('+') ? rawDisplayNumber : `+${rawDisplayNumber}`
 
         if (msg.type !== 'text' || !msg.text) {
           // Sticker, image, voice note, video, etc. — reply with guidance
