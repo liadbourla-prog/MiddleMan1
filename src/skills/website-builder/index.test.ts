@@ -9,6 +9,7 @@ import type { SiteSchema } from './site-schema.js'
 vi.mock('./content-generator.js', () => ({
   generateSiteContent: vi.fn().mockResolvedValue(null),
   patchSiteContent: vi.fn().mockResolvedValue(null),
+  generateAddonContent: vi.fn().mockResolvedValue(null),
   suggestPalette: vi.fn().mockResolvedValue('midnight-blue'),
 }))
 
@@ -416,7 +417,7 @@ describe('handle — structure-confirm', () => {
 // ── handle — manager-review step ─────────────────────────────────────────────
 
 describe('handle — manager-review', () => {
-  it('build flow: approval advances to domain-setup', async () => {
+  it('build flow: first approval (no baseApproved) advances to addons-menu', async () => {
     const c = ctx({
       message: { text: 'approve', receivedAt: new Date() },
       workflowState: makeWorkflowState({
@@ -426,11 +427,26 @@ describe('handle — manager-review', () => {
     })
     const result = await websiteBuilderSkill.handle(c)
 
+    expect(c.workflow.advance).toHaveBeenCalledWith('addons-menu', expect.any(Object))
+    expect(result.handled).toBe(true)
+    if (result.handled) expect(result.reply).toMatch(/add|תוסיפו|special|sections/i)
+  })
+
+  it('build flow: second approval (baseApproved=true) advances to domain-setup', async () => {
+    const c = ctx({
+      message: { text: 'approve', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'manager-review',
+        state: { previewUrl: 'https://preview.example.com/wf-1/index.html', isUpdateFlow: false, baseApproved: true },
+      }),
+    })
+    const result = await websiteBuilderSkill.handle(c)
+
     expect(c.workflow.advance).toHaveBeenCalledWith('domain-setup', expect.any(Object))
     expect(result.handled).toBe(true)
   })
 
-  it('update flow: approval advances to domain-setup', async () => {
+  it('update flow: approval advances to domain-setup (skips add-ons menu)', async () => {
     const c = ctx({
       message: { text: 'אשר', receivedAt: new Date() },
       workflowState: makeWorkflowState({
@@ -482,6 +498,159 @@ describe('handle — manager-review', () => {
     expect(allSteps).toContain('content-patch')
     // Must NOT go to content-generate in update flow
     expect(allSteps).not.toContain('content-generate')
+  })
+})
+
+// ── handle — addons-menu step ────────────────────────────────────────────────
+
+describe('handle — addons-menu', () => {
+  it('skip advances straight to domain-setup', async () => {
+    const c = ctx({
+      message: { text: 'skip', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'addons-menu',
+        state: { previewUrl: 'https://p.example.com/wf-1/', baseApproved: true },
+      }),
+    })
+    await websiteBuilderSkill.handle(c)
+    expect(c.workflow.advance).toHaveBeenCalledWith('domain-setup', expect.any(Object))
+  })
+
+  it('"none" advances straight to domain-setup', async () => {
+    const c = ctx({
+      message: { text: 'none', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'addons-menu',
+        state: { previewUrl: 'https://p.example.com/wf-2/', baseApproved: true },
+      }),
+    })
+    await websiteBuilderSkill.handle(c)
+    expect(c.workflow.advance).toHaveBeenCalledWith('domain-setup', expect.any(Object))
+  })
+
+  it('numeric selection advances to addon-gather', async () => {
+    const c = ctx({
+      message: { text: '3, 5', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'addons-menu',
+        state: { previewUrl: 'https://p.example.com/wf-3/', baseApproved: true },
+      }),
+    })
+    const result = await websiteBuilderSkill.handle(c)
+    expect(c.workflow.advance).toHaveBeenCalledWith('addon-gather', expect.any(Object))
+    expect(result.handled).toBe(true)
+    if (result.handled) {
+      // Should ask the first selected addon question (3 = memberships)
+      expect(result.reply).toMatch(/membership|מנויים/i)
+    }
+  })
+
+  it('name selection ("team") advances to addon-gather', async () => {
+    const c = ctx({
+      message: { text: 'team and testimonials', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'addons-menu',
+        state: { previewUrl: 'https://p.example.com/wf-4/', baseApproved: true },
+      }),
+    })
+    const result = await websiteBuilderSkill.handle(c)
+    expect(c.workflow.advance).toHaveBeenCalledWith('addon-gather', expect.any(Object))
+    expect(result.handled).toBe(true)
+    if (result.handled) {
+      // First selected is team
+      expect(result.reply).toMatch(/team|צוות/i)
+    }
+  })
+
+  it('"all" selects all 7 add-ons', async () => {
+    const c = ctx({
+      message: { text: 'all', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'addons-menu',
+        state: { previewUrl: 'https://p.example.com/wf-5/', baseApproved: true },
+      }),
+    })
+    await websiteBuilderSkill.handle(c)
+    const advanceCall = vi.mocked(c.workflow.advance).mock.calls.find((call) => call[0] === 'addon-gather')
+    expect(advanceCall).toBeDefined()
+    const passedState = advanceCall?.[1] as { selectedAddons?: string[] }
+    expect(passedState?.selectedAddons).toHaveLength(7)
+  })
+})
+
+// ── handle — addon-gather step ───────────────────────────────────────────────
+
+describe('handle — addon-gather', () => {
+  it('stores answer and asks next addon question when more addons pending', async () => {
+    const c = ctx({
+      message: { text: 'Cash, credit card, Bit', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'addon-gather',
+        state: {
+          previewUrl: 'https://p.example.com/wf-1/',
+          baseApproved: true,
+          selectedAddons: ['paymentOptions', 'team'],
+          pendingAddons: ['paymentOptions', 'team'],
+          currentAddonKey: 'paymentOptions',
+          addonGatherState: {},
+        },
+      }),
+    })
+    const result = await websiteBuilderSkill.handle(c)
+
+    // Should advance to addon-gather again for 'team'
+    expect(c.workflow.advance).toHaveBeenCalledWith('addon-gather', expect.any(Object))
+    expect(result.handled).toBe(true)
+    if (result.handled) {
+      // Should ask team question
+      expect(result.reply).toMatch(/team|צוות/i)
+    }
+  })
+
+  it('after last addon: calls generateAddonContent and previews', async () => {
+    const siteSchema = {
+      business: { name: 'Test', category: 'Massage', tagline: 'Test tagline',
+        description: 'A test business description that is long enough to pass validation checks.',
+        city: 'TLV', address: null, serviceArea: [], phone: '+972501234567',
+        googleBusinessProfileUrl: null, openingHours: [], credentials: [], foundedYear: null,
+        practitionerName: null, practitionerTitle: null, practitionerBio: null },
+      style: { variant: 'minimal', palette: 'midnight-blue', logoUrl: null, heroImageUrl: null },
+      services: [{
+        slug: 'swedish', name: 'Swedish Massage', description: 'A relaxing full body massage treatment for stress relief and relaxation delivered by skilled therapists.',
+        durationMinutes: 60, price: 280, priceOnRequest: false, currency: 'ILS',
+        whoFor: 'Ideal for clients who want relaxation.', processSteps: ['Consult', 'Prepare', 'Treat'],
+        contraindications: null, faqs: [],
+      }],
+      faqs: [
+        { question: 'How do I book?', answer: 'Send a WhatsApp message to schedule your appointment.', topic: 'booking', serviceSlug: null },
+        { question: 'What is the price?', answer: 'Prices start from 280 ILS per session.', topic: 'pricing', serviceSlug: null },
+        { question: 'Where are you?', answer: 'We are located in Tel Aviv city center.', topic: 'location', serviceSlug: null },
+        { question: 'What is your policy?', answer: 'We require 24 hours notice for cancellations.', topic: 'policy', serviceSlug: null },
+        { question: 'What services?', answer: 'We offer Swedish and deep tissue massage.', topic: 'services', serviceSlug: null },
+        { question: 'Any discounts?', answer: 'We offer package deals and membership discounts.', topic: 'general', serviceSlug: null },
+      ],
+      language: 'en', generatedAt: new Date().toISOString(), workflowId: 'wf-test',
+    }
+    const c = ctx({
+      message: { text: 'Sarah — Head Therapist — 8 years experience', receivedAt: new Date() },
+      workflowState: makeWorkflowState({
+        step: 'addon-gather',
+        state: {
+          previewUrl: 'https://p.example.com/wf-2/',
+          baseApproved: true,
+          selectedAddons: ['team'],
+          pendingAddons: ['team'],
+          currentAddonKey: 'team',
+          addonGatherState: {},
+          siteSchema,
+        },
+      }),
+    })
+    await websiteBuilderSkill.handle(c)
+
+    // generateAddonContent should have been called
+    const { generateAddonContent } = await import('./content-generator.js')
+    expect(generateAddonContent).toHaveBeenCalled()
   })
 })
 

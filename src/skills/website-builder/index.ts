@@ -1,7 +1,7 @@
 import type { Skill, SkillContext, SkillOutcome } from '../../shared/skill-types.js'
-import { generateSiteContent, patchSiteContent, suggestPalette } from './content-generator.js'
+import { generateSiteContent, patchSiteContent, suggestPalette, generateAddonContent, type AddonGatherInput } from './content-generator.js'
 import { runFullAeoPass, formatAeoSummary, type AeoReport } from './aeo-validator.js'
-import type { SiteSchema } from './site-schema.js'
+import type { SiteSchema, AddonKey } from './site-schema.js'
 import { SiteSchemaZod } from './site-schema.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -28,6 +28,12 @@ interface WbsState {
   // Update flow
   isUpdateFlow?: boolean
   editRequest?: string
+  // Add-ons flow (build flow only, after first manager-review approval)
+  baseApproved?: boolean
+  selectedAddons?: AddonKey[]
+  pendingAddons?: AddonKey[]
+  currentAddonKey?: AddonKey
+  addonGatherState?: Partial<Record<AddonKey, { rawText: string }>>
 }
 
 type Step =
@@ -37,6 +43,8 @@ type Step =
   | 'aeo-pass'
   | 'preview-deploy'
   | 'manager-review'
+  | 'addons-menu'
+  | 'addon-gather'
   | 'domain-setup'
   | 'deploy'
   | 'complete'
@@ -57,6 +65,118 @@ function isApproveText(text: string): boolean {
 
 function isSkipText(text: string): boolean {
   return /^(skip|next|דלג|הבא|pass)(?:\b|$)/i.test(text.trim())
+}
+
+// ── Add-on helpers ────────────────────────────────────────────────────────────
+
+const ADDON_INFO: Record<AddonKey, { num: number; labelEn: string; labelHe: string; descEn: string; descHe: string }> = {
+  bookingWidget:  { num: 1, labelEn: 'Booking Calendar',  labelHe: 'יומן הזמנות',   descEn: 'live availability widget powered by your PA calendar', descHe: 'ווידג׳ט זמינות חי, מחובר ליומן ה-PA שלכם' },
+  paymentOptions: { num: 2, labelEn: 'Payment Options',   labelHe: 'אמצעי תשלום',   descEn: 'accepted payment methods and links',                  descHe: 'שיטות תשלום וקישורים' },
+  memberships:    { num: 3, labelEn: 'Memberships',       labelHe: 'מנויים',         descEn: 'subscription plans and tier comparison',              descHe: 'תוכניות מנוי ומסלולים' },
+  products:       { num: 4, labelEn: 'Products',          labelHe: 'מוצרים',         descEn: 'product catalog with pricing',                        descHe: 'קטלוג מוצרים עם מחירים' },
+  team:           { num: 5, labelEn: 'Meet the Team',     labelHe: 'הצוות שלנו',     descEn: 'staff profiles and bios',                             descHe: 'פרופילים וביוגרפיות' },
+  testimonials:   { num: 6, labelEn: 'Testimonials',      labelHe: 'המלצות',         descEn: 'customer reviews and quotes',                         descHe: 'ביקורות ואמרות לקוחות' },
+  gallery:        { num: 7, labelEn: 'Photo Gallery',     labelHe: 'גלריית תמונות',  descEn: 'showcase sections for images',                        descHe: 'קבצי תמונה ותצוגה' },
+}
+
+const ADDON_KEYS_ORDERED: AddonKey[] = ['bookingWidget', 'paymentOptions', 'memberships', 'products', 'team', 'testimonials', 'gallery']
+
+function parseAddonSelection(text: string): AddonKey[] {
+  const lower = text.toLowerCase()
+  if (/^(skip|none|no|דלג|אין|לא)(?:\b|$)/i.test(text.trim())) return []
+
+  const selected = new Set<AddonKey>()
+
+  // Number matching (1-7)
+  const nums = lower.match(/\b[1-7]\b/g)
+  if (nums) {
+    for (const n of nums) {
+      const num = parseInt(n, 10)
+      const key = ADDON_KEYS_ORDERED.find((k) => ADDON_INFO[k].num === num)
+      if (key) selected.add(key)
+    }
+  }
+
+  // Name matching (English)
+  if (/booking|calendar|יומן/.test(lower))     selected.add('bookingWidget')
+  if (/payment|תשלום/.test(lower))             selected.add('paymentOptions')
+  if (/membership|מנוי|מנויים/.test(lower))    selected.add('memberships')
+  if (/product|מוצר/.test(lower))              selected.add('products')
+  if (/team|staff|צוות/.test(lower))           selected.add('team')
+  if (/testimonial|review|המלצה|ביקורת/.test(lower)) selected.add('testimonials')
+  if (/gallery|photo|גלריה|תמונה/.test(lower)) selected.add('gallery')
+
+  // "all" → select everything
+  if (/\ball\b|הכל|הכול/.test(lower)) return [...ADDON_KEYS_ORDERED]
+
+  return ADDON_KEYS_ORDERED.filter((k) => selected.has(k))
+}
+
+function qAddonsMenu(ctx: SkillContext): string {
+  const isHe = ctx.language === 'he'
+  const lines = ADDON_KEYS_ORDERED.map((k) => {
+    const info = ADDON_INFO[k]
+    return isHe
+      ? `${info.num}️⃣ *${info.labelHe}* — ${info.descHe}`
+      : `${info.num}️⃣ *${info.labelEn}* — ${info.descEn}`
+  }).join('\n')
+
+  if (isHe) {
+    return `✅ *האתר הבסיסי נשמר!*
+
+האם תרצו להוסיף עמודים מיוחדים לאתר?
+
+${lines}
+
+ענו עם מספרים (לדוגמה "1, 3, 5"), שמות, *הכל*, או *דלג* להמשיך לפריסה.`
+  }
+  return `✅ *Base website saved!*
+
+Would you like to add any special sections to your site?
+
+${lines}
+
+Reply with numbers (e.g. "1, 3, 5"), names, *all*, or *skip* to proceed to deployment.`
+}
+
+function qAddonQuestion(ctx: SkillContext, key: AddonKey, state: WbsState): string {
+  const isHe = ctx.language === 'he'
+  const info = ADDON_INFO[key]
+  const currency = ctx.business.currency
+  const serviceNames = ctx.businessKnowledge.services.map((s) => s.name).join(', ')
+
+  const progressDone = (state.selectedAddons?.length ?? 1) - (state.pendingAddons?.length ?? 1)
+  const progressTotal = state.selectedAddons?.length ?? 1
+  const progressLine = progressTotal > 1
+    ? (isHe ? `\n_(${progressDone + 1}/${progressTotal}: ${info.labelHe})_` : `\n_(${progressDone + 1}/${progressTotal}: ${info.labelEn})_`)
+    : ''
+
+  if (isHe) {
+    const q: Record<AddonKey, string> = {
+      bookingWidget:  `📅 *יומן הזמנות*${progressLine}\n\nאיזה שירותים להציג ביומן (או "הכל")?\nכמה ימים קדימה להציג?\nלהציג מחירים? (כן/לא)\n\nלדוגמה: "הכל, 14 ימים, כן"\nשירותים קיימים: ${serviceNames}`,
+      paymentOptions: `💳 *אמצעי תשלום*${progressLine}\n\nאיזה אמצעי תשלום אתם מקבלים? (לדוגמה: מזומן, כרטיס אשראי, ביט, PayPal)\nיש לכם קישורי תשלום? צרפו אותם.\n\nלדוגמה: "מזומן, כרטיס, ביט — https://bit.ly/mybiz"`,
+      memberships:    `👑 *מנויים*${progressLine}\n\nתארו את מסלולי המנוי שלכם. לכל מסלול:\nשם, מחיר (ב-${currency}), תקופה, ומה כלול.\n\nלדוגמה: "בסיסי — 200 ${currency}/חודש — 4 טיפולים, 10% הנחה"`,
+      products:       `🛍 *מוצרים*${progressLine}\n\nפרטו את המוצרים שלכם. לכל מוצר:\nשם, תיאור קצר, ומחיר.\n\nלדוגמה: "ערכת שמן ארומתרפי — ערכה לשימוש ביתי — 180 ${currency}"`,
+      team:           `👥 *הצוות שלנו*${progressLine}\n\nספרו על חברי הצוות. לכל חבר:\nשם, תפקיד, וביו קצר.\n\nלדוגמה: "שרה כהן — מטפלת ראשית — מומחית בעיסוי רקמות עמוקות עם 8 שנות ניסיון"`,
+      testimonials:   `⭐ *המלצות*${progressLine}\n\nשתפו 3–5 המלצות לקוחות. לכל אחת:\nשם (או ראשי תיבות), ציטוט, ושירות שהתקבל.\n\nלדוגמה: "מ.כ. — 'העיסוי הכי טוב שקיבלתי!' — עיסוי שוודי"`,
+      gallery:        `🖼 *גלריית תמונות*${progressLine}\n\nאיזה קבצי/קטגוריות תמונות תרצו?\n\nלדוגמה: "הסטודיו שלנו, לפני ואחרי, הצוות בעבודה"`,
+    }
+    return q[key]
+  }
+  const q: Record<AddonKey, string> = {
+    bookingWidget:  `📅 *Booking Calendar*${progressLine}\n\nWhich services to show (or "all")?\nHow far ahead to display? (e.g. "2 weeks")\nShow prices? (yes/no)\n\nExample: "all, 2 weeks, yes"\nAvailable services: ${serviceNames}`,
+    paymentOptions: `💳 *Payment Options*${progressLine}\n\nWhat payment methods do you accept? (e.g. Cash, Credit card, PayPal, Bit)\nAny payment links? Include them.\n\nExample: "Cash, credit card, Bit — https://bit.ly/mybiz"`,
+    memberships:    `👑 *Memberships*${progressLine}\n\nDescribe your membership plans. For each:\nName, price (in ${currency}), period, and what's included.\n\nExample: "Basic — ${currency}200/month — 4 treatments, 10% discount"`,
+    products:       `🛍 *Products*${progressLine}\n\nList your products. For each:\nName, short description, and price.\n\nExample: "Aromatherapy oil kit — home-use set — ${currency}180"`,
+    team:           `👥 *Meet the Team*${progressLine}\n\nDescribe your team members. For each:\nName, role, and a short bio.\n\nExample: "Sarah Cohen — Head Therapist — Deep tissue specialist with 8 years of experience"`,
+    testimonials:   `⭐ *Testimonials*${progressLine}\n\nShare 3–5 customer quotes. For each:\nName (or initials), their quote, and the service they received.\n\nExample: "M.K. — 'Best massage I've ever had!' — Swedish Massage"`,
+    gallery:        `🖼 *Photo Gallery*${progressLine}\n\nWhat gallery sections would you like?\n\nExample: "Our Studio, Before & After, Team at Work"`,
+  }
+  return q[key]
+}
+
+function formatAddonLabels(keys: AddonKey[], isHe: boolean): string {
+  return keys.map((k) => isHe ? ADDON_INFO[k].labelHe : ADDON_INFO[k].labelEn).join(', ')
 }
 
 // ── Question builders ─────────────────────────────────────────────────────────
@@ -424,9 +544,16 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
     // ── 6. manager-review ──────────────────────────────────────────────────
     case 'manager-review': {
       if (isApproveText(text) || isSkipText(text)) {
-        const ns: WbsState = { ...state }
-        await advance('domain-setup', ns)
-        return await runDomainSetup(ctx, ns, skillName)
+        // Update flow or already through add-ons menu: go straight to domain-setup
+        if (state.isUpdateFlow || state.baseApproved) {
+          const ns: WbsState = { ...state }
+          await advance('domain-setup', ns)
+          return await runDomainSetup(ctx, ns, skillName)
+        }
+        // Build flow, first approval: offer add-ons
+        const ns: WbsState = { ...state, baseApproved: true }
+        await ctx.workflow.advance('addons-menu', ns as unknown as Record<string, unknown>)
+        return { handled: true, reply: qAddonsMenu(ctx), sessionComplete: false, skillName }
       }
 
       // Edit request — loop back
@@ -449,12 +576,67 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
         : await runContentGenerate(ctx, ns, skillName)
     }
 
-    // ── 7. domain-setup (GATE-1) ───────────────────────────────────────────
+    // ── 7. addons-menu ────────────────────────────────────────────────────
+    case 'addons-menu': {
+      const selected = parseAddonSelection(text)
+      if (selected.length === 0) {
+        // No add-ons selected — go straight to deployment
+        const ns: WbsState = { ...state }
+        await advance('domain-setup', ns)
+        return await runDomainSetup(ctx, ns, skillName)
+      }
+      const firstKey = selected[0] as AddonKey
+      const ns: WbsState = {
+        ...state,
+        selectedAddons: selected,
+        pendingAddons: [...selected],
+        currentAddonKey: firstKey,
+        addonGatherState: {},
+      }
+      await ctx.workflow.advance('addon-gather', ns as unknown as Record<string, unknown>)
+      return { handled: true, reply: qAddonQuestion(ctx, firstKey, ns), sessionComplete: false, skillName }
+    }
+
+    // ── 8. addon-gather ───────────────────────────────────────────────────
+    case 'addon-gather': {
+      const currentKey = state.currentAddonKey
+      if (!currentKey) {
+        // Shouldn't happen — safety fallback
+        const ns: WbsState = { ...state }
+        await advance('domain-setup', ns)
+        return await runDomainSetup(ctx, ns, skillName)
+      }
+
+      // Store the owner's answer for the current add-on
+      const ns: WbsState = {
+        ...state,
+        addonGatherState: {
+          ...state.addonGatherState,
+          [currentKey]: { rawText: text },
+        },
+      }
+
+      const remaining = (state.pendingAddons ?? []).slice(1)
+
+      if (remaining.length > 0) {
+        // More add-ons to gather
+        const nextKey = remaining[0]!
+        const ns2: WbsState = { ...ns, pendingAddons: remaining, currentAddonKey: nextKey }
+        await ctx.workflow.advance('addon-gather', ns2 as unknown as Record<string, unknown>)
+        return { handled: true, reply: qAddonQuestion(ctx, nextKey, ns2), sessionComplete: false, skillName }
+      }
+
+      // All add-ons gathered — generate enhanced site
+      const ns2: WbsState = { ...ns, pendingAddons: [] }
+      return await runAddonGenerate(ctx, ns2, skillName)
+    }
+
+    // ── 10. domain-setup (GATE-1) ──────────────────────────────────────────
     case 'domain-setup': {
       return await runDomainSetup(ctx, state, skillName)
     }
 
-    // ── 8. deploy (GATE-1) ─────────────────────────────────────────────────
+    // ── 11. deploy (GATE-1) ────────────────────────────────────────────────
     case 'deploy': {
       // GATE-1 not resolved — stay paused
       const reply = isHe
@@ -463,7 +645,7 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
       return { handled: true, reply, sessionComplete: false, skillName }
     }
 
-    // ── 9. complete ────────────────────────────────────────────────────────
+    // ── 12. complete ───────────────────────────────────────────────────────
     case 'complete': {
       await ctx.workflow.complete()
       const url = state.previewUrl ?? ''
@@ -641,12 +823,54 @@ async function runPreviewDeploy(ctx: SkillContext, state: WbsState, skillName: s
   const changesSummary = state.isUpdateFlow && state.editRequest
     ? (isHe ? `\n\n*שינויים שהוחלו:* בהתאם לבקשתך — "${state.editRequest.slice(0, 80)}"` : `\n\n*Changes applied* based on: "${state.editRequest.slice(0, 80)}"`)
     : ''
+  const addonsIncluded = state.selectedAddons?.length
+    ? (isHe
+        ? `\n\n*תוספות שנוספו:* ${formatAddonLabels(state.selectedAddons, true)}`
+        : `\n\n*Add-ons included:* ${formatAddonLabels(state.selectedAddons, false)}`)
+    : ''
 
   const reply = isHe
-    ? `🌐 *תצוגה מקדימה של האתר מוכנה:*\n${previewUrl}${changesSummary}\n\n${aeoSummary}\n\nפתחו את הקישור, עיינו, וענו:\n✅ *אשר* — להמשיך\n✏️ או תארו מה לשנות`
-    : `🌐 *Your website preview is ready:*\n${previewUrl}${changesSummary}\n\n${aeoSummary}\n\nOpen the link, take a look, and reply:\n✅ *APPROVE* — to proceed\n✏️ or describe what to change`
+    ? `🌐 *תצוגה מקדימה של האתר מוכנה:*\n${previewUrl}${changesSummary}${addonsIncluded}\n\n${aeoSummary}\n\nפתחו את הקישור, עיינו, וענו:\n✅ *אשר* — להמשיך\n✏️ או תארו מה לשנות`
+    : `🌐 *Your website preview is ready:*\n${previewUrl}${changesSummary}${addonsIncluded}\n\n${aeoSummary}\n\nOpen the link, take a look, and reply:\n✅ *APPROVE* — to proceed\n✏️ or describe what to change`
 
   return { handled: true, reply, sessionComplete: false, skillName }
+}
+
+async function runAddonGenerate(ctx: SkillContext, state: WbsState, skillName: string): Promise<SkillOutcome> {
+  const lang = ctx.language
+  const isHe = lang === 'he'
+
+  const rawSchema = state.siteSchema
+  if (!rawSchema) {
+    return { handled: true, reply: isHe ? '⚠️ לא נמצאו נתוני אתר.' : '⚠️ No site data found.', sessionComplete: false, skillName }
+  }
+
+  const parsed = SiteSchemaZod.safeParse(rawSchema)
+  if (!parsed.success) {
+    return { handled: true, reply: isHe ? '⚠️ שגיאה בנתוני האתר.' : '⚠️ Site data error.', sessionComplete: false, skillName }
+  }
+
+  const addonInput = (state.addonGatherState ?? {}) as AddonGatherInput
+  const withAddons = await generateAddonContent(parsed.data, addonInput, ctx)
+  const schemaToUse = withAddons ?? parsed.data
+
+  if (!withAddons) {
+    // Addon generation failed — proceed with base site and inform the owner
+    const warnLine = isHe
+      ? '\n\n⚠️ חלק מהתוספות לא נוצרו — ניתן לנסות שוב מאוחר יותר.'
+      : '\n\n⚠️ Some add-ons could not be generated — you can retry later.'
+    const { schema: fixedSchema, report } = await runFullAeoPass(schemaToUse)
+    const ns: WbsState = { ...state, siteSchema: fixedSchema as unknown as Record<string, unknown>, aeoReport: report }
+    await ctx.workflow.advance('preview-deploy', ns as unknown as Record<string, unknown>)
+    const result = await runPreviewDeploy(ctx, ns, skillName)
+    if (result.handled) return { ...result, reply: result.reply + warnLine }
+    return result
+  }
+
+  const { schema: fixedSchema, report } = await runFullAeoPass(withAddons)
+  const ns: WbsState = { ...state, siteSchema: fixedSchema as unknown as Record<string, unknown>, aeoReport: report }
+  await ctx.workflow.advance('preview-deploy', ns as unknown as Record<string, unknown>)
+  return await runPreviewDeploy(ctx, ns, skillName)
 }
 
 async function runDomainSetup(ctx: SkillContext, state: WbsState, skillName: string): Promise<SkillOutcome> {

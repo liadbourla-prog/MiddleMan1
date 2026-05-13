@@ -1,8 +1,10 @@
 import { z } from 'zod'
 import { GoogleGenAI } from '@google/genai'
 import type { SkillContext } from '../../shared/skill-types.js'
-import { SiteSchemaZod, type SiteSchema } from './site-schema.js'
+import { SiteSchemaZod, siteAddonsZod, type SiteSchema, type AddonKey } from './site-schema.js'
 import { matchPaletteFromText } from '../../shared/palettes.js'
+
+export type AddonGatherInput = Partial<Record<AddonKey, { rawText: string }>>
 
 const ai = new GoogleGenAI({ apiKey: process.env['LLM_API_KEY'] ?? '', apiVersion: 'v1beta' })
 const MODEL = 'gemini-2.5-flash'
@@ -143,6 +145,67 @@ Current site schema:
 ${JSON.stringify(existingSchema, null, 2)}`
 
   return (await callJson(system, user, SiteSchemaZod)) as unknown as SiteSchema | null
+}
+
+// ── Add-on content generation ─────────────────────────────────────────────────
+
+export async function generateAddonContent(
+  schema: SiteSchema,
+  addonInput: AddonGatherInput,
+  ctx: SkillContext,
+): Promise<SiteSchema | null> {
+  const isHe = ctx.language === 'he'
+  const keys = Object.keys(addonInput) as AddonKey[]
+  if (keys.length === 0) return schema
+
+  const serviceSlugs = schema.services.map((s) => s.slug)
+  const serviceNames = schema.services.map((s) => `${s.slug}: ${s.name}`).join(', ')
+
+  const keyDescriptions: Record<AddonKey, string> = {
+    bookingWidget: 'bookingWidget: { serviceIds (array of slugs or ["all"]), lookAheadDays (integer, default 14), showPrices (boolean), liveApiPath (null always — set by infrastructure later) }',
+    paymentOptions: 'paymentOptions: { methods (array of lowercase strings e.g. ["cash","credit_card","bit"]), links (object mapping method→URL, empty {} if none), notes (string or null) }',
+    memberships: 'memberships: { tiers (array of { name, price (string), period (string), features (string[]) }) }',
+    products: 'products: { items (array of { name, description, price (string) }) }',
+    team: 'team: { members (array of { name, title, bio (2–3 sentences) }) }',
+    testimonials: 'testimonials: { reviews (array of { authorName, quote, serviceName (or null), rating (1-5 integer or null) }) }',
+    gallery: 'gallery: { sections (array of { title, description (or null) }) }',
+  }
+
+  const requestedSchemas = keys.map((k) => keyDescriptions[k]).join('\n')
+  const requestedInputs = keys.map((k) => `${k}: "${addonInput[k]?.rawText ?? ''}"`).join('\n')
+
+  const system = `You are generating structured add-on content for a business website.
+The owner has provided freeform descriptions for each add-on they want.
+Convert their input into the exact JSON schema specified below.
+
+Business context:
+- Name: ${schema.business.name}
+- Category: ${schema.business.category}
+- Language: ${isHe ? 'Hebrew (עברית) — all text fields must be in Hebrew' : 'English'}
+- Services available (slugs): ${serviceSlugs.join(', ')} (${serviceNames})
+- Currency: ${schema.services[0]?.currency ?? ctx.business.currency}
+
+Return a JSON object with ONLY these top-level keys (one per requested add-on):
+${requestedSchemas}
+
+Rules:
+- For bookingWidget.serviceIds: use ["all"] if the owner said "all" or didn't specify, otherwise use matching service slugs
+- For bookingWidget.lookAheadDays: parse "2 weeks"→14, "1 month"→30, "3 weeks"→21, default 14
+- For bookingWidget.liveApiPath: always null (infrastructure-controlled)
+- All descriptive text must be in ${isHe ? 'Hebrew' : 'English'}
+- prices: preserve the owner's format as a string (e.g. "₪200/month", "200 ILS")
+- testimonial quotes: preserve verbatim from owner input`
+
+  const user = `Owner-provided add-on information:\n${requestedInputs}`
+
+  const addonsResult = await callJson(system, user, siteAddonsZod)
+  if (!addonsResult) return null
+
+  return {
+    ...schema,
+    addons: addonsResult,
+    generatedAt: new Date().toISOString(),
+  }
 }
 
 // ── Palette suggestion ────────────────────────────────────────────────────────
