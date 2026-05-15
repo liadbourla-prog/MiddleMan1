@@ -30,3 +30,4 @@ npm-debug.log*
 cloud-sql-proxy
 cloud-sql-proxy.darwin.*
 cloud-sql-proxy.linux.*
+.claude/worktrees/

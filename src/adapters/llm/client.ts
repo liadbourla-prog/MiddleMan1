@@ -696,6 +696,26 @@ Output: the explanation message ONLY. No quotes, no labels, no preamble.`
   return ''
 }
 
+// ── Onboarding: timezone extractor ───────────────────────────────────────────
+
+export async function extractTimezone(userInput: string): Promise<string | null> {
+  const schema = z.object({ iana: z.string().nullable() })
+  const systemPrompt = `You are a timezone resolver. Given a city, country, or partial timezone name, return the IANA timezone string.
+Output JSON only: {"iana": "Region/City"} or {"iana": null} if you cannot determine it.
+Examples: "Jerusalem" → {"iana":"Asia/Jerusalem"}, "Paris" → {"iana":"Europe/Paris"}, "banana" → {"iana":null}`
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: userInput,
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 64, temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: 'application/json' },
+    })
+    const parsed = schema.safeParse(JSON.parse(result.text ?? '{}'))
+    return parsed.success ? parsed.data.iana : null
+  } catch {
+    return null
+  }
+}
+
 // ── Onboarding: structured answer parser ─────────────────────────────────────
 
 const cancellationSchema = z.object({ hours: z.number().int().min(0) })

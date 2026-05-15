@@ -16,8 +16,8 @@ const strings = {
     en: `Perfect! What timezone is your business in?\n\nExamples: "Tel Aviv", "New York", "London" — or an IANA name like "Asia/Jerusalem".`,
   },
   mm_bad_timezone: {
-    he: `לא הצלחתי לזהות את אזור הזמן. נסו שם IANA, למשל:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
-    en: `I didn't recognise that timezone. Please use an IANA name, for example:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
+    he: `לא הצלחתי לזהות את זה. באיזו עיר או מדינה נמצא העסק שלכם?`,
+    en: `I didn't catch that. Which city or country is your business in?`,
   },
   mm_ask_calendar_mode: {
     he: `האם יש לכם Google Calendar שתרצו לחבר, או שנתחיל עם יומן פנימי בינתיים? (אפשר לחבר Google בכל עת מאוחר יותר)`,
@@ -36,28 +36,28 @@ const strings = {
     en: `I didn't catch that. Please try again — for example: *Haircut, 30 minutes*`,
   },
   mm_ask_credentials: {
-    he: `דבר אחרון — שלחו את פרטי ה-WhatsApp Business API מ-Meta Business Manager:\n\n• *Phone Number ID* — WhatsApp → Phone Numbers\n• *Access Token* — System User token קבוע\n\nשלחו כך:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
-    en: `Last thing — share your WhatsApp Business API credentials from Meta Business Manager:\n\n• *Phone Number ID* — WhatsApp → Phone Numbers\n• *Access Token* — your System User permanent token\n\nSend them like this:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+    he: `כמעט סיימנו — אני צריך שלושה פרטים מ-Meta Business Manager:\n\n• *Phone Number ID* — הגדרות עסק → WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → בחרו את האפליקציה *MiddleMan* → סמנו whatsapp_business_messaging\n• *WhatsApp Account ID* — הגדרות עסק → WhatsApp Accounts (המספר מתחת לשם החשבון)\n\nשלחו כך:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
+    en: `Almost there — I need three things from Meta Business Manager:\n\n• *Phone Number ID* — Business Settings → WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → select the *MiddleMan* app → check whatsapp_business_messaging\n• *WhatsApp Account ID* — Business Settings → WhatsApp Accounts (the number under your account name)\n\nSend them like this:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
   },
   mm_retry_credentials: {
-    he: `ננסה שוב — שלחו את הפרטים בפורמט הזה:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
-    en: `Let's try that again — send your credentials in this format:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+    he: `ננסה שוב — שלחו את שלושת הפרטים:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
+    en: `Let's try again — send all three:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
   },
   mm_credentials_help: {
-    he: `אין בעיה — הפרטים האלה מגיעים מ-Meta Business Manager, הם שונים לחלוטין מהמספר הטלפוני שלכם.\n\n*מה תצטרכו:*\n• *Phone Number ID* — מזהה מספרי ב-Meta (15 ספרות בערך, לא המספר הטלפוני שלכם)\n• *Access Token* — מפתח גישה שמאפשר ל-PA לשלוח הודעות בשמכם\n\n*איך מגיעים לזה:*\n1. נכנסים ל-business.facebook.com ← הגדרות עסק\n2. בצד שמאל: WhatsApp ← Phone Numbers — שם תמצאו את ה-*Phone Number ID*\n3. לטוקן: System Users ← בחרו משתמש ← Generate New Token ← סמנו whatsapp_business_messaging\n\nכשיהיו לכם הפרטים, שלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
-    en: `No worries — these come from Meta Business Manager and are completely different from your regular phone number.\n\n*What you need:*\n• *Phone Number ID* — a numeric Meta ID (~15 digits, not your actual phone number)\n• *Access Token* — an access key that lets your PA send messages on your behalf\n\n*How to get them:*\n1. Go to business.facebook.com → Business Settings\n2. Left sidebar: WhatsApp → Phone Numbers — your *Phone Number ID* is listed there\n3. For the token: System Users → select a user → Generate New Token → check whatsapp_business_messaging\n\nWhen you have them, send:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+    he: `אין בעיה — הפרטים האלה מגיעים מ-Meta Business Manager, שונים לחלוטין מהמספר הרגיל שלכם.\n\n*מה צריך:*\n• *Phone Number ID* — מספר ב-Meta (כ-15 ספרות) מתחת ל-WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → בחרו *MiddleMan* → סמנו whatsapp_business_messaging\n• *WhatsApp Account ID (WABA ID)* — הגדרות עסק → WhatsApp Accounts, המספר מתחת לשם החשבון\n\nשלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
+    en: `No problem — these come from Meta Business Manager and have nothing to do with your regular phone number.\n\n*What you need:*\n• *Phone Number ID* — a ~15-digit number under WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → select *MiddleMan* → check whatsapp_business_messaging\n• *WhatsApp Account ID (WABA ID)* — Business Settings → WhatsApp Accounts, the number under your account name\n\nSend:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
   },
   mm_credentials_partial_id: {
-    he: (id: string) => `קיבלתי את ה-ID (${id}) ✓\n\nעכשיו צריך את ה-Access Token — מחרוזת שמתחילה ב-EAA. שלחו:\n\`TOKEN: EAAxxxxxxxxx\``,
-    en: (id: string) => `Got the ID (${id}) ✓\n\nNow I need the Access Token — a string starting with EAA. Send:\n\`TOKEN: EAAxxxxxxxxx\``,
+    he: (id: string) => `קיבלתי את ה-Phone Number ID (${id}) ✓\n\nעכשיו צריך את ה-Access Token — מחרוזת שמתחילה ב-EAA, מ-System Users → Generate New Token → אפליקציה *MiddleMan*.`,
+    en: (id: string) => `Got the Phone Number ID (${id}) ✓\n\nNow I need the Access Token — a string starting with EAA, from System Users → Generate New Token → *MiddleMan* app.`,
   },
   mm_credentials_partial_token: {
-    he: `קיבלתי את ה-Token ✓\n\nעכשיו צריך את ה-Phone Number ID — מספר של 15 ספרות בערך מ-Meta. שלחו:\n\`ID: 123456789012345\``,
-    en: `Got the Token ✓\n\nNow I need the Phone Number ID — a ~15-digit number from Meta. Send:\n\`ID: 123456789012345\``,
+    he: `קיבלתי את ה-Token ✓\n\nעכשיו צריך את ה-Phone Number ID — המספר הארוך מתחת ל-WhatsApp → Phone Numbers ב-Meta.`,
+    en: `Got the Token ✓\n\nNow I need the Phone Number ID — the long number under WhatsApp → Phone Numbers in Meta.`,
   },
   mm_credentials_stuck: {
-    he: `מובן שזה לא פשוט 🙏\n\nהפרטים האלה חיוניים כדי לחבר את ה-PA למספר ה-WhatsApp שלכם — אי אפשר להמשיך בלעדיהם.\n\nכשתהיו מוכנים, חזרו לכאן עם:\n• *Phone Number ID* מ-Meta → הגדרות עסק → WhatsApp → Phone Numbers\n• *Access Token* מ-System Users → Generate Token\n\nשלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
-    en: `Totally understand — this part isn't easy 🙏\n\nThese credentials are required to connect your PA to your WhatsApp number — there's no way to proceed without them.\n\nWhen you're ready, come back here with:\n• *Phone Number ID* from Meta → Business Settings → WhatsApp → Phone Numbers\n• *Access Token* from System Users → Generate Token\n\nSend:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
+    he: `מובן שזה לא פשוט 🙏\n\nכשתהיו מוכנים, חזרו עם שלושת הפרטים מ-Meta Business Manager:\n• *Phone Number ID* — WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → אפליקציה MiddleMan\n• *WABA ID* — WhatsApp Accounts, המספר מתחת לשם החשבון\n\nשלחו:\n\`ID: ...\nTOKEN: EAA...\nWABA: ...\``,
+    en: `Totally understand — this part isn't easy 🙏\n\nWhen you're ready, come back with three things from Meta Business Manager:\n• *Phone Number ID* — WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → MiddleMan app\n• *WABA ID* — WhatsApp Accounts, the number under your account name\n\nSend:\n\`ID: ...\nTOKEN: EAA...\nWABA: ...\``,
   },
   mm_credentials_ask_waba_id: {
     he: `✓ הפרטים מאומתים — המספר שלכם מוכן.\n\nצעד אחרון: שלחו את ה-*WhatsApp Business Account ID* (WABA ID). זה המספר שמופיע ב-Meta Business Manager ← הגדרות עסק ← WhatsApp Accounts, מתחת לשם חשבון ה-WhatsApp שלכם.`,

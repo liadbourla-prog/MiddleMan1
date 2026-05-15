@@ -16,7 +16,7 @@ import type { ProviderOnboardingSession } from '../../db/schema.js'
 import { handleOperatorMessage } from './operator.js'
 import { i18n, detectLang, type Lang } from '../i18n/t.js'
 import { sendMessage } from '../../adapters/whatsapp/sender.js'
-import { explainOnboardingConcept } from '../../adapters/llm/client.js'
+import { explainOnboardingConcept, extractTimezone } from '../../adapters/llm/client.js'
 
 export interface ProviderOnboardingResult {
   reply: string
@@ -51,14 +51,14 @@ const WABA_GUIDE_FULL: Record<Lang, string[]> = {
     'ב-Meta Business Manager, מלאו את שם העסק, המדינה והאזור הזמן כדי לאמת את החשבון.',
     'לכו ל-Business Settings, אחר כך WhatsApp Accounts, והוסיפו חשבון WhatsApp Business חדש עם מספר הטלפון שלכם.',
     'ב-Business Settings, לכו ל-System Users, הוסיפו משתמש מערכת חדש ותנו לו גישת Admin לחשבון ה-WhatsApp שלכם.',
-    'פתחו את ה-System User, לחצו על Generate New Token, בחרו whatsapp_business_messaging, והעתיקו אותו. ה-Phone Number ID נמצא תחת WhatsApp ← Phone Numbers.',
+    'פתחו את ה-System User, לחצו על Generate New Token, בחרו את האפליקציה *MiddleMan* מהרשימה, סמנו whatsapp_business_messaging, והעתיקו את הטוקן. ה-Phone Number ID נמצא תחת WhatsApp ← Phone Numbers.',
   ],
   en: [
     'Go to business.facebook.com and create a Meta Business account if you don\'t have one yet.',
     'In Meta Business Manager, fill in your business name, country, and timezone to verify your account.',
     'Go to Business Settings, then WhatsApp Accounts, and add a new WhatsApp Business Account with your phone number.',
     'In Business Settings, go to System Users, add a new System User, and give it Admin access to your WhatsApp account.',
-    'Open that System User, click Generate New Token, select whatsapp_business_messaging, and copy it. Your Phone Number ID is in WhatsApp → Phone Numbers.',
+    'Open that System User, click Generate New Token, select *MiddleMan* from the app dropdown, check whatsapp_business_messaging, and copy the token. Your Phone Number ID is in WhatsApp → Phone Numbers.',
   ],
 }
 
@@ -123,8 +123,10 @@ async function handleStep(
 
   switch (session.step) {
     case 'business_name': {
-      // Treat casual greetings as a re-ask rather than accepting as the business name
-      if (/^(שלום|היי|הי|אהלן|hello|hi|hey)\b/i.test(text)) {
+      // Reject greetings and "I want to join" openers — \b doesn't work with Hebrew so use lookahead
+      const isGreeting = /^(?:שלום|היי|הי|אהלן|hello|hi|hey)(?=\s|[.,!?]|$)/i.test(text)
+      const isJoinRequest = /להצטרף|join\s+middleman|join\s+middle\s*man|אני רוצה|i want to/i.test(text)
+      if (isGreeting || isJoinRequest) {
         return { reply: `מה שם העסק שלכם? / What's the name of your business?` }
       }
       const name = text.slice(0, 100)
@@ -139,7 +141,8 @@ async function handleStep(
         const explanation = await explainOnboardingConcept({ concept: 'timezone', userMessage: text, step: 'timezone', lang })
         if (explanation) return { reply: explanation }
       }
-      const tz = resolveTimezone(text)
+      // Shortcuts first, then LLM fallback for any city/country name we don't have hardcoded
+      const tz = resolveTimezone(text) ?? await extractTimezone(text)
       if (!tz) {
         return { reply: i18n.mm_bad_timezone[lang] }
       }
@@ -320,14 +323,60 @@ async function handleStep(
       }
 
       // Extract whatever the user just sent
-      const newId = text.match(/\d{10,20}/)?.[0] ?? null
+      // WABA ID may be labeled explicitly (WABA: ...) or be the second long number in the message
       const newToken = text.match(/EAA[A-Za-z0-9]+/)?.[0] ?? null
+      const allNumbers = [...text.matchAll(/\b(\d{10,20})\b/g)].map(m => m[1]!)
+      // Labeled extraction takes priority
+      const labeledWabaId = text.match(/(?:WABA|waba|account\s*id)[:\s]+(\d{10,20})/i)?.[1] ?? null
+      const labeledId = text.match(/(?:ID|id|phone\s*number\s*id)[:\s]+(\d{10,20})/i)?.[1] ?? null
+      // Fall back: first number = phone_number_id, second number = WABA ID
+      const newId = labeledId ?? allNumbers[0] ?? null
+      const newWabaId = labeledWabaId ?? (allNumbers.length >= 2 ? allNumbers.find(n => n !== newId) ?? null : null)
 
       // Merge with anything stored from a previous partial message
       const resolvedId = newId ?? data._pendingPhoneNumberId ?? null
       const resolvedToken = newToken ?? data._pendingAccessToken ?? null
+      const resolvedWabaId = newWabaId ?? data._pendingWabaId ?? null
 
-      // Both pieces present — validate then ask for WABA ID
+      // All three present — validate and provision immediately (no extra turn needed)
+      if (resolvedId && resolvedToken && resolvedWabaId) {
+        const metaResult = await fetchPhoneNumberFromMeta(resolvedId, resolvedToken)
+        if (!metaResult.ok) {
+          await db.update(providerOnboardingSessions)
+            .set({ collectedData: { ...data, _pendingPhoneNumberId: undefined, _pendingAccessToken: undefined, _pendingWabaId: undefined } as Record<string, unknown>, updatedAt: new Date() })
+            .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+          return { reply: `${i18n.mm_credentials_error[lang](metaResult.error)}\n\n${i18n.mm_retry_credentials[lang]}` }
+        }
+
+        const fullData: CollectedData = {
+          ...data,
+          phoneNumberId: resolvedId,
+          accessToken: resolvedToken,
+          wabaId: resolvedWabaId,
+          paPhoneNumber: metaResult.phoneNumber,
+        }
+        const provisionResult = await provisionBusiness(db, session.managerPhone, fullData, resolvedWabaId)
+        if (!provisionResult.ok) {
+          return { reply: i18n.mm_setup_failed[lang](provisionResult.error) }
+        }
+
+        await db.update(providerOnboardingSessions)
+          .set({ completedAt: new Date(), collectedData: fullData as Record<string, unknown>, updatedAt: new Date() })
+          .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+
+        const bkOpeningPrompt = lang === 'he'
+          ? `לפני שהלקוחות מגיעים, בואנו נלמד על *${fullData.businessName}* כדי שאוכל לייצג אתכם הכי טוב.\n\nאיך היית מתאר/ת את *${fullData.businessName}*? מה הרגש שאתה/את רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?\n\n(ככל שתשתף/י יותר, כך אדבר טוב יותר בשמך)`
+          : `Before customers arrive, let me get to know *${fullData.businessName}* so I can represent you well.\n\nHow would you describe *${fullData.businessName}*? What feeling do you want customers to walk away with? What makes you stand out?\n\n(The more detail you share, the better I'll speak in your voice)`
+
+        await sendMessage(
+          { toNumber: session.managerPhone, body: bkOpeningPrompt },
+          { accessToken: fullData.accessToken!, phoneNumberId: fullData.phoneNumberId! },
+        ).catch(() => { /* BK setup kickoff is best-effort */ })
+
+        return { reply: i18n.mm_done[lang](fullData.paPhoneNumber!) }
+      }
+
+      // ID + token present but no WABA ID yet — validate credentials first, then ask for WABA ID
       if (resolvedId && resolvedToken) {
         const metaResult = await fetchPhoneNumberFromMeta(resolvedId, resolvedToken)
         if (!metaResult.ok) {
@@ -466,13 +515,14 @@ async function fetchPhoneNumberFromMeta(
   try {
     // Note: whatsapp_business_account field only works with system user tokens, not user tokens.
     // WABA ID is collected separately during credentials step.
-    const url = `https://graph.facebook.com/v21.0/${phoneNumberId}?fields=display_phone_number,verified_name`
+    const url = `https://graph.facebook.com/v21.0/${phoneNumberId}?fields=display_phone_number,verified_name,code_verification_status`
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${accessToken}` },
     })
     const json = (await res.json()) as {
       display_phone_number?: string
       verified_name?: string
+      code_verification_status?: string
       error?: { message?: string }
     }
 
@@ -482,6 +532,14 @@ async function fetchPhoneNumberFromMeta(
 
     const raw = json.display_phone_number
     if (!raw) return { ok: false, error: 'Could not retrieve phone number from Meta' }
+
+    // Block Meta sandbox test numbers — they cannot receive real WhatsApp messages
+    if (json.code_verification_status === 'NOT_VERIFIED' || json.verified_name === 'Test Number') {
+      return {
+        ok: false,
+        error: 'This appears to be a Meta sandbox test number. Please use a real verified business phone number.',
+      }
+    }
 
     // Normalise to E.164 (Meta returns formatted like "+1 555-000-1234")
     const e164 = '+' + raw.replace(/\D/g, '')
