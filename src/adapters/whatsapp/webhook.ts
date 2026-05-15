@@ -44,8 +44,23 @@ export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
         const rawDisplayNumber = value.metadata.display_phone_number.replace(/[\s\-\(\)]/g, '')
         const toNumber = rawDisplayNumber.startsWith('+') ? rawDisplayNumber : `+${rawDisplayNumber}`
 
+        if (msg.type === 'image' && msg.image) {
+          const body = msg.image.caption?.trim() ?? ''
+          messages.push({
+            messageId: msg.id,
+            fromNumber,
+            toNumber,
+            body,
+            timestamp: new Date(parseInt(msg.timestamp, 10) * 1000),
+            rawPayload: payload,
+            imageMediaId: msg.image.id,
+            imageMediaType: msg.image.mime_type,
+          })
+          continue
+        }
+
         if (msg.type !== 'text' || !msg.text) {
-          // Sticker, image, voice note, video, etc. — reply with guidance
+          // Sticker, voice note, video, etc. — reply with guidance
           if (fromNumber && toNumber) {
             nonTextReplies.push({ toNumber: fromNumber, body: i18n.non_text_reply.he })
           }

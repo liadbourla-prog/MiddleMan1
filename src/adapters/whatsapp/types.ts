@@ -5,6 +5,8 @@ export interface InboundMessage {
   body: string
   timestamp: Date
   rawPayload: unknown
+  imageMediaId?: string
+  imageMediaType?: string
 }
 
 export interface OutboundMessage {
@@ -31,6 +33,7 @@ export interface WhatsAppWebhookPayload {
           timestamp: string
           type: string
           text?: { body: string }
+          image?: { id: string; mime_type: string; caption?: string }
         }>
       }
       field: string

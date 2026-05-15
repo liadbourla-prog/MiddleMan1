@@ -28,6 +28,9 @@ interface WbsState {
   // Update flow
   isUpdateFlow?: boolean
   editRequest?: string
+  // Photo classify
+  pendingPhotoUrl?: string
+  photoReturnStep?: Step
 }
 
 type Step =
@@ -42,6 +45,7 @@ type Step =
   | 'complete'
   | 'edit-request'
   | 'content-patch'
+  | 'photo-classify'
 
 // ── Intent helpers ────────────────────────────────────────────────────────────
 
@@ -334,6 +338,17 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
     }
   }
 
+  // Image interception — applies to steps where photos are contextually relevant
+  const imageEligibleSteps = new Set<Step>(['requirements-gather', 'structure-confirm', 'manager-review', 'edit-request'])
+  if (ctx.message.imageUrl && imageEligibleSteps.has(step)) {
+    const ns: WbsState = { ...state, pendingPhotoUrl: ctx.message.imageUrl, photoReturnStep: step }
+    await ctx.workflow.advance('photo-classify', ns as unknown as Record<string, unknown>)
+    const msg = isHe
+      ? 'מה התמונה הזו?\n• תמונת כותרת (ראש הדף)\n• לוגו\n• תמונת שירות\n• תמונת צוות'
+      : "What's this photo for?\n• Hero image (top of the page)\n• Logo\n• Service photo\n• Team photo"
+    return { handled: true, reply: msg, sessionComplete: false, skillName }
+  }
+
   switch (step) {
 
     // ── 1. requirements-gather ─────────────────────────────────────────────
@@ -500,6 +515,57 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
     // ── U2. content-patch ──────────────────────────────────────────────────
     case 'content-patch': {
       return await runContentPatch(ctx, state, skillName)
+    }
+
+    // ── P. photo-classify ──────────────────────────────────────────────────
+    case 'photo-classify': {
+      const lower = text.toLowerCase()
+      const isHero = /hero|header|main|top|כותרת|ראשי|1/.test(lower)
+      const isLogo = /logo|לוגו|2/.test(lower)
+      const isService = /service|treatment|שירות|3/.test(lower)
+      const isTeam = /team|staff|צוות|4/.test(lower)
+      const returnStep: Step = (state.photoReturnStep as Step) ?? 'manager-review'
+      const photoUrl = state.pendingPhotoUrl
+
+      if (!photoUrl || (!isHero && !isLogo && !isService && !isTeam)) {
+        // Unrecognized — skip, return to prior step
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { pendingPhotoUrl: _, photoReturnStep: __, ...cleanState } = state
+        await ctx.workflow.advance(returnStep, cleanState as unknown as Record<string, unknown>)
+        return await dispatchStep(returnStep, ctx, cleanState, skillName)
+      }
+
+      // Update siteSchema with the photo URL
+      const existingSchema = (state.siteSchema ?? {}) as Record<string, unknown>
+      const style = (existingSchema['style'] ?? {}) as Record<string, unknown>
+      let updatedStyle = { ...style }
+
+      if (isHero) updatedStyle = { ...updatedStyle, heroImageUrl: photoUrl }
+      else if (isLogo) updatedStyle = { ...updatedStyle, logoUrl: photoUrl }
+      else if (isService) updatedStyle = { ...updatedStyle, serviceImageUrl: photoUrl }
+      else if (isTeam) updatedStyle = { ...updatedStyle, teamImageUrl: photoUrl }
+
+      const updatedSchema = { ...existingSchema, style: updatedStyle }
+
+      // Persist to DB
+      if (state.previewUrl) {
+        await ctx.saveWebsiteConfig(updatedSchema, state.previewUrl)
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { pendingPhotoUrl: _, photoReturnStep: __, ...cleanState } = state
+      const ns: WbsState = { ...cleanState, siteSchema: updatedSchema }
+      await ctx.workflow.advance(returnStep, ns as unknown as Record<string, unknown>)
+
+      const photoType = isHero ? (isHe ? 'תמונת הכותרת' : 'hero image')
+        : isLogo ? (isHe ? 'לוגו' : 'logo')
+        : isService ? (isHe ? 'תמונת שירות' : 'service photo')
+        : (isHe ? 'תמונת צוות' : 'team photo')
+
+      const msg = isHe
+        ? `✅ ${photoType} עודכנה. ממשיכים.`
+        : `✅ ${photoType} updated. Continuing.`
+      return { handled: true, reply: msg, sessionComplete: false, skillName }
     }
   }
 }

@@ -34,6 +34,8 @@ const baseCtx: SkillContext = {
     websiteJson: null,
     websitePreviewUrl: null,
     websiteUrl: null,
+    gmbProfileUrl: null,
+    gmbVerified: false,
   },
   workflowState: null,
   workflow: {
@@ -57,6 +59,10 @@ const baseCtx: SkillContext = {
   saveCancellationCutoffMinutes: vi.fn().mockResolvedValue(undefined),
   deferFeatureRequest: vi.fn().mockResolvedValue(undefined),
   saveWebsiteConfig: vi.fn().mockResolvedValue(undefined),
+  requestGmbOAuth: vi.fn().mockResolvedValue('https://accounts.google.com/oauth'),
+  requestGmbVerification: vi.fn().mockResolvedValue(undefined),
+  saveGmbLocation: vi.fn().mockResolvedValue(undefined),
+  createGmbListing: vi.fn().mockResolvedValue({ locationId: 'accounts/123/locations/456', profileUrl: 'https://maps.google.com/test' }),
 }
 
 function ctx(text: string, workflowState: WorkflowState | null = null): SkillContext {
@@ -225,14 +231,14 @@ describe('handle', () => {
     }
   })
 
-  it('open-question DONE completes the workflow', async () => {
+  it('open-question DONE transitions to website-offer', async () => {
     const c = ctx('done', makeWorkflow({ step: 'open-question' }))
     const result = await businessKnowledgeSetupSkill.handle(c)
 
     expect(result.handled).toBe(true)
     if (result.handled) {
-      expect(c.workflow.complete).toHaveBeenCalled()
-      expect(result.sessionComplete).toBe(true)
+      expect(c.workflow.advance).toHaveBeenCalledWith('website-offer', expect.any(Object))
+      expect(result.sessionComplete).toBe(false)
     }
   })
 })

@@ -6,6 +6,7 @@ import {
   normalizeWebhookPayload,
 } from '../adapters/whatsapp/webhook.js'
 import { sendMessage } from '../adapters/whatsapp/sender.js'
+import { downloadAndUploadMedia } from '../adapters/whatsapp/media.js'
 import type { WhatsAppWebhookPayload, InboundMessage } from '../adapters/whatsapp/types.js'
 import { db } from '../db/client.js'
 import { processedMessages, businesses, identities, managerMemory } from '../db/schema.js'
@@ -99,6 +100,16 @@ const PROVIDER_WA_NUMBER = process.env['PROVIDER_WA_NUMBER'] ?? ''
 export async function processInboundMessage(msg: InboundMessage, app: FastifyInstance) {
   // Step 0 — provider onboarding (central number, no business context)
   if (PROVIDER_WA_NUMBER && msg.toNumber === PROVIDER_WA_NUMBER) {
+    if (msg.imageMediaId) {
+      await sendMessage(
+        { toNumber: msg.fromNumber, body: i18n.non_text_reply.he },
+        {
+          accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
+          phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
+        },
+      )
+      return
+    }
     const result = await handleProviderOnboarding(db, msg.fromNumber, msg.body)
     const providerSendResult = await sendMessage(
       { toNumber: msg.fromNumber, body: result.reply },
@@ -311,6 +322,32 @@ async function routeCustomerMessage(
     loadBusinessKnowledge(db, business.id, business.currency),
     loadActiveWorkflow(db, identity.id),
   ])
+
+  // Image handling — download only for skills that support photos; others get non-text reply
+  let uploadedImageUrl: string | null = null
+  let uploadedImageMediaType: string | null = null
+  if (msg.imageMediaId) {
+    const imageSkills = new Set(['website-builder', 'google-business-setup'])
+    const shouldUpload = workflowState?.skillName && imageSkills.has(workflowState.skillName)
+    if (shouldUpload && business.whatsappAccessToken) {
+      const mediaResult = await downloadAndUploadMedia({
+        mediaId: msg.imageMediaId,
+        accessToken: business.whatsappAccessToken,
+        businessId: business.id,
+        ...(msg.imageMediaType ? { mediaType: msg.imageMediaType } : {}),
+      })
+      if (mediaResult.ok) {
+        uploadedImageUrl = mediaResult.publicUrl
+        uploadedImageMediaType = mediaResult.mediaType
+      } else {
+        app.log.warn({ error: mediaResult.error, mediaId: msg.imageMediaId }, 'Customer image upload failed — proceeding without image')
+      }
+    } else {
+      await sendMessage({ toNumber: msg.fromNumber, body: i18n.non_text_reply[lang] }, waCredentials)
+      return
+    }
+  }
+
   const skillCtx = await buildSkillContext({
     db,
     business,
@@ -325,6 +362,8 @@ async function routeCustomerMessage(
     ...(business.whatsappPhoneNumberId && business.whatsappAccessToken
       ? { waCredentials: { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId } }
       : {}),
+    imageUrl: uploadedImageUrl,
+    imageMediaType: uploadedImageMediaType,
   })
   const skillOutcome = await dispatchSkill(skillCtx)
   if (skillOutcome?.handled) {
@@ -491,6 +530,25 @@ async function routeManagerMessage(
         .limit(3),
     ])
     const mgMemorySummaries = mgMemoryRows.map((r) => r.summary)
+
+    // Managers can always send images (for website-builder and google-business-setup)
+    let mgUploadedImageUrl: string | null = null
+    let mgUploadedImageMediaType: string | null = null
+    if (msg.imageMediaId && business.whatsappAccessToken) {
+      const mediaResult = await downloadAndUploadMedia({
+        mediaId: msg.imageMediaId,
+        accessToken: business.whatsappAccessToken,
+        businessId: business.id,
+        ...(msg.imageMediaType ? { mediaType: msg.imageMediaType } : {}),
+      })
+      if (mediaResult.ok) {
+        mgUploadedImageUrl = mediaResult.publicUrl
+        mgUploadedImageMediaType = mediaResult.mediaType
+      } else {
+        app.log.warn({ error: mediaResult.error, mediaId: msg.imageMediaId }, 'Manager image upload failed — proceeding without image')
+      }
+    }
+
     const mgSkillCtx = await buildSkillContext({
       db,
       business,
@@ -506,6 +564,8 @@ async function routeManagerMessage(
         ? { waCredentials: { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId } }
         : {}),
       ...(mgMemorySummaries.length > 0 ? { managerMemorySummaries: mgMemorySummaries } : {}),
+      imageUrl: mgUploadedImageUrl,
+      imageMediaType: mgUploadedImageMediaType,
     })
     const mgSkillOutcome = await dispatchSkill(mgSkillCtx)
     if (mgSkillOutcome?.handled) {

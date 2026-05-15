@@ -55,9 +55,12 @@ interface BksState {
   automatedMessages?: AutomatedMessagesConfig
   messageReviewGroup?: number     // 0-based, which group we're reviewing
   messageReviewFeedback?: string  // last manager feedback for regeneration
+  messageReviewRegenCount?: number // regen attempts for current group (capped at 2)
   generatedFaqs?: Array<{ question: string; answer: string }>
   openQuestionCount?: number
   skippedSteps?: string[]
+  websiteAlreadyExists?: boolean
+  gmbAlreadyExists?: boolean
 }
 
 // ── Steps ─────────────────────────────────────────────────────────────────────
@@ -75,6 +78,8 @@ type Step =
   | 'message-review'
   | 'faq-review'
   | 'open-question'
+  | 'website-offer'
+  | 'gmb-offer'
 
 // ── Intent detection ──────────────────────────────────────────────────────────
 
@@ -209,15 +214,21 @@ Answer however feels natural — a list, a description, or just say "talk like I
   'open-question': (ctx) => ctx.language === 'he'
     ? `מצוין! כיסינו הרבה. יש משהו נוסף שרצית שאדע או שרצית לקבוע — משהו על העסק, על הלקוחות, על כל דבר שלא שאלתי?\n\n(ענה/י *סיים* אם הכל נאמר)`
     : `Great! We've covered a lot. Is there anything else you'd like me to know or set up — something about the business, customers, or anything I didn't ask?\n\n(Reply *done* if that's everything)`,
+
+  'website-offer': (ctx) => ctx.language === 'he'
+    ? 'רוצה שאבנה לך אתר עכשיו? זה לוקח רק כמה דקות.'
+    : 'Want me to build you a website now? It only takes a few minutes.',
+
+  'gmb-offer': (ctx) => ctx.language === 'he'
+    ? 'רוצה גם להגדיר פרופיל Google Business? כך לקוחות ימצאו אותך בגוגל.'
+    : 'Want to set up your Google Business profile too? That puts you on Google Maps.',
 }
 
 // ── Message review helpers ─────────────────────────────────────────────────────
 
 const MESSAGE_GROUPS: Array<Array<keyof AutomatedMessagesConfig>> = [
-  ['booking_confirmation', 'reminder_24h', 'reminder_1h', 'rescheduled_confirmation'],
-  ['post_appointment', 'review_request', 'no_show'],
-  ['first_booking_welcome', 'cancellation_ack', 'waitlist_offer'],
-  ['payment_request'],
+  ['booking_confirmation', 'reminder_24h', 'reminder_1h', 'rescheduled_confirmation', 'post_appointment', 'review_request'],
+  ['no_show', 'first_booking_welcome', 'cancellation_ack', 'waitlist_offer', 'payment_request'],
 ]
 
 const MSG_LABELS: Record<keyof AutomatedMessagesConfig, { he: string; en: string }> = {
@@ -531,6 +542,10 @@ export const businessKnowledgeSetupSkill: Skill = {
         if (ctx.businessKnowledge.handoffBehavior) initialState.handoffBehavior = ctx.businessKnowledge.handoffBehavior
         if (ctx.businessKnowledge.automatedMessagesConfig) initialState.automatedMessages = ctx.businessKnowledge.automatedMessagesConfig
 
+        // Seed website/GMB awareness so offer steps can skip if already set up
+        initialState.websiteAlreadyExists = !!(ctx.businessKnowledge.websiteUrl || ctx.businessKnowledge.websitePreviewUrl)
+        initialState.gmbAlreadyExists = !!(ctx.businessKnowledge.gmbProfileUrl)
+
         await ctx.workflow.create('business-knowledge-setup', startStep, initialState as unknown as Record<string, unknown>)
         const question = Q[startStep as Step](ctx, initialState)
         return { handled: true, reply: question, sessionComplete: false, skillName: this.name }
@@ -772,17 +787,17 @@ async function dispatchStep(
     // ── 10. message-review ────────────────────────────────────────────────────
     case 'message-review': {
       const group = state.messageReviewGroup ?? 0
-      const isPostPayment = ctx.businessKnowledge.confirmationGate === 'post_payment'
-      const totalGroups = isPostPayment ? 4 : 3
+      const totalGroups = 2 // compressed from 4 to 2 groups
+      const regenCount = state.messageReviewRegenCount ?? 0
 
-      if (isApproveText(text)) {
+      if (isApproveText(text) || regenCount >= 2) {
         const nextGroup = group + 1
         if (nextGroup >= totalGroups) {
           // All groups approved — save config and generate FAQs
           if (state.automatedMessages) await ctx.saveAutomatedMessagesConfig(state.automatedMessages)
           return await runFaqGeneration(ctx, state, skillName)
         }
-        const ns: BksState = { ...state, messageReviewGroup: nextGroup }
+        const ns: BksState = { ...state, messageReviewGroup: nextGroup, messageReviewRegenCount: 0 }
         await ctx.workflow.advance('message-review', ns as unknown as Record<string, unknown>)
         return { handled: true, reply: buildMessageReviewPrompt(ctx, ns), sessionComplete: false, skillName }
       }
@@ -793,10 +808,14 @@ async function dispatchStep(
         return await runFaqGeneration(ctx, state, skillName)
       }
 
-      // Manager wants changes — regenerate this group
+      // Manager wants changes — regenerate this group (capped at 2 attempts)
       const updated = await regenerateMessageGroup(ctx, state, text)
       const finalMessages = updated ?? state.automatedMessages
-      const ns: BksState = { ...state, ...(finalMessages !== undefined ? { automatedMessages: finalMessages } : {}) }
+      const ns: BksState = {
+        ...state,
+        ...(finalMessages !== undefined ? { automatedMessages: finalMessages } : {}),
+        messageReviewRegenCount: regenCount + 1,
+      }
       await ctx.workflow.advance('message-review', ns as unknown as Record<string, unknown>)
       const editConfirm = lang === 'he' ? '✅ עדכנתי. בדוק/י שוב:\n\n' : '✅ Updated. Review again:\n\n'
       return { handled: true, reply: editConfirm + buildMessageReviewPrompt(ctx, ns), sessionComplete: false, skillName }
@@ -827,8 +846,7 @@ async function dispatchStep(
       const count = state.openQuestionCount ?? 0
 
       if (isCancelText(text) || isSkipText(text) || count >= 3) {
-        await ctx.workflow.complete()
-        return { handled: true, reply: completionReply(lang), sessionComplete: true, skillName }
+        return await runWebsiteOffer(ctx, state, skillName)
       }
 
       const classification = await classifyOpenQuestion(text)
@@ -890,6 +908,63 @@ async function dispatchStep(
         sessionComplete: false,
         skillName,
       }
+    }
+
+    // ── 13. website-offer ─────────────────────────────────────────────────────
+    case 'website-offer': {
+      if (state.websiteAlreadyExists) {
+        return await runGmbOffer(ctx, state, skillName)
+      }
+
+      if (isApproveText(text)) {
+        try {
+          await ctx.workflow.create('website-builder', 'requirements-gather', {})
+        } catch {
+          // WorkflowConflictError — website-builder already exists, treat as created
+        }
+        await ctx.workflow.complete()
+        const bridge = lang === 'he'
+          ? 'מעולה! בואנו נבנה את האתר שלך. מה סגנון העיצוב שאתה מעדיף?'
+          : "Great! Let's build your website. What design style do you prefer?"
+        return { handled: true, reply: bridge, sessionComplete: true, skillName }
+      }
+
+      if (isSkipText(text) || /no|לא/.test(text.toLowerCase())) {
+        return await runGmbOffer(ctx, state, skillName)
+      }
+
+      // Re-ask with LLM-generated natural sentence
+      const offerMsg = await generateOfferMessage(ctx, 'website')
+      return { handled: true, reply: offerMsg, sessionComplete: false, skillName }
+    }
+
+    // ── 14. gmb-offer ─────────────────────────────────────────────────────────
+    case 'gmb-offer': {
+      if (state.gmbAlreadyExists) {
+        await ctx.workflow.complete()
+        return { handled: true, reply: completionReply(lang), sessionComplete: true, skillName }
+      }
+
+      if (isApproveText(text)) {
+        try {
+          await ctx.workflow.create('google-business-setup', 'check-existing', {})
+        } catch {
+          // WorkflowConflictError — already exists
+        }
+        await ctx.workflow.complete()
+        const bridge = lang === 'he'
+          ? 'בואנו נגדיר את הפרופיל שלך ב-Google Business.'
+          : "Let's set up your Google Business profile."
+        return { handled: true, reply: bridge, sessionComplete: true, skillName }
+      }
+
+      if (isSkipText(text) || /no|לא/.test(text.toLowerCase())) {
+        await ctx.workflow.complete()
+        return { handled: true, reply: completionReply(lang), sessionComplete: true, skillName }
+      }
+
+      const offerMsg = await generateOfferMessage(ctx, 'gmb')
+      return { handled: true, reply: offerMsg, sessionComplete: false, skillName }
     }
   }
 }
@@ -963,4 +1038,43 @@ function completionReply(lang: 'he' | 'en'): string {
   return lang === 'he'
     ? '✅ *הגדרת הידע העסקי הושלמה!*\n\nשמרתי את כל המידע. ה-PA מוכן לייצג אותך בצורה הטובה ביותר.\n\nאפשר לעדכן כל הגדרה בכל עת — פשוט כתב/י "עדכן מידע עסקי".'
     : '✅ *Business knowledge setup complete!*\n\nAll information saved. Your PA is ready to represent you at its best.\n\nYou can update any setting at any time — just say "update business info".'
+}
+
+async function generateOfferMessage(ctx: SkillContext, type: 'website' | 'gmb'): Promise<string> {
+  const systemPrompt = `You are a helpful PA assistant. Generate ONE short natural conversational sentence (no menus, no bullet points, no emoji) offering to help set up the ${type === 'website' ? 'business website' : 'Google Business Profile'} for "${ctx.business.name}". Language: ${ctx.language === 'he' ? 'Hebrew' : 'English'}. Output: the sentence ONLY.`
+  const fallback = type === 'website'
+    ? (ctx.language === 'he' ? 'רוצה שאבנה לך אתר עכשיו? זה לוקח רק כמה דקות.' : 'Want me to build you a website now? It only takes a few minutes.')
+    : (ctx.language === 'he' ? 'רוצה גם להגדיר פרופיל Google Business? כך לקוחות ימצאו אותך בגוגל.' : 'Want to set up your Google Business profile too? That puts you on Google Maps.')
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: 'Generate the offer message.',
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 128, temperature: 0.5 },
+    })
+    return result.text?.trim() || fallback
+  } catch {
+    return fallback
+  }
+}
+
+async function runWebsiteOffer(ctx: SkillContext, state: BksState, skillName: string): Promise<SkillOutcome> {
+  if (state.websiteAlreadyExists) {
+    return runGmbOffer(ctx, state, skillName)
+  }
+  const offerMsg = await generateOfferMessage(ctx, 'website')
+  const ns: BksState = { ...state }
+  await ctx.workflow.advance('website-offer', ns as unknown as Record<string, unknown>)
+  return { handled: true, reply: offerMsg, sessionComplete: false, skillName }
+}
+
+async function runGmbOffer(ctx: SkillContext, state: BksState, skillName: string): Promise<SkillOutcome> {
+  const lang = ctx.language
+  if (state.gmbAlreadyExists) {
+    await ctx.workflow.complete()
+    return { handled: true, reply: completionReply(lang), sessionComplete: true, skillName }
+  }
+  const offerMsg = await generateOfferMessage(ctx, 'gmb')
+  const ns: BksState = { ...state }
+  await ctx.workflow.advance('gmb-offer', ns as unknown as Record<string, unknown>)
+  return { handled: true, reply: offerMsg, sessionComplete: false, skillName }
 }

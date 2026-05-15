@@ -53,6 +53,8 @@ const baseBusinessKnowledge = {
   websiteJson: null,
   websitePreviewUrl: null,
   websiteUrl: null,
+  gmbProfileUrl: null,
+  gmbVerified: false,
 }
 
 const baseCtx: SkillContext = {
@@ -98,6 +100,10 @@ const baseCtx: SkillContext = {
   saveCancellationCutoffMinutes: vi.fn().mockResolvedValue(undefined),
   deferFeatureRequest: vi.fn().mockResolvedValue(undefined),
   saveWebsiteConfig: vi.fn().mockResolvedValue(undefined),
+  requestGmbOAuth: vi.fn().mockResolvedValue('https://accounts.google.com/oauth'),
+  requestGmbVerification: vi.fn().mockResolvedValue(undefined),
+  saveGmbLocation: vi.fn().mockResolvedValue(undefined),
+  createGmbListing: vi.fn().mockResolvedValue({ locationId: 'accounts/123/locations/456', profileUrl: 'https://maps.google.com/test' }),
 }
 
 function ctx(overrides: Partial<SkillContext> = {}): SkillContext {

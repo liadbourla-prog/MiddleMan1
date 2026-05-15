@@ -33,6 +33,13 @@ export const operatorCapabilityRegistry: SkillOperatorCapabilities[] = [
     retriggerable: true,
     retriggersFirstStep: 'requirements-gather',
   },
+  {
+    skillName: 'google-business-setup',
+    statusCommands: ['SKILLS [business]'],
+    writesFeatureRequests: false,
+    retriggerable: true,
+    retriggersFirstStep: 'check-existing',
+  },
 ]
 
 export const registeredSkillNames: string[] = operatorCapabilityRegistry.map((c) => c.skillName)

@@ -27,6 +27,8 @@ export async function loadBusinessKnowledge(db: Db, businessId: string, currency
       websiteJson: businesses.websiteJson,
       websitePreviewUrl: businesses.websitePreviewUrl,
       websiteUrl: businesses.websiteUrl,
+      gmbLocationId: businesses.gmbLocationId,
+      googleBusinessProfileUrl: businesses.googleBusinessProfileUrl,
     }).from(businesses).where(eq(businesses.id, businessId)).limit(1),
 
     db.select({
@@ -75,5 +77,7 @@ export async function loadBusinessKnowledge(db: Db, businessId: string, currency
     websiteJson: (biz?.websiteJson as Record<string, unknown> | null) ?? null,
     websitePreviewUrl: biz?.websitePreviewUrl ?? null,
     websiteUrl: biz?.websiteUrl ?? null,
+    gmbProfileUrl: biz?.googleBusinessProfileUrl ?? null,
+    gmbVerified: !!(biz?.gmbLocationId),
   }
 }

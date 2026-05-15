@@ -59,6 +59,10 @@ const strings = {
     he: `מובן שזה לא פשוט 🙏\n\nהפרטים האלה חיוניים כדי לחבר את ה-PA למספר ה-WhatsApp שלכם — אי אפשר להמשיך בלעדיהם.\n\nכשתהיו מוכנים, חזרו לכאן עם:\n• *Phone Number ID* מ-Meta → הגדרות עסק → WhatsApp → Phone Numbers\n• *Access Token* מ-System Users → Generate Token\n\nשלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
     en: `Totally understand — this part isn't easy 🙏\n\nThese credentials are required to connect your PA to your WhatsApp number — there's no way to proceed without them.\n\nWhen you're ready, come back here with:\n• *Phone Number ID* from Meta → Business Settings → WhatsApp → Phone Numbers\n• *Access Token* from System Users → Generate Token\n\nSend:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\``,
   },
+  mm_credentials_ask_waba_id: {
+    he: `✓ הפרטים מאומתים — המספר שלכם מוכן.\n\nצעד אחרון: שלחו את ה-*WhatsApp Business Account ID* (WABA ID). זה המספר שמופיע ב-Meta Business Manager ← הגדרות עסק ← WhatsApp Accounts, מתחת לשם חשבון ה-WhatsApp שלכם.`,
+    en: `✓ Credentials verified — your number checks out.\n\nOne last thing: send your *WhatsApp Business Account ID* (WABA ID). You can find it in Meta Business Manager → Business Settings → WhatsApp Accounts, shown below your WhatsApp account name.`,
+  },
   mm_credentials_error: {
     he: (err: string) => `לא הצלחתי לאמת את הפרטים (${err}).\n\nבדקו שה-Phone Number ID וה-Access Token נכונים ב-Meta Business Manager, ונסו שוב.`,
     en: (err: string) => `I couldn't validate those credentials (${err}).\n\nDouble-check your Phone Number ID and Access Token in Meta Business Manager, then try again.`,
@@ -599,6 +603,18 @@ const strings = {
   hold_expired: {
     he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
     en: `Your booking hold has expired because it wasn't confirmed in time. Feel free to book again whenever you're ready.`,
+  },
+  mm_ask_waba_check: {
+    he: `שאלה קצרה לפני שנמשיך — האם כבר יש לך את פרטי ה-WhatsApp Business API? זה ה-Phone Number ID וה-Access Token מ-Meta. אם עדיין לא, אוכל להדריך אותך.`,
+    en: `Quick check before we continue — do you already have your WhatsApp Business API credentials? That's the Phone Number ID and Access Token from Meta. If not, I can walk you through getting them.`,
+  },
+  mm_waba_guide_next_prompt: {
+    he: `ספר לי כשסיימת ואמשיך.`,
+    en: `Let me know when you're done and I'll continue.`,
+  },
+  mm_waba_guide_done: {
+    he: `מצוין! עכשיו בוא נכניס את פרטי ה-API שלך.`,
+    en: `Great! Now let's enter your API credentials.`,
   },
 } as const
 

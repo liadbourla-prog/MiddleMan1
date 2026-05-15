@@ -21,6 +21,8 @@ export interface SkillCaller {
 export interface SkillMessage {
   text: string
   receivedAt: Date
+  imageUrl?: string | null
+  imageMediaType?: string | null
 }
 
 export interface SkillConversationTurn {
@@ -122,6 +124,9 @@ export interface BusinessKnowledge {
   websiteJson: Record<string, unknown> | null      // stored SiteSchema — non-null = site exists, seed for content-patch
   websitePreviewUrl: string | null                  // preview URL — non-null triggers update flow
   websiteUrl: string | null                         // production URL once live
+  // Google Business Profile
+  gmbProfileUrl: string | null
+  gmbVerified: boolean                              // true when gmbLocationId is set
 }
 
 export interface WorkflowState {
@@ -196,6 +201,19 @@ export interface SkillContext {
   deferFeatureRequest: (text: string) => Promise<void>
   // Website builder — writes website_json + website_preview_url to businesses table
   saveWebsiteConfig: (schema: Record<string, unknown>, previewUrl: string) => Promise<void>
+  // Google Business Profile
+  requestGmbOAuth: () => Promise<string>
+  requestGmbVerification: (locationId: string, method: 'POSTCARD' | 'PHONE_CALL') => Promise<void>
+  saveGmbLocation: (locationId: string, profileUrl: string) => Promise<void>
+  createGmbListing: (params: {
+    businessName: string
+    categoryId: string
+    phone: string
+    address: { streetAddress: string; city: string; country: string }
+    websiteUrl: string | null
+    description: string
+    serviceArea: string[]
+  }) => Promise<{ locationId: string; profileUrl: string }>
 }
 
 /** Everything a skill may return. The core engine decides what to do with it. */

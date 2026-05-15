@@ -63,6 +63,10 @@ export const businesses = pgTable('businesses', {
   websiteJson: jsonb('website_json'),
   websitePreviewUrl: text('website_preview_url'),
   websiteUrl: text('website_url'),
+  // Google Business Profile
+  gmbRefreshToken: text('gmb_refresh_token'),
+  gmbLocationId: text('gmb_location_id'),
+  googleBusinessProfileUrl: text('google_business_profile_url'),
   // Daily briefing (opt-in manager summary)
   dailyBriefingEnabled: boolean('daily_briefing_enabled').notNull().default(false),
   dailyBriefingTime: text('daily_briefing_time').default('09:00'),
@@ -354,7 +358,7 @@ export const providerOnboardingSessions = pgTable('provider_onboarding_sessions'
   id: uuid('id').primaryKey().defaultRandom(),
   managerPhone: text('manager_phone').notNull().unique(),
   step: text('step', {
-    enum: ['business_name', 'timezone', 'calendar', 'services', 'credentials'],
+    enum: ['business_name', 'timezone', 'calendar', 'services', 'waba_check', 'waba_guide', 'credentials'],
   }).notNull().default('business_name'),
   collectedData: jsonb('collected_data').notNull().default({}),
   completedAt: timestamp('completed_at', { withTimezone: true }),

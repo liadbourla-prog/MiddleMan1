@@ -1,10 +1,12 @@
 import type { Skill, SkillContext, SkillOutcome } from '../shared/skill-types.js'
 import { businessKnowledgeSetupSkill } from './business-knowledge-setup/index.js'
 import { websiteBuilderSkill } from './website-builder/index.js'
+import { googleBusinessSetupSkill } from './google-business-setup/index.js'
 
 export const registry: Skill[] = [
   businessKnowledgeSetupSkill,
   websiteBuilderSkill,
+  googleBusinessSetupSkill,
 ]
 
 export function registerSkill(skill: Skill): void {

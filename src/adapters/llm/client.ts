@@ -653,6 +653,12 @@ const CONCEPT_CONTEXT: Record<string, string> = {
   calendar: "Whether to connect Google Calendar or use the built-in calendar. Google Calendar keeps existing appointments in sync automatically. The internal option is fully managed by the PA. Either works — it can be changed later.",
   services: "The service(s) this business offers and how long each takes. Just say the service name and its duration, e.g. 'Haircut, 30 min' or 'Massage, 60 minutes'.",
   credentials: "Two values from Meta (WhatsApp Business API): a Phone Number ID (a long number) and an Access Token (starts with EAA). Both are found in the Meta Business Suite under the WhatsApp section.",
+  waba_check: "WhatsApp Business API (WABA) credentials: a Phone Number ID (a long number) and an Access Token (starts with EAA). These come from Meta's Business Manager. Some businesses already have these from a developer; others need to set them up from scratch.",
+  meta_account: "A Meta Business account is a free business profile on business.facebook.com. It's the starting point for connecting WhatsApp Business API. Anyone can create one with a business name, country, and timezone.",
+  business_manager: "Meta Business Manager (business.facebook.com) is where you manage your business's WhatsApp account, Pages, and ad accounts. You add a WhatsApp Business Account (WABA) there under Business Settings.",
+  waba_setup: "A WhatsApp Business Account (WABA) is set up in Meta Business Manager under Business Settings → WhatsApp Accounts. You register a phone number and link it to your business.",
+  system_user: "A System User in Meta Business Manager is an automated account used to generate long-lived API tokens. Go to Business Settings → System Users, add a new System User, give it Admin access to your WhatsApp account.",
+  credentials_guide: "Your Phone Number ID and Access Token are found in Meta Business Manager. The Phone Number ID is a long number under WhatsApp → Phone Numbers. The Token is generated from a System User with whatsapp_business_messaging permission.",
 }
 
 export async function explainOnboardingConcept(input: {

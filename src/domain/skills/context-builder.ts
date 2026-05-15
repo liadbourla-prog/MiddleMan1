@@ -47,11 +47,14 @@ export async function buildSkillContext(params: {
   managerPhone?: string
   waCredentials?: { accessToken: string; phoneNumberId: string }
   managerMemorySummaries?: string[]
+  imageUrl?: string | null
+  imageMediaType?: string | null
 }): Promise<SkillContext> {
   const {
     db: dbInst, business, identity, session, messageText,
     conversationHistory, language, workflowState, businessKnowledge,
     managerPhone, waCredentials, managerMemorySummaries,
+    imageUrl, imageMediaType,
   } = params
 
   const recentCompletedBooking = await loadRecentCompletedBooking(dbInst, identity.id)
@@ -79,6 +82,8 @@ export async function buildSkillContext(params: {
     message: {
       text: messageText,
       receivedAt: new Date(),
+      imageUrl: imageUrl ?? null,
+      imageMediaType: imageMediaType ?? null,
     },
     conversationHistory,
     language,
@@ -197,6 +202,43 @@ export async function buildSkillContext(params: {
       await dbInst.update(businessesTable)
         .set({ websiteJson: schema, websitePreviewUrl: previewUrl })
         .where(eq(businessesTable.id, business.id))
+    },
+    requestGmbOAuth: async () => {
+      const baseUrl = process.env['PUBLIC_BASE_URL'] ?? 'https://your-domain.com'
+      const state = encodeURIComponent(JSON.stringify({ businessId: business.id, purpose: 'gmb' }))
+      const scopes = encodeURIComponent('https://www.googleapis.com/auth/business.manage')
+      const clientId = process.env['GOOGLE_CLIENT_ID'] ?? ''
+      const redirectUri = encodeURIComponent(`${baseUrl}/oauth/google/callback`)
+      return `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scopes}&access_type=offline&prompt=consent&state=${state}`
+    },
+    requestGmbVerification: async (locationId: string, method: 'POSTCARD' | 'PHONE_CALL') => {
+      if (identity.role !== 'manager') return
+      const { createGmbClient } = await import('../../adapters/gmb/client.js')
+      const gmbRefreshToken = business.gmbRefreshToken
+      if (!gmbRefreshToken) throw new Error('No GMB refresh token available')
+      const gmbClient = createGmbClient(gmbRefreshToken)
+      await gmbClient.requestVerification(locationId, method)
+    },
+    saveGmbLocation: async (locationId: string, profileUrl: string) => {
+      if (identity.role !== 'manager') return
+      await dbInst.update(businessesTable)
+        .set({ gmbLocationId: locationId, googleBusinessProfileUrl: profileUrl })
+        .where(eq(businessesTable.id, business.id))
+    },
+    createGmbListing: async (params) => {
+      if (identity.role !== 'manager') throw new Error('Manager only')
+      const { createGmbClient } = await import('../../adapters/gmb/client.js')
+      const gmbRefreshToken = business.gmbRefreshToken
+      if (!gmbRefreshToken) throw new Error('No GMB refresh token available')
+      const gmbClient = createGmbClient(gmbRefreshToken)
+      const accounts = await gmbClient.listAccounts()
+      if (accounts.length === 0) throw new Error('No GMB accounts found')
+      const accountId = accounts[0]!.accountId
+      const result = await gmbClient.createLocation(accountId, params)
+      await dbInst.update(businessesTable)
+        .set({ gmbLocationId: result.locationId, googleBusinessProfileUrl: result.profileUrl })
+        .where(eq(businessesTable.id, business.id))
+      return result
     },
   }
 }
