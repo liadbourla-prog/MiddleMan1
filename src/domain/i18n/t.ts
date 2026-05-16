@@ -16,8 +16,8 @@ const strings = {
     en: `Perfect! What timezone is your business in?\n\nExamples: "Tel Aviv", "New York", "London" — or an IANA name like "Asia/Jerusalem".`,
   },
   mm_bad_timezone: {
-    he: `לא הצלחתי לזהות את זה. באיזו עיר או מדינה נמצא העסק שלכם?`,
-    en: `I didn't catch that. Which city or country is your business in?`,
+    he: `לא הצלחתי לזהות את אזור הזמן. נסו שם IANA, למשל:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
+    en: `I didn't recognise that timezone. Please use an IANA name, for example:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
   },
   mm_ask_calendar_mode: {
     he: `האם יש לכם Google Calendar שתרצו לחבר, או שנתחיל עם יומן פנימי בינתיים? (אפשר לחבר Google בכל עת מאוחר יותר)`,
@@ -35,45 +35,25 @@ const strings = {
     he: `לא הצלחתי לפענח. נסו שוב — למשל: *תספורת, 30 דקות*`,
     en: `I didn't catch that. Please try again — for example: *Haircut, 30 minutes*`,
   },
-  mm_ask_credentials: {
-    he: `כמעט סיימנו — אני צריך שלושה פרטים מ-Meta Business Manager:\n\n• *Phone Number ID* — הגדרות עסק → WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → בחרו את האפליקציה *MiddleMan* → סמנו whatsapp_business_messaging\n• *WhatsApp Account ID* — הגדרות עסק → WhatsApp Accounts (המספר מתחת לשם החשבון)\n\nשלחו כך:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
-    en: `Almost there — I need three things from Meta Business Manager:\n\n• *Phone Number ID* — Business Settings → WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → select the *MiddleMan* app → check whatsapp_business_messaging\n• *WhatsApp Account ID* — Business Settings → WhatsApp Accounts (the number under your account name)\n\nSend them like this:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
+  mm_embedded_signup_link: {
+    he: (url: string) => `כמעט סיימנו! לחצו על הקישור כדי לחבר את מספר ה-WhatsApp שלכם — לוקח כ-30 שניות:\n${url}`,
+    en: (url: string) => `Almost done! Tap this link to connect your WhatsApp number — takes about 30 seconds:\n${url}`,
   },
-  mm_retry_credentials: {
-    he: `ננסה שוב — שלחו את שלושת הפרטים:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
-    en: `Let's try again — send all three:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
+  mm_embedded_signup_waiting: {
+    he: `כשתסיימו עם הקישור, אקבל אישור אוטומטי ואסיים את ההגדרה.`,
+    en: `Once you complete the link, I'll get a confirmation automatically and finish setup.`,
   },
-  mm_credentials_help: {
-    he: `אין בעיה — הפרטים האלה מגיעים מ-Meta Business Manager, שונים לחלוטין מהמספר הרגיל שלכם.\n\n*מה צריך:*\n• *Phone Number ID* — מספר ב-Meta (כ-15 ספרות) מתחת ל-WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → בחרו *MiddleMan* → סמנו whatsapp_business_messaging\n• *WhatsApp Account ID (WABA ID)* — הגדרות עסק → WhatsApp Accounts, המספר מתחת לשם החשבון\n\nשלחו:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
-    en: `No problem — these come from Meta Business Manager and have nothing to do with your regular phone number.\n\n*What you need:*\n• *Phone Number ID* — a ~15-digit number under WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → select *MiddleMan* → check whatsapp_business_messaging\n• *WhatsApp Account ID (WABA ID)* — Business Settings → WhatsApp Accounts, the number under your account name\n\nSend:\n\`ID: 123456789012345\nTOKEN: EAAxxxxxxxxx\nWABA: 123456789012345\``,
-  },
-  mm_credentials_partial_id: {
-    he: (id: string) => `קיבלתי את ה-Phone Number ID (${id}) ✓\n\nעכשיו צריך את ה-Access Token — מחרוזת שמתחילה ב-EAA, מ-System Users → Generate New Token → אפליקציה *MiddleMan*.`,
-    en: (id: string) => `Got the Phone Number ID (${id}) ✓\n\nNow I need the Access Token — a string starting with EAA, from System Users → Generate New Token → *MiddleMan* app.`,
-  },
-  mm_credentials_partial_token: {
-    he: `קיבלתי את ה-Token ✓\n\nעכשיו צריך את ה-Phone Number ID — המספר הארוך מתחת ל-WhatsApp → Phone Numbers ב-Meta.`,
-    en: `Got the Token ✓\n\nNow I need the Phone Number ID — the long number under WhatsApp → Phone Numbers in Meta.`,
-  },
-  mm_credentials_stuck: {
-    he: `מובן שזה לא פשוט 🙏\n\nכשתהיו מוכנים, חזרו עם שלושת הפרטים מ-Meta Business Manager:\n• *Phone Number ID* — WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → אפליקציה MiddleMan\n• *WABA ID* — WhatsApp Accounts, המספר מתחת לשם החשבון\n\nשלחו:\n\`ID: ...\nTOKEN: EAA...\nWABA: ...\``,
-    en: `Totally understand — this part isn't easy 🙏\n\nWhen you're ready, come back with three things from Meta Business Manager:\n• *Phone Number ID* — WhatsApp → Phone Numbers\n• *Access Token* — System Users → Generate New Token → MiddleMan app\n• *WABA ID* — WhatsApp Accounts, the number under your account name\n\nSend:\n\`ID: ...\nTOKEN: EAA...\nWABA: ...\``,
-  },
-  mm_credentials_ask_waba_id: {
-    he: `✓ הפרטים מאומתים — המספר שלכם מוכן.\n\nצעד אחרון: שלחו את ה-*WhatsApp Business Account ID* (WABA ID). זה המספר שמופיע ב-Meta Business Manager ← הגדרות עסק ← WhatsApp Accounts, מתחת לשם חשבון ה-WhatsApp שלכם.`,
-    en: `✓ Credentials verified — your number checks out.\n\nOne last thing: send your *WhatsApp Business Account ID* (WABA ID). You can find it in Meta Business Manager → Business Settings → WhatsApp Accounts, shown below your WhatsApp account name.`,
-  },
-  mm_credentials_error: {
-    he: (err: string) => `לא הצלחתי לאמת את הפרטים (${err}).\n\nבדקו שה-Phone Number ID וה-Access Token נכונים ב-Meta Business Manager, ונסו שוב.`,
-    en: (err: string) => `I couldn't validate those credentials (${err}).\n\nDouble-check your Phone Number ID and Access Token in Meta Business Manager, then try again.`,
+  mm_embedded_signup_error: {
+    he: (err: string) => `משהו השתבש בחיבור (${err}). נסו שוב או פנו לתמיכה.`,
+    en: (err: string) => `Something went wrong with the connection (${err}). Please try again or contact support.`,
   },
   mm_setup_failed: {
     he: (err: string) => `ההגדרה נכשלה: ${err}. נסו שוב או צרו קשר עם התמיכה.`,
     en: (err: string) => `Setup failed: ${err}. Please try again or contact support.`,
   },
   mm_done: {
-    he: (phone: string) => `✅ ה-PA שלכם מוכן!\n\nמספר ה-PA: *${phone}*\n\nעכשיו שלחו הודעה למספר הזה מה-WhatsApp האישי שלכם להשלמת ההגדרה (שירותים, שעות, חיבור לוח שנה).\n\nמיד לאחר ההגדרה תתחיל שיחת היכרות קצרה — ה-PA ישאל כמה שאלות על העסק כדי לדעת איך לייצג אתכם.\n\nלא תצטרכו את המספר הזה שוב — הכל מנוהל דרך מספר ה-PA.`,
-    en: (phone: string) => `✅ Your PA is ready!\n\nPA number: *${phone}*\n\nNow text that number from your personal WhatsApp to complete setup (services, hours, calendar connection).\n\nRight after setup, a short onboarding interview will begin — your PA will ask a few questions about your business to learn how to represent you.\n\nYou won't need this number again — everything from here is managed through your PA number.`,
+    he: (phone: string) => `✅ ה-PA שלכם מוכן!\n\nמספר ה-PA: *${phone}*\n\nשלחו הודעה למספר הזה מה-WhatsApp האישי שלכם — ה-PA ידריך אתכם משם.`,
+    en: (phone: string) => `✅ Your PA is ready!\n\nPA number: *${phone}*\n\nText that number from your personal WhatsApp — your PA will guide you from there.`,
   },
   mm_already_done: {
     he: `ה-PA שלכם כבר מוגדר! 🎉 לשינויים, שלחו הודעה למספר ה-PA שלכם ישירות.`,
@@ -603,18 +583,6 @@ const strings = {
   hold_expired: {
     he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
     en: `Your booking hold has expired because it wasn't confirmed in time. Feel free to book again whenever you're ready.`,
-  },
-  mm_ask_waba_check: {
-    he: `שאלה קצרה לפני שנמשיך — האם כבר יש לך את פרטי ה-WhatsApp Business API? זה ה-Phone Number ID וה-Access Token מ-Meta. אם עדיין לא, אוכל להדריך אותך.`,
-    en: `Quick check before we continue — do you already have your WhatsApp Business API credentials? That's the Phone Number ID and Access Token from Meta. If not, I can walk you through getting them.`,
-  },
-  mm_waba_guide_next_prompt: {
-    he: `ספר לי כשסיימת ואמשיך.`,
-    en: `Let me know when you're done and I'll continue.`,
-  },
-  mm_waba_guide_done: {
-    he: `מצוין! עכשיו בוא נכניס את פרטי ה-API שלך.`,
-    en: `Great! Now let's enter your API credentials.`,
   },
 } as const
 

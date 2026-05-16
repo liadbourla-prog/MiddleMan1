@@ -652,13 +652,6 @@ const CONCEPT_CONTEXT: Record<string, string> = {
   timezone: "The timezone for this business. Accepts an IANA timezone name (e.g. 'Asia/Jerusalem', 'America/New_York') or a city/country like 'Tel Aviv', 'London', 'Israel'.",
   calendar: "Whether to connect Google Calendar or use the built-in calendar. Google Calendar keeps existing appointments in sync automatically. The internal option is fully managed by the PA. Either works — it can be changed later.",
   services: "The service(s) this business offers and how long each takes. Just say the service name and its duration, e.g. 'Haircut, 30 min' or 'Massage, 60 minutes'.",
-  credentials: "Two values from Meta (WhatsApp Business API): a Phone Number ID (a long number) and an Access Token (starts with EAA). Both are found in the Meta Business Suite under the WhatsApp section.",
-  waba_check: "WhatsApp Business API (WABA) credentials: a Phone Number ID (a long number) and an Access Token (starts with EAA). These come from Meta's Business Manager. Some businesses already have these from a developer; others need to set them up from scratch.",
-  meta_account: "A Meta Business account is a free business profile on business.facebook.com. It's the starting point for connecting WhatsApp Business API. Anyone can create one with a business name, country, and timezone.",
-  business_manager: "Meta Business Manager (business.facebook.com) is where you manage your business's WhatsApp account, Pages, and ad accounts. You add a WhatsApp Business Account (WABA) there under Business Settings.",
-  waba_setup: "A WhatsApp Business Account (WABA) is set up in Meta Business Manager under Business Settings → WhatsApp Accounts. You register a phone number and link it to your business.",
-  system_user: "A System User in Meta Business Manager is an automated account used to generate long-lived API tokens. Go to Business Settings → System Users, add a new System User, give it Admin access to your WhatsApp account.",
-  credentials_guide: "Your Phone Number ID and Access Token are found in Meta Business Manager. The Phone Number ID is a long number under WhatsApp → Phone Numbers. The Token is generated from a System User with whatsapp_business_messaging permission.",
 }
 
 export async function explainOnboardingConcept(input: {
@@ -673,7 +666,7 @@ export async function explainOnboardingConcept(input: {
 
 Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
 Rules:
-- 2–4 sentences maximum
+- 1–3 sentences maximum
 - Plain language — no jargon, no markdown, no bullet points
 - Explain the concept clearly, then end with a direct question asking them to provide the information (your last sentence MUST be a question ending with ?)
 - Sound like a helpful human, not a bot
@@ -694,26 +687,6 @@ Output: the explanation message ONLY. No quotes, no labels, no preamble.`
     // fall through — caller uses static fallback
   }
   return ''
-}
-
-// ── Onboarding: timezone extractor ───────────────────────────────────────────
-
-export async function extractTimezone(userInput: string): Promise<string | null> {
-  const schema = z.object({ iana: z.string().nullable() })
-  const systemPrompt = `You are a timezone resolver. Given a city, country, or partial timezone name, return the IANA timezone string.
-Output JSON only: {"iana": "Region/City"} or {"iana": null} if you cannot determine it.
-Examples: "Jerusalem" → {"iana":"Asia/Jerusalem"}, "Paris" → {"iana":"Europe/Paris"}, "banana" → {"iana":null}`
-  try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
-      contents: userInput,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 64, temperature: 0, thinkingConfig: { thinkingBudget: 0 }, responseMimeType: 'application/json' },
-    })
-    const parsed = schema.safeParse(JSON.parse(result.text ?? '{}'))
-    return parsed.success ? parsed.data.iana : null
-  } catch {
-    return null
-  }
 }
 
 // ── Onboarding: structured answer parser ─────────────────────────────────────
