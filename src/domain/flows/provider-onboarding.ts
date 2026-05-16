@@ -184,6 +184,9 @@ async function handleStep(
       // Any follow-up message here means the user is texting while waiting — reassure them.
       return { reply: i18n.mm_embedded_signup_waiting[lang] }
     }
+
+    default:
+      return { reply: i18n.mm_embedded_signup_waiting[lang] }
   }
 }
 
