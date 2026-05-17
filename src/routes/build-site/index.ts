@@ -6,14 +6,14 @@ import { buildLlmsTxt, buildRobotsTxt, buildSitemapXml } from './aeo-layer.js'
 
 const BUCKET_NAME = process.env['PREVIEW_BUCKET'] ?? ''
 const BUCKET_URL = (process.env['PREVIEW_BUCKET_URL'] ?? '').replace(/\/$/, '')
-const SITE_BUILDER_SECRET = process.env['SITE_BUILDER_SECRET'] ?? ''
 
 export async function buildSiteRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Body: unknown }>('/build-site', async (request, reply) => {
-    // Auth check
+    // Read at request time so late env-var changes (and tests) are honored
+    const siteBuilderSecret = process.env['SITE_BUILDER_SECRET'] ?? ''
     const authHeader = request.headers['authorization'] ?? ''
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : ''
-    if (SITE_BUILDER_SECRET && token !== SITE_BUILDER_SECRET) {
+    if (siteBuilderSecret && token !== siteBuilderSecret) {
       return reply.code(401).send({ error: 'Unauthorized' })
     }
 

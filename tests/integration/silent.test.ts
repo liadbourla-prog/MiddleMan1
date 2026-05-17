@@ -3,6 +3,19 @@ import { vi } from 'vitest'
 
 vi.mock('../../src/redis.js', () => ({
   redisConnection: { quit: vi.fn(), on: vi.fn(), disconnect: vi.fn() },
+  redis: {
+    quit: vi.fn(),
+    on: vi.fn(),
+    disconnect: vi.fn(),
+    set: vi.fn().mockResolvedValue('OK'),
+    get: vi.fn().mockResolvedValue(null),
+    del: vi.fn().mockResolvedValue(0),
+    eval: vi.fn().mockResolvedValue(1),
+    rpush: vi.fn().mockResolvedValue(0),
+    lpush: vi.fn().mockResolvedValue(0),
+    lpop: vi.fn().mockResolvedValue(null),
+    expire: vi.fn().mockResolvedValue(1),
+  },
 }))
 vi.mock('../../src/workers/message-retry.js', () => ({
   enqueueMessage: vi.fn().mockResolvedValue(undefined),
@@ -141,14 +154,13 @@ describe.skipIf(!integrationEnabled)('F — Silent failure injection', () => {
     replaceMockApp(spiedApp)
 
     let callCount = 0
-    const saveSpy = vi.spyOn(
-      await import('../../src/domain/messages/repository.js'),
-      'saveMessage',
-    ).mockImplementation(async (...args) => {
+    const messagesRepo = await import('../../src/domain/messages/repository.js')
+    const originalSaveMessage = messagesRepo.saveMessage
+    const saveSpy = vi.spyOn(messagesRepo, 'saveMessage').mockImplementation(async (...args) => {
       callCount++
       // Fail on the second call (outbound reply)
       if (callCount === 2) throw new Error('F5b injected: outbound save failed')
-      return saveSpy.wrappedMethod?.(...args as Parameters<typeof saveSpy.wrappedMethod>)
+      return originalSaveMessage(...args as Parameters<typeof originalSaveMessage>)
     })
 
     try {
@@ -296,8 +308,9 @@ describe.skipIf(!integrationEnabled)('F — Silent failure injection', () => {
 
     // Spy on all calendar clients created
     const calendarMod = await import('../../src/adapters/calendar/client.js')
+    const originalCreateCalendarClient = calendarMod.createCalendarClient
     const createSpy = vi.spyOn(calendarMod, 'createCalendarClient').mockImplementation((...args) => {
-      const real = createSpy.wrappedMethod!(...args as Parameters<typeof createSpy.wrappedMethod>)
+      const real = originalCreateCalendarClient(...args as Parameters<typeof originalCreateCalendarClient>)
       return {
         ...real,
         deleteEvent: vi.fn().mockRejectedValue(new Error('F2 injected: calendar delete failed')),

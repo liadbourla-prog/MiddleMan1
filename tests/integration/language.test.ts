@@ -3,6 +3,19 @@ import { vi } from 'vitest'
 
 vi.mock('../../src/redis.js', () => ({
   redisConnection: { quit: vi.fn(), on: vi.fn(), disconnect: vi.fn() },
+  redis: {
+    quit: vi.fn(),
+    on: vi.fn(),
+    disconnect: vi.fn(),
+    set: vi.fn().mockResolvedValue('OK'),
+    get: vi.fn().mockResolvedValue(null),
+    del: vi.fn().mockResolvedValue(0),
+    eval: vi.fn().mockResolvedValue(1),
+    rpush: vi.fn().mockResolvedValue(0),
+    lpush: vi.fn().mockResolvedValue(0),
+    lpop: vi.fn().mockResolvedValue(null),
+    expire: vi.fn().mockResolvedValue(1),
+  },
 }))
 vi.mock('../../src/workers/message-retry.js', () => ({
   enqueueMessage: vi.fn().mockResolvedValue(undefined),
@@ -123,8 +136,8 @@ describe.skipIf(!integrationEnabled)('C — Language parity', () => {
       expect(r.replies.length).toBeGreaterThan(0)
       const reply = r.replies[0]!
 
-      // Session must be waiting for language confirmation
-      expect(r.sessionState).toBe('waiting_language_confirmation')
+      // Session stays active; language offer is inline (per CLAUDE.md, replaced waiting_language_confirmation)
+      expect(r.sessionState).toBe('active')
 
       // B4: English-default side is missing Hebrew (כן / לא) — FAILS until B4 fixed
       expect(reply).toMatch(/כן/)

@@ -341,7 +341,7 @@ describe.skipIf(!integrationEnabled)('D — Session edge cases', () => {
       slotStart,
       slotEnd,
       state: 'held',
-      holdExpiresAt: new Date(Date.now() - 1000), // already expired
+      holdExpiresAt: new Date(Date.now() - 61_000), // past 60s grace period
       calendarEventId: `internal:test-${crypto.randomUUID()}`,
       slotTzAtCreation: 'Asia/Jerusalem',
     }).returning()
