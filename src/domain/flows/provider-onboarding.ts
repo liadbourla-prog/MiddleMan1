@@ -394,7 +394,7 @@ export function buildSignupUrl(state: string): string {
   const configId = process.env['META_EMBEDDED_SIGNUP_CONFIG_ID'] ?? ''
   const publicBaseUrl = process.env['PUBLIC_BASE_URL'] ?? ''
   const redirectUri = encodeURIComponent(`${publicBaseUrl}/oauth/meta/callback`)
-  const scope = encodeURIComponent('whatsapp_business_management,whatsapp_business_messaging')
+  const scope = encodeURIComponent('business_management,whatsapp_business_management,whatsapp_business_messaging')
   const extras = encodeURIComponent(
     JSON.stringify({ setup: {}, featureType: 'whatsapp_embedded_signup', sessionInfoVersion: '3' }),
   )
