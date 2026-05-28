@@ -1,4 +1,4 @@
-import { eq, and, or, lte, gte, gt, lt, ne, count, desc } from 'drizzle-orm'
+import { eq, and, or, lte, gte, gt, lt, ne, count, desc, isNull, ilike } from 'drizzle-orm'
 import { z } from 'zod'
 import type { Db } from '../../db/client.js'
 import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages } from '../../db/schema.js'
@@ -790,6 +790,80 @@ export async function pausePA(db: Db, businessId: string, lang: Lang = 'he'): Pr
 export async function resumePA(db: Db, businessId: string, lang: Lang = 'he'): Promise<string> {
   await db.update(businesses).set({ paused: false }).where(eq(businesses.id, businessId))
   return t('resume_confirm', lang)
+}
+
+// ── PAUSE / RESUME CONVERSATION ──────────────────────────────────────────────
+
+export async function pauseConversation(
+  db: Db,
+  businessId: string,
+  customerIdentifier: string,
+  durationMinutes: number,
+  lang: Lang = 'he',
+): Promise<string> {
+  const matches = await db
+    .select({ id: identities.id, phoneNumber: identities.phoneNumber, displayName: identities.displayName })
+    .from(identities)
+    .where(
+      and(
+        eq(identities.businessId, businessId),
+        eq(identities.role, 'customer'),
+        isNull(identities.revokedAt),
+        or(
+          ilike(identities.displayName, `%${customerIdentifier}%`),
+          eq(identities.phoneNumber, customerIdentifier),
+        ),
+      ),
+    )
+    .limit(5)
+
+  if (matches.length === 0) return t('pause_conv_not_found', lang)
+  if (matches.length > 1) {
+    const names = matches.map((m) => m.displayName ?? m.phoneNumber).join(', ')
+    return i18n.pause_conv_ambiguous[lang](names)
+  }
+
+  const match = matches[0]!
+  const pausedUntil = new Date(Date.now() + durationMinutes * 60_000)
+  await db.update(identities).set({ conversationPausedUntil: pausedUntil }).where(eq(identities.id, match.id))
+
+  const name = match.displayName ?? match.phoneNumber
+  return i18n.pause_conv_confirm[lang](name, durationMinutes)
+}
+
+export async function resumeConversation(
+  db: Db,
+  businessId: string,
+  customerIdentifier: string,
+  lang: Lang = 'he',
+): Promise<string> {
+  const matches = await db
+    .select({ id: identities.id, phoneNumber: identities.phoneNumber, displayName: identities.displayName })
+    .from(identities)
+    .where(
+      and(
+        eq(identities.businessId, businessId),
+        eq(identities.role, 'customer'),
+        isNull(identities.revokedAt),
+        or(
+          ilike(identities.displayName, `%${customerIdentifier}%`),
+          eq(identities.phoneNumber, customerIdentifier),
+        ),
+      ),
+    )
+    .limit(5)
+
+  if (matches.length === 0) return t('pause_conv_not_found', lang)
+  if (matches.length > 1) {
+    const names = matches.map((m) => m.displayName ?? m.phoneNumber).join(', ')
+    return i18n.pause_conv_ambiguous[lang](names)
+  }
+
+  const match = matches[0]!
+  await db.update(identities).set({ conversationPausedUntil: null }).where(eq(identities.id, match.id))
+
+  const name = match.displayName ?? match.phoneNumber
+  return i18n.resume_conv_confirm[lang](name)
 }
 
 // ── UPCOMING / BOOKINGS [date] ────────────────────────────────────────────────

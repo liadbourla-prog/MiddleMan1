@@ -241,26 +241,46 @@ export async function oauthRoutes(app: FastifyInstance) {
         const longLivedJson = (await longLivedRes.json()) as { access_token?: string; error?: { message?: string } }
         const accessToken = longLivedJson.access_token ?? tokenJson.access_token
 
-        // 4. Retrieve WhatsApp phone numbers linked to this token
-        const phoneRes = await fetch(
-          `https://graph.facebook.com/v21.0/me/phone_numbers?fields=id,display_phone_number`,
+        // 4. Retrieve WhatsApp Business Accounts and phone numbers via business graph
+        // /me/phone_numbers is for Facebook login codes — WABA phone numbers live under /businesses
+        const wabaRes = await fetch(
+          `https://graph.facebook.com/v21.0/me/businesses?fields=whatsapp_business_accounts{id,phone_numbers{id,display_phone_number}}`,
           { headers: { Authorization: `Bearer ${accessToken}` } },
         )
-        const phoneJson = (await phoneRes.json()) as {
-          data?: Array<{ id: string; display_phone_number: string }>
+        const wabaJson = (await wabaRes.json()) as {
+          data?: Array<{
+            id: string
+            whatsapp_business_accounts?: {
+              data?: Array<{
+                id: string
+                phone_numbers?: { data?: Array<{ id: string; display_phone_number: string }> }
+              }>
+            }
+          }>
           error?: { message?: string }
         }
 
-        if (!phoneRes.ok || !phoneJson.data?.length) {
-          const err = phoneJson.error?.message ?? 'No phone numbers found for this account'
-          app.log.error({ err }, 'Meta phone number fetch failed')
+        // Flatten: find the first available phone number across all WABAs
+        let phoneNumberId: string | undefined
+        let paPhoneNumber: string | undefined
+        for (const biz of wabaJson.data ?? []) {
+          for (const waba of biz.whatsapp_business_accounts?.data ?? []) {
+            const phones = waba.phone_numbers?.data ?? []
+            if (phones.length > 0) {
+              phoneNumberId = phones[0]!.id
+              paPhoneNumber = '+' + phones[0]!.display_phone_number.replace(/\D/g, '')
+              break
+            }
+          }
+          if (phoneNumberId) break
+        }
+
+        if (!phoneNumberId || !paPhoneNumber) {
+          const err = wabaJson.error?.message ?? 'No WhatsApp phone numbers found for this account'
+          app.log.error({ wabaJson }, 'Meta phone number fetch failed')
           await sendError(err)
           return reply.status(502).send('Could not retrieve phone number from Meta')
         }
-
-        const phoneEntry = phoneJson.data[0]!
-        const phoneNumberId = phoneEntry.id
-        const paPhoneNumber = '+' + phoneEntry.display_phone_number.replace(/\D/g, '')
 
         // 5. Provision the business
         const fullData = {
@@ -301,6 +321,35 @@ export async function oauthRoutes(app: FastifyInstance) {
           { toNumber: session.managerPhone, body: bkOpeningPrompt },
           { accessToken, phoneNumberId },
         ).catch(() => { /* BK setup kickoff is best-effort */ })
+
+        // 9. Post-provisioning case-specific messages
+        const wabaCase = (collectedData['_wabaCase'] as string | undefined) ?? '1'
+
+        if (wabaCase === '2') {
+          // Coexistence case: 14-day reminder is already embedded in the link message.
+          // No additional message needed — the reminder was sent with the signup link.
+        } else {
+          // Case 1 and 3a: send Business Suite info + coexistence nudge for Case 1
+          const businessSuiteMsg = lang === 'he'
+            ? i18n.mm_business_suite['he']
+            : i18n.mm_business_suite['en']
+
+          await sendMessage(
+            { toNumber: session.managerPhone, body: businessSuiteMsg },
+            { accessToken, phoneNumberId },
+          ).catch(() => { /* best-effort */ })
+
+          if (wabaCase === '1') {
+            const nudgeMsg = lang === 'he'
+              ? i18n.mm_case1_coexistence_nudge['he']
+              : i18n.mm_case1_coexistence_nudge['en']
+
+            await sendMessage(
+              { toNumber: session.managerPhone, body: nudgeMsg },
+              { accessToken: providerAccessToken, phoneNumberId: providerPhoneNumberId },
+            ).catch(() => { /* best-effort */ })
+          }
+        }
 
         app.log.info({ managerPhone: session.managerPhone, paPhoneNumber }, 'Meta Embedded Signup completed — business provisioned')
         return reply.redirect('/oauth-success')

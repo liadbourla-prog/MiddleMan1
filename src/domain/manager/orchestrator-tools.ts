@@ -9,7 +9,7 @@ import type { Db } from '../../db/client.js'
 import { identities, bookings, customerProfiles, managerInstructions, businessContacts } from '../../db/schema.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
-import { applyInstruction } from './apply.js'
+import { applyInstruction, pauseConversation, resumeConversation } from './apply.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import type { Lang } from '../i18n/t.js'
 import { db as defaultDb } from '../../db/client.js'
@@ -476,4 +476,36 @@ export async function executeSaveContactNote(
   }
 
   return { error: 'Unknown targetType' }
+}
+
+// ── pauseConversation ─────────────────────────────────────────────────────────
+
+interface PauseConversationArgs {
+  customer_identifier: string
+  duration_minutes?: number
+}
+
+export async function executePauseConversation(
+  args: PauseConversationArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const duration = typeof args.duration_minutes === 'number' && args.duration_minutes > 0
+    ? args.duration_minutes
+    : 30
+  const message = await pauseConversation(ctx.db, ctx.businessId, args.customer_identifier, duration, ctx.lang)
+  return { success: true, message }
+}
+
+// ── resumeConversation ────────────────────────────────────────────────────────
+
+interface ResumeConversationArgs {
+  customer_identifier: string
+}
+
+export async function executeResumeConversation(
+  args: ResumeConversationArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const message = await resumeConversation(ctx.db, ctx.businessId, args.customer_identifier, ctx.lang)
+  return { success: true, message }
 }

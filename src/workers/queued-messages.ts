@@ -98,6 +98,9 @@ async function processJob(job: { data: QueuedMessageJob }) {
     business.botPersona, business, business.defaultLanguage,
   )
 
+  // Conversation paused — manager is handling it; do not send any reply
+  if (result.paused) return
+
   await saveMessage(db, session.id, 'assistant', result.reply).catch(() => {})
 
   if (result.reply) {

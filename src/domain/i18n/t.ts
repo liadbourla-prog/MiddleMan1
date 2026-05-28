@@ -60,6 +60,55 @@ const strings = {
     en: `Your PA is already set up! 🎉 If you need to make changes, message your PA number directly.`,
   },
 
+  // ── WABA detection (new steps) ───────────────────────────────────────────────
+  mm_waba_check: {
+    he: `האם יש לכם כבר מספר וואטסאפ עסקי?`,
+    en: `Do you already have a WhatsApp Business number for your business?`,
+  },
+  mm_waba_guide_type: {
+    he: `האם המספר הזה פועל דרך אפליקציית וואטסאפ ביזנס בטלפון, או שהוא מחובר דרך Meta Business Manager?`,
+    en: `Is that number running through the WhatsApp Business App on your phone, or is it connected through Meta Business Manager?`,
+  },
+  mm_waba_guide_bsp: {
+    he: `האם הגדרתם את החשבון בעצמכם, או שחברה חיצונית ניהלה את ההגדרה עבורכם?`,
+    en: `Did you set up the account yourselves, or did an external company manage the setup for you?`,
+  },
+
+  // Case 2 — coexistence (existing WhatsApp Business App number)
+  mm_coexistence_link: {
+    he: (url: string) => `מעולה — המספר שלכם יישאר פעיל בוואטסאפ ביזנס ויתחבר גם ל-PA. תצטרכו חשבון פייסבוק אישי. לחצו:\n\n${url}\n\nחשוב: כדי לשמור על החיבור, פתחו את אפליקציית וואטסאפ ביזנס לפחות פעם בשבועיים.`,
+    en: (url: string) => `Great — your number will stay active in the WhatsApp Business App and connect to the PA as well. You'll need a personal Facebook account. Tap:\n\n${url}\n\nImportant: to keep the connection active, open the WhatsApp Business App at least once every two weeks.`,
+  },
+  // Case 1 — post-provisioning coexistence nudge (sent after provisioning, not in the flow)
+  mm_case1_coexistence_nudge: {
+    he: `טיפ לשבוע הבא: אחרי 7 ימים של שימוש במספר החדש, תוכלו לחבר אותו לאפליקציית וואטסאפ ביזנס ולראות את כל השיחות ישירות שם. כשתהיו מוכנים — שלחו לי "חיבור" בצ'אט הזה.`,
+    en: `Tip for next week: after 7 days of activity on your new number, you can connect it to the WhatsApp Business App and see all conversations directly there. When you're ready — reply "connect" in this chat.`,
+  },
+
+  // Case 1 — fresh number
+  mm_case1_link: {
+    he: (url: string) => `מעולה. שימו לב — תצטרכו חשבון פייסבוק אישי כדי להתחבר. אם אין לכם, פתחו אחד ב-facebook.com לפני שתלחצו.\n\n${url}`,
+    en: (url: string) => `Great. Note — you'll need a personal Facebook account to connect. If you don't have one, create one at facebook.com first.\n\n${url}`,
+  },
+
+  // Case 3a — existing Cloud API WABA
+  mm_case3a_link: {
+    he: (url: string) => `מצוין. היכנסו עם חשבון הפייסבוק המקושר ל-Meta Business Manager שלכם.\n\n${url}`,
+    en: (url: string) => `Great. Log in with the Facebook account linked to your Meta Business Manager.\n\n${url}`,
+  },
+
+  // Case 3b — BSP managed, out of scope
+  mm_case3b_exit: {
+    he: `במקרה הזה צריך לתאם את החיבור ישירות עם החברה שהגדירה את החשבון. בקשו מהם לחבר את המספר ל-PA, ואז חזרו אלינו.`,
+    en: `In this case the connection needs to be coordinated with the company that set up the account. Ask them to connect the number to the PA, then come back to us.`,
+  },
+
+  // Business Suite post-provisioning
+  mm_business_suite: {
+    he: `עוד דבר — כדי לצפות בשיחות ולהשתלט עליהן ידנית אם צריך, הורידו את *Meta Business Suite* לטלפון או היכנסו ל-business.facebook.com. שם תראו את כל השיחות עם הלקוחות בזמן אמת.`,
+    en: `One more thing — to view conversations and step in manually when needed, download *Meta Business Suite* or go to business.facebook.com. You'll see all customer conversations there in real time.`,
+  },
+
   // ── PA manager onboarding (steps.ts / manager-onboarding.ts) ────────────────
   ob_business_name: {
     he: `שלום! אני ה-PA שלכם 👋 בואו נגדיר אותי ביחד — לוקח רק כמה דקות.\n\nאיזה שם יוצג ללקוחות שלכם? (למשל: "מספרת ליאד")`,
@@ -583,6 +632,28 @@ const strings = {
   hold_expired: {
     he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
     en: `Your booking hold has expired because it wasn't confirmed in time. Feel free to book again whenever you're ready.`,
+  },
+
+  // ── Per-conversation pause (manager ops) ─────────────────────────────────────
+  pause_conv_confirm: {
+    he: (name: string, mins: number) => `⏸ השיחה עם ${name} הושהתה ל-${mins} דקות. תוכל לנהל אותה ישירות דרך Meta Business Suite.`,
+    en: (name: string, mins: number) => `⏸ Conversation with ${name} paused for ${mins} minutes. You can handle it directly via Meta Business Suite.`,
+  },
+  resume_conv_confirm: {
+    he: (name: string) => `▶️ השיחה עם ${name} הופעלה מחדש. ה-PA ימשיך לענות.`,
+    en: (name: string) => `▶️ Conversation with ${name} resumed. The PA will respond again.`,
+  },
+  pause_conv_not_found: {
+    he: `לא מצאתי לקוח כזה. נסה שם אחר או מספר טלפון.`,
+    en: `I couldn't find that customer. Try a different name or phone number.`,
+  },
+  pause_conv_ambiguous: {
+    he: (names: string) => `מצאתי כמה לקוחות תואמים: ${names}. אנא ציין מספר טלפון מלא.`,
+    en: (names: string) => `Found multiple matching customers: ${names}. Please provide a full phone number.`,
+  },
+  pa_paused_customer: {
+    he: `אנחנו לא זמינים כרגע לתיאום תורים — נחזור אליכם בהקדם.`,
+    en: `We're not available for bookings right now — we'll be in touch shortly.`,
   },
 } as const
 

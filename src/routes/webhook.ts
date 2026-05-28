@@ -438,6 +438,9 @@ async function routeCustomerMessage(
     isFirstMessage,
   )
 
+  // Conversation paused — manager is handling it; do not send any reply
+  if (result.paused) return
+
   // Save outbound reply — failure must not kill the flow
   if (result.reply) {
     await saveMessage(db, session.id, 'assistant', result.reply).catch((err) => {

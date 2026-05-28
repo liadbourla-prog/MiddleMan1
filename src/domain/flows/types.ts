@@ -3,6 +3,7 @@ export interface FlowResult {
   sessionComplete: boolean
   sessionFailed?: boolean
   escalated?: boolean
+  paused?: boolean
 }
 
 export type ConfirmationParse = 'yes' | 'no' | 'unclear'

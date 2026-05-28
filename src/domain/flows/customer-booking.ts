@@ -15,6 +15,7 @@ import type { TranscriptTurn } from '../../adapters/llm/types.js'
 import type { HydratedContext } from '../session/hydration.js'
 import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/engine.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
+import { t } from '../i18n/t.js'
 
 type CustomerMemoryInput = {
   returningCustomer: boolean
@@ -118,6 +119,21 @@ export async function handleBookingFlow(
   } as BookingFlowContext
   const defaultLang: 'he' | 'en' = businessDefaultLanguage ?? 'he'
   const lang: 'he' | 'en' = (ctx.languageOverride ?? ctx.detectedLanguage) ?? defaultLang
+
+  // ── Per-conversation pause guard ─────────────────────────────────────────
+  if (identity.conversationPausedUntil) {
+    if (identity.conversationPausedUntil > new Date()) {
+      return { reply: '', sessionComplete: false, paused: true }
+    }
+    // Pause expired — clear it and continue
+    await db.update(identities).set({ conversationPausedUntil: null }).where(eq(identities.id, identity.id))
+  }
+
+  // ── Business-wide pause guard ─────────────────────────────────────────────
+  if (business?.paused) {
+    const pauseLang: 'he' | 'en' = (ctx.languageOverride ?? ctx.detectedLanguage) ?? (businessDefaultLanguage ?? 'he')
+    return { reply: t('pa_paused_customer', pauseLang), sessionComplete: false }
+  }
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
