@@ -389,7 +389,7 @@ async function handleStep(
 
 // ── Embedded Signup URL builder ───────────────────────────────────────────────
 
-function buildSignupUrl(state: string): string {
+export function buildSignupUrl(state: string): string {
   const appId = process.env['META_APP_ID'] ?? ''
   const configId = process.env['META_EMBEDDED_SIGNUP_CONFIG_ID'] ?? ''
   const publicBaseUrl = process.env['PUBLIC_BASE_URL'] ?? ''

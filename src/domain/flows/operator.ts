@@ -26,6 +26,8 @@ import { detectLang, i18n, type Lang } from '../i18n/t.js'
 import { redis } from '../../redis.js'
 import { loadOperatorSession, appendOperatorTurn } from '../session/operator-session.js'
 import { enqueueOperatorSummary } from '../../workers/generate-operator-summary.js'
+import { buildSignupUrl } from './provider-onboarding.js'
+import { providerOnboardingSessions } from '../../db/schema.js'
 
 export interface OperatorResult {
   reply: string
@@ -127,6 +129,14 @@ async function routeOperatorMessage(
 
   if (upper === 'FEATURES' || upper === 'FEATURE' || text === 'פיצ\'רים' || text === 'פיצרים') {
     return handleFeatures(db, lang)
+  }
+
+  // Operator requests a test Embedded Signup link
+  if (
+    /^(link|test link|signup link|onboarding link|קישור|לינק|קישור הרשמה|לינק בדיקה)/i.test(upper) ||
+    /^(link|test link|signup link|onboarding link|קישור|לינק|קישור הרשמה|לינק בדיקה)/i.test(text)
+  ) {
+    return handleTestLink(db, fromNumber, lang)
   }
 
   const retriggerMatch = text.match(/^RETRIGGER\s+(.+)$/i) ?? text.match(/^הפעל מחדש\s+(.+)$/)
@@ -679,6 +689,53 @@ async function handleRetrigger(db: Db, nameOrNumber: string, skillName: string |
     fallback: rawRetrigger,
   })
   return { reply: formattedRetrigger }
+}
+
+async function handleTestLink(db: Db, operatorPhone: string, lang: Lang): Promise<OperatorResult> {
+  const crypto = await import('crypto')
+  const signupState = crypto.randomUUID()
+
+  // Upsert a minimal onboarding session so the OAuth callback can validate the state
+  await db
+    .insert(providerOnboardingSessions)
+    .values({
+      managerPhone: operatorPhone,
+      step: 'credentials',
+      collectedData: {
+        businessName: 'Test Business',
+        timezone: 'Asia/Jerusalem',
+        calendarMode: 'internal',
+        calendarId: null,
+        services: [{ name: 'Test', durationMinutes: 30 }],
+        language: lang,
+        _wabaCase: '1',
+        _signupState: signupState,
+      } as Record<string, unknown>,
+    })
+    .onConflictDoUpdate({
+      target: providerOnboardingSessions.managerPhone,
+      set: {
+        step: 'credentials',
+        completedAt: null,
+        collectedData: {
+          businessName: 'Test Business',
+          timezone: 'Asia/Jerusalem',
+          calendarMode: 'internal',
+          calendarId: null,
+          services: [{ name: 'Test', durationMinutes: 30 }],
+          language: lang,
+          _wabaCase: '1',
+          _signupState: signupState,
+        } as Record<string, unknown>,
+        updatedAt: new Date(),
+      },
+    })
+
+  const url = buildSignupUrl(signupState)
+  const reply = lang === 'he'
+    ? `🔗 קישור בדיקה להרשמת עסק:\n${url}\n\nתוקף: חד-פעמי. לחץ, השלם את ה-Embedded Signup, ותוצאת ה-provisioning תגיע אליך כאן.`
+    : `🔗 Test business signup link:\n${url}\n\nSingle-use. Click, complete Embedded Signup, and provisioning result will come back here.`
+  return { reply }
 }
 
 async function fetchBusinessSummaries(db: Db): Promise<CompactBusinessSummary[]> {
