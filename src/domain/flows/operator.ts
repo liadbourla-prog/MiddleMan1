@@ -131,11 +131,16 @@ async function routeOperatorMessage(
     return handleFeatures(db, lang)
   }
 
-  // Operator requests a test Embedded Signup link
-  if (
-    /^(link|test link|signup link|onboarding link|קישור|לינק|קישור הרשמה|לינק בדיקה)/i.test(upper) ||
-    /^(link|test link|signup link|onboarding link|קישור|לינק|קישור הרשמה|לינק בדיקה)/i.test(text)
-  ) {
+  // Operator requests a test Embedded Signup link — match both keyword shorthand and natural language
+  const isLinkRequest =
+    // Exact keyword / shorthand
+    /^(link|test link|signup link|onboarding link|קישור|לינק)\b/i.test(text) ||
+    // Natural language: "send me the link", "שלח לי את הלינק", etc.
+    /(שלח|תביא|תן|give|send|provide).*(לינק|קישור|link)/i.test(text) ||
+    // Link type mentioned alongside signup / onboarding / system / test
+    /(לינק|קישור|link).*(הרשמה|signup|onboard|התחבר|מערכת|system|בדיקה|test)/i.test(text) ||
+    /(הרשמה|signup|onboard|התחבר|מערכת|system|בדיקה|test).*(לינק|קישור|link)/i.test(text)
+  if (isLinkRequest) {
     return handleTestLink(db, fromNumber, lang)
   }
 
