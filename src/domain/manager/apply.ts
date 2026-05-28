@@ -5,6 +5,7 @@ import { availability, serviceTypes, identities, managerInstructions, bookings, 
 import { logAudit } from '../audit/logger.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
+import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 
 // Bilingual day names (Sun=0 … Sat=6)
 function dayName(dayOfWeek: number | null | undefined, lang: Lang): string {
@@ -153,6 +154,7 @@ async function applyAvailabilityChange(
         // Fetch business calendar info once for all affected bookings
         const [biz] = await db
           .select({
+            name: businesses.name,
             whatsappNumber: businesses.whatsappNumber,
             googleCalendarId: businesses.googleCalendarId,
             googleRefreshToken: businesses.googleRefreshToken,
@@ -197,9 +199,17 @@ async function applyAvailabilityChange(
             const dateStr = booking.slotStart.toLocaleDateString(locale, {
               weekday: 'long', day: 'numeric', month: 'long',
             })
+            const cancelFallback = i18n.booking_cancelled_schedule[custLang](dateStr)
+            const cancelMsg = await generateProactiveCustomerMessage({
+              businessName: biz?.name ?? biz?.whatsappNumber ?? 'the business',
+              language: custLang,
+              situation: `The customer's appointment on ${dateStr} has been cancelled due to a schedule change. Apologise briefly and tell them they can reply REBOOK to find a new slot or contact the business directly.`,
+              fallback: cancelFallback,
+              timeoutMs: 2500,
+            }).catch(() => cancelFallback)
             await enqueueMessage(
               customerIdentity.phoneNumber,
-              i18n.booking_cancelled_schedule[custLang](dateStr),
+              cancelMsg,
             ).catch(() => { /* non-fatal */ })
           }
 

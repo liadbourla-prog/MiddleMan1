@@ -18,7 +18,7 @@ import {
   deferredFeatureRequests,
   operatorSessionNotes,
 } from '../../db/schema.js'
-import { classifyManagerInstruction, classifyOperatorMessage, answerOperatorQuestion, type CompactBusinessSummary } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, classifyOperatorMessage, answerOperatorQuestion, formatOperatorDataReply, type CompactBusinessSummary } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
 import { operatorCapabilityRegistry } from './operator-capability-registry.js'
@@ -229,7 +229,14 @@ async function handleStatusAll(db: Db, lang: Lang): Promise<OperatorResult> {
     lines.push(`${statusLabel} *${biz.name}* (${biz.whatsappNumber}) ${cal} · ${lastMsgStr}`)
   }
 
-  return { reply: lines.join('\n') }
+  const rawReply = lines.join('\n')
+  const formattedReply = await formatOperatorDataReply({
+    question: 'STATUS ALL — overview of all businesses',
+    dataBlock: rawReply,
+    lang,
+    fallback: rawReply,
+  })
+  return { reply: formattedReply }
 }
 
 async function handleStatusOne(db: Db, nameOrNumber: string, lang: Lang): Promise<OperatorResult> {
@@ -322,21 +329,26 @@ async function handleStatusOne(db: Db, nameOrNumber: string, lang: Lang): Promis
     ? { number: 'מספר', status: 'סטטוס', calendar: 'לוח שנה', confirm: 'אישור', customers: 'לקוחות', lastBooking: 'תור אחרון', lastMsg: 'הודעה אחרונה', pending: 'הנחיות ממתינות', openEsc: 'פניות פתוחות', knowledge: i18n.op_knowledge_label.he }
     : { number: 'Number', status: 'Status', calendar: 'Calendar', confirm: 'Confirmation', customers: 'Customers', lastBooking: 'Last booking', lastMsg: 'Last message', pending: 'Pending instructions', openEsc: 'Open escalations', knowledge: i18n.op_knowledge_label.en }
 
-  return {
-    reply: [
-      `📋 *${found.name}*`,
-      `${L.number}: ${found.whatsappNumber}`,
-      `${L.status}: ${statusLabel}`,
-      `${L.calendar}: ${calStatus}`,
-      `${L.confirm}: ${confirmStatus}`,
-      `${L.customers}: ${customerRow?.total ?? 0}`,
-      `${L.lastBooking}: ${lastBookingStr}`,
-      `${L.lastMsg}: ${lastMsgStr}`,
-      `${L.pending}: ${pendingInstructions?.total ?? 0}`,
-      `${L.openEsc}: ${openEscalations?.total ?? 0}`,
-      `${L.knowledge}: ${knowledgeStatus}`,
-    ].join('\n'),
-  }
+  const rawStatusOne = [
+    `📋 *${found.name}*`,
+    `${L.number}: ${found.whatsappNumber}`,
+    `${L.status}: ${statusLabel}`,
+    `${L.calendar}: ${calStatus}`,
+    `${L.confirm}: ${confirmStatus}`,
+    `${L.customers}: ${customerRow?.total ?? 0}`,
+    `${L.lastBooking}: ${lastBookingStr}`,
+    `${L.lastMsg}: ${lastMsgStr}`,
+    `${L.pending}: ${pendingInstructions?.total ?? 0}`,
+    `${L.openEsc}: ${openEscalations?.total ?? 0}`,
+    `${L.knowledge}: ${knowledgeStatus}`,
+  ].join('\n')
+  const formattedStatusOne = await formatOperatorDataReply({
+    question: `STATUS ${found.name}`,
+    dataBlock: rawStatusOne,
+    lang,
+    fallback: rawStatusOne,
+  })
+  return { reply: formattedStatusOne }
 }
 
 async function handleEscalations(db: Db, lang: Lang): Promise<OperatorResult> {
@@ -376,7 +388,14 @@ async function handleEscalations(db: Db, lang: Lang): Promise<OperatorResult> {
     lines.push(`  "${t.messageBody.slice(0, 120)}"`)
   }
 
-  return { reply: lines.join('\n') }
+  const rawEscalations = lines.join('\n')
+  const formattedEscalations = await formatOperatorDataReply({
+    question: 'ESCALATIONS — open escalations list',
+    dataBlock: rawEscalations,
+    lang,
+    fallback: rawEscalations,
+  })
+  return { reply: formattedEscalations }
 }
 
 async function handleUpdateAll(db: Db, instruction: string, lang: Lang): Promise<OperatorResult> {
@@ -458,9 +477,14 @@ async function handleUpdateAll(db: Db, instruction: string, lang: Lang): Promise
     ? `\n\n⚠️ ${lang === 'he' ? `נכשל ב-${failures.length}` : `Failed on ${failures.length}`}:\n${failures.slice(0, 5).join('\n')}`
     : ''
 
-  return {
-    reply: `${i18n.op_update_ok[lang](applied, liveBizRows.length)}${failureNote}`,
-  }
+  const rawUpdateResult = `${i18n.op_update_ok[lang](applied, liveBizRows.length)}${failureNote}`
+  const formattedUpdateResult = await formatOperatorDataReply({
+    question: `UPDATE ALL: ${instruction}`,
+    dataBlock: rawUpdateResult,
+    lang,
+    fallback: rawUpdateResult,
+  })
+  return { reply: formattedUpdateResult }
 }
 
 async function handleSkillsOne(db: Db, nameOrNumber: string, lang: Lang): Promise<OperatorResult> {
@@ -527,7 +551,14 @@ async function handleSkillsOne(db: Db, nameOrNumber: string, lang: Lang): Promis
   lines.push(i18n.op_skills_faqs[lang](faqRow?.[0]?.total ?? 0))
   lines.push(i18n.op_skills_deferred[lang](deferredRow?.[0]?.total ?? 0))
 
-  return { reply: lines.join('\n') }
+  const rawSkills = lines.join('\n')
+  const formattedSkills = await formatOperatorDataReply({
+    question: `SKILLS ${found.name}`,
+    dataBlock: rawSkills,
+    lang,
+    fallback: rawSkills,
+  })
+  return { reply: formattedSkills }
 }
 
 async function handleFeatures(db: Db, lang: Lang): Promise<OperatorResult> {
@@ -569,7 +600,14 @@ async function handleFeatures(db: Db, lang: Lang): Promise<OperatorResult> {
     lines.push(`  "${r.rawText.slice(0, 140)}"`)
   }
 
-  return { reply: lines.join('\n') }
+  const rawFeatures = lines.join('\n')
+  const formattedFeatures = await formatOperatorDataReply({
+    question: 'FEATURES — deferred feature requests',
+    dataBlock: rawFeatures,
+    lang,
+    fallback: rawFeatures,
+  })
+  return { reply: formattedFeatures }
 }
 
 async function handleRetrigger(db: Db, nameOrNumber: string, skillName: string | null, lang: Lang): Promise<OperatorResult> {
@@ -633,7 +671,14 @@ async function handleRetrigger(db: Db, nameOrNumber: string, skillName: string |
   // Operator channel is permitted to write to skill_workflows (see DEV_OPERATING_MODEL invariant note).
   await createWorkflow(db, found.id, manager.id, skillName, capability.retriggersFirstStep)
 
-  return { reply: i18n.op_retrigger_ok[lang](found.name, skillName) }
+  const rawRetrigger = i18n.op_retrigger_ok[lang](found.name, skillName)
+  const formattedRetrigger = await formatOperatorDataReply({
+    question: `RETRIGGER ${found.name} ${skillName}`,
+    dataBlock: rawRetrigger,
+    lang,
+    fallback: rawRetrigger,
+  })
+  return { reply: formattedRetrigger }
 }
 
 async function fetchBusinessSummaries(db: Db): Promise<CompactBusinessSummary[]> {
@@ -748,5 +793,12 @@ async function handleWebsitesAll(db: Db, lang: Lang): Promise<OperatorResult> {
     lines.push(`❌ *${bizMap.get(r.businessId)?.name ?? r.businessId}* — ${lang === 'he' ? 'נכשל' : 'failed'}`)
   }
 
-  return { reply: lines.join('\n') }
+  const rawWebsites = lines.join('\n')
+  const formattedWebsites = await formatOperatorDataReply({
+    question: 'WEBSITES — business websites status',
+    dataBlock: rawWebsites,
+    lang,
+    fallback: rawWebsites,
+  })
+  return { reply: formattedWebsites }
 }

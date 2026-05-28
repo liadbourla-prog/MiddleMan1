@@ -360,7 +360,7 @@ export async function handleBookingFlow(
           ? `This is the customer's first message and it is unclear or generic. Welcome them warmly, introduce yourself as the booking assistant for ${businessName}, briefly explain what you can help with (booking, cancellations, rescheduling${hasFaqs ? ', and questions about the business' : ''}), and ask how you can help.`
           : hasFaqs
             ? `Customer sent a message the system couldn't classify as booking, cancellation, or rescheduling. Their message: "${messageText}". Check the FAQs above — if one is relevant, answer it directly. If not, politely explain the assistant handles bookings and invite them to ask about that.`
-            : 'Message intent is unknown. Explain the assistant handles booking, cancellation, rescheduling, and service inquiries only. They can also ask "what are my bookings?" to see upcoming appointments.'
+            : `Customer sent something that couldn't be understood or is out of scope. Respond warmly — acknowledge you didn't quite follow, then in 1–2 friendly sentences let them know you can help with booking, cancelling, rescheduling, or checking upcoming appointments. Invite them to try.`
 
         const unknownKnowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,

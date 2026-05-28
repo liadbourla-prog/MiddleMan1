@@ -7,6 +7,7 @@ import { canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sende
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
+import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 
 const QUEUE_NAME = 'reminders'
 
@@ -129,9 +130,14 @@ async function processReminder(job: { data: ReminderJob }) {
     ? i18n.reminder_24h[lang](serviceName, biz.name, dateStr, timeStr)
     : i18n.reminder_1h[lang](serviceName, biz.name, timeStr)
 
+  const situation = type === '24h'
+    ? `Send a friendly 24-hour reminder: the customer has "${serviceName}" at ${biz.name} tomorrow, ${dateStr} at ${timeStr}. Tell them to reply CANCEL if they need to cancel.`
+    : `Send a friendly 1-hour reminder: the customer has "${serviceName}" at ${biz.name} in 1 hour at ${timeStr}. Warm and brief.`
+
   const freeFormAllowed = await canSendFreeForm(customerId)
   if (freeFormAllowed) {
-    await enqueueMessage(customer.phoneNumber, body)
+    const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: body, timeoutMs: 2500 })
+    await enqueueMessage(customer.phoneNumber, llmBody)
   } else {
     // Customer has not messaged in 24h — use Meta-approved template
     const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken

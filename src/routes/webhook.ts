@@ -40,6 +40,7 @@ import { checkBusinessHours, computeNextOpenMs } from '../domain/hours/gate.js'
 import { queueMessageForLater } from '../workers/queued-messages.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
+import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply } from '../adapters/llm/client.js'
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
@@ -101,8 +102,14 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
   // Step 0 — provider onboarding (central number, no business context)
   if (PROVIDER_WA_NUMBER && msg.toNumber === PROVIDER_WA_NUMBER) {
     if (msg.imageMediaId) {
+      const imgFallback = `${i18n.non_text_reply.he}\n\n${i18n.non_text_reply.en}`
+      const imgReply = await generateProviderOnboardingReply({
+        step: 'image_not_supported',
+        lang: 'bilingual',
+        fallback: imgFallback,
+      })
       await sendMessage(
-        { toNumber: msg.fromNumber, body: i18n.non_text_reply.he },
+        { toNumber: msg.fromNumber, body: imgReply },
         {
           accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
           phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
@@ -160,7 +167,15 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
       const revokedCreds = business.whatsappPhoneNumberId && business.whatsappAccessToken
         ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
         : undefined
-      await sendMessage({ toNumber: msg.fromNumber, body: i18n.revoked_access[lang] }, revokedCreds)
+      const revokedFallback = i18n.revoked_access[lang]
+      const revokedReply = await generateProactiveCustomerMessage({
+        businessName: business.name,
+        language: lang,
+        situation: 'This person\'s access has been revoked. Tell them politely to contact the business directly.',
+        fallback: revokedFallback,
+        timeoutMs: 3000,
+      })
+      await sendMessage({ toNumber: msg.fromNumber, body: revokedReply }, revokedCreds)
       return
     }
     await registerCustomer(db, business.id, msg.fromNumber)
@@ -266,9 +281,25 @@ async function routeCustomerMessage(
       const opensAt = hoursCheck.opensAt ?? ''
       if (delayMs !== null && delayMs > 0) {
         await queueMessageForLater(business.id, msg.fromNumber, msg.toNumber, msg.body, delayMs)
-        await sendMessage({ toNumber: msg.fromNumber, body: i18n.closed_queued[lang](business.name, opensAt) }, waCredentials)
+        const closedQueuedFallback = i18n.closed_queued[lang](business.name, opensAt)
+        const closedQueuedReply = await generateProactiveCustomerMessage({
+          businessName: business.name,
+          language: lang,
+          situation: `The business is currently closed${opensAt ? ` and reopens at ${opensAt}` : ''}. The customer's message has been saved and we'll reply when we open. Let them know warmly.`,
+          fallback: closedQueuedFallback,
+          timeoutMs: 3000,
+        })
+        await sendMessage({ toNumber: msg.fromNumber, body: closedQueuedReply }, waCredentials)
       } else {
-        await sendMessage({ toNumber: msg.fromNumber, body: i18n.closed_drop[lang](business.name, opensAt) }, waCredentials)
+        const closedDropFallback = i18n.closed_drop[lang](business.name, opensAt)
+        const closedDropReply = await generateProactiveCustomerMessage({
+          businessName: business.name,
+          language: lang,
+          situation: `The business is currently closed${opensAt ? ` and reopens at ${opensAt}` : ''}. Acknowledge briefly and invite the customer to message again when we're open.`,
+          fallback: closedDropFallback,
+          timeoutMs: 3000,
+        })
+        await sendMessage({ toNumber: msg.fromNumber, body: closedDropReply }, waCredentials)
       }
       return
     }
@@ -276,7 +307,15 @@ async function routeCustomerMessage(
 
   // Paused gate — PA is silent when owner has manually paused it
   if (business.paused) {
-    await sendMessage({ toNumber: msg.fromNumber, body: i18n.paused_msg[lang](business.name) }, waCredentials)
+    const pausedFallback = i18n.paused_msg[lang](business.name)
+    const pausedReply = await generateProactiveCustomerMessage({
+      businessName: business.name,
+      language: lang,
+      situation: 'The PA is currently paused — the business is handling bookings directly. Tell the customer to contact the business directly for availability.',
+      fallback: pausedFallback,
+      timeoutMs: 3000,
+    })
+    await sendMessage({ toNumber: msg.fromNumber, body: pausedReply }, waCredentials)
     return
   }
 
@@ -343,7 +382,15 @@ async function routeCustomerMessage(
         app.log.warn({ error: mediaResult.error, mediaId: msg.imageMediaId }, 'Customer image upload failed — proceeding without image')
       }
     } else {
-      await sendMessage({ toNumber: msg.fromNumber, body: i18n.non_text_reply[lang] }, waCredentials)
+      const nonTextFallback = i18n.non_text_reply[lang]
+      const nonTextReply = await generateProactiveCustomerMessage({
+        businessName: business.name,
+        language: lang,
+        situation: 'Customer sent an image or non-text message. Let them know this assistant only understands text messages and ask them to describe what they need.',
+        fallback: nonTextFallback,
+        timeoutMs: 3000,
+      })
+      await sendMessage({ toNumber: msg.fromNumber, body: nonTextReply }, waCredentials)
       return
     }
   }
@@ -454,32 +501,65 @@ async function routeManagerMessage(
   const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
 
   if (upper === 'STATUS') {
-    const report = await buildStatusReport(db, business.id, lang)
+    const rawReport = await buildStatusReport(db, business.id, lang)
+    const report = await generateManagerCommandReply({
+      businessName: business.name,
+      language: lang,
+      situation: 'Manager requested the PA status report.',
+      dataBlock: rawReport,
+      fallback: rawReport,
+    })
     await sendMessage({ toNumber: msg.fromNumber, body: report }, waCredentials)
     return
   }
 
   if (upper === 'PAUSE') {
-    const reply = await pausePA(db, business.id, lang)
+    await pausePA(db, business.id, lang)
+    const reply = await generateManagerCommandReply({
+      businessName: business.name,
+      language: lang,
+      situation: 'Manager paused the PA. It will no longer respond to customer messages until resumed. Confirm this and tell them to send RESUME to reactivate.',
+      fallback: i18n.pause_confirm[lang],
+    })
     await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
     return
   }
 
   if (upper === 'RESUME') {
-    const reply = await resumePA(db, business.id, lang)
+    await resumePA(db, business.id, lang)
+    const reply = await generateManagerCommandReply({
+      businessName: business.name,
+      language: lang,
+      situation: 'Manager reactivated the PA. It will now respond to customer messages normally again. Confirm this briefly.',
+      fallback: i18n.resume_confirm[lang],
+    })
     await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
     return
   }
 
   if (upper === 'UPCOMING') {
-    const report = await buildUpcomingReport(db, business.id, undefined, lang)
+    const rawReport = await buildUpcomingReport(db, business.id, undefined, lang)
+    const report = await generateManagerCommandReply({
+      businessName: business.name,
+      language: lang,
+      situation: 'Manager requested the list of upcoming confirmed bookings.',
+      dataBlock: rawReport,
+      fallback: rawReport,
+    })
     await sendMessage({ toNumber: msg.fromNumber, body: report }, waCredentials)
     return
   }
 
   if (upper.startsWith('BOOKINGS ')) {
     const datePart = raw.slice('BOOKINGS '.length).trim()
-    const report = await buildUpcomingReport(db, business.id, datePart, lang)
+    const rawReport = await buildUpcomingReport(db, business.id, datePart, lang)
+    const report = await generateManagerCommandReply({
+      businessName: business.name,
+      language: lang,
+      situation: `Manager requested bookings for date: ${datePart}.`,
+      dataBlock: rawReport,
+      fallback: rawReport,
+    })
     await sendMessage({ toNumber: msg.fromNumber, body: report }, waCredentials)
     return
   }
@@ -494,16 +574,31 @@ async function routeManagerMessage(
       calendarMode: business.calendarMode,
     })
     const payResult = await confirmPaymentReceived(db, calendar, business.id, customerPhone)
-    const reply = payResult.ok
+    const paidFallback = payResult.ok
       ? (lang === 'he' ? `✅ תשלום אושר עבור ${customerPhone}. התור נעול.` : `✅ Payment confirmed for ${customerPhone}. Booking locked in.`)
       : (lang === 'he' ? `❌ לא ניתן לאשר תשלום: ${payResult.reason}` : `❌ Could not confirm payment: ${payResult.reason}`)
+    const situation = payResult.ok
+      ? `Payment was confirmed for customer ${customerPhone}. Their booking is now locked in. Confirm this to the manager briefly.`
+      : `Could not confirm payment for customer ${customerPhone}: ${payResult.reason}. Let the manager know briefly.`
+    const reply = await generateManagerCommandReply({
+      businessName: business.name,
+      language: lang,
+      situation,
+      fallback: paidFallback,
+    })
     await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
     return
   }
 
   if (upper.startsWith('HANDLED ')) {
     const customerPhone = raw.slice('HANDLED '.length).trim()
-    const reply = await markEscalationHandled(db, business.id, customerPhone, lang)
+    await markEscalationHandled(db, business.id, customerPhone, lang)
+    const reply = await generateManagerCommandReply({
+      businessName: business.name,
+      language: lang,
+      situation: `Manager marked the escalation from ${customerPhone} as handled/resolved. Confirm briefly.`,
+      fallback: i18n.escalation_handled[lang](customerPhone),
+    })
     await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
     return
   }

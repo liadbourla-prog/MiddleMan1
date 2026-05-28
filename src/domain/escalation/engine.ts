@@ -17,6 +17,7 @@ import { escalatedTasks, identities } from '../../db/schema.js'
 import type { EscalationRule, Business } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { i18n, type Lang } from '../i18n/t.js'
+import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 
 export type EscalationCheckResult =
   | { escalated: false }
@@ -87,7 +88,7 @@ export async function checkOwnerEscalationRules(
     forwardedAt: new Date(),
   }).catch(() => { /* non-fatal */ })
 
-  const customerReply = buildCustomerReply(matchedRule, business.name, customerLang)
+  const customerReply = await buildCustomerEscalationReply(matchedRule, business.name, customerLang)
   return { escalated: true, customerReply, source: 'owner_rule' }
 }
 
@@ -123,17 +124,35 @@ export async function escalateToPlatform(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function buildCustomerReply(rule: EscalationRule, businessName: string, lang: Lang): string | null {
+async function buildCustomerEscalationReply(rule: EscalationRule, businessName: string, lang: Lang): Promise<string | null> {
+  if (rule.customerMessage === 'silent' || rule.customerMessage === undefined) return null
+
+  let situation: string
+  let fallback: string
+
   switch (rule.customerMessage) {
-    case 'silent':
-      return null
     case 'passed_to_owner':
-      return i18n.escalation_customer_passed[lang](businessName)
+      situation = `The customer's message has been escalated. Tell them briefly that their message has been passed to ${businessName} and someone will be in touch shortly.`
+      fallback = i18n.escalation_customer_passed[lang](businessName)
+      break
     case 'owner_callback':
-      return i18n.escalation_customer_callback[lang](businessName)
+      situation = `The customer's message has been escalated. Tell them briefly that the team at ${businessName} will call them back shortly.`
+      fallback = i18n.escalation_customer_callback[lang](businessName)
+      break
     case 'custom':
-      return rule.customText ?? i18n.escalation_customer_default[lang]
+      if (rule.customText) return rule.customText
+      situation = `The customer's message has been escalated. Send a brief acknowledgement that we'll be in touch.`
+      fallback = i18n.escalation_customer_default[lang]
+      break
     default:
       return null
   }
+
+  return generateProactiveCustomerMessage({
+    businessName,
+    language: lang,
+    situation,
+    fallback,
+    timeoutMs: 2500,
+  })
 }

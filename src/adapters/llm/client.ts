@@ -749,6 +749,255 @@ export async function parseOnboardingAnswer(
   return { ok: true, data: { step: 'escalation_policy', ...raw.data } }
 }
 
+// ── Proactive customer message generator ─────────────────────────────────────
+// Used for all system-initiated messages to customers: reminders, hold expiry,
+// waitlist offers, schedule-change cancellations, payment confirmations, and
+// the business-hours / paused / revoked gates in the webhook.
+
+const PROACTIVE_PERSONA = `You are sending a WhatsApp message on behalf of {businessName}. Speak as the business — not as an AI, not as a bot.
+
+LANGUAGE: write ENTIRELY in {language}. Never mix languages.
+
+WHATSAPP FORMATTING (hard rules):
+- *bold* only for key info (service name, time). Never bold full sentences.
+- Bullet lists: • (U+2022) with a space. Never -, *, or numbered unless order matters.
+- URLs: on their own line, never inline.
+- No HTML, no markdown headers (#, ##), no tables.
+- One question maximum per message.
+- Confirmations / notices: 1–3 sentences. Never pad.
+- Emoji: one maximum at a key moment (✅ confirmed, ⏰ reminder, ❌ cancelled). None in questions.
+
+TONE: Warm and direct — like a trusted local business texting you. Hebrew: natural Israeli phrasing, 24h times. English: contractions always ("it's", "we'll"). Never reference AI or technology.
+
+Output: one message ONLY. No preamble, no quotation marks.`
+
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms)
+    promise.then((v) => { clearTimeout(timer); resolve(v) }, () => { clearTimeout(timer); resolve(fallback) })
+  })
+}
+
+export async function generateProactiveCustomerMessage(input: {
+  businessName: string
+  language: 'he' | 'en'
+  situation: string
+  fallback: string
+  timeoutMs?: number
+}): Promise<string> {
+  const systemPrompt = PROACTIVE_PERSONA
+    .replace('{businessName}', input.businessName)
+    .replace('{language}', input.language === 'he' ? 'he (Hebrew)' : 'en (English)')
+
+  const call = (async (): Promise<string> => {
+    try {
+      const result = await ai.models.generateContent({
+        model: MODEL,
+        contents: `Situation: ${input.situation}`,
+        config: { systemInstruction: systemPrompt, maxOutputTokens: 512, temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } },
+      })
+      return result.text?.trim() || input.fallback
+    } catch {
+      return input.fallback
+    }
+  })()
+
+  return input.timeoutMs ? withTimeout(call, input.timeoutMs, input.fallback) : call
+}
+
+// ── Provider onboarding reply generator (Branch 2 — MiddleMan) ────────────────
+
+const PROVIDER_STEP_GOALS: Record<string, { he: string; en: string }> = {
+  welcome: {
+    he: 'ברך את בעל העסק בחום וקצר, וגם בעברית וגם באנגלית (שכן השפה טרם ידועה). שאל מה שם העסק שלהם.',
+    en: 'Greet the business owner warmly and briefly in BOTH Hebrew and English (language unknown). Ask for their business name.',
+  },
+  ask_business_name: {
+    he: 'שאל שוב מה שם העסק — הם שלחו ברכה ולא שם. שאלה אחת.',
+    en: 'Ask again for the business name — they greeted you without giving a name. One sentence.',
+  },
+  ask_timezone: {
+    he: 'שאל באיזה אזור זמן נמצא העסק. דוגמאות: "ישראל", "תל אביב", "לונדון". קצר.',
+    en: 'Ask what timezone the business is in. Examples: "Israel", "Tel Aviv", "London". Brief.',
+  },
+  bad_timezone: {
+    he: 'אזור הזמן שנשלח לא זוהה. בקש שינסו שם עיר, מדינה, או IANA — למשל "ישראל" או "Asia/Jerusalem".',
+    en: 'Timezone wasn\'t recognized. Ask them to try a city/country name or IANA — like "Israel" or "Asia/Jerusalem".',
+  },
+  ask_calendar_mode: {
+    he: 'שאל אם יש להם Google Calendar לחיבור, או שמתחילים עם יומן פנימי. ניתן לשנות מאוחר. שאלה אחת.',
+    en: "Ask if they have a Google Calendar to connect, or if they'd prefer an internal calendar to start. Can be changed later. One question.",
+  },
+  ask_calendar_id: {
+    he: 'שאל מה ה-Google Calendar ID שלהם (בדרך כלל כתובת אימייל, נמצא בהגדרות Google Calendar).',
+    en: 'Ask for their Google Calendar ID (usually their email address — found in Google Calendar settings).',
+  },
+  ask_services: {
+    he: 'שאל מה השירות הראשי שלהם ומשך הזמן שלו — למשל "תספורת, 30 דקות". אפשר כמה שירותים.',
+    en: 'Ask what their main service is and how long it takes — like "Haircut, 30 minutes". Multiple services are fine.',
+  },
+  bad_services: {
+    he: 'לא הצלחנו לפענח. בקש ניסוח מחדש עם שם ומשך — למשל "תספורת, 30 דקות".',
+    en: 'Couldn\'t parse the service. Ask them to rephrase — name and duration, like "Haircut, 30 minutes".',
+  },
+  credentials_waiting: {
+    he: 'ממתינים לאישור הקישור. הסבר בקצרה שברגע שיסיימו בקישור, הכל יסתיים אוטומטית.',
+    en: 'Waiting for the signup link to be completed. Briefly explain that once they finish the link, everything completes automatically.',
+  },
+  already_done: {
+    he: 'ה-PA כבר מוגדר. ספר להם לפנות למספר ה-PA ישירות לשינויים.',
+    en: 'The PA is already set up. Tell them to contact the PA number directly for any changes.',
+  },
+  image_not_supported: {
+    he: 'הם שלחו תמונה. הסבר בחום שניתן לשלוח טקסט בלבד, ובקש שיכתבו מה ברצונם.',
+    en: 'They sent an image. Warmly explain this assistant only understands text messages and ask them to describe what they need in words.',
+  },
+}
+
+export async function generateProviderOnboardingReply(input: {
+  step: string
+  lang: 'he' | 'en' | 'bilingual'
+  collectedData?: { businessName?: string }
+  justConfirmed?: string
+  isRetry?: boolean
+  extraContext?: string
+  fallback: string
+}): Promise<string> {
+  const isBilingual = input.lang === 'bilingual'
+  const lang: 'he' | 'en' = isBilingual ? 'he' : (input.lang as 'he' | 'en')
+  const goals = PROVIDER_STEP_GOALS[input.step]
+  const stepGoal = goals?.[lang] ?? goals?.en ?? 'Ask for the next required piece of information.'
+
+  const langInstruction = isBilingual
+    ? 'Write the message in BOTH Hebrew and English. Put the Hebrew version first, then an empty line, then the English version.'
+    : `Write ENTIRELY in ${lang === 'he' ? 'Hebrew' : 'English'}.`
+
+  const ackLine = input.justConfirmed
+    ? (lang === 'he'
+      ? `הם אישרו: "${input.justConfirmed}". התחל בהתייחסות קצרה ואז שאל.`
+      : `They confirmed: "${input.justConfirmed}". Open with a brief acknowledgement then ask.`)
+    : ''
+
+  const retryNote = input.isRetry
+    ? (lang === 'he' ? 'ניסיון חוזר — נסח מחדש בסבלנות.' : 'Retry — rephrase patiently with slightly different wording.')
+    : ''
+
+  const nameCtx = input.collectedData?.businessName ? `Business name: "${input.collectedData.businessName}".` : ''
+
+  const systemPrompt = `You are MiddleMan — a WhatsApp platform that sets up AI booking assistants for local businesses. You are onboarding a new business owner via WhatsApp.
+
+${langInstruction}
+Rules:
+- 1–3 sentences maximum
+- No bullet points. No numbered lists. No markdown.
+- Ask exactly ONE thing per message (in bilingual mode: one thing per language block)
+- Sound like a real helpful service texting them, not a form or bot
+${ackLine}
+${retryNote}
+${nameCtx}
+${input.extraContext ? `Extra context: ${input.extraContext}` : ''}
+
+Current step: ${stepGoal}
+
+Output: the message text ONLY. No quotes, no labels, no preamble.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: 'Generate the next onboarding message.',
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 512, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through to fallback
+  }
+  return input.fallback
+}
+
+// ── Manager command reply generator (Branch 3 — keyword commands) ─────────────
+// Used to format the output of STATUS / PAUSE / RESUME / UPCOMING / PAID / HANDLED
+// and other deterministic manager commands into natural WhatsApp messages.
+
+export async function generateManagerCommandReply(input: {
+  businessName: string
+  language: 'he' | 'en'
+  situation: string
+  dataBlock?: string
+  fallback: string
+}): Promise<string> {
+  const systemPrompt = `You are the PA admin assistant for "${input.businessName}". The business manager just ran a command and you are responding on WhatsApp.
+
+LANGUAGE: reply ENTIRELY in ${input.language === 'he' ? 'Hebrew (עברית)' : 'English'}.
+
+WHATSAPP FORMATTING:
+- No HTML. No markdown headers (#, ##). No markdown links.
+- Bullet lists: • (U+2022). Not -, *, or numbered unless order matters.
+- *bold* only for key labels or values — never whole sentences.
+- Emoji for status: ✅ active/ok, ⏸ paused, ❌ error/missing, 📅 calendar, 💳 payment.
+- Maximum 15 lines for data reports.
+
+TONE: Direct and informative — a competent admin assistant reporting data. No filler. No "I hope this helps." Never expose internal field names or UUIDs. Present the data naturally, not as raw key-value pairs.
+
+${input.dataBlock ? `Data to present:\n${input.dataBlock}` : ''}
+
+Output: the reply ONLY. No preamble, no quotes.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: `Command context: ${input.situation}`,
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.25, thinkingConfig: { thinkingBudget: 0 } },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through to fallback
+  }
+  return input.fallback
+}
+
+// ── Operator data formatter (Branch 1 — structured command responses) ─────────
+// Wraps pre-assembled operator console data through LLM for natural formatting.
+
+export async function formatOperatorDataReply(input: {
+  question: string
+  dataBlock: string
+  lang: 'he' | 'en'
+  fallback: string
+}): Promise<string> {
+  const systemPrompt = `You are the MiddleMan admin assistant. The operator (platform owner) ran a command and you need to present the results clearly on WhatsApp.
+
+LANGUAGE: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
+
+WHATSAPP FORMATTING:
+- No HTML. No markdown headers. No markdown links.
+- Bullet lists: • (U+2022). Not -, *, or numbered unless order matters.
+- *bold* for business names, section headers, and key statuses only.
+- Emoji for status: ✅ live/ok, ⏸ paused, ⏳ onboarding, ❌ error, 📅 calendar, 🌐 website.
+- Maximum 25 lines. Group intelligently for long lists.
+
+TONE: Clear and efficient. Operator is the platform admin — they need data at a glance. No filler. Lead with the key number or finding, then the detail. Use the exact data provided — do not add, infer, or invent anything.
+
+Data to present:
+${input.dataBlock}
+
+Output: the formatted reply ONLY. No preamble, no quotes.`
+
+  try {
+    const result = await ai.models.generateContent({
+      model: MODEL,
+      contents: `Operator command: ${input.question}`,
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
+    })
+    const text = result.text?.trim()
+    if (text) return text
+  } catch {
+    // fall through to fallback
+  }
+  return input.fallback
+}
+
 const QUOTA_ERROR_CODES = new Set([429, 503, 'RESOURCE_EXHAUSTED', 'UNAVAILABLE'])
 
 function isQuotaError(err: unknown): boolean {

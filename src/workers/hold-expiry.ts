@@ -7,6 +7,7 @@ import { logAudit } from '../domain/audit/logger.js'
 import { redisConnection } from '../redis.js'
 import { enqueueMessage } from './message-retry.js'
 import { t } from '../domain/i18n/t.js'
+import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 
 const QUEUE_NAME = 'hold-expiry'
 const REPEAT_EVERY_MS = 60_000
@@ -36,6 +37,7 @@ export async function expireHeldBookings() {
         googleRefreshToken: businesses.googleRefreshToken,
         googleCalendarId: businesses.googleCalendarId,
         defaultLanguage: businesses.defaultLanguage,
+        name: businesses.name,
       })
       .from(businesses)
       .where(eq(businesses.id, booking.businessId))
@@ -92,8 +94,16 @@ export async function expireHeldBookings() {
         .limit(1)
 
       if (customer) {
-        const lang = customer.preferredLanguage ?? business.defaultLanguage
-        await enqueueMessage(customer.phoneNumber, t('hold_expired', lang))
+        const lang: 'he' | 'en' = ((customer.preferredLanguage ?? business.defaultLanguage) as 'he' | 'en' | null) ?? 'he'
+        const fallback = t('hold_expired', lang)
+        const msg = await generateProactiveCustomerMessage({
+          businessName: business.name,
+          language: lang,
+          situation: 'The customer\'s booking hold has expired because they did not confirm in time. Let them know briefly and invite them to book again whenever they\'re ready.',
+          fallback,
+          timeoutMs: 2500,
+        })
+        await enqueueMessage(customer.phoneNumber, msg)
       }
     }
   }

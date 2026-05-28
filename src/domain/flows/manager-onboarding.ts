@@ -5,7 +5,7 @@ import { businesses, importTokens, managerInstructions, serviceTypes, availabili
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
 import type { ResolvedIdentity } from '../identity/types.js'
-import { classifyManagerInstruction, generateOnboardingReply, parseOnboardingAnswer } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
@@ -340,7 +340,7 @@ async function handleEscalationPolicyStep(
     ? nextQ
     : `${nextQ}\n\n${calendarLink}`
 
-  return { reply: `✅ ${summary}\n\n${reply}` }
+  return { reply }
 }
 
 export async function handleCalendarStepWithBody(
@@ -362,7 +362,17 @@ export async function handleCalendarStepWithBody(
 
   // Step advances via OAuth callback — resend the link with real URL
   const calendarLink = buildCalendarLink(business, baseUrl)
-  return { reply: i18n.ob_calendar_waiting[lang](calendarLink) }
+  const calWaitFallback = i18n.ob_calendar_waiting[lang](calendarLink)
+  const calWaitQ = await generateOnboardingReply({
+    step: 'calendar',
+    businessName: business.name,
+    lang,
+    isRetry: false,
+    extraContext: `The business has not connected Google Calendar yet. Remind them the link is waiting and they need to click it. The OAuth link is: ${calendarLink}`,
+  })
+  const calWaitReply = calWaitQ || calWaitFallback
+  const calWaitWithUrl = calWaitReply.includes(calendarLink) ? calWaitReply : `${calWaitReply}\n${calendarLink}`
+  return { reply: calWaitWithUrl }
 }
 
 async function handleCustomerImportStep(
@@ -382,13 +392,33 @@ async function handleCustomerImportStep(
 
     log.info({ businessId: business.id }, 'Onboarding: import token generated')
     const uploadUrl = `${baseUrl}/import/${token!.token}`
-    return { reply: i18n.ob_import_link[lang](uploadUrl) }
+    const importLinkFallback = i18n.ob_import_link[lang](uploadUrl)
+    const importLinkQ = await generateOnboardingReply({
+      step: 'customer_import',
+      businessName: business.name,
+      lang,
+      isRetry: false,
+      extraContext: `Manager agreed to import. The secure upload link (valid 30 min) is: ${uploadUrl}. It MUST appear on its own line in the reply. Accepted formats: CSV of contacts (name, phone), booking history (name, phone, date, service), or service catalog (name, duration_minutes, price).`,
+    })
+    const importLinkReply = importLinkQ || importLinkFallback
+    const importLinkWithUrl = importLinkReply.includes(uploadUrl) ? importLinkReply : `${importLinkReply}\n${uploadUrl}`
+    return { reply: importLinkWithUrl }
   }
 
   await db.update(businesses).set({ onboardingStep: 'verify' }).where(eq(businesses.id, business.id))
   log.info({ businessId: business.id }, 'Onboarding: customer import skipped')
   const summary = await buildVerifySummary(db, business, lang)
-  return { reply: `${i18n.ob_import_skip[lang]}\n\n${summary}` }
+  const importSkipFallback = `${i18n.ob_import_skip[lang]}\n\n${summary}`
+  const importSkipQ = await generateOnboardingReply({
+    step: 'verify',
+    businessName: business.name,
+    lang,
+    isRetry: false,
+    justConfirmed: lang === 'he' ? 'דילגו על הייבוא' : 'Skipped import',
+    extraContext: `Here is the full setup summary to show the manager:\n${summary}`,
+  })
+  const importSkipReply = importSkipQ || importSkipFallback
+  return { reply: importSkipReply }
 }
 
 async function handleVerifyStep(
@@ -412,11 +442,18 @@ async function handleVerifyStep(
       log.warn({ err, businessId: business.id }, 'Failed to create business-knowledge-setup workflow after onboarding')
     })
 
-    const completionMsg = i18n.ob_complete[lang](business.whatsappNumber)
-    const interviewPrompt = lang === 'he'
-      ? '\n\nלפני שהלקוחות מגיעים, בואי נלמד קצת על העסק שלך. איך היית מתארת את *[שם העסק]* — מה הרגש שאת רוצה שלקוחות יקבלו?'
-      : '\n\nBefore customers arrive, let me learn about your business. How would you describe *[business name]* — what feeling do you want customers to have?'
-    return { reply: completionMsg + interviewPrompt.replace('[שם העסק]', business.name).replace('[business name]', business.name) }
+    const completionFallback = i18n.ob_complete[lang](business.whatsappNumber) + (lang === 'he'
+      ? `\n\nלפני שהלקוחות מגיעים, בואי נלמד קצת על העסק שלך. איך היית מתארת את *${business.name}* — מה הרגש שאת רוצה שלקוחות יקבלו?`
+      : `\n\nBefore customers arrive, let me learn about your business. How would you describe *${business.name}* — what feeling do you want customers to have?`)
+    const completionQ = await generateOnboardingReply({
+      step: 'verify',
+      businessName: business.name,
+      lang,
+      isRetry: false,
+      justConfirmed: lang === 'he' ? `ה-PA שלכם פעיל! מספר ה-PA: ${business.whatsappNumber}` : `Your PA is now live! PA number: ${business.whatsappNumber}`,
+      extraContext: `Setup is complete. Congratulate them warmly, mention their customers can now text ${business.whatsappNumber}, briefly mention STATUS/UPCOMING/PAUSE commands, then transition to asking about their business brand and voice for the knowledge setup.`,
+    })
+    return { reply: completionQ || completionFallback }
   }
 
   // Not GO — treat as a correction
@@ -461,7 +498,16 @@ async function handleVerifyStep(
   }
 
   log.info({ businessId: business.id, type: instruction.instructionType }, 'Onboarding: verify-step correction applied')
-  return { reply: `${applyResult.confirmationMessage}\n\n${t('ob_verify_correction_done', lang)}` }
+  const correctionFallback = `${applyResult.confirmationMessage}\n\n${t('ob_verify_correction_done', lang)}`
+  const correctionQ = await generateOnboardingReply({
+    step: 'verify',
+    businessName: business.name,
+    lang,
+    isRetry: false,
+    justConfirmed: applyResult.confirmationMessage,
+    extraContext: 'A correction was applied. Acknowledge it briefly and tell them to reply GO when they are ready to launch, or send another correction.',
+  })
+  return { reply: correctionQ || correctionFallback }
 }
 
 // ── Verify summary builder (exported for import.ts and oauth.ts) ──────────────
@@ -517,7 +563,7 @@ export async function buildVerifySummary(db: Db, business: Business, lang: Lang)
     ? t('ob_verify_calendar_internal', lang)
     : t('ob_verify_calendar_google', lang)
 
-  return [
+  const rawSummary = [
     t('ob_verify_header', lang),
     '',
     `${t('ob_verify_services_label', lang)}: ${servicesStr}`,
@@ -529,6 +575,15 @@ export async function buildVerifySummary(db: Db, business: Business, lang: Lang)
     '',
     t('ob_verify_go_prompt', lang),
   ].join('\n')
+
+  const formattedSummary = await generateManagerCommandReply({
+    businessName: business.name,
+    language: lang,
+    situation: 'Show the manager a summary of their PA setup for review. Ask them to reply GO to launch or tell you what to change.',
+    dataBlock: rawSummary,
+    fallback: rawSummary,
+  })
+  return formattedSummary
 }
 
 // ── Shared helper for LLM-classified onboarding steps ────────────────────────

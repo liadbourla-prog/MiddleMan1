@@ -6,6 +6,7 @@ import { sendMessage, canSendFreeForm, sendTemplateMessage } from '../adapters/w
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
+import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 
 const QUEUE_NAME = 'waitlist'
 const OFFER_TTL_MINUTES = parseInt(process.env['WAITLIST_OFFER_TTL_MINUTES'] ?? '15', 10)
@@ -131,11 +132,14 @@ async function processJob(job: { data: WaitlistJob }) {
     const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
       ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
       : undefined
-    const offerBody = i18n.waitlist_offer[lang](biz.name, service?.name ?? (lang === 'he' ? 'תור' : 'appointment'), dateStr, OFFER_TTL_MINUTES)
+    const serviceName = service?.name ?? (lang === 'he' ? 'תור' : 'appointment')
+    const offerBody = i18n.waitlist_offer[lang](biz.name, serviceName, dateStr, OFFER_TTL_MINUTES)
 
     const freeFormAllowed = await canSendFreeForm(next.customerId)
     if (freeFormAllowed) {
-      await sendMessage({ toNumber: customer.phoneNumber, body: offerBody }, waCredentials)
+      const situation = `A slot just opened up at ${biz.name}: "${serviceName}" on ${dateStr}. Tell the customer the good news and ask them to reply YES to book it or NO to pass. The offer expires in ${OFFER_TTL_MINUTES} minutes.`
+      const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: offerBody, timeoutMs: 2500 })
+      await sendMessage({ toNumber: customer.phoneNumber, body: llmBody }, waCredentials)
         .catch(() => { /* retry queue handles failures */ })
     } else {
       await sendTemplateMessage({
@@ -146,7 +150,7 @@ async function processJob(job: { data: WaitlistJob }) {
           type: 'body',
           parameters: [
             { type: 'text', text: biz.name },
-            { type: 'text', text: service?.name ?? (lang === 'he' ? 'תור' : 'appointment') },
+            { type: 'text', text: serviceName },
             { type: 'text', text: dateStr },
             { type: 'text', text: String(OFFER_TTL_MINUTES) },
           ],

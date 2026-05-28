@@ -17,7 +17,7 @@ import type { ProviderOnboardingSession } from '../../db/schema.js'
 import { handleOperatorMessage } from './operator.js'
 import { i18n, detectLang, type Lang } from '../i18n/t.js'
 import { sendMessage } from '../../adapters/whatsapp/sender.js'
-import { explainOnboardingConcept } from '../../adapters/llm/client.js'
+import { explainOnboardingConcept, generateProviderOnboardingReply } from '../../adapters/llm/client.js'
 
 export interface ProviderOnboardingResult {
   reply: string
@@ -57,13 +57,22 @@ export async function handleProviderOnboarding(
   if (!session) {
     session = await createSession(db, fromNumber)
     // Welcome is bilingual — language not yet known
-    return { reply: `${i18n.mm_welcome.he}\n\n${i18n.mm_welcome.en}` }
+    const welcomeFallback = `${i18n.mm_welcome.he}\n\n${i18n.mm_welcome.en}`
+    const welcomeReply = await generateProviderOnboardingReply({ step: 'welcome', lang: 'bilingual', fallback: welcomeFallback })
+    return { reply: welcomeReply }
   }
 
   if (session.completedAt) {
     const data = session.collectedData as CollectedData
     const lang: Lang = data.language ?? 'he'
-    return { reply: i18n.mm_already_done[lang] }
+    const alreadyDoneFallback = i18n.mm_already_done[lang]
+    const alreadyDoneReply = await generateProviderOnboardingReply({
+      step: 'already_done',
+      lang,
+      collectedData: data.businessName ? { businessName: data.businessName } : {},
+      fallback: alreadyDoneFallback,
+    })
+    return { reply: alreadyDoneReply }
   }
 
   return handleStep(db, session, body.trim())
@@ -83,13 +92,22 @@ async function handleStep(
     case 'business_name': {
       // Treat casual greetings as a re-ask rather than accepting as the business name
       if (/^(שלום|היי|הי|אהלן|hello|hi|hey)\b/i.test(text)) {
-        return { reply: `מה שם העסק שלכם? / What's the name of your business?` }
+        const greetFallback = `מה שם העסק שלכם? / What's the name of your business?`
+        const greetReply = await generateProviderOnboardingReply({ step: 'ask_business_name', lang: 'bilingual', fallback: greetFallback })
+        return { reply: greetReply }
       }
       const name = text.slice(0, 100)
       const detectedLang = detectLang(text)
       await advance(db, session.managerPhone, 'timezone', { ...data, businessName: name, language: detectedLang })
-      const confirm = detectedLang === 'he' ? `מעולה, "${name}"!` : `Great, "${name}"!`
-      return { reply: `${confirm}\n\n${i18n.mm_ask_timezone[detectedLang]}` }
+      const timezoneFallback = `${detectedLang === 'he' ? `מעולה, "${name}"!` : `Great, "${name}"!`}\n\n${i18n.mm_ask_timezone[detectedLang]}`
+      const timezoneReply = await generateProviderOnboardingReply({
+        step: 'ask_timezone',
+        lang: detectedLang,
+        collectedData: { businessName: name },
+        justConfirmed: name,
+        fallback: timezoneFallback,
+      })
+      return { reply: timezoneReply }
     }
 
     case 'timezone': {
@@ -99,10 +117,26 @@ async function handleStep(
       }
       const tz = resolveTimezone(text)
       if (!tz) {
-        return { reply: i18n.mm_bad_timezone[lang] }
+        const badTzFallback = i18n.mm_bad_timezone[lang]
+        const badTzReply = await generateProviderOnboardingReply({
+          step: 'bad_timezone',
+          lang,
+          collectedData: data.businessName ? { businessName: data.businessName } : {},
+          isRetry: true,
+          fallback: badTzFallback,
+        })
+        return { reply: badTzReply }
       }
       await advance(db, session.managerPhone, 'calendar', { ...data, timezone: tz })
-      return { reply: i18n.mm_ask_calendar_mode[lang] }
+      const calendarModeFallback = i18n.mm_ask_calendar_mode[lang]
+      const calendarModeReply = await generateProviderOnboardingReply({
+        step: 'ask_calendar_mode',
+        lang,
+        collectedData: data.businessName ? { businessName: data.businessName } : {},
+        justConfirmed: tz,
+        fallback: calendarModeFallback,
+      })
+      return { reply: calendarModeReply }
     }
 
     case 'calendar': {
@@ -126,20 +160,51 @@ async function handleStep(
             .update(providerOnboardingSessions)
             .set({ collectedData: { ...data, calendarMode: 'google' } as Record<string, unknown>, updatedAt: new Date() })
             .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
-          return { reply: i18n.mm_ask_calendar[lang] }
+          const calIdFallback = i18n.mm_ask_calendar[lang]
+          const calIdReply = await generateProviderOnboardingReply({
+            step: 'ask_calendar_id',
+            lang,
+            collectedData: data.businessName ? { businessName: data.businessName } : {},
+            justConfirmed: 'Google Calendar',
+            fallback: calIdFallback,
+          })
+          return { reply: calIdReply }
         }
         if (wantsInternal && !wantsGoogle) {
           await advance(db, session.managerPhone, 'services', { ...data, calendarMode: 'internal', calendarId: null })
-          return { reply: i18n.mm_ask_services[lang] }
+          const servicesFallback1 = i18n.mm_ask_services[lang]
+          const servicesReply1 = await generateProviderOnboardingReply({
+            step: 'ask_services',
+            lang,
+            collectedData: data.businessName ? { businessName: data.businessName } : {},
+            justConfirmed: lang === 'he' ? 'יומן פנימי' : 'internal calendar',
+            fallback: servicesFallback1,
+          })
+          return { reply: servicesReply1 }
         }
         // Ambiguous — re-ask with clearer question
-        return { reply: i18n.mm_ask_calendar_mode[lang] }
+        const calendarModeFallback2 = i18n.mm_ask_calendar_mode[lang]
+        const calendarModeReply2 = await generateProviderOnboardingReply({
+          step: 'ask_calendar_mode',
+          lang,
+          collectedData: data.businessName ? { businessName: data.businessName } : {},
+          isRetry: true,
+          fallback: calendarModeFallback2,
+        })
+        return { reply: calendarModeReply2 }
       }
 
       // calendarMode is 'google' — next input is the Google Calendar ID
       const calendarId = text.trim()
       await advance(db, session.managerPhone, 'services', { ...data, calendarId })
-      return { reply: i18n.mm_ask_services[lang] }
+      const servicesFallback2 = i18n.mm_ask_services[lang]
+      const servicesReply2 = await generateProviderOnboardingReply({
+        step: 'ask_services',
+        lang,
+        collectedData: data.businessName ? { businessName: data.businessName } : {},
+        fallback: servicesFallback2,
+      })
+      return { reply: servicesReply2 }
     }
 
     case 'services': {
@@ -161,7 +226,18 @@ async function handleStep(
             services: [fallback],
             _signupState: signupState,
           })
-          return { reply: i18n.mm_embedded_signup_link[lang](buildSignupUrl(signupState)) }
+          const signupUrl = buildSignupUrl(signupState)
+          const signupFallback = i18n.mm_embedded_signup_link[lang](signupUrl)
+          const signupReply = await generateProviderOnboardingReply({
+            step: 'credentials_waiting',
+            lang,
+            collectedData: data.businessName ? { businessName: data.businessName } : {},
+            extraContext: `The signup URL that MUST appear on its own line in the reply: ${signupUrl}`,
+            fallback: signupFallback,
+          })
+          // Ensure URL is in the reply
+          const signupReplyWithUrl = signupReply.includes(signupUrl) ? signupReply : `${signupReply}\n${signupUrl}`
+          return { reply: signupReplyWithUrl }
         }
         await db
           .update(providerOnboardingSessions)
@@ -170,23 +246,56 @@ async function handleStep(
             updatedAt: new Date(),
           })
           .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
-        return { reply: i18n.mm_bad_services[lang] }
+        const badSvcFallback = i18n.mm_bad_services[lang]
+        const badSvcReply = await generateProviderOnboardingReply({
+          step: 'bad_services',
+          lang,
+          collectedData: data.businessName ? { businessName: data.businessName } : {},
+          isRetry: true,
+          fallback: badSvcFallback,
+        })
+        return { reply: badSvcReply }
       }
 
       const { _serviceFailCount: _, ...cleanData } = data
-      const signupState = crypto.randomUUID()
-      await advance(db, session.managerPhone, 'credentials', { ...cleanData, services: [parsed], _signupState: signupState })
-      return { reply: i18n.mm_embedded_signup_link[lang](buildSignupUrl(signupState)) }
+      const signupState2 = crypto.randomUUID()
+      await advance(db, session.managerPhone, 'credentials', { ...cleanData, services: [parsed], _signupState: signupState2 })
+      const signupUrl2 = buildSignupUrl(signupState2)
+      const signupFallback2 = i18n.mm_embedded_signup_link[lang](signupUrl2)
+      const signupReply2 = await generateProviderOnboardingReply({
+        step: 'credentials_waiting',
+        lang,
+        collectedData: data.businessName ? { businessName: data.businessName } : {},
+        extraContext: `The signup URL that MUST appear on its own line in the reply: ${signupUrl2}`,
+        fallback: signupFallback2,
+      })
+      const signupReplyWithUrl2 = signupReply2.includes(signupUrl2) ? signupReply2 : `${signupReply2}\n${signupUrl2}`
+      return { reply: signupReplyWithUrl2 }
     }
 
     case 'credentials': {
       // The signup link is always sent during the services→credentials transition.
       // Any follow-up message here means the user is texting while waiting — reassure them.
-      return { reply: i18n.mm_embedded_signup_waiting[lang] }
+      const waitingFallback = i18n.mm_embedded_signup_waiting[lang]
+      const waitingReply = await generateProviderOnboardingReply({
+        step: 'credentials_waiting',
+        lang,
+        collectedData: data.businessName ? { businessName: data.businessName } : {},
+        fallback: waitingFallback,
+      })
+      return { reply: waitingReply }
     }
 
-    default:
-      return { reply: i18n.mm_embedded_signup_waiting[lang] }
+    default: {
+      const waitingFallback2 = i18n.mm_embedded_signup_waiting[lang]
+      const waitingReply2 = await generateProviderOnboardingReply({
+        step: 'credentials_waiting',
+        lang,
+        collectedData: data.businessName ? { businessName: data.businessName } : {},
+        fallback: waitingFallback2,
+      })
+      return { reply: waitingReply2 }
+    }
   }
 }
 

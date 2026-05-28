@@ -13,6 +13,7 @@ import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
 import { i18n, type Lang } from '../i18n/t.js'
+import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 
 const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15', 10)
 
@@ -700,10 +701,15 @@ export async function confirmPaymentReceived(
     const timeStr = new Intl.DateTimeFormat(locale, {
       timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
     }).format(booking.slotStart)
-    await enqueueMessage(
-      customerPhone,
-      i18n.payment_confirmed[lang](service.name, biz.name, dateStr, timeStr),
-    ).catch(() => { /* non-fatal */ })
+    const paymentFallback = i18n.payment_confirmed[lang](service.name, biz.name, dateStr, timeStr)
+    const paymentMsg = await generateProactiveCustomerMessage({
+      businessName: biz.name,
+      language: lang,
+      situation: `The customer's booking for "${service.name}" at ${biz.name} has been confirmed after payment. Let them know their appointment is confirmed for ${dateStr} at ${timeStr}.`,
+      fallback: paymentFallback,
+      timeoutMs: 2500,
+    }).catch(() => paymentFallback)
+    await enqueueMessage(customerPhone, paymentMsg).catch(() => { /* non-fatal */ })
   }
 
   return { ok: true, bookingId: booking.id, message: `Booking confirmed for ${customerPhone}.` }
