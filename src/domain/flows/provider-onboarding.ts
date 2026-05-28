@@ -37,6 +37,8 @@ type CollectedData = {
   accessToken?: string
   paPhoneNumber?: string
   language?: Lang
+  _wabaType?: 'app' | 'meta'
+  _wabaCase?: '1' | '2' | '3a' | '3b'
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -65,6 +67,20 @@ export async function handleProviderOnboarding(
   if (session.completedAt) {
     const data = session.collectedData as CollectedData
     const lang: Lang = data.language ?? 'he'
+
+    // Case 1 completed — detect coexistence request after 7-day wait
+    if (
+      data._wabaCase === '1' &&
+      /coexistence|coexist|שיתוף|לחבר|חיבור|ready|מוכן|מוכנה/i.test(body)
+    ) {
+      const signupState = crypto.randomUUID()
+      await db
+        .update(providerOnboardingSessions)
+        .set({ collectedData: { ...data, _signupState: signupState } as Record<string, unknown>, updatedAt: new Date() })
+        .where(eq(providerOnboardingSessions.managerPhone, fromNumber))
+      return { reply: i18n.mm_coexistence_link[lang](buildSignupUrl(signupState)) }
+    }
+
     const alreadyDoneFallback = i18n.mm_already_done[lang]
     const alreadyDoneReply = await generateProviderOnboardingReply({
       step: 'already_done',
@@ -220,24 +236,11 @@ async function handleStep(
           // Second failure — accept as-is with 30-minute default
           const fallback = { name: text.trim().slice(0, 100), durationMinutes: 30 }
           const { _serviceFailCount: _, ...cleanData } = data
-          const signupState = crypto.randomUUID()
-          await advance(db, session.managerPhone, 'credentials', {
+          await advance(db, session.managerPhone, 'waba_check', {
             ...cleanData,
             services: [fallback],
-            _signupState: signupState,
           })
-          const signupUrl = buildSignupUrl(signupState)
-          const signupFallback = i18n.mm_embedded_signup_link[lang](signupUrl)
-          const signupReply = await generateProviderOnboardingReply({
-            step: 'credentials_waiting',
-            lang,
-            collectedData: data.businessName ? { businessName: data.businessName } : {},
-            extraContext: `The signup URL that MUST appear on its own line in the reply: ${signupUrl}`,
-            fallback: signupFallback,
-          })
-          // Ensure URL is in the reply
-          const signupReplyWithUrl = signupReply.includes(signupUrl) ? signupReply : `${signupReply}\n${signupUrl}`
-          return { reply: signupReplyWithUrl }
+          return { reply: i18n.mm_waba_check[lang] }
         }
         await db
           .update(providerOnboardingSessions)
@@ -258,23 +261,108 @@ async function handleStep(
       }
 
       const { _serviceFailCount: _, ...cleanData } = data
-      const signupState2 = crypto.randomUUID()
-      await advance(db, session.managerPhone, 'credentials', { ...cleanData, services: [parsed], _signupState: signupState2 })
-      const signupUrl2 = buildSignupUrl(signupState2)
-      const signupFallback2 = i18n.mm_embedded_signup_link[lang](signupUrl2)
-      const signupReply2 = await generateProviderOnboardingReply({
-        step: 'credentials_waiting',
-        lang,
-        collectedData: data.businessName ? { businessName: data.businessName } : {},
-        extraContext: `The signup URL that MUST appear on its own line in the reply: ${signupUrl2}`,
-        fallback: signupFallback2,
-      })
-      const signupReplyWithUrl2 = signupReply2.includes(signupUrl2) ? signupReply2 : `${signupReply2}\n${signupUrl2}`
-      return { reply: signupReplyWithUrl2 }
+      await advance(db, session.managerPhone, 'waba_check', { ...cleanData, services: [parsed] })
+      return { reply: i18n.mm_waba_check[lang] }
+    }
+
+    case 'waba_check': {
+      const lower = text.toLowerCase()
+      const hasNumber =
+        lower.includes('yes') || lower.includes('כן') || lower.includes('יש') ||
+        lower.includes('yeah') || lower.includes('yep') || lower.includes('כן,') ||
+        lower.includes('have') || lower.includes('already')
+      const noNumber =
+        lower.includes('no') || lower.includes('לא') || lower.includes('אין') ||
+        lower.includes('nope') || lower.includes('not yet') || lower.includes('עדיין לא') ||
+        lower.includes('never') || lower.includes('fresh') || lower.includes('new number') ||
+        lower.includes('חדש')
+
+      if (noNumber && !hasNumber) {
+        // Case 1: fresh number
+        const signupState = crypto.randomUUID()
+        await advance(db, session.managerPhone, 'credentials', {
+          ...data, _wabaCase: '1', _signupState: signupState,
+        })
+        return { reply: i18n.mm_case1_link[lang](buildSignupUrl(signupState)) }
+      }
+      if (hasNumber && !noNumber) {
+        await advance(db, session.managerPhone, 'waba_guide', { ...data })
+        return { reply: i18n.mm_waba_guide_type[lang] }
+      }
+      // Ambiguous — re-ask
+      return { reply: i18n.mm_waba_check[lang] }
+    }
+
+    case 'waba_guide': {
+      const lower = text.toLowerCase()
+
+      // ── Sub-state: waba type not yet known ────────────────────────────────
+      if (!data._wabaType) {
+        const isApp =
+          lower.includes('app') || lower.includes('אפליקציה') || lower.includes('טלפון') ||
+          lower.includes('phone') || lower.includes('mobile') || lower.includes('business app') ||
+          lower.includes('ביזנס אפ') || lower.includes('whatsapp business') && !lower.includes('manager') && !lower.includes('מנג\'ר')
+        const isMeta =
+          lower.includes('meta') || lower.includes('business manager') || lower.includes('מנג\'ר') ||
+          lower.includes('cloud') || lower.includes('api') || lower.includes('developer') ||
+          lower.includes('מפתח')
+
+        if (isApp && !isMeta) {
+          const signupState = crypto.randomUUID()
+          await advance(db, session.managerPhone, 'credentials', {
+            ...data, _wabaType: 'app', _wabaCase: '2', _signupState: signupState,
+          })
+          return { reply: i18n.mm_coexistence_link[lang](buildSignupUrl(signupState)) }
+        }
+        if (isMeta && !isApp) {
+          await db
+            .update(providerOnboardingSessions)
+            .set({ collectedData: { ...data, _wabaType: 'meta' } as Record<string, unknown>, updatedAt: new Date() })
+            .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+          return { reply: i18n.mm_waba_guide_bsp[lang] }
+        }
+        // Confused — explain
+        if (detectsQuestion(text)) {
+          const explanation = await explainOnboardingConcept({ concept: 'waba_type', userMessage: text, step: 'waba_guide', lang })
+          if (explanation) return { reply: explanation }
+        }
+        return { reply: i18n.mm_waba_guide_type[lang] }
+      }
+
+      // ── Sub-state: meta confirmed — own setup or BSP ─────────────────────
+      if (data._wabaType === 'meta') {
+        const selfSetup =
+          lower.includes('myself') || lower.includes('we did') || lower.includes('i did') ||
+          lower.includes('בעצמי') || lower.includes('בעצמנו') || lower.includes('yes') ||
+          lower.includes('כן') || lower.includes('own') || lower.includes('our')
+        const bsp =
+          lower.includes('agency') || lower.includes('company') || lower.includes('provider') ||
+          lower.includes('חברה') || lower.includes('סוכנות') || lower.includes('someone else') ||
+          lower.includes('external') || lower.includes('no') || lower.includes('לא')
+
+        if (selfSetup && !bsp) {
+          const signupState = crypto.randomUUID()
+          await advance(db, session.managerPhone, 'credentials', {
+            ...data, _wabaCase: '3a', _signupState: signupState,
+          })
+          return { reply: i18n.mm_case3a_link[lang](buildSignupUrl(signupState)) }
+        }
+        if (bsp && !selfSetup) {
+          // Case 3b — out of scope, exit gracefully, leave session open
+          await db
+            .update(providerOnboardingSessions)
+            .set({ collectedData: { ...data, _wabaCase: '3b' } as Record<string, unknown>, updatedAt: new Date() })
+            .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
+          return { reply: i18n.mm_case3b_exit[lang] }
+        }
+        return { reply: i18n.mm_waba_guide_bsp[lang] }
+      }
+
+      return { reply: i18n.mm_embedded_signup_waiting[lang] }
     }
 
     case 'credentials': {
-      // The signup link is always sent during the services→credentials transition.
+      // The signup link is always sent during the waba_check/waba_guide→credentials transition.
       // Any follow-up message here means the user is texting while waiting — reassure them.
       const waitingFallback = i18n.mm_embedded_signup_waiting[lang]
       const waitingReply = await generateProviderOnboardingReply({
@@ -303,10 +391,14 @@ async function handleStep(
 
 function buildSignupUrl(state: string): string {
   const appId = process.env['META_APP_ID'] ?? ''
+  const configId = process.env['META_EMBEDDED_SIGNUP_CONFIG_ID'] ?? ''
   const publicBaseUrl = process.env['PUBLIC_BASE_URL'] ?? ''
   const redirectUri = encodeURIComponent(`${publicBaseUrl}/oauth/meta/callback`)
   const scope = encodeURIComponent('whatsapp_business_management,whatsapp_business_messaging')
-  return `https://www.facebook.com/dialog/oauth?client_id=${appId}&redirect_uri=${redirectUri}&scope=${scope}&state=${state}`
+  const extras = encodeURIComponent(
+    JSON.stringify({ setup: {}, featureType: 'whatsapp_embedded_signup', sessionInfoVersion: '3' }),
+  )
+  return `https://www.facebook.com/dialog/oauth?client_id=${appId}&config_id=${configId}&redirect_uri=${redirectUri}&scope=${scope}&state=${state}&display=page&response_type=code&extras=${extras}`
 }
 
 // ── Provisioning ──────────────────────────────────────────────────────────────

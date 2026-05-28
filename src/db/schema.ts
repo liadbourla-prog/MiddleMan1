@@ -88,6 +88,7 @@ export const identities = pgTable(
     messagingOptOut: boolean('messaging_opt_out').notNull().default(false),
     // Customer's preferred language for PA replies; null = use business default
     preferredLanguage: text('preferred_language', { enum: ['he', 'en'] }),
+    conversationPausedUntil: timestamp('conversation_paused_until', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('identities_business_phone_idx').on(t.businessId, t.phoneNumber)],

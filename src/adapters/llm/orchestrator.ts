@@ -20,6 +20,8 @@ import {
   executeSearchWeb,
   executeLookupCustomer,
   executeSaveContactNote,
+  executePauseConversation,
+  executeResumeConversation,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
 import {
@@ -154,6 +156,38 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
       required: ['targetType', 'identifier', 'note'],
     },
   },
+  {
+    name: 'pauseConversation',
+    description: 'Pause PA responses for one customer so the manager can handle the conversation manually via Meta Business Suite. The PA will go completely silent for that customer until the pause expires or is manually lifted.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        customer_identifier: {
+          type: Type.STRING,
+          description: 'Customer name (partial match) or full phone number (E.164)',
+        },
+        duration_minutes: {
+          type: Type.NUMBER,
+          description: 'How long to pause in minutes. Defaults to 30 if not specified.',
+        },
+      },
+      required: ['customer_identifier'],
+    },
+  },
+  {
+    name: 'resumeConversation',
+    description: 'Resume PA responses for a customer whose conversation was previously paused. The PA will start responding to that customer again immediately.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        customer_identifier: {
+          type: Type.STRING,
+          description: 'Customer name (partial match) or full phone number (E.164)',
+        },
+      },
+      required: ['customer_identifier'],
+    },
+  },
 ]
 
 // ── System prompt builder ─────────────────────────────────────────────────────
@@ -282,6 +316,10 @@ async function dispatchTool(
       return executeLookupCustomer(args as unknown as Parameters<typeof executeLookupCustomer>[0], ctx)
     case 'saveContactNote':
       return executeSaveContactNote(args as unknown as Parameters<typeof executeSaveContactNote>[0], ctx)
+    case 'pauseConversation':
+      return executePauseConversation(args as unknown as Parameters<typeof executePauseConversation>[0], ctx)
+    case 'resumeConversation':
+      return executeResumeConversation(args as unknown as Parameters<typeof executeResumeConversation>[0], ctx)
     default:
       return { error: `Unknown tool: ${name}` }
   }

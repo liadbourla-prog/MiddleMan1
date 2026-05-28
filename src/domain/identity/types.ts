@@ -8,6 +8,7 @@ export interface ResolvedIdentity {
   displayName: string | null
   messagingOptOut: boolean
   preferredLanguage: 'he' | 'en' | null
+  conversationPausedUntil: Date | null
 }
 
 export type ResolveResult =
