@@ -262,7 +262,13 @@ async function handleStep(
 
       const { _serviceFailCount: _, ...cleanData } = data
       await advance(db, session.managerPhone, 'waba_check', { ...cleanData, services: [parsed] })
-      return { reply: i18n.mm_waba_check[lang] }
+      const wabaCheckReply = await generateProviderOnboardingReply({
+        step: 'waba_check',
+        lang,
+        collectedData: data.businessName ? { businessName: data.businessName } : {},
+        fallback: i18n.mm_waba_check[lang],
+      })
+      return { reply: wabaCheckReply }
     }
 
     case 'waba_check': {
@@ -278,7 +284,7 @@ async function handleStep(
         lower.includes('חדש')
 
       if (noNumber && !hasNumber) {
-        // Case 1: fresh number
+        // Case 1: fresh number — URL must be verbatim; no LLM wrapping here
         const signupState = crypto.randomUUID()
         await advance(db, session.managerPhone, 'credentials', {
           ...data, _wabaCase: '1', _signupState: signupState,
@@ -287,10 +293,23 @@ async function handleStep(
       }
       if (hasNumber && !noNumber) {
         await advance(db, session.managerPhone, 'waba_guide', { ...data })
-        return { reply: i18n.mm_waba_guide_type[lang] }
+        const guideTypeReply = await generateProviderOnboardingReply({
+          step: 'waba_guide_type',
+          lang,
+          collectedData: data.businessName ? { businessName: data.businessName } : {},
+          fallback: i18n.mm_waba_guide_type[lang],
+        })
+        return { reply: guideTypeReply }
       }
-      // Ambiguous — re-ask
-      return { reply: i18n.mm_waba_check[lang] }
+      // Ambiguous — rephrase patiently via LLM rather than repeating verbatim
+      const wabaCheckRetryReply = await generateProviderOnboardingReply({
+        step: 'waba_check_retry',
+        lang,
+        collectedData: data.businessName ? { businessName: data.businessName } : {},
+        isRetry: true,
+        fallback: i18n.mm_waba_check[lang],
+      })
+      return { reply: wabaCheckRetryReply }
     }
 
     case 'waba_guide': {
@@ -301,13 +320,14 @@ async function handleStep(
         const isApp =
           lower.includes('app') || lower.includes('אפליקציה') || lower.includes('טלפון') ||
           lower.includes('phone') || lower.includes('mobile') || lower.includes('business app') ||
-          lower.includes('ביזנס אפ') || lower.includes('whatsapp business') && !lower.includes('manager') && !lower.includes('מנג\'ר')
+          lower.includes('ביזנס אפ') || (lower.includes('whatsapp business') && !lower.includes('manager') && !lower.includes('מנג\'ר'))
         const isMeta =
           lower.includes('meta') || lower.includes('business manager') || lower.includes('מנג\'ר') ||
           lower.includes('cloud') || lower.includes('api') || lower.includes('developer') ||
           lower.includes('מפתח')
 
         if (isApp && !isMeta) {
+          // Case 2: coexistence — URL must be verbatim
           const signupState = crypto.randomUUID()
           await advance(db, session.managerPhone, 'credentials', {
             ...data, _wabaType: 'app', _wabaCase: '2', _signupState: signupState,
@@ -319,14 +339,27 @@ async function handleStep(
             .update(providerOnboardingSessions)
             .set({ collectedData: { ...data, _wabaType: 'meta' } as Record<string, unknown>, updatedAt: new Date() })
             .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
-          return { reply: i18n.mm_waba_guide_bsp[lang] }
+          const bspReply = await generateProviderOnboardingReply({
+            step: 'waba_guide_bsp',
+            lang,
+            collectedData: data.businessName ? { businessName: data.businessName } : {},
+            fallback: i18n.mm_waba_guide_bsp[lang],
+          })
+          return { reply: bspReply }
         }
-        // Confused — explain
+        // Confused (includes plain "כן"/"yes" to an either/or, or a question) — rephrase
         if (detectsQuestion(text)) {
           const explanation = await explainOnboardingConcept({ concept: 'waba_type', userMessage: text, step: 'waba_guide', lang })
           if (explanation) return { reply: explanation }
         }
-        return { reply: i18n.mm_waba_guide_type[lang] }
+        const guideTypeRetryReply = await generateProviderOnboardingReply({
+          step: 'waba_guide_type_retry',
+          lang,
+          collectedData: data.businessName ? { businessName: data.businessName } : {},
+          isRetry: true,
+          fallback: i18n.mm_waba_guide_type[lang],
+        })
+        return { reply: guideTypeRetryReply }
       }
 
       // ── Sub-state: meta confirmed — own setup or BSP ─────────────────────
@@ -341,6 +374,7 @@ async function handleStep(
           lower.includes('external') || lower.includes('no') || lower.includes('לא')
 
         if (selfSetup && !bsp) {
+          // Case 3a — URL must be verbatim
           const signupState = crypto.randomUUID()
           await advance(db, session.managerPhone, 'credentials', {
             ...data, _wabaCase: '3a', _signupState: signupState,
@@ -355,7 +389,15 @@ async function handleStep(
             .where(eq(providerOnboardingSessions.managerPhone, session.managerPhone))
           return { reply: i18n.mm_case3b_exit[lang] }
         }
-        return { reply: i18n.mm_waba_guide_bsp[lang] }
+        // Ambiguous — rephrase patiently
+        const bspRetryReply = await generateProviderOnboardingReply({
+          step: 'waba_guide_bsp_retry',
+          lang,
+          collectedData: data.businessName ? { businessName: data.businessName } : {},
+          isRetry: true,
+          fallback: i18n.mm_waba_guide_bsp[lang],
+        })
+        return { reply: bspRetryReply }
       }
 
       return { reply: i18n.mm_embedded_signup_waiting[lang] }

@@ -852,6 +852,30 @@ const PROVIDER_STEP_GOALS: Record<string, { he: string; en: string }> = {
     he: 'הם שלחו תמונה. הסבר בחום שניתן לשלוח טקסט בלבד, ובקש שיכתבו מה ברצונם.',
     en: 'They sent an image. Warmly explain this assistant only understands text messages and ask them to describe what they need in words.',
   },
+  waba_check: {
+    he: 'שאל אם יש להם כבר מספר וואטסאפ עסקי שהם משתמשים בו לעסק. כן/לא. שאלה אחת.',
+    en: 'Ask if they already have a WhatsApp Business number they use for the business. Yes/No. One sentence.',
+  },
+  waba_check_retry: {
+    he: 'לא ברור אם יש להם מספר וואטסאפ עסקי. נסח מחדש בסבלנות: יש להם מספר וואטסאפ של העסק, או שהם מתחילים מאפס?',
+    en: "It's unclear if they have a business WhatsApp number. Rephrase patiently: do they have an existing WhatsApp Business number, or are they starting fresh?",
+  },
+  waba_guide_type: {
+    he: 'שאל אם המספר פועל דרך אפליקציית וואטסאפ ביזנס על הטלפון, או שהוא מחובר דרך Meta Business Manager. שתי אפשרויות — תן לבחור אחת.',
+    en: 'Ask whether their number runs through the WhatsApp Business App on their phone, or through Meta Business Manager. Two options — let them pick one.',
+  },
+  waba_guide_type_retry: {
+    he: 'התשובה לא ברורה. נסח מחדש בסבלנות: האם הם מנהלים את מספר העסק דרך האפליקציה בטלפון (וואטסאפ ביזנס), או דרך Meta Business Manager?',
+    en: "The answer wasn't clear. Rephrase patiently: do they manage their business number through the app on their phone (WhatsApp Business App), or through Meta Business Manager?",
+  },
+  waba_guide_bsp: {
+    he: 'שאל אם הגדירו את חשבון ה-Meta Business Manager בעצמם, או שחברה/סוכנות חיצונית ניהלה את ההגדרה עבורם.',
+    en: 'Ask whether they set up their Meta Business Manager account themselves, or if an external company or agency managed the setup for them.',
+  },
+  waba_guide_bsp_retry: {
+    he: 'לא ברור. נסח מחדש: הם הגדירו את ה-Meta Business Manager בעצמם, או שמישהו אחר עשה את זה?',
+    en: "Not clear. Rephrase: did they set up Meta Business Manager themselves, or did someone else do it?",
+  },
 }
 
 export async function generateProviderOnboardingReply(input: {

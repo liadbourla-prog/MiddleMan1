@@ -241,52 +241,53 @@ export async function oauthRoutes(app: FastifyInstance) {
         const longLivedJson = (await longLivedRes.json()) as { access_token?: string; error?: { message?: string } }
         const accessToken = longLivedJson.access_token ?? tokenJson.access_token
 
-        // 4. Retrieve WhatsApp Business Accounts and phone numbers via business graph
-        // Step 4a: get the list of Business Manager IDs the user manages
-        const bizListRes = await fetch(
-          `https://graph.facebook.com/v21.0/me/businesses`,
-          { headers: { Authorization: `Bearer ${accessToken}` } },
+        // 4. Retrieve the phone number ID via debug_token.
+        // debug_token returns granular_scopes which list exactly which WABA IDs and
+        // phone number IDs the user just granted — the only reliable post-Embedded-Signup method.
+        const debugRes = await fetch(
+          `https://graph.facebook.com/v21.0/debug_token?input_token=${accessToken}&access_token=${appId}|${appSecret}`,
         )
-        const bizListJson = (await bizListRes.json()) as {
-          data?: Array<{ id: string; name?: string }>
+        const debugJson = (await debugRes.json()) as {
+          data?: {
+            granular_scopes?: Array<{ scope: string; target_ids?: string[] }>
+          }
           error?: { message?: string }
         }
 
-        app.log.info({ bizListJson }, 'Meta businesses list')
+        app.log.info({ debugJson }, 'Meta debug_token response')
+
+        // phone number IDs are listed under whatsapp_business_messaging scope
+        const messagingScope = debugJson.data?.granular_scopes?.find(
+          (s) => s.scope === 'whatsapp_business_messaging',
+        )
+        const phoneNumberIds = messagingScope?.target_ids ?? []
 
         let phoneNumberId: string | undefined
         let paPhoneNumber: string | undefined
 
-        // Step 4b: for each business, query its owned WABAs as a separate edge
-        for (const biz of bizListJson.data ?? []) {
-          const wabaRes = await fetch(
-            `https://graph.facebook.com/v21.0/${biz.id}/whatsapp_business_accounts?fields=id,phone_numbers{id,display_phone_number}`,
+        for (const pid of phoneNumberIds) {
+          const phoneRes = await fetch(
+            `https://graph.facebook.com/v21.0/${pid}?fields=display_phone_number`,
             { headers: { Authorization: `Bearer ${accessToken}` } },
           )
-          const wabaJson = (await wabaRes.json()) as {
-            data?: Array<{
-              id: string
-              phone_numbers?: { data?: Array<{ id: string; display_phone_number: string }> }
-            }>
+          const phoneJson = (await phoneRes.json()) as {
+            display_phone_number?: string
             error?: { message?: string }
           }
+          app.log.info({ pid, phoneJson }, 'Meta phone number lookup')
 
-          app.log.info({ bizId: biz.id, wabaJson }, 'Meta WABA fetch for business')
-
-          for (const waba of wabaJson.data ?? []) {
-            const phones = waba.phone_numbers?.data ?? []
-            if (phones.length > 0) {
-              phoneNumberId = phones[0]!.id
-              paPhoneNumber = '+' + phones[0]!.display_phone_number.replace(/\D/g, '')
-              break
-            }
+          if (phoneJson.display_phone_number) {
+            phoneNumberId = pid
+            paPhoneNumber = '+' + phoneJson.display_phone_number.replace(/\D/g, '')
+            break
           }
-          if (phoneNumberId) break
         }
 
         if (!phoneNumberId || !paPhoneNumber) {
-          app.log.error({ bizListJson }, 'Meta phone number fetch failed — no phone numbers found across all WABAs')
-          await sendError(`No WhatsApp phone numbers found. Businesses found: ${bizListJson.data?.length ?? 0}. ${bizListJson.error?.message ?? ''}`)
+          app.log.error({ debugJson }, 'Meta phone number fetch failed — no phone numbers in debug_token scopes')
+          await sendError(
+            `No WhatsApp phone numbers found in granted scopes. ${debugJson.error?.message ?? ''}`,
+          )
           return reply.status(502).send('Could not retrieve phone number from Meta')
         }
 
