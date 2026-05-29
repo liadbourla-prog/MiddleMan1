@@ -186,6 +186,13 @@ PROVIDER_WA_NUMBER              E.164 phone number (e.g. +15550001234)
 PROVIDER_WA_PHONE_NUMBER_ID     Meta phone number ID for provider number
 PROVIDER_WA_ACCESS_TOKEN        System user token for provider number
 
+# Meta Embedded Signup (business WhatsApp onboarding via the /embedded-signup widget)
+META_APP_ID                     Meta app ID (Facebook JS SDK + token exchange)
+META_APP_SECRET                 Meta app secret (token exchange)
+META_EMBEDDED_SIGNUP_CONFIG_ID  Facebook Login for Business config ID with the WhatsApp
+                                Embedded Signup / coexistence feature enabled. PUBLIC_BASE_URL
+                                must also be listed under the app's Allowed Domains.
+
 # Google Calendar
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET

@@ -432,15 +432,12 @@ async function handleStep(
 // ── Embedded Signup URL builder ───────────────────────────────────────────────
 
 export function buildSignupUrl(state: string): string {
-  const appId = process.env['META_APP_ID'] ?? ''
-  const configId = process.env['META_EMBEDDED_SIGNUP_CONFIG_ID'] ?? ''
+  // Points at our hosted Embedded Signup widget page (src/routes/oauth.ts), which runs
+  // Meta's WhatsApp onboarding wizard via the Facebook JS SDK. A raw facebook.com
+  // /dialog/oauth redirect does NOT run the wizard — it only does a plain Facebook login
+  // and never yields a phone number. See ONBOARDING_DESIGN.md.
   const publicBaseUrl = process.env['PUBLIC_BASE_URL'] ?? ''
-  const redirectUri = encodeURIComponent(`${publicBaseUrl}/oauth/meta/callback`)
-  const scope = encodeURIComponent('business_management,whatsapp_business_management,whatsapp_business_messaging')
-  const extras = encodeURIComponent(
-    JSON.stringify({ setup: {}, featureType: 'whatsapp_embedded_signup', sessionInfoVersion: '3' }),
-  )
-  return `https://www.facebook.com/dialog/oauth?client_id=${appId}&config_id=${configId}&redirect_uri=${redirectUri}&scope=${scope}&state=${state}&display=page&response_type=code&extras=${extras}`
+  return `${publicBaseUrl}/embedded-signup?state=${encodeURIComponent(state)}`
 }
 
 // ── Provisioning ──────────────────────────────────────────────────────────────
