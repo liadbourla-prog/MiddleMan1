@@ -242,29 +242,38 @@ export async function oauthRoutes(app: FastifyInstance) {
         const accessToken = longLivedJson.access_token ?? tokenJson.access_token
 
         // 4. Retrieve WhatsApp Business Accounts and phone numbers via business graph
-        // /me/phone_numbers is for Facebook login codes — WABA phone numbers live under /businesses
-        const wabaRes = await fetch(
-          `https://graph.facebook.com/v21.0/me/businesses?fields=whatsapp_business_accounts{id,phone_numbers{id,display_phone_number}}`,
+        // Step 4a: get the list of Business Manager IDs the user manages
+        const bizListRes = await fetch(
+          `https://graph.facebook.com/v21.0/me/businesses`,
           { headers: { Authorization: `Bearer ${accessToken}` } },
         )
-        const wabaJson = (await wabaRes.json()) as {
-          data?: Array<{
-            id: string
-            whatsapp_business_accounts?: {
-              data?: Array<{
-                id: string
-                phone_numbers?: { data?: Array<{ id: string; display_phone_number: string }> }
-              }>
-            }
-          }>
+        const bizListJson = (await bizListRes.json()) as {
+          data?: Array<{ id: string; name?: string }>
           error?: { message?: string }
         }
 
-        // Flatten: find the first available phone number across all WABAs
+        app.log.info({ bizListJson }, 'Meta businesses list')
+
         let phoneNumberId: string | undefined
         let paPhoneNumber: string | undefined
-        for (const biz of wabaJson.data ?? []) {
-          for (const waba of biz.whatsapp_business_accounts?.data ?? []) {
+
+        // Step 4b: for each business, query its owned WABAs as a separate edge
+        for (const biz of bizListJson.data ?? []) {
+          const wabaRes = await fetch(
+            `https://graph.facebook.com/v21.0/${biz.id}/whatsapp_business_accounts?fields=id,phone_numbers{id,display_phone_number}`,
+            { headers: { Authorization: `Bearer ${accessToken}` } },
+          )
+          const wabaJson = (await wabaRes.json()) as {
+            data?: Array<{
+              id: string
+              phone_numbers?: { data?: Array<{ id: string; display_phone_number: string }> }
+            }>
+            error?: { message?: string }
+          }
+
+          app.log.info({ bizId: biz.id, wabaJson }, 'Meta WABA fetch for business')
+
+          for (const waba of wabaJson.data ?? []) {
             const phones = waba.phone_numbers?.data ?? []
             if (phones.length > 0) {
               phoneNumberId = phones[0]!.id
@@ -276,9 +285,8 @@ export async function oauthRoutes(app: FastifyInstance) {
         }
 
         if (!phoneNumberId || !paPhoneNumber) {
-          const err = wabaJson.error?.message ?? 'No WhatsApp phone numbers found for this account'
-          app.log.error({ wabaJson }, 'Meta phone number fetch failed')
-          await sendError(err)
+          app.log.error({ bizListJson }, 'Meta phone number fetch failed — no phone numbers found across all WABAs')
+          await sendError(`No WhatsApp phone numbers found. Businesses found: ${bizListJson.data?.length ?? 0}. ${bizListJson.error?.message ?? ''}`)
           return reply.status(502).send('Could not retrieve phone number from Meta')
         }
 
