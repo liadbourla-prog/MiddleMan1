@@ -107,6 +107,12 @@ const embeddedSignupHtml = (esConfig: string) => `<!DOCTYPE html>
       var btn = this;
       btn.disabled = true;
       setStatus('Opening Meta…');
+      // Build extras. featureType is only included for coexistence
+      // ('whatsapp_business_app_onboarding'); omitting it runs standard Embedded Signup.
+      // An invalid/unknown featureType makes Meta fall back to a plain Login-for-Business
+      // reconnect and never launch the WhatsApp wizard.
+      var extras = { setup: {}, sessionInfoVersion: '3' };
+      if (ES.featureType) extras.featureType = ES.featureType;
       FB.login(function (response) {
         if (response.authResponse && response.authResponse.code) {
           finish(response.authResponse.code);
@@ -118,7 +124,7 @@ const embeddedSignupHtml = (esConfig: string) => `<!DOCTYPE html>
         config_id: ES.configId,
         response_type: 'code',
         override_default_response_type: true,
-        extras: { setup: {}, featureType: 'whatsapp_embedded_signup', sessionInfoVersion: '3' }
+        extras: extras
       });
     });
   </script>
@@ -270,12 +276,16 @@ export async function oauthRoutes(app: FastifyInstance) {
   // ── Meta Embedded Signup widget page ──────────────────────────────────────────
   // Serves the Facebook JS SDK Embedded Signup widget. The MiddleMan signup link points
   // here (not directly at facebook.com) so the WhatsApp onboarding wizard actually runs.
-  app.get<{ Querystring: { state?: string } }>('/embedded-signup', async (request, reply) => {
+  app.get<{ Querystring: { state?: string; ft?: string } }>('/embedded-signup', async (request, reply) => {
     const state = request.query.state ?? ''
+    // featureType selects the Meta wizard variant. 'whatsapp_business_app_onboarding' runs
+    // the coexistence flow (QR-link an existing WA Business App number); empty runs standard
+    // Embedded Signup. Allowlist the value so a crafted query can't inject arbitrary input.
+    const ft = request.query.ft === 'whatsapp_business_app_onboarding' ? request.query.ft : ''
     const appId = process.env['META_APP_ID'] ?? ''
     const configId = process.env['META_EMBEDDED_SIGNUP_CONFIG_ID'] ?? ''
     // <-escaped so the JSON literal can't break out of the <script> context
-    const esConfig = JSON.stringify({ appId, configId, state }).replace(/</g, '\\u003c')
+    const esConfig = JSON.stringify({ appId, configId, state, featureType: ft }).replace(/</g, '\\u003c')
     return reply.type('text/html').send(embeddedSignupHtml(esConfig))
   })
 

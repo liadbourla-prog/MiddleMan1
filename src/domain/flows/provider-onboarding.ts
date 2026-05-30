@@ -78,7 +78,7 @@ export async function handleProviderOnboarding(
         .update(providerOnboardingSessions)
         .set({ collectedData: { ...data, _signupState: signupState } as Record<string, unknown>, updatedAt: new Date() })
         .where(eq(providerOnboardingSessions.managerPhone, fromNumber))
-      return { reply: i18n.mm_coexistence_link[lang](buildSignupUrl(signupState)) }
+      return { reply: i18n.mm_coexistence_link[lang](buildSignupUrl(signupState, COEXISTENCE_FEATURE_TYPE)) }
     }
 
     const alreadyDoneFallback = i18n.mm_already_done[lang]
@@ -332,7 +332,7 @@ async function handleStep(
           await advance(db, session.managerPhone, 'credentials', {
             ...data, _wabaType: 'app', _wabaCase: '2', _signupState: signupState,
           })
-          return { reply: i18n.mm_coexistence_link[lang](buildSignupUrl(signupState)) }
+          return { reply: i18n.mm_coexistence_link[lang](buildSignupUrl(signupState, COEXISTENCE_FEATURE_TYPE)) }
         }
         if (isMeta && !isApp) {
           await db
@@ -431,14 +431,26 @@ async function handleStep(
 
 // ── Embedded Signup URL builder ───────────────────────────────────────────────
 
-export function buildSignupUrl(state: string): string {
+export function buildSignupUrl(state: string, featureType?: string): string {
   // Points at our hosted Embedded Signup widget page (src/routes/oauth.ts), which runs
   // Meta's WhatsApp onboarding wizard via the Facebook JS SDK. A raw facebook.com
   // /dialog/oauth redirect does NOT run the wizard — it only does a plain Facebook login
   // and never yields a phone number. See ONBOARDING_DESIGN.md.
+  //
+  // `featureType` selects which onboarding wizard Meta runs:
+  //   • 'whatsapp_business_app_onboarding' → coexistence (number already on the WA Business
+  //     App; wizard shows the QR-link step). Required for Case 2 / Case 1→coexistence.
+  //   • omitted → standard Embedded Signup (Case 1 fresh, Case 3a existing Cloud API).
+  // Passing an invalid value makes Meta fall back to a plain Login-for-Business reconnect
+  // and never launch the WhatsApp wizard (no phone_number_id comes back).
   const publicBaseUrl = process.env['PUBLIC_BASE_URL'] ?? ''
-  return `${publicBaseUrl}/embedded-signup?state=${encodeURIComponent(state)}`
+  const ft = featureType ? `&ft=${encodeURIComponent(featureType)}` : ''
+  return `${publicBaseUrl}/embedded-signup?state=${encodeURIComponent(state)}${ft}`
 }
+
+// Coexistence onboarding featureType — connects a number already running on the WhatsApp
+// Business App (Case 2, and Case 1 after the 7-day coexistence wait).
+export const COEXISTENCE_FEATURE_TYPE = 'whatsapp_business_app_onboarding'
 
 // ── Provisioning ──────────────────────────────────────────────────────────────
 
