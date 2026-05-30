@@ -298,8 +298,12 @@ export async function oauthRoutes(app: FastifyInstance) {
     async (request, reply) => {
       const { code, phone_number_id, waba_id, state } = request.body ?? {}
 
-      if (!code || !state || !phone_number_id) {
-        return reply.status(400).send({ ok: false, error: 'Missing code, state, or phone_number_id' })
+      // phone_number_id / waba_id come from the WA_EMBEDDED_SIGNUP widget event. On a
+      // Facebook "reconnect" (returning user re-granting an existing connection) that event
+      // may not fire, so they can be absent here — we resolve them from the granted token
+      // below. Only code + state are strictly required at this point.
+      if (!code || !state) {
+        return reply.status(400).send({ ok: false, error: 'Missing code or state' })
       }
 
       // 1. Look up the onboarding session by the state token stored in collectedData
@@ -348,38 +352,92 @@ export async function oauthRoutes(app: FastifyInstance) {
         const longLivedJson = (await longLivedRes.json()) as { access_token?: string; error?: { message?: string } }
         const accessToken = longLivedJson.access_token ?? tokenJson.access_token
 
-        // 4. Resolve the display number from the phone_number_id the widget returned
+        // 3b. Resolve phone_number_id / waba_id. The widget event is the primary source, but
+        // on a reconnect it may not fire — fall back to the token's granted WhatsApp assets:
+        // debug_token → granular_scopes (whatsapp_business_management target_ids = WABA IDs)
+        // → GET /{waba_id}/phone_numbers → phone_number_id.
+        let resolvedPhoneNumberId = phone_number_id
+        let resolvedWabaId = waba_id
+        if (!resolvedPhoneNumberId) {
+          try {
+            const dbgRes = await fetch(
+              `https://graph.facebook.com/v21.0/debug_token?input_token=${accessToken}&access_token=${appId}|${appSecret}`,
+            )
+            const dbgJson = (await dbgRes.json()) as {
+              data?: { granular_scopes?: { scope: string; target_ids?: string[] }[] }
+            }
+            const scopes = dbgJson.data?.granular_scopes ?? []
+            const waScope =
+              scopes.find((s) => s.scope === 'whatsapp_business_management') ??
+              scopes.find((s) => s.scope === 'whatsapp_business_messaging')
+            const wabaIds = waScope?.target_ids ?? []
+            app.log.info({ wabaIds }, 'Meta exchange: resolving WABA from token (widget event absent)')
+            for (const wid of wabaIds) {
+              const pnRes = await fetch(
+                `https://graph.facebook.com/v21.0/${wid}/phone_numbers?fields=id,display_phone_number`,
+                { headers: { Authorization: `Bearer ${accessToken}` } },
+              )
+              const pnJson = (await pnRes.json()) as {
+                data?: { id?: string; display_phone_number?: string }[]
+              }
+              const first = pnJson.data?.[0]
+              if (first?.id) {
+                resolvedPhoneNumberId = first.id
+                resolvedWabaId = wid
+                break
+              }
+            }
+          } catch (e) {
+            app.log.warn({ err: e instanceof Error ? e.message : String(e) }, 'WABA resolution from token failed')
+          }
+        }
+
+        if (!resolvedPhoneNumberId) {
+          // No number came back from the widget and none is attached to the granted token.
+          // This is the "reconnect with nothing to onboard" dead-end: the user re-granted an
+          // existing Facebook connection that has no linked WhatsApp number. They must remove
+          // the existing connection and run onboarding fresh so the QR / number step appears.
+          app.log.warn({ state }, 'Meta exchange: no phone_number_id from widget and no WABA on token')
+          const noNumberMsg = i18n.mm_no_number_linked[lang]
+          await sendMessage(
+            { toNumber: session.managerPhone, body: noNumberMsg },
+            { accessToken: providerAccessToken, phoneNumberId: providerPhoneNumberId },
+          ).catch(() => {})
+          return reply.status(422).send({ ok: false, error: noNumberMsg })
+        }
+
+        // 4. Resolve the display number from the resolved phone_number_id
         const phoneRes = await fetch(
-          `https://graph.facebook.com/v21.0/${phone_number_id}?fields=display_phone_number`,
+          `https://graph.facebook.com/v21.0/${resolvedPhoneNumberId}?fields=display_phone_number`,
           { headers: { Authorization: `Bearer ${accessToken}` } },
         )
         const phoneJson = (await phoneRes.json()) as {
           display_phone_number?: string
           error?: { message?: string }
         }
-        app.log.info({ phone_number_id, phoneJson }, 'Meta phone number lookup')
+        app.log.info({ phoneNumberId: resolvedPhoneNumberId, phoneJson }, 'Meta phone number lookup')
 
         if (!phoneJson.display_phone_number) {
           const err = phoneJson.error?.message ?? 'display_phone_number missing'
-          app.log.error({ phone_number_id, phoneJson }, 'Meta phone number fetch failed')
+          app.log.error({ phoneNumberId: resolvedPhoneNumberId, phoneJson }, 'Meta phone number fetch failed')
           await sendError(err)
           return reply.status(502).send({ ok: false, error: 'Could not retrieve phone number from Meta' })
         }
-        const phoneNumberId = phone_number_id
+        const phoneNumberId = resolvedPhoneNumberId
         const paPhoneNumber = '+' + phoneJson.display_phone_number.replace(/\D/g, '')
 
         // 5. Subscribe our app to the WABA's webhooks (required for inbound messages).
         // Best-effort: an "already subscribed" response is fine.
-        if (waba_id) {
+        if (resolvedWabaId) {
           const subRes = await fetch(
-            `https://graph.facebook.com/v21.0/${waba_id}/subscribed_apps`,
+            `https://graph.facebook.com/v21.0/${resolvedWabaId}/subscribed_apps`,
             { method: 'POST', headers: { Authorization: `Bearer ${accessToken}` } },
           )
           const subJson = (await subRes.json()) as { success?: boolean; error?: { message?: string } }
           if (!subRes.ok || subJson.error) {
-            app.log.warn({ waba_id, subJson }, 'subscribed_apps non-success (continuing)')
+            app.log.warn({ wabaId: resolvedWabaId, subJson }, 'subscribed_apps non-success (continuing)')
           } else {
-            app.log.info({ waba_id }, 'WABA subscribed to app webhooks')
+            app.log.info({ wabaId: resolvedWabaId }, 'WABA subscribed to app webhooks')
           }
         }
 

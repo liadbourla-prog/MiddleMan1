@@ -47,6 +47,10 @@ const strings = {
     he: (err: string) => `משהו השתבש בחיבור (${err}). נסו שוב או פנו לתמיכה.`,
     en: (err: string) => `Something went wrong with the connection (${err}). Please try again or contact support.`,
   },
+  mm_no_number_linked: {
+    he: `לא חובר מספר WhatsApp. מטא החזירה התחברות אך ללא מספר — סימן שכבר יש חיבור קודם לחשבון.\n\nכדי לתקן: היכנסו לפייסבוק → הגדרות → אינטגרציות עסקיות (Business Integrations) → MiddleMan → הסירו. ואז נסו שוב את הקישור — הפעם יופיע שלב סריקת ה-QR לחיבור המספר.`,
+    en: `No WhatsApp number was linked. Meta returned a login but no number — which means this account already has a prior connection.\n\nTo fix: open Facebook → Settings → Business Integrations → MiddleMan → Remove. Then tap the link again — this time the QR / number step will appear.`,
+  },
   mm_setup_failed: {
     he: (err: string) => `ההגדרה נכשלה: ${err}. נסו שוב או צרו קשר עם התמיכה.`,
     en: (err: string) => `Setup failed: ${err}. Please try again or contact support.`,

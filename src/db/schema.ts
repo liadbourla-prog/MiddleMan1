@@ -209,6 +209,40 @@ export const bookings = pgTable(
   ],
 )
 
+// Time-ranged blocks, personal events, and proactively-scheduled group sessions.
+// Single home for "manager-occupied time" — distinct from recurring working hours
+// (availability table) and customer bookings (bookings table). See CALENDAR_UX_DESIGN.md.
+export const calendarBlocks = pgTable(
+  'calendar_blocks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    type: text('type', { enum: ['block', 'personal', 'class'] }).notNull().default('block'),
+    startTs: timestamp('start_ts', { withTimezone: true }).notNull(),
+    endTs: timestamp('end_ts', { withTimezone: true }).notNull(),
+    title: text('title'),
+    reason: text('reason'),
+    // For type='class': the group service this session instances, and its capacity
+    serviceTypeId: uuid('service_type_id').references(() => serviceTypes.id),
+    maxParticipants: integer('max_participants'),
+    // Optional owner/staff scoping
+    providerId: uuid('provider_id').references(() => identities.id),
+    // Google mirror linkage (Google mode only)
+    googleEventId: text('google_event_id'),
+    googleEtag: text('google_etag'),
+    // Provenance: 'internal' = created via PA/Branch 3; 'google_import' = ingested from owner's Google edit
+    source: text('source', { enum: ['internal', 'google_import'] }).notNull().default('internal'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('calendar_blocks_business_range_idx').on(t.businessId, t.startTs, t.endTs),
+    index('calendar_blocks_google_event_idx').on(t.businessId, t.googleEventId),
+  ],
+)
+
 export const conversationSessions = pgTable(
   'conversation_sessions',
   {
@@ -523,6 +557,8 @@ export type ServiceType = typeof serviceTypes.$inferSelect
 export type Availability = typeof availability.$inferSelect
 export type ProviderAssignment = typeof providerAssignments.$inferSelect
 export type Booking = typeof bookings.$inferSelect
+export type CalendarBlock = typeof calendarBlocks.$inferSelect
+export type CalendarBlockType = CalendarBlock['type']
 export type ConversationSession = typeof conversationSessions.$inferSelect
 export type ManagerInstruction = typeof managerInstructions.$inferSelect
 export type AuditLogEntry = typeof auditLog.$inferSelect
