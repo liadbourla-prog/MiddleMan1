@@ -67,8 +67,25 @@ const embeddedSignupHtml = (esConfig: string) => `<!DOCTYPE html>
     var statusEl = document.getElementById('status');
     function setStatus(msg, isErr) { statusEl.textContent = msg; statusEl.className = isErr ? 'err' : ''; }
 
+    // Client-side telemetry beacon. Browser console logs never reach the server, so we
+    // POST key milestones (SDK init, every postMessage origin/type, FB.login result) to
+    // /oauth/meta/debug. This is how we tell "WA wizard never launched" (no
+    // WA_EMBEDDED_SIGNUP event at all) apart from "event fired but we dropped it"
+    // (wrong origin). Best-effort, never blocks the flow.
+    function beacon(event, detail) {
+      try {
+        fetch('/oauth/meta/debug', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ state: ES.state, event: event, detail: detail, ua: navigator.userAgent })
+        }).catch(function () {});
+      } catch (e) { /* ignore */ }
+    }
+    beacon('page_loaded', { featureType: ES.featureType || '(none)', hasConfigId: Boolean(ES.configId), href: location.href });
+
     window.fbAsyncInit = function () {
       FB.init({ appId: ES.appId, autoLogAppEvents: true, xfbml: false, version: 'v21.0' });
+      beacon('fb_init', {});
     };
     (function (d, s, id) {
       var js, fjs = d.getElementsByTagName(s)[0];
@@ -79,14 +96,23 @@ const embeddedSignupHtml = (esConfig: string) => `<!DOCTYPE html>
     }(document, 'script', 'facebook-jssdk'));
 
     window.addEventListener('message', function (event) {
-      if (event.origin !== 'https://www.facebook.com' && event.origin !== 'https://web.facebook.com') return;
+      // Match any facebook.com subdomain (www, web, business, regional locales). An exact
+      // www-only match silently drops WA_EMBEDDED_SIGNUP events posted from other FB origins.
+      var origin = String(event.origin || '');
+      var isFb = origin.indexOf('facebook.com') !== -1;
+      var parsedType = null;
       try {
         var data = JSON.parse(event.data);
-        if (data.type === 'WA_EMBEDDED_SIGNUP' && data.data) {
+        parsedType = data && data.type;
+        if (isFb && data.type === 'WA_EMBEDDED_SIGNUP' && data.data) {
           if (data.data.phone_number_id) captured.phone_number_id = data.data.phone_number_id;
           if (data.data.waba_id) captured.waba_id = data.data.waba_id;
+          beacon('wa_embedded_signup', { origin: origin, eventName: data.data.event, hasPhone: Boolean(data.data.phone_number_id), hasWaba: Boolean(data.data.waba_id) });
         }
-      } catch (e) { /* non-JSON postMessage, ignore */ }
+      } catch (e) { /* non-JSON postMessage (e.g. SDK noise), ignore for capture */ }
+      // Log every inbound message's origin + parsed type so we can see whether the WA
+      // wizard is posting anything at all, and from where.
+      beacon('postmessage', { origin: origin, isFb: isFb, type: parsedType });
     });
 
     function finish(code) {
@@ -115,7 +141,15 @@ const embeddedSignupHtml = (esConfig: string) => `<!DOCTYPE html>
       var extras = { setup: {}, sessionInfoVersion: '3' };
       if (ES.featureType) extras.featureType = ES.featureType;
       FB.login(function (response) {
-        if (response.authResponse && response.authResponse.code) {
+        var hasCode = Boolean(response && response.authResponse && response.authResponse.code);
+        beacon('fb_login_callback', {
+          status: response && response.status,
+          hasAuthResponse: Boolean(response && response.authResponse),
+          hasCode: hasCode,
+          hadPhone: Boolean(captured.phone_number_id),
+          hadWaba: Boolean(captured.waba_id)
+        });
+        if (hasCode) {
           finish(response.authResponse.code);
         } else {
           btn.disabled = false;
@@ -125,6 +159,7 @@ const embeddedSignupHtml = (esConfig: string) => `<!DOCTYPE html>
         config_id: ES.configId,
         response_type: 'code',
         override_default_response_type: true,
+        scope: 'whatsapp_business_management,whatsapp_business_messaging',
         extras: extras
       });
     });
@@ -610,6 +645,20 @@ export async function oauthRoutes(app: FastifyInstance) {
         await sendError(msg)
         return reply.status(500).send({ ok: false, error: msg })
       }
+    },
+  )
+
+  // ── Meta Embedded Signup client telemetry ─────────────────────────────────────
+  // The widget page POSTs milestones here (page_loaded, fb_init, every postMessage
+  // origin/type, wa_embedded_signup, fb_login_callback) so we can diagnose the flow from
+  // Cloud Run logs. Browser console isn't visible server-side; this is our only window
+  // into whether the WhatsApp wizard launches and what it posts back. No side effects.
+  app.post<{ Body: { state?: string; event?: string; detail?: unknown; ua?: string } }>(
+    '/oauth/meta/debug',
+    async (request, reply) => {
+      const { state, event, detail, ua } = request.body ?? {}
+      app.log.info({ state, esEvent: event, detail, ua }, 'Embedded Signup client telemetry')
+      return reply.send({ ok: true })
     },
   )
 
