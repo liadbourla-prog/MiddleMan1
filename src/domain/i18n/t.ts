@@ -633,9 +633,23 @@ const strings = {
     he: `חיבור Google Calendar פג תוקף ולא ניתן לחדשו אוטומטית. אנא חיברו מחדש את לוח השנה.`,
     en: `Your Google Calendar connection has expired and could not be refreshed automatically. Please reconnect your calendar.`,
   },
+  calendar_mirror_divergence: {
+    he: `⚠️ לא הצלחתי לעדכן אירוע ב-Google Calendar שלך אחרי כמה ניסיונות. המערכת הפנימית מעודכנת ונכונה, אבל ייתכן שתצוגת Google שלך אינה מסונכרנת כרגע. אבדוק שוב אוטומטית — אם זה נמשך, כדאי לחבר מחדש את לוח השנה.`,
+    en: `⚠️ I couldn't update an event in your Google Calendar after several attempts. Your internal schedule is correct and up to date, but your Google view may be temporarily out of sync. I'll keep retrying automatically — if this persists, reconnecting your calendar will fix it.`,
+  },
   hold_expired: {
     he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
     en: `Your booking hold has expired because it wasn't confirmed in time. Feel free to book again whenever you're ready.`,
+  },
+  // Inbound sync (Phase 3): we applied an owner-originated Google Calendar change.
+  calendar_owner_reconcile_applied: {
+    he: (n: number) => `סנכרנתי שינוי שביצעת ביומן Google: ${n === 1 ? 'הזמנה אחת בוטלה' : `${n} הזמנות בוטלו`} בהתאם. הלקוחות שהושפעו עודכנו.`,
+    en: (n: number) => `I synced a change you made in your Google Calendar: ${n === 1 ? '1 booking was cancelled' : `${n} bookings were cancelled`} to match. The affected customers have been notified.`,
+  },
+  // Inbound sync (Phase 3): owner change touches many bookings — blast-radius gate.
+  calendar_owner_reconcile_gate: {
+    he: (n: number) => `שמתי לב שמחקת מ-Google Calendar אירוע שמשפיע על ${n} הזמנות לקוחות. כדי לא לבטל בטעות הזמנות, לא ביטלתי כלום אוטומטית. רוצה שאבטל את כל ${n} ההזמנות? השב/י "כן לבטל" כדי לאשר.`,
+    en: (n: number) => `I noticed you removed a Google Calendar event that affects ${n} customer bookings. To avoid mass-cancelling by mistake, I didn't cancel anything automatically. Want me to cancel all ${n} bookings? Reply "yes cancel" to confirm.`,
   },
 
   // ── Per-conversation pause (manager ops) ─────────────────────────────────────

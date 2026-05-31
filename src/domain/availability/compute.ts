@@ -94,14 +94,20 @@ export function localTimeToUtc(dateStr: string, timeStr: string, tz: string): Da
   const [y, mo, d] = dateStr.split('-').map(Number)
   const [h, mi] = timeStr.split(':').map(Number)
   const naive = new Date(Date.UTC(y ?? 1970, (mo ?? 1) - 1, d ?? 1, h ?? 0, mi ?? 0, 0))
-  const localAtNaive = new Intl.DateTimeFormat('en-GB', {
-    timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
+  // What local wall-clock (date + time) does `naive` map to in `tz`? We compare
+  // the FULL timestamp, not just minute-of-day, so a midnight-adjacent target
+  // that lands on a different local calendar day is corrected without a day-wrap
+  // sign error.
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
   }).formatToParts(naive)
-  const lh = parseInt(localAtNaive.find((p) => p.type === 'hour')?.value ?? '0', 10)
-  const lm = parseInt(localAtNaive.find((p) => p.type === 'minute')?.value ?? '0', 10)
+  const get = (t: string) => parseInt(parts.find((p) => p.type === t)?.value ?? '0', 10)
+  const lh = get('hour')
   const lhNorm = lh === 24 ? 0 : lh
-  const diffMin = ((h ?? 0) * 60 + (mi ?? 0)) - (lhNorm * 60 + lm)
-  return new Date(naive.getTime() + diffMin * 60_000)
+  const localMs = Date.UTC(get('year'), get('month') - 1, get('day'), lhNorm, get('minute'), 0)
+  const targetMs = Date.UTC(y ?? 1970, (mo ?? 1) - 1, d ?? 1, h ?? 0, mi ?? 0, 0)
+  return new Date(naive.getTime() + (targetMs - localMs))
 }
 
 // ── Working-hours window ────────────────────────────────────────────────────

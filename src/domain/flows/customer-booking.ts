@@ -16,6 +16,7 @@ import type { HydratedContext } from '../session/hydration.js'
 import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/engine.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
+import { getOpenSlots } from '../availability/service.js'
 
 type CustomerMemoryInput = {
   returningCustomer: boolean
@@ -96,6 +97,33 @@ async function loadHoursSummary(db: Db, businessId: string): Promise<string | nu
     .map((r) => `${DAY_NAMES[r.dayOfWeek!] ?? r.dayOfWeek}: ${r.openTime}–${r.closeTime}`)
 
   return parts.length > 0 ? `Business hours: ${parts.join(', ')}.` : null
+}
+
+// Enumerate up to 4 real bookable openings for a service, starting from the
+// requested time, over the next 14 days. Returns a compact human string for the
+// LLM to phrase, or null when nothing is open. Uses the canonical availability
+// spine so suggestions never collide with hours, blocks, or existing bookings.
+async function suggestOpenSlotsText(
+  db: Db,
+  business: Business,
+  serviceTypeId: string,
+  requestedStart: Date,
+  requestedEnd: Date,
+  tz: string,
+): Promise<string | null> {
+  const durationMinutes = Math.max(15, Math.round((requestedEnd.getTime() - requestedStart.getTime()) / 60_000))
+  const now = new Date()
+  const from = requestedStart.getTime() > now.getTime() ? requestedStart : now
+  const to = new Date(from.getTime() + 14 * 24 * 60 * 60_000)
+  try {
+    const slots = await getOpenSlots(db, business, { start: from, end: to }, durationMinutes, { maxSlots: 4 })
+    if (slots.length === 0) return null
+    return slots
+      .map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`)
+      .join(', ')
+  } catch {
+    return null
+  }
 }
 
 export async function handleBookingFlow(
@@ -683,10 +711,19 @@ async function handleHoldConfirmation(
   if (!result.ok) {
     await completeSession(db, session.id)
     const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
+    // Proactive suggestion: enumerate real bookable openings near the request so
+    // we can offer concrete alternatives ("I have 3pm or 4:30 free") instead of a
+    // bare "that time doesn't work". Canonical spine — honours hours + blocks +
+    // existing bookings. (CALENDAR_UX_DESIGN.md decision D.)
+    const openSlotsText = business
+      ? await suggestOpenSlotsText(db, business, pendingSlot.serviceTypeId, new Date(pendingSlot.start), new Date(pendingSlot.end), businessTimezone)
+      : null
     const unavailSituation = [
       `The requested slot is unavailable because ${sanitiseReason(result.reason)}.`,
       hoursSummary ?? '',
-      'Suggest the customer pick a different time that falls within business hours.',
+      openSlotsText
+        ? `Offer these actual open times and ask which they'd like: ${openSlotsText}.`
+        : 'Suggest the customer pick a different time that falls within business hours.',
     ].filter(Boolean).join(' ')
     const reply = await generateCustomerReply({
       businessName,

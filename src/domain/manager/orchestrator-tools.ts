@@ -4,15 +4,17 @@
  * Return value is the JSON object that the Gemini model sees as the tool result.
  */
 
-import { and, desc, eq, gte, ilike, or } from 'drizzle-orm'
+import { and, desc, eq, gt, gte, ilike, inArray, lt, or } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { identities, bookings, customerProfiles, managerInstructions, businessContacts } from '../../db/schema.js'
+import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes } from '../../db/schema.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
 import { applyInstruction, pauseConversation, resumeConversation } from './apply.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import type { Lang } from '../i18n/t.js'
-import { db as defaultDb } from '../../db/client.js'
+import { createBlock, deleteBlockById, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX } from '../availability/blocks.js'
+import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
+import { getOpenSlots } from '../availability/service.js'
 
 export interface ToolContext {
   db: Db
@@ -69,20 +71,74 @@ export async function executeListCalendarEvents(
     }
   }
 
+  const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
+
+  // Proactive open-slot suggestion — the canonical availability spine enumerates
+  // bookable gaps (working hours − blocks − bookings) over the next 7 days.
+  if (args.intent === 'check_free_slots') {
+    try {
+      const [business] = await ctx.db.select().from(businesses).where(eq(businesses.id, ctx.businessId)).limit(1)
+      if (!business) return { error: 'Business not found' }
+
+      // Use the shortest active service as the probe duration so we surface the
+      // finest-grained openings; default to 30 min when no service is configured.
+      const [svc] = await ctx.db
+        .select({ durationMinutes: serviceTypes.durationMinutes })
+        .from(serviceTypes)
+        .where(and(eq(serviceTypes.businessId, ctx.businessId), eq(serviceTypes.isActive, true)))
+        .orderBy(serviceTypes.durationMinutes)
+        .limit(1)
+      const duration = svc?.durationMinutes ?? 30
+
+      const slots = await getOpenSlots(ctx.db, business, { start: from, end: to }, duration, { maxSlots: 12 })
+      if (slots.length === 0) {
+        return { freeSlots: [], summary: ctx.lang === 'he' ? 'אין משבצות פנויות בשבוע הקרוב.' : 'No open slots in the next 7 days.' }
+      }
+      return {
+        freeSlots: slots.map((s) => ({
+          start: s.start.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+          end: s.end.toLocaleString(locale, { timeZone: tz, hour: '2-digit', minute: '2-digit' }),
+        })),
+        durationMinutes: duration,
+        count: slots.length,
+      }
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) }
+    }
+  }
+
   try {
+    // Merge two internal-truth sources: bookings/Google events (via the calendar
+    // client) AND calendar_blocks (personal events, intra-day blocks, classes).
+    // Both must show in read-back so Branch 3 reflects the full picture.
     const events = await ctx.calendar.listEvents(from, to)
-    if (events.length === 0) {
+    const blocks = await listBlocksInRange(ctx.db, ctx.businessId, from, to)
+
+    const formatted = [
+      ...events.map((ev) => ({
+        eventId: ev.eventId,
+        title: ev.title,
+        start: ev.start.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+        end: ev.end.toLocaleString(locale, { timeZone: tz, hour: '2-digit', minute: '2-digit' }),
+        isBooking: ev.isBooking,
+        kind: 'booking' as const,
+        _sortTs: ev.start.getTime(),
+      })),
+      ...blocks.map((b) => ({
+        eventId: `${BLOCK_ID_PREFIX}${b.id}`,
+        title: blockLabel(b, ctx.lang === 'he' ? 'he' : 'en'),
+        start: b.startTs.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+        end: b.endTs.toLocaleString(locale, { timeZone: tz, hour: '2-digit', minute: '2-digit' }),
+        isBooking: false,
+        kind: b.type,
+        _sortTs: b.startTs.getTime(),
+      })),
+    ].sort((a, b) => a._sortTs - b._sortTs)
+      .map(({ _sortTs: _omit, ...rest }) => rest)
+
+    if (formatted.length === 0) {
       return { events: [], summary: ctx.lang === 'he' ? 'אין אירועים בתקופה זו.' : 'No events in this period.' }
     }
-
-    const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
-    const formatted = events.map((ev) => ({
-      eventId: ev.eventId,
-      title: ev.title,
-      start: ev.start.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
-      end: ev.end.toLocaleString(locale, { timeZone: tz, hour: '2-digit', minute: '2-digit' }),
-      isBooking: ev.isBooking,
-    }))
 
     return { events: formatted, count: formatted.length }
   } catch (err) {
@@ -113,30 +169,20 @@ export async function executeCreateCalendarEvent(
     return { success: false, error: 'End time must be after start time.' }
   }
 
-  // Guard: refuse to create if it overlaps a confirmed customer booking
-  const conflicts = await ctx.db
+  // Guard: refuse to create if it overlaps an active customer booking. Precise
+  // overlap predicate: existing.start < new.end AND existing.end > new.start.
+  // (Personal events MAY fall outside working hours — that is the owner's own
+  // time — so we deliberately do NOT enforce business hours here.)
+  const actualConflicts = await ctx.db
     .select({ id: bookings.id })
     .from(bookings)
     .where(and(
       eq(bookings.businessId, ctx.businessId),
-      or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held')),
-      // overlap: existing.start < new.end AND existing.end > new.start
-      // We only have slotStart; approximate with a 1-minute check
-    ))
-    .limit(20)
-
-  // More precise overlap query using slotStart in range
-  const overlapping = await ctx.db
-    .select({ id: bookings.id, slotStart: bookings.slotStart, slotEnd: bookings.slotEnd })
-    .from(bookings)
-    .where(and(
-      eq(bookings.businessId, ctx.businessId),
-      or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held')),
-      gte(bookings.slotStart, start),
+      inArray(bookings.state, ['held', 'pending_payment', 'confirmed']),
+      lt(bookings.slotStart, end),
+      gt(bookings.slotEnd, start),
     ))
     .limit(5)
-
-  const actualConflicts = overlapping.filter((b) => b.slotStart < end && b.slotEnd > start)
 
   if (actualConflicts.length > 0) {
     const msg = ctx.lang === 'he'
@@ -145,16 +191,119 @@ export async function executeCreateCalendarEvent(
     return { success: false, message: msg }
   }
 
-  const result = await ctx.calendar.createPersonalEvent(
-    { start, end },
-    args.title,
-    args.notes,
-  )
+  // Persist to calendar_blocks — the internal source of truth. This is the fix
+  // for the old data-loss bug where internal-mode personal events silently
+  // vanished (CALENDAR_UX_DESIGN.md §4).
+  const block = await createBlock(ctx.db, {
+    businessId: ctx.businessId,
+    type: 'personal',
+    start,
+    end,
+    title: args.title,
+    reason: args.notes ?? null,
+  })
 
-  if (result.status === 'confirmed') {
-    return { success: true, eventId: result.eventId }
+  // Durable outbound mirror (Phase 2): the internal row is the source of truth;
+  // a queued worker write-throughs it into Google with retries + etag tracking.
+  // No-op for internal-mode businesses.
+  await enqueueBlockMirror(ctx.businessId, block.id)
+
+  return { success: true, eventId: `${BLOCK_ID_PREFIX}${block.id}` }
+}
+
+// ── scheduleGroupSession ──────────────────────────────────────────────────────
+
+interface ScheduleGroupSessionArgs {
+  serviceName?: string
+  title?: string
+  startDatetime: string
+  endDatetime: string
+  maxParticipants?: number
+}
+
+/**
+ * Proactively place a group session (class) on the calendar as a first-class
+ * primitive — the manager no longer has to wait for the first customer to book
+ * for a class to "exist" (CALENDAR_UX_DESIGN.md §4). Stored as a calendar_blocks
+ * row of type 'class', linked to a service type when one matches.
+ */
+export async function executeScheduleGroupSession(
+  args: ScheduleGroupSessionArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const start = new Date(args.startDatetime)
+  const end = new Date(args.endDatetime)
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    return { success: false, error: 'Invalid datetime format. Use ISO 8601.' }
   }
-  return { success: false, error: result.status === 'error' ? result.reason : 'Unknown error' }
+  if (end <= start) {
+    return { success: false, error: 'End time must be after start time.' }
+  }
+
+  // Resolve the linked service (gives capacity + a canonical title) if named.
+  let serviceTypeId: string | null = null
+  let serviceName: string | null = null
+  let serviceCapacity: number | null = null
+  if (args.serviceName) {
+    const [svc] = await ctx.db
+      .select({ id: serviceTypes.id, name: serviceTypes.name, maxParticipants: serviceTypes.maxParticipants })
+      .from(serviceTypes)
+      .where(and(eq(serviceTypes.businessId, ctx.businessId), ilike(serviceTypes.name, `%${args.serviceName}%`)))
+      .limit(1)
+    if (svc) {
+      serviceTypeId = svc.id
+      serviceName = svc.name
+      serviceCapacity = svc.maxParticipants
+    }
+  }
+
+  // Conflict guard: a class cannot run over an active customer booking or over
+  // manager-blocked/personal time (but may overlap other classes).
+  const bookingConflicts = await ctx.db
+    .select({ id: bookings.id })
+    .from(bookings)
+    .where(and(
+      eq(bookings.businessId, ctx.businessId),
+      inArray(bookings.state, ['held', 'pending_payment', 'confirmed']),
+      lt(bookings.slotStart, end),
+      gt(bookings.slotEnd, start),
+    ))
+    .limit(5)
+  if (bookingConflicts.length > 0) {
+    return {
+      success: false,
+      message: ctx.lang === 'he'
+        ? `אותה שעה כוללת ${bookingConflicts.length} תור/ים פעיל/ים. בטל אותם קודם או בחר שעה אחרת.`
+        : `That time overlaps ${bookingConflicts.length} active booking(s). Cancel them first or choose another time.`,
+    }
+  }
+
+  const maxParticipants = args.maxParticipants ?? serviceCapacity ?? null
+  const title = args.title ?? serviceName ?? (ctx.lang === 'he' ? 'שיעור קבוצתי' : 'Group class')
+
+  const block = await createBlock(ctx.db, {
+    businessId: ctx.businessId,
+    type: 'class',
+    start,
+    end,
+    title,
+    serviceTypeId,
+    maxParticipants,
+  })
+
+  // Durable outbound mirror (Phase 2) — no-op in internal mode.
+  await enqueueBlockMirror(ctx.businessId, block.id)
+
+  const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
+  const when = start.toLocaleString(locale, { timeZone: ctx.timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+  const capStr = maxParticipants ? (ctx.lang === 'he' ? ` (עד ${maxParticipants} משתתפים)` : ` (up to ${maxParticipants} participants)`) : ''
+  return {
+    success: true,
+    eventId: `${BLOCK_ID_PREFIX}${block.id}`,
+    confirmation: ctx.lang === 'he'
+      ? `✅ ${title} נקבע ל-${when}${capStr}.`
+      : `✅ ${title} scheduled for ${when}${capStr}.`,
+  }
 }
 
 // ── deleteCalendarEvent ───────────────────────────────────────────────────────
@@ -168,6 +317,22 @@ export async function executeDeleteCalendarEvent(
   args: DeleteCalendarEventArgs,
   ctx: ToolContext,
 ): Promise<object> {
+  // calendar_blocks (personal events, intra-day blocks, classes) carry a
+  // 'block:' prefix in read-back. Delete them from the internal store directly.
+  const blockId = parseBlockId(args.eventId)
+  if (blockId) {
+    const removed = await deleteBlockById(ctx.db, ctx.businessId, blockId)
+    if (!removed) {
+      return { success: false, message: ctx.lang === 'he' ? 'האירוע לא נמצא.' : 'Event not found.' }
+    }
+    // Durable mirror: remove the corresponding Google event when one was created.
+    if (removed.googleEventId) {
+      await enqueueBlockDeletion(ctx.businessId, removed.id, removed.googleEventId)
+    }
+    const hint = args.confirmationHint ? ` (${args.confirmationHint})` : ''
+    return { success: true, message: ctx.lang === 'he' ? `האירוע${hint} נמחק.` : `Event${hint} deleted.` }
+  }
+
   // Guard: refuse to delete events that correspond to active customer bookings
   const bookingRow = await ctx.db
     .select({ id: bookings.id, state: bookings.state })

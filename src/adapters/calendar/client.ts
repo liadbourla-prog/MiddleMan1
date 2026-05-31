@@ -7,6 +7,13 @@ import type {
   ConfirmResult,
   DeleteResult,
   ListedEvent,
+  MirrorEventInput,
+  MirrorResult,
+  WatchResult,
+  StopChannelResult,
+  IncrementalSyncResult,
+  IncrementalSyncOptions,
+  RawCalendarEvent,
 } from './types.js'
 import { sendMessage } from '../whatsapp/sender.js'
 import { i18n, type Lang } from '../../domain/i18n/t.js'
@@ -137,7 +144,24 @@ function createInternalCalendarClient(options: CalendarClientOptions) {
     return createConfirmedEvent(slot, summary, description ?? '')
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent }
+  // Internal mode has no Google calendar — the outbound mirror is a no-op.
+  // Return a stable internal id so callers can store linkage uniformly.
+  async function upsertMirrorEvent(input: MirrorEventInput): Promise<MirrorResult> {
+    return { status: 'ok', eventId: input.googleEventId ?? `internal:${Date.now()}`, etag: null }
+  }
+
+  // Inbound sync is a Google-only concern — internal mode has no push channels.
+  async function watchEvents(): Promise<WatchResult> {
+    return { status: 'error', reason: 'internal mode has no watch channels' }
+  }
+  async function stopChannel(): Promise<StopChannelResult> {
+    return { status: 'ok' }
+  }
+  async function incrementalSync(): Promise<IncrementalSyncResult> {
+    return { status: 'ok', events: [], nextSyncToken: null }
+  }
+
+  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync }
 }
 
 // ── Google Calendar ───────────────────────────────────────────────────────────
@@ -219,13 +243,17 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
             end: { dateTime: slot.end.toISOString() },
             colorId: HOLD_COLOR_ID,
             status: 'tentative',
+            // Linkage for inbound loop prevention (Phase 3): mark this as a
+            // PA-managed booking event so owner-edit sync can tell it apart from
+            // the owner's own calendar entries.
+            extendedProperties: { private: { paManaged: '1', paType: 'booking', paId: bookingId } },
           },
         }),
       )
 
       const eventId = response.data.id
       if (!eventId) return { status: 'error', reason: 'Calendar returned no event id' }
-      return { status: 'held', eventId }
+      return { status: 'held', eventId, etag: response.data.etag ?? null }
     } catch (err) {
       return { status: 'error', reason: extractErrorMessage(err) }
     }
@@ -252,7 +280,7 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
 
       const id = response.data.id
       if (!id) return { status: 'error', reason: 'Calendar returned no event id on confirm' }
-      return { status: 'confirmed', eventId: id }
+      return { status: 'confirmed', eventId: id, etag: response.data.etag ?? null }
     } catch (err) {
       return { status: 'error', reason: extractErrorMessage(err) }
     }
@@ -327,7 +355,135 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
     return createConfirmedEvent(slot, summary, description ?? '')
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent }
+  // Outbound mirror write (Phase 2). Inserts or patches a PA-managed event,
+  // stamping linkage into extendedProperties.private (decision 9) and returning
+  // the Google etag so the caller can record it for inbound loop prevention.
+  async function upsertMirrorEvent(input: MirrorEventInput): Promise<MirrorResult> {
+    const privateProps: Record<string, string> = { paManaged: '1', ...input.privateProps }
+    const requestBody = {
+      summary: input.summary,
+      ...(input.description !== undefined ? { description: input.description } : {}),
+      start: { dateTime: input.start.toISOString() },
+      end: { dateTime: input.end.toISOString() },
+      ...(input.colorId != null ? { colorId: String(input.colorId) } : {}),
+      status: 'confirmed',
+      extendedProperties: { private: privateProps },
+    }
+    try {
+      if (input.googleEventId && !input.googleEventId.startsWith('internal:')) {
+        const response = await withTokenRefresh(() =>
+          calendar.events.patch({ calendarId, eventId: input.googleEventId as string, requestBody }),
+        )
+        const id = response.data.id
+        if (!id) return { status: 'error', reason: 'Calendar returned no event id on mirror patch' }
+        return { status: 'ok', eventId: id, etag: response.data.etag ?? null }
+      }
+      const response = await withTokenRefresh(() =>
+        calendar.events.insert({ calendarId, requestBody }),
+      )
+      const id = response.data.id
+      if (!id) return { status: 'error', reason: 'Calendar returned no event id on mirror insert' }
+      return { status: 'ok', eventId: id, etag: response.data.etag ?? null }
+    } catch (err: unknown) {
+      // A patch against a since-deleted event (404/410) is recoverable: fall back
+      // to an insert so the mirror self-heals instead of getting stuck.
+      if (input.googleEventId && isGoogleApiError(err) && (err.code === 404 || err.code === 410)) {
+        try {
+          const response = await withTokenRefresh(() =>
+            calendar.events.insert({ calendarId, requestBody }),
+          )
+          const id = response.data.id
+          if (!id) return { status: 'error', reason: 'Calendar returned no event id on mirror re-insert' }
+          return { status: 'ok', eventId: id, etag: response.data.etag ?? null }
+        } catch (reErr) {
+          return { status: 'error', reason: extractErrorMessage(reErr) }
+        }
+      }
+      return { status: 'error', reason: extractErrorMessage(err) }
+    }
+  }
+
+  // ── Inbound sync (Phase 3) ────────────────────────────────────────────────
+
+  // Register a push (watch) channel on the events resource. Google delivers a
+  // POST to `address` whenever the calendar changes; we then pull incrementally.
+  async function watchEvents(
+    channelId: string,
+    address: string,
+    channelToken: string,
+    ttlMs: number,
+  ): Promise<WatchResult> {
+    try {
+      const response = await withTokenRefresh(() =>
+        calendar.events.watch({
+          calendarId,
+          requestBody: {
+            id: channelId,
+            type: 'web_hook',
+            address,
+            token: channelToken,
+            params: { ttl: String(Math.floor(ttlMs / 1000)) },
+          },
+        }),
+      )
+      const expMs = response.data.expiration ? Number(response.data.expiration) : null
+      return {
+        status: 'ok',
+        resourceId: response.data.resourceId ?? null,
+        expiration: expMs ? new Date(expMs) : null,
+      }
+    } catch (err) {
+      return { status: 'error', reason: extractErrorMessage(err) }
+    }
+  }
+
+  async function stopChannel(channelId: string, resourceId: string): Promise<StopChannelResult> {
+    try {
+      await withTokenRefresh(() => calendar.channels.stop({ requestBody: { id: channelId, resourceId } }))
+      return { status: 'ok' }
+    } catch (err: unknown) {
+      // Already-stopped / unknown channel is fine — the end state is what we want.
+      if (isGoogleApiError(err) && (err.code === 404 || err.code === 410)) return { status: 'ok' }
+      return { status: 'error', reason: extractErrorMessage(err) }
+    }
+  }
+
+  // Pull events. With a syncToken we get only what changed since last sync; without
+  // one we do a windowed full reconcile. A 410 means the token expired ⇒ caller must
+  // re-seed with a full reconcile. Paginates internally and returns nextSyncToken.
+  async function incrementalSync(opts: IncrementalSyncOptions): Promise<IncrementalSyncResult> {
+    try {
+      const events: RawCalendarEvent[] = []
+      let pageToken: string | undefined
+      let nextSyncToken: string | null = null
+      do {
+        const response = await withTokenRefresh(() =>
+          calendar.events.list({
+            calendarId,
+            singleEvents: true,
+            showDeleted: true,
+            maxResults: 250,
+            ...(opts.syncToken
+              ? { syncToken: opts.syncToken }
+              : {
+                  timeMin: (opts.timeMin ?? new Date()).toISOString(),
+                  ...(opts.timeMax ? { timeMax: opts.timeMax.toISOString() } : {}),
+                }),
+            ...(pageToken ? { pageToken } : {}),
+          }),
+        )
+        for (const ev of response.data.items ?? []) events.push(mapRawEvent(ev))
+        pageToken = response.data.nextPageToken ?? undefined
+        if (response.data.nextSyncToken) nextSyncToken = response.data.nextSyncToken
+      } while (pageToken)
+      return { status: 'ok', events, nextSyncToken }
+    } catch (err: unknown) {
+      if (isGoogleApiError(err) && err.code === 410) return { status: 'expired' }
+      return { status: 'error', reason: extractErrorMessage(err) }
+    }
+  }
+
+  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -350,4 +506,35 @@ function extractErrorMessage(err: unknown): string {
 
 function isGoogleApiError(err: unknown): err is { code: number } {
   return typeof err === 'object' && err !== null && 'code' in err
+}
+
+// Normalize a Google Calendar API event into the inbound-sync shape. Pulls PA
+// linkage from extendedProperties.private and tolerates all-day (date) vs timed
+// (dateTime) events. Owner titles are carried in `summary` but callers treat
+// owner-originated events as opaque (never surfaced).
+type GoogleApiEvent = {
+  id?: string | null
+  status?: string | null
+  summary?: string | null
+  etag?: string | null
+  start?: { dateTime?: string | null; date?: string | null } | null
+  end?: { dateTime?: string | null; date?: string | null } | null
+  extendedProperties?: { private?: Record<string, string> | null } | null
+}
+
+function mapRawEvent(ev: GoogleApiEvent): RawCalendarEvent {
+  const priv = ev.extendedProperties?.private ?? {}
+  const startRaw = ev.start?.dateTime ?? ev.start?.date ?? null
+  const endRaw = ev.end?.dateTime ?? ev.end?.date ?? null
+  return {
+    eventId: ev.id ?? '',
+    status: ev.status ?? null,
+    summary: ev.summary ?? null,
+    start: startRaw ? new Date(startRaw) : null,
+    end: endRaw ? new Date(endRaw) : null,
+    etag: ev.etag ?? null,
+    paManaged: priv['paManaged'] === '1',
+    paType: priv['paType'] ?? null,
+    paId: priv['paId'] ?? null,
+  }
 }

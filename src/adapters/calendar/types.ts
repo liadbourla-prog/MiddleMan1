@@ -9,12 +9,12 @@ export type AvailabilityResult =
   | { status: 'error'; reason: string }
 
 export type HoldResult =
-  | { status: 'held'; eventId: string }
+  | { status: 'held'; eventId: string; etag?: string | null }
   | { status: 'conflict' }
   | { status: 'error'; reason: string }
 
 export type ConfirmResult =
-  | { status: 'confirmed'; eventId: string }
+  | { status: 'confirmed'; eventId: string; etag?: string | null }
   | { status: 'error'; reason: string }
 
 export type DeleteResult =
@@ -34,4 +34,62 @@ export interface HoldEventMeta {
   eventId: string
   bookingId: string
   expiresAt: Date
+}
+
+// ── Outbound mirror (Phase 2) ──────────────────────────────────────────────────
+
+// A single write-through of a PA-managed entity into Google Calendar. Linkage is
+// carried in extendedProperties.private (decision 9) — never the description —
+// so the owner cannot accidentally break it by editing event text.
+export interface MirrorEventInput {
+  // When set, patch the existing Google event; otherwise insert a new one.
+  googleEventId?: string | null
+  summary: string
+  description?: string
+  start: Date
+  end: Date
+  colorId?: number | null
+  // Stamped into extendedProperties.private. Always includes paManaged='1'.
+  privateProps: Record<string, string>
+}
+
+export type MirrorResult =
+  | { status: 'ok'; eventId: string; etag: string | null }
+  | { status: 'error'; reason: string }
+
+// ── Inbound sync (Phase 3) ──────────────────────────────────────────────────────
+
+// Result of registering a Google push (watch) channel on the events resource.
+export type WatchResult =
+  | { status: 'ok'; resourceId: string | null; expiration: Date | null }
+  | { status: 'error'; reason: string }
+
+export type StopChannelResult =
+  | { status: 'ok' }
+  | { status: 'error'; reason: string }
+
+// A raw Google event as seen by inbound sync. We deliberately keep the owner's
+// title separate (callers must NOT surface it — privacy, decision: opaque blocks)
+// and expose the PA linkage carried in extendedProperties.private.
+export interface RawCalendarEvent {
+  eventId: string
+  status: string | null // 'confirmed' | 'tentative' | 'cancelled'
+  summary: string | null
+  start: Date | null
+  end: Date | null
+  etag: string | null
+  paManaged: boolean // extendedProperties.private.paManaged === '1' ⇒ a PA-created event
+  paType: string | null // 'booking' | 'block' | 'personal' | 'class'
+  paId: string | null
+}
+
+export type IncrementalSyncResult =
+  | { status: 'ok'; events: RawCalendarEvent[]; nextSyncToken: string | null }
+  | { status: 'expired' } // 410 GONE — syncToken invalid; caller must full-reconcile
+  | { status: 'error'; reason: string }
+
+export interface IncrementalSyncOptions {
+  syncToken?: string | null
+  timeMin?: Date
+  timeMax?: Date
 }

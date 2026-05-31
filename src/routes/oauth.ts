@@ -8,6 +8,7 @@ import { getPrompt } from '../domain/onboarding/steps.js'
 import { t, i18n, type Lang } from '../domain/i18n/t.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
 import { provisionBusiness } from '../domain/flows/provider-onboarding.js'
+import { registerWatchChannel } from '../domain/calendar/inbound-sync.js'
 
 function buildOAuth2Client() {
   return new google.auth.OAuth2(
@@ -268,6 +269,13 @@ export async function oauthRoutes(app: FastifyInstance) {
         ).catch((err) => app.log.warn({ err }, 'Failed to send calendar confirmation to manager'))
       }
 
+      // Inbound sync (Phase 3): open a Google push channel for this business so
+      // owner-originated calendar edits flow back into the internal record.
+      // No-op unless ops has enabled the feature + provisioned the callback.
+      void registerWatchChannel(businessId).catch((err: unknown) => {
+        app.log.warn({ err, businessId }, 'Calendar watch-channel registration failed (non-fatal)')
+      })
+
       app.log.info({ businessId }, 'Google OAuth completed — refresh token stored')
       return reply.redirect('/oauth-success')
     },
@@ -333,17 +341,43 @@ export async function oauthRoutes(app: FastifyInstance) {
         ).catch(() => {})
 
       try {
-        // 2. Exchange the JS-SDK code for a token. Codes from FB.login are exchanged
-        // WITHOUT redirect_uri (unlike the server-side redirect dialog).
-        const tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${appId}&client_secret=${appSecret}&code=${encodeURIComponent(code)}`
-        const tokenRes = await fetch(tokenUrl)
-        const tokenJson = (await tokenRes.json()) as { access_token?: string; error?: { message?: string } }
+        // 2. Exchange the JS-SDK code for a token. The redirect_uri sent here must be
+        // IDENTICAL to the one the FB JS SDK bound the code to in the OAuth dialog.
+        //   - Desktop (popup): the SDK uses Facebook's internal receiver → exchange with NO
+        //     redirect_uri (the documented Embedded Signup path).
+        //   - Mobile / in-app browser (popups suppressed): the SDK falls back to a redirect
+        //     using one of the app's allowlisted "Valid OAuth Redirect URIs". Under Strict
+        //     Mode that must be an exact match — the origin-with-trailing-slash entry — so the
+        //     code is bound to `${PUBLIC_BASE_URL}/` and the exchange must repeat it.
+        // We can't tell which path the client took, so try each candidate until one validates.
+        const publicBaseUrl = (process.env['PUBLIC_BASE_URL'] ?? '').replace(/\/+$/, '')
+        const redirectCandidates: (string | undefined)[] = [
+          publicBaseUrl ? `${publicBaseUrl}/` : undefined,
+          publicBaseUrl || undefined,
+          undefined,
+        ]
+        let tokenJson: { access_token?: string; error?: { message?: string } } = {}
+        let tokenOk = false
+        let lastErr = ''
+        for (const redirectUri of redirectCandidates) {
+          let tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${appId}&client_secret=${appSecret}&code=${encodeURIComponent(code)}`
+          if (redirectUri) tokenUrl += `&redirect_uri=${encodeURIComponent(redirectUri)}`
+          const tokenRes = await fetch(tokenUrl)
+          tokenJson = (await tokenRes.json()) as { access_token?: string; error?: { message?: string } }
+          if (tokenRes.ok && tokenJson.access_token) {
+            tokenOk = true
+            app.log.info({ redirectUri: redirectUri ?? '(none)' }, 'Meta token exchange succeeded')
+            break
+          }
+          lastErr = tokenJson.error?.message ?? `HTTP ${tokenRes.status}`
+          // A used/expired code won't be fixed by a different redirect_uri — stop retrying.
+          if (/expired|been used|already been/i.test(lastErr)) break
+        }
 
-        if (!tokenRes.ok || !tokenJson.access_token) {
-          const err = tokenJson.error?.message ?? `HTTP ${tokenRes.status}`
-          app.log.error({ err }, 'Meta token exchange failed')
-          await sendError(err)
-          return reply.status(502).send({ ok: false, error: err })
+        if (!tokenOk || !tokenJson.access_token) {
+          app.log.error({ err: lastErr }, 'Meta token exchange failed (all redirect_uri candidates)')
+          await sendError(lastErr)
+          return reply.status(502).send({ ok: false, error: lastErr })
         }
 
         // 3. Exchange for a long-lived token (~60 days)

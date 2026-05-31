@@ -1,4 +1,4 @@
-import { eq, and, or, lte, gte, gt, lt, ne, count, desc, isNull, ilike } from 'drizzle-orm'
+import { eq, and, or, lte, gte, gt, lt, count, desc, isNull, ilike, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 import type { Db } from '../../db/client.js'
 import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages } from '../../db/schema.js'
@@ -6,6 +6,9 @@ import { logAudit } from '../audit/logger.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
+import { createBlock } from '../availability/blocks.js'
+import { localTimeToUtc } from '../availability/compute.js'
+import { enqueueBlockMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
 
 // Bilingual day names (Sun=0 … Sat=6)
 function dayName(dayOfWeek: number | null | undefined, lang: Lang): string {
@@ -131,6 +134,14 @@ async function applyAvailabilityChange(
 
   if (p.timezone && !isValidIANATimezone(p.timezone)) {
     return { ok: false, reason: `Invalid timezone "${p.timezone}". Use an IANA timezone name, e.g. "Asia/Jerusalem".` }
+  }
+
+  // Intra-day block (a specific date with explicit start/end times) is a
+  // time-ranged block, not a whole-day closure. It lives in calendar_blocks, not
+  // the availability table — this is what makes "block 2–4pm Tuesday" possible
+  // (CALENDAR_UX_DESIGN.md §4). Whole-day blocks (no times) keep the old path.
+  if (p.action === 'block' && p.specificDate && p.openTime && p.closeTime) {
+    return applyIntradayBlock(db, businessId, p.specificDate, p.openTime, p.closeTime, p.reason ?? null, lang)
   }
 
   if (p.action === 'block' || p.action === 'bulk_close') {
@@ -339,6 +350,85 @@ async function applyAvailabilityChange(
   }
 
   return { ok: false, reason: t('apply_set_hours_requires_target', lang) }
+}
+
+// Intra-day time-ranged block → calendar_blocks. Cancels and notifies any active
+// bookings that fall inside the blocked window (owner action wins).
+async function applyIntradayBlock(
+  db: Db,
+  businessId: string,
+  specificDate: string,
+  openTime: string,
+  closeTime: string,
+  reason: string | null,
+  lang: Lang,
+): Promise<ApplyResult> {
+  const [biz] = await db
+    .select({ timezone: businesses.timezone, name: businesses.name, whatsappNumber: businesses.whatsappNumber })
+    .from(businesses)
+    .where(eq(businesses.id, businessId))
+    .limit(1)
+  const tz = biz?.timezone ?? 'UTC'
+
+  const startTs = localTimeToUtc(specificDate, openTime, tz)
+  const endTs = localTimeToUtc(specificDate, closeTime, tz)
+  if (endTs <= startTs) {
+    return { ok: false, reason: lang === 'he' ? 'שעת הסיום חייבת להיות אחרי שעת ההתחלה.' : 'End time must be after start time.' }
+  }
+
+  // Cancel + notify bookings overlapping the blocked window.
+  const affected = await db
+    .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId })
+    .from(bookings)
+    .where(and(
+      eq(bookings.businessId, businessId),
+      inArray(bookings.state, ['held', 'confirmed', 'pending_payment']),
+      lt(bookings.slotStart, endTs),
+      gt(bookings.slotEnd, startTs),
+    ))
+
+  for (const booking of affected) {
+    await db.update(bookings)
+      .set({ state: 'cancelled', cancellationReason: reason ?? 'Business schedule change', cancelledByRole: 'manager', updatedAt: new Date() })
+      .where(eq(bookings.id, booking.id))
+
+    // Durable mirror: remove the cancelled booking's Google event when present.
+    if (booking.calendarEventId) {
+      await enqueueBookingDeletion(businessId, booking.id, booking.calendarEventId)
+    }
+
+    const [customer] = await db
+      .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
+      .from(identities)
+      .where(eq(identities.id, booking.customerId))
+      .limit(1)
+    if (customer) {
+      const custLang: Lang = (customer.preferredLanguage as Lang | null | undefined) ?? 'he'
+      const locale = custLang === 'he' ? 'he-IL' : 'en-GB'
+      const dateStr = booking.slotStart.toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long' })
+      await enqueueMessage(customer.phoneNumber, i18n.booking_cancelled_schedule[custLang](dateStr)).catch(() => { /* non-fatal */ })
+    }
+  }
+
+  const block = await createBlock(db, {
+    businessId,
+    type: 'block',
+    start: startTs,
+    end: endTs,
+    title: reason ?? (lang === 'he' ? 'זמן חסום' : 'Blocked time'),
+    reason,
+  })
+
+  // Durable outbound mirror (Phase 2) — no-op in internal mode.
+  await enqueueBlockMirror(businessId, block.id)
+
+  const affectedNote = affected.length > 0
+    ? (lang === 'he' ? ` ${affected.length} תורים בוטלו והלקוחות עודכנו.` : ` ${affected.length} booking(s) were cancelled and customers notified.`)
+    : ''
+  const msg = lang === 'he'
+    ? `✅ נחסם ${specificDate} בין ${openTime} ל-${closeTime}.${affectedNote}`
+    : `✅ Blocked ${specificDate} from ${openTime} to ${closeTime}.${affectedNote}`
+  return { ok: true, confirmationMessage: msg }
 }
 
 // ── Service change ────────────────────────────────────────────────────────────

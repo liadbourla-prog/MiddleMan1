@@ -3,6 +3,7 @@ import Fastify from 'fastify'
 import rateLimit from '@fastify/rate-limit'
 import { webhookRoutes } from './routes/webhook.js'
 import { oauthRoutes } from './routes/oauth.js'
+import { calendarWebhookRoutes } from './routes/calendar-webhook.js'
 import { importRoutes } from './routes/import.js'
 import { buildSiteRoutes } from './routes/build-site/index.js'
 import { startHoldExpiryWorker, scheduleHoldExpiryJob } from './workers/hold-expiry.js'
@@ -14,6 +15,8 @@ import { startQueuedMessageWorker } from './workers/queued-messages.js'
 import { startManagerSummaryWorker } from './workers/generate-manager-summary.js'
 import { startOperatorSummaryWorker } from './workers/generate-operator-summary.js'
 import { startDailyBriefingWorker } from './workers/daily-briefing.js'
+import { startCalendarMirrorWorker } from './workers/calendar-mirror.js'
+import { startCalendarSyncRenewalWorker, scheduleCalendarSyncRenewalJob } from './workers/calendar-sync-renewal.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
@@ -58,6 +61,7 @@ app.addContentTypeParser(
 
 await app.register(webhookRoutes)
 await app.register(oauthRoutes)
+await app.register(calendarWebhookRoutes)
 await app.register(importRoutes)
 await app.register(buildSiteRoutes)
 
@@ -80,5 +84,8 @@ startQueuedMessageWorker()
 startManagerSummaryWorker()
 startOperatorSummaryWorker()
 startDailyBriefingWorker()
+startCalendarMirrorWorker()
+startCalendarSyncRenewalWorker()
 await scheduleHoldExpiryJob()
+await scheduleCalendarSyncRenewalJob()
 app.log.info('Background workers started')

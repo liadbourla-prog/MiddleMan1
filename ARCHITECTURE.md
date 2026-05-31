@@ -62,15 +62,17 @@ External systems fail. Calendar unavailability, WhatsApp delivery failure, and L
 Every state-changing action produces an audit record. No silent mutations. Logs must be able to answer: who requested it, what was the system state, what was the outcome, and why.
 
 **8. Source-of-truth hierarchy**
-When sources conflict, this ordering is authoritative:
+The **internal system is the operational source of truth** for all scheduling primitives (bookings, holds, blocks, personal events, class instances), for every business, always — whether or not Google is connected. Google Calendar is a **bidirectional mirror**, not a competing authority: the PA write-throughs internal state changes outbound, and owner-originated edits in Google are ingested as input events and reconciled into the internal record (**internal-as-hub**). When sources conflict, this ordering is authoritative:
 
 | Source | Truth domain |
 |---|---|
-| Google Calendar | Schedule reality (what is actually occupied) |
-| Internal system | Policy, permissions, booking state |
+| Internal system | Schedule reality, policy, permissions, booking state — the operational source of truth |
+| Google Calendar | Bidirectional mirror — owner edits are inputs reconciled into the internal record, never an independent authority |
 | WhatsApp | Interface only — never source of truth |
 | State machine definitions | Valid transitions |
 | This document | Design intent |
+
+> **Note — inversion from V1.** Earlier revisions ranked "Google Calendar > internal system." That ordering is **inverted** by the local-calendar UX design: the internal DB is now the hub and Google is a mirror. See `CALENDAR_UX_DESIGN.md` §2 for the full model and reconciliation guarantees (eventually-consistent push + periodic full reconcile, owner-edits-win with a blast-radius gate).
 
 ---
 

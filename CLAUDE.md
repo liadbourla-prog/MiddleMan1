@@ -15,7 +15,7 @@ The system is live at **v1.0.0** on GCP Cloud Run (europe-west3, project: `deepr
 
 1. **The LLM is interpretive only.** It extracts intent and produces structured output. It never directly mutates state. Every proposed action passes through the deterministic core before taking effect.
 2. **Deterministic core.** Every state change passes in order: identity check → policy check → scheduling logic → calendar validation → safe write. No step may be skipped.
-3. **Source-of-truth hierarchy.** Google Calendar > internal system > WhatsApp. WhatsApp is an interface, never a source of truth.
+3. **Source-of-truth hierarchy.** The **internal system is the operational source of truth** for all scheduling primitives, for every business, always. Google Calendar is a **bidirectional mirror** when connected: the PA write-throughs state changes outbound, and owner-originated edits in Google are ingested as input events and reconciled into the internal record (internal-as-hub). WhatsApp is an interface, never a source of truth. *(This inverts the former "Google > internal" ordering — see CALENDAR_UX_DESIGN.md §2.)*
 4. **Skills are isolated.** Skills live in `src/skills/`, receive a typed context bundle from the core, return a typed result, and cannot import from the core engine. The boundary is enforced by ESLint and CI.
 5. **Failure is explicit.** A failed operation is never treated as a success. Partial state changes are rolled back or flagged.
 

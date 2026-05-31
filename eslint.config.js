@@ -6,6 +6,31 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // Honor the `_`-prefix convention for intentionally-unused bindings
+    // (e.g. destructure-to-omit: `const { key: _omit, ...rest } = obj`).
+    // Scoped to the core tree; src/skills/ lint behavior is left untouched
+    // (Developer B's domain — see CODEOWNERS).
+    files: [
+      'src/domain/**/*.ts',
+      'src/adapters/**/*.ts',
+      'src/workers/**/*.ts',
+      'src/routes/**/*.ts',
+      'src/db/**/*.ts',
+      'src/shared/**/*.ts',
+    ],
+    rules: {
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+          ignoreRestSiblings: true,
+        },
+      ],
+    },
+  },
+  {
     // Enforce the isolation boundary: skills may not reach into the core engine.
     files: ['src/skills/**/*.ts'],
     rules: {

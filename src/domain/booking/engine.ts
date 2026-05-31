@@ -14,6 +14,8 @@ import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
+import { isSlotBookable } from '../availability/service.js'
+import type { CalendarBlockType } from '../../db/schema.js'
 
 const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15', 10)
 
@@ -46,6 +48,22 @@ function validateSlotTiming(
   return null
 }
 
+// Map a spatial BookableReason to an upstream reason string. These are sanitised
+// into customer-facing wording by the Branch 4 flow (sanitiseReason); managers
+// see them via the orchestrator. Kept stable so REASON_MAP can phrase them.
+function spatialReason(reason: 'invalid_slot' | 'outside_hours' | 'busy' | 'ok'): string {
+  switch (reason) {
+    case 'outside_hours':
+      return 'Requested time is outside business hours'
+    case 'busy':
+      return 'Slot is not available'
+    case 'invalid_slot':
+      return 'Slot end must be after slot start'
+    default:
+      return 'Slot is not available'
+  }
+}
+
 export async function requestBooking(
   db: Db,
   calendar: CalendarClient,
@@ -65,13 +83,7 @@ export async function requestBooking(
   if (!service.isActive) return { ok: false, reason: 'Service type is not currently available' }
 
   const [business] = await db
-    .select({
-      minBookingBufferMinutes: businesses.minBookingBufferMinutes,
-      maxBookingDaysAhead: businesses.maxBookingDaysAhead,
-      timezone: businesses.timezone,
-      confirmationGate: businesses.confirmationGate,
-      paymentMethod: businesses.paymentMethod,
-    })
+    .select()
     .from(businesses)
     .where(eq(businesses.id, actor.businessId))
     .limit(1)
@@ -97,6 +109,43 @@ export async function requestBooking(
   const providerDisplayName = resolvedProvider?.displayName ?? null
 
   const isGroupClass = (service.maxParticipants ?? 1) > 1
+
+  // Spatial pre-flight: enforce working hours + manager-occupied blocks for BOTH
+  // calendar modes, independent of provider assignment. This is the canonical
+  // availability spine (CALENDAR_UX_DESIGN.md §5.2) — it closes the gap where
+  // solo internal-mode businesses got no hours/block enforcement at all.
+  // Booking-vs-booking conflicts stay with the per-flow transactional FOR UPDATE
+  // check (the race-safe authority), so we exclude bookings here. A class can be
+  // booked into even though its container 'class' block overlaps, so group
+  // bookings ignore class-type blocks.
+  if (business) {
+    const blockTypes: CalendarBlockType[] = isGroupClass
+      ? ['block', 'personal']
+      : ['block', 'personal', 'class']
+    const spatial = await isSlotBookable(
+      db,
+      business,
+      { start: request.slotStart, end: request.slotEnd },
+      { blockTypes, includeBookings: false },
+    )
+    if (!spatial.bookable) {
+      return { ok: false, reason: spatialReason(spatial.reason) }
+    }
+
+    // Write-time freebusy guard (CALENDAR_UX_DESIGN.md §6, decision 6). In
+    // connected mode the internal model can lag owner-created Google events that
+    // inbound sync (Phase 3) has not yet ingested. Layer one live freebusy probe
+    // on top of the internal composition at the approval seam so we never book a
+    // customer into a slot the owner has already taken in Google. Internal SoT
+    // stays authoritative: a freebusy *error* fails open (we don't block a valid
+    // booking just because Google is unreachable).
+    if (business.calendarMode === 'google') {
+      const fb = await calendar.checkAvailability({ start: request.slotStart, end: request.slotEnd })
+      if (fb.status === 'occupied') {
+        return { ok: false, reason: 'Slot is no longer available' }
+      }
+    }
+  }
 
   if (isGroupClass) {
     return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName)
@@ -202,6 +251,7 @@ async function requestPrivateBooking(
         state: 'pending_payment',
         holdExpiresAt,
         calendarEventId: holdResult.eventId,
+        googleEtag: holdResult.etag ?? null,
         paymentStatus: 'pending',
         updatedAt: new Date(),
       })
@@ -242,6 +292,7 @@ async function requestPrivateBooking(
       state: 'held',
       holdExpiresAt,
       calendarEventId: holdResult.eventId,
+      googleEtag: holdResult.etag ?? null,
       updatedAt: new Date(),
     })
     .where(eq(bookings.id, result.bookingId))
@@ -367,6 +418,7 @@ async function requestGroupClassBooking(
     .limit(1)
 
   let calendarEventId: string | null = existingParticipant?.calendarEventId ?? null
+  let groupGoogleEtag: string | null = null
 
   if (!calendarEventId) {
     // First participant — create the calendar event
@@ -391,12 +443,13 @@ async function requestGroupClassBooking(
     }
 
     calendarEventId = confirmResult.eventId
+    groupGoogleEtag = confirmResult.etag ?? null
   }
 
   // Transition to confirmed
   await db
     .update(bookings)
-    .set({ state: 'confirmed', calendarEventId, updatedAt: new Date() })
+    .set({ state: 'confirmed', calendarEventId, googleEtag: groupGoogleEtag, updatedAt: new Date() })
     .where(eq(bookings.id, txResult.bookingId))
 
   await logAudit(db, {
@@ -471,7 +524,7 @@ export async function confirmBooking(
 
   await db
     .update(bookings)
-    .set({ state: 'confirmed', holdExpiresAt: null, updatedAt: new Date() })
+    .set({ state: 'confirmed', holdExpiresAt: null, googleEtag: confirmResult.etag ?? null, updatedAt: new Date() })
     .where(eq(bookings.id, bookingId))
 
   await logAudit(db, {
@@ -664,7 +717,7 @@ export async function confirmPaymentReceived(
 
   await db
     .update(bookings)
-    .set({ state: 'confirmed', paymentStatus: 'paid', holdExpiresAt: null, updatedAt: new Date() })
+    .set({ state: 'confirmed', paymentStatus: 'paid', holdExpiresAt: null, googleEtag: confirmResult.etag ?? null, updatedAt: new Date() })
     .where(eq(bookings.id, booking.id))
 
   await logAudit(db, {

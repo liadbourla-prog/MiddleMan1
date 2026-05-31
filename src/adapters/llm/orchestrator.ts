@@ -5,7 +5,7 @@
 
 import { GoogleGenAI, Type, FunctionCallingConfigMode } from '@google/genai'
 import type { Content, FunctionDeclaration } from '@google/genai'
-import { and, desc, eq } from 'drizzle-orm'
+import { desc, eq } from 'drizzle-orm'
 import { db } from '../../db/client.js'
 import { managerMemory } from '../../db/schema.js'
 import type { CalendarClient } from '../calendar/client.js'
@@ -15,6 +15,7 @@ import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import {
   executeListCalendarEvents,
   executeCreateCalendarEvent,
+  executeScheduleGroupSession,
   executeDeleteCalendarEvent,
   executeManageBusinessSettings,
   executeSearchWeb,
@@ -71,8 +72,23 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'scheduleGroupSession',
+    description: 'Proactively place a group session / class on the calendar (e.g. "schedule a Vinyasa class Tuesday 11:00–12:00, 10 spots"). Use this when the manager wants to put a class on the calendar BEFORE any customer books it. Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours use manageBusinessSettings.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        serviceName: { type: Type.STRING, description: 'Name of the existing group service this class is an instance of (optional; matched fuzzily)' },
+        title: { type: Type.STRING, description: 'Display title if no service is linked (optional)' },
+        startDatetime: { type: Type.STRING, description: 'ISO 8601 in business timezone' },
+        endDatetime: { type: Type.STRING, description: 'ISO 8601 in business timezone' },
+        maxParticipants: { type: Type.NUMBER, description: 'Capacity for this session (optional; defaults to the linked service capacity)' },
+      },
+      required: ['startDatetime', 'endDatetime'],
+    },
+  },
+  {
     name: 'deleteCalendarEvent',
-    description: 'Delete a personal or business event from the calendar. Only for events the manager created (meetings, blocks, personal appointments). Never use this to cancel a customer booking — use manageBusinessSettings for booking cancellations.',
+    description: 'Delete a personal/business event, intra-day block, or scheduled class from the calendar. Only for events the manager created (meetings, blocks, personal appointments, group sessions). Never use this to cancel a customer booking — use manageBusinessSettings for booking cancellations.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -264,10 +280,11 @@ Reply entirely in ${language}. All WhatsApp formatting rules apply:
 - URLs on their own line.
 
 ## Tool usage rules
-- manageBusinessSettings: ALWAYS use this for any change to hours, services, pricing, policies, staff access, or booking cancellations. Never handle these as conversational replies.
-- listCalendarEvents: use for schedule questions. Do not call it unless the manager is asking about their calendar.
-- createCalendarEvent: personal/business events only. Do not use for blocking customer booking slots — that is manageBusinessSettings.
-- deleteCalendarEvent: only for personal/business events the manager created. NEVER use for customer bookings — use manageBusinessSettings with a cancellation instruction for those.
+- manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Never handle these as conversational replies.
+- listCalendarEvents: use for schedule questions. Use intent check_free_slots when the manager asks what times are open/free — it returns real bookable openings. Do not call it unless the manager is asking about their calendar.
+- createCalendarEvent: personal/business 1-on-1 events only (e.g. "dentist 3pm"). Do not use for blocking customer booking slots — that is manageBusinessSettings.
+- scheduleGroupSession: use when the manager wants to put a class/group session on the calendar ahead of bookings (e.g. "add a yoga class Tuesday 11am, 10 spots").
+- deleteCalendarEvent: only for personal/business events, blocks, or classes the manager created. NEVER use for customer bookings — use manageBusinessSettings with a cancellation instruction for those.
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
@@ -306,6 +323,8 @@ async function dispatchTool(
       return executeListCalendarEvents(args as unknown as Parameters<typeof executeListCalendarEvents>[0], ctx)
     case 'createCalendarEvent':
       return executeCreateCalendarEvent(args as unknown as Parameters<typeof executeCreateCalendarEvent>[0], ctx)
+    case 'scheduleGroupSession':
+      return executeScheduleGroupSession(args as unknown as Parameters<typeof executeScheduleGroupSession>[0], ctx)
     case 'deleteCalendarEvent':
       return executeDeleteCalendarEvent(args as unknown as Parameters<typeof executeDeleteCalendarEvent>[0], ctx)
     case 'manageBusinessSettings':

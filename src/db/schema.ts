@@ -186,6 +186,9 @@ export const bookings = pgTable(
     }).notNull(),
     holdExpiresAt: timestamp('hold_expires_at', { withTimezone: true }),
     calendarEventId: text('calendar_event_id'),
+    // Last Google etag written by the outbound mirror — used by inbound sync for
+    // loop prevention (incoming etag == last-written ⇒ our own echo, ignore).
+    googleEtag: text('google_etag'),
     paymentStatus: text('payment_status', {
       enum: ['not_required', 'pending', 'paid', 'failed'],
     })
@@ -549,6 +552,42 @@ export const operatorSessionNotes = pgTable(
   },
 )
 
+// Per-business Google Calendar watch-channel + incremental-sync state (Phase 3,
+// inbound sync). One row per business in connected mode. The watch channel is a
+// push subscription that Google renews-by-expiry; syncToken drives incremental
+// events.list with a periodic full-reconcile fallback when it is null/expired.
+// See CALENDAR_UX_DESIGN.md §6 Phase 3.
+export const calendarSyncChannels = pgTable(
+  'calendar_sync_channels',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id)
+      .unique(),
+    calendarId: text('calendar_id').notNull(),
+    // The channel UUID we generate and Google echoes back in X-Goog-Channel-ID.
+    channelId: text('channel_id'),
+    // Google-assigned opaque resource id (X-Goog-Resource-ID) for the watched calendar.
+    resourceId: text('resource_id'),
+    // Shared secret echoed in X-Goog-Channel-Token — authenticates inbound pushes.
+    channelToken: text('channel_token'),
+    // When the current watch channel lapses; the renewal cron re-registers before this.
+    channelExpiration: timestamp('channel_expiration', { withTimezone: true }),
+    // Incremental sync cursor from events.list; null ⇒ next run does a full reconcile.
+    syncToken: text('sync_token'),
+    lastSyncAt: timestamp('last_sync_at', { withTimezone: true }),
+    status: text('status', { enum: ['active', 'expired', 'error'] }).notNull().default('active'),
+    lastError: text('last_error'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('calendar_sync_channels_channel_idx').on(t.channelId),
+    index('calendar_sync_channels_resource_idx').on(t.resourceId),
+  ],
+)
+
 // ── Type exports ──────────────────────────────────────────────────────────────
 
 export type Business = typeof businesses.$inferSelect
@@ -577,6 +616,7 @@ export type DeferredFeatureRequest = typeof deferredFeatureRequests.$inferSelect
 export type ManagerMemory = typeof managerMemory.$inferSelect
 export type BusinessContact = typeof businessContacts.$inferSelect
 export type OperatorSessionNote = typeof operatorSessionNotes.$inferSelect
+export type CalendarSyncChannel = typeof calendarSyncChannels.$inferSelect
 
 export type BookingState = Booking['state']
 export type IdentityRole = Identity['role']
