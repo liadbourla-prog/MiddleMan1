@@ -351,31 +351,70 @@ export async function oauthRoutes(app: FastifyInstance) {
         //     code is bound to `${PUBLIC_BASE_URL}/` and the exchange must repeat it.
         // We can't tell which path the client took, so try each candidate until one validates.
         const publicBaseUrl = (process.env['PUBLIC_BASE_URL'] ?? '').replace(/\/+$/, '')
-        const redirectCandidates: (string | undefined)[] = [
-          publicBaseUrl ? `${publicBaseUrl}/` : undefined,
-          publicBaseUrl || undefined,
-          undefined,
+        type FbErr = {
+          message?: string
+          code?: number
+          error_subcode?: number
+          type?: string
+          fbtrace_id?: string
+        }
+        type TokenResp = { access_token?: string; error?: FbErr }
+        // Try candidate redirect_uris in order. `undefined` = omit redirect_uri (the documented
+        // SDK path). Meta's "redirect_uri" error text is generic — it masks the real cause — so
+        // we capture the FULL error object (code/subcode/type/fbtrace_id) for the FIRST attempt,
+        // which is the clean one before the code could be consumed by a retry.
+        const redirectCandidates: { label: string; uri: string | undefined }[] = [
+          { label: '(none)', uri: undefined },
+          { label: 'origin/', uri: publicBaseUrl ? `${publicBaseUrl}/` : undefined },
+          { label: 'origin', uri: publicBaseUrl || undefined },
+          { label: 'page', uri: publicBaseUrl ? `${publicBaseUrl}/embedded-signup` : undefined },
+          { label: 'cb', uri: publicBaseUrl ? `${publicBaseUrl}/oauth/meta/callback` : undefined },
         ]
-        let tokenJson: { access_token?: string; error?: { message?: string } } = {}
+        let tokenJson: TokenResp = {}
         let tokenOk = false
         let lastErr = ''
-        for (const redirectUri of redirectCandidates) {
+        let firstErr: FbErr | undefined
+        for (const cand of redirectCandidates) {
           let tokenUrl = `https://graph.facebook.com/v21.0/oauth/access_token?client_id=${appId}&client_secret=${appSecret}&code=${encodeURIComponent(code)}`
-          if (redirectUri) tokenUrl += `&redirect_uri=${encodeURIComponent(redirectUri)}`
+          if (cand.uri) tokenUrl += `&redirect_uri=${encodeURIComponent(cand.uri)}`
           const tokenRes = await fetch(tokenUrl)
-          tokenJson = (await tokenRes.json()) as { access_token?: string; error?: { message?: string } }
+          tokenJson = (await tokenRes.json()) as TokenResp
           if (tokenRes.ok && tokenJson.access_token) {
             tokenOk = true
-            app.log.info({ redirectUri: redirectUri ?? '(none)' }, 'Meta token exchange succeeded')
+            app.log.info({ redirectUri: cand.label }, 'Meta token exchange succeeded')
             break
           }
-          lastErr = tokenJson.error?.message ?? `HTTP ${tokenRes.status}`
+          const e = tokenJson.error ?? {}
+          if (!firstErr) firstErr = e
+          lastErr = e.message ?? `HTTP ${tokenRes.status}`
+          app.log.warn(
+            {
+              candidate: cand.label,
+              code: e.code,
+              subcode: e.error_subcode,
+              type: e.type,
+              fbtrace_id: e.fbtrace_id,
+              msg: e.message,
+            },
+            'Meta token exchange candidate failed',
+          )
           // A used/expired code won't be fixed by a different redirect_uri — stop retrying.
           if (/expired|been used|already been/i.test(lastErr)) break
         }
 
         if (!tokenOk || !tokenJson.access_token) {
-          app.log.error({ err: lastErr }, 'Meta token exchange failed (all redirect_uri candidates)')
+          app.log.error(
+            {
+              err: lastErr,
+              firstCode: firstErr?.code,
+              firstSubcode: firstErr?.error_subcode,
+              firstType: firstErr?.type,
+              firstTrace: firstErr?.fbtrace_id,
+              hadPhoneFromWidget: Boolean(phone_number_id),
+              hadWabaFromWidget: Boolean(waba_id),
+            },
+            'Meta token exchange failed (all redirect_uri candidates)',
+          )
           await sendError(lastErr)
           return reply.status(502).send({ ok: false, error: lastErr })
         }
