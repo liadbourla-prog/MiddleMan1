@@ -5,7 +5,7 @@ import { businesses, importTokens, managerInstructions, serviceTypes, availabili
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
 import type { ResolvedIdentity } from '../identity/types.js'
-import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, type OnboardingHourEntry } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
@@ -202,22 +202,75 @@ async function handleHoursStep(
 
   const retryPrompt = await onboardingQuestion('hours', business.name, lang, { isRetry: true })
 
-  return applyOnboardingInstruction(
-    db, msg, identity, business,
-    'availability_change',
-    retryPrompt,
-    async (confirmationMessage) => {
-      await db.update(businesses)
-        .set({ onboardingStep: 'cancellation_policy', available247: false })
-        .where(eq(businesses.id, business.id))
-      log.info({ businessId: business.id }, 'Onboarding: hours step complete')
-      const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, {
-        justConfirmed: confirmationMessage,
+  // A weekly schedule spans several days; the single-day availability_change
+  // schema can't hold it. Parse the whole week, then apply set_hours per day.
+  const parsed = await parseOnboardingHours(msg.body, lang)
+
+  if (parsed.ok && parsed.data.understood && parsed.data.always247) {
+    await db.update(businesses)
+      .set({ onboardingStep: 'cancellation_policy', available247: true })
+      .where(eq(businesses.id, business.id))
+    log.info({ businessId: business.id }, 'Onboarding: hours step complete (24/7 via parser)')
+    const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, { justConfirmed: '24/7' })
+    return { reply: nextQ }
+  }
+
+  if (!parsed.ok || !parsed.data.understood || parsed.data.days.length === 0) {
+    return { reply: retryPrompt }
+  }
+
+  const appliedDays: OnboardingHourEntry[] = []
+  for (const day of parsed.data.days) {
+    const params = {
+      action: 'set_hours' as const,
+      dayOfWeek: day.dayOfWeek,
+      openTime: day.openTime,
+      closeTime: day.closeTime,
+    }
+
+    const [saved] = await db
+      .insert(managerInstructions)
+      .values({
+        businessId: business.id,
+        identityId: identity.id,
+        rawMessage: msg.body,
+        receivedAt: msg.timestamp,
+        classifiedAs: 'availability_change',
+        structuredOutput: { instructionType: 'availability_change', structuredParams: params } as unknown as Record<string, unknown>,
+        applyStatus: 'pending',
       })
-      return { reply: nextQ }
-    },
-    lang,
-  )
+      .returning({ id: managerInstructions.id })
+
+    if (!saved) continue
+
+    const applyResult = await applyInstruction(
+      db, saved.id, business.id, identity.id, 'availability_change', params, lang,
+    )
+    if (applyResult.ok) appliedDays.push(day)
+    else log.warn({ businessId: business.id, dayOfWeek: day.dayOfWeek, reason: applyResult.reason }, 'Onboarding: set_hours failed')
+  }
+
+  if (appliedDays.length === 0) {
+    return { reply: retryPrompt }
+  }
+
+  await db.update(businesses)
+    .set({ onboardingStep: 'cancellation_policy', available247: false })
+    .where(eq(businesses.id, business.id))
+  log.info({ businessId: business.id, days: appliedDays.length }, 'Onboarding: hours step complete')
+
+  const dayNames = lang === 'he'
+    ? ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת']
+    : ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+  const hoursSummary = appliedDays
+    .sort((a, b) => a.dayOfWeek - b.dayOfWeek)
+    .map((d) => `${dayNames[d.dayOfWeek]} ${d.openTime}–${d.closeTime}`)
+    .join(', ')
+  const confirmation = lang === 'he' ? `שעות הפעילות נשמרו: ${hoursSummary}` : `Hours saved: ${hoursSummary}`
+  const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, {
+    justConfirmed: confirmation,
+  })
+  return { reply: nextQ }
 }
 
 async function handleCancellationPolicyStep(
@@ -639,63 +692,6 @@ export async function buildVerifySummary(db: Db, business: Business, lang: Lang)
     fallback: rawSummary,
   })
   return formattedSummary
-}
-
-// ── Shared helper for LLM-classified onboarding steps ────────────────────────
-
-async function applyOnboardingInstruction(
-  db: Db,
-  msg: InboundMessage,
-  identity: ResolvedIdentity,
-  business: Business,
-  expectedType: string,
-  retryPrompt: string,
-  onSuccess: (confirmationMessage: string) => Promise<OnboardingResult>,
-  lang?: Lang,
-): Promise<OnboardingResult> {
-  const classifyResult = await classifyManagerInstruction(msg.body, {
-    businessId: business.id,
-    timezone: business.timezone,
-  }, lang)
-
-  if (!classifyResult.ok || classifyResult.data.instructionType !== expectedType) {
-    return { reply: retryPrompt }
-  }
-
-  const instruction = classifyResult.data
-  if (instruction.ambiguous) {
-    return { reply: instruction.clarificationNeeded ?? retryPrompt }
-  }
-
-  const [saved] = await db
-    .insert(managerInstructions)
-    .values({
-      businessId: business.id,
-      identityId: identity.id,
-      rawMessage: msg.body,
-      receivedAt: msg.timestamp,
-      classifiedAs: instruction.instructionType as 'availability_change' | 'policy_change' | 'service_change' | 'permission_change' | 'booking_cancellation' | 'unknown',
-      structuredOutput: instruction as unknown as Record<string, unknown>,
-      applyStatus: 'pending',
-    })
-    .returning({ id: managerInstructions.id })
-
-  if (!saved) return { reply: retryPrompt }
-
-  const applyResult = await applyInstruction(
-    db,
-    saved.id,
-    business.id,
-    identity.id,
-    instruction.instructionType,
-    instruction.structuredParams as Record<string, unknown>,
-  )
-
-  if (!applyResult.ok) {
-    return { reply: `${retryPrompt}\n(${applyResult.reason})` }
-  }
-
-  return onSuccess(applyResult.confirmationMessage)
 }
 
 // ── Escalation policy fallback (regex) ────────────────────────────────────────

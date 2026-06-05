@@ -719,6 +719,17 @@ const businessNameSchema = z.object({
   name: z.string().nullable(),
 })
 
+const onboardingHourEntrySchema = z.object({
+  dayOfWeek: z.coerce.number().int().min(0).max(6),
+  openTime: z.string().regex(/^\d{1,2}:\d{2}$/).transform((s) => (s.length === 4 ? `0${s}` : s)),
+  closeTime: z.string().regex(/^\d{1,2}:\d{2}$/).transform((s) => (s.length === 4 ? `0${s}` : s)),
+})
+const onboardingHoursSchema = z.object({
+  understood: z.boolean(),
+  always247: z.boolean(),
+  days: z.array(onboardingHourEntrySchema),
+})
+
 const PARSE_PROMPTS: Record<ParseableOnboardingStep, string> = {
   cancellation_policy: `Extract how many hours before an appointment the customer wants to allow cancellations.
 If they say "any time", "no restriction", "ללא הגבלה", "כל עת", "0", "whenever", etc. → hours: 0.
@@ -811,6 +822,36 @@ The manager was just asked: what display name should customers see for their bus
 Return JSON: { "isBusinessName": boolean, "name": string | null }`
   const safeMessage = sanitizeUserInput(message)
   return callWithSchema(systemPrompt, safeMessage, businessNameSchema)
+}
+
+export type OnboardingHourEntry = z.infer<typeof onboardingHourEntrySchema>
+
+// Onboarding "hours" step — parses a full weekly schedule into per-day entries.
+// The single-day availability_change schema cannot represent a multi-day week,
+// but managers naturally give ranges like "Sun–Fri 9–21, Friday 9–16".
+export async function parseOnboardingHours(
+  message: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<{ understood: boolean; always247: boolean; days: OnboardingHourEntry[] }>> {
+  const langNote = lang === 'he' ? 'The manager is writing in Hebrew.' : 'The manager is writing in English.'
+  const systemPrompt = `${langNote}
+
+The manager is setting up their business PA and was asked when the business is open — days and opening hours. Convert their answer into a per-day weekly schedule.
+
+dayOfWeek numbering: 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday.
+Hebrew day names: ראשון=0, שני=1, שלישי=2, רביעי=3, חמישי=4, שישי=5, שבת=6. Treat "שישית" as שישי (Friday, 5).
+
+Rules:
+- Expand day ranges into individual days. "ראשון עד שישי" / "Sun–Fri" → days 0,1,2,3,4,5. "א'-ה'" → 0,1,2,3,4.
+- Apply exceptions: "למעט"/"except"/"חוץ מ" override the general hours for the named day(s). Example: "Sun–Fri 09:00–21:00, except Friday 09:00–16:00" → days 0,1,2,3,4 at 09:00–21:00 AND day 5 at 09:00–16:00.
+- Only include days the business is OPEN. Days not mentioned are closed — omit them entirely.
+- openTime/closeTime: 24-hour, zero-padded "HH:MM" (e.g. "09:00", "21:00"). Convert "9"/"9:00"/"9am" → "09:00", "9pm" → "21:00", "4pm" → "16:00".
+- always247: true ONLY if they say always open / 24/7 / "תמיד פתוח" / "פתוח כל הזמן" — then return days: [].
+- understood: false ONLY if the message has no hours information at all (a greeting, a question, or confusion) — then return days: [] and always247: false.
+
+Return JSON: { "understood": boolean, "always247": boolean, "days": [ { "dayOfWeek": number, "openTime": "HH:MM", "closeTime": "HH:MM" } ] }`
+  const safeMessage = sanitizeUserInput(message)
+  return callWithSchema(systemPrompt, safeMessage, onboardingHoursSchema)
 }
 
 // ── Proactive customer message generator ─────────────────────────────────────
