@@ -703,6 +703,22 @@ const escalationSchema = z.object({
   customText: z.string().nullable(),
 })
 
+const onboardingServiceItemSchema = z.object({
+  name: z.string().min(1),
+  durationMinutes: z.coerce.number().int().positive(),
+  maxParticipants: z.coerce.number().int().positive().nullable(),
+  paymentAmount: z.coerce.number().nonnegative().nullable(),
+  category: z.string().nullable(),
+})
+const onboardingServicesSchema = z.object({
+  understood: z.boolean(),
+  services: z.array(onboardingServiceItemSchema),
+})
+const businessNameSchema = z.object({
+  isBusinessName: z.boolean(),
+  name: z.string().nullable(),
+})
+
 const PARSE_PROMPTS: Record<ParseableOnboardingStep, string> = {
   cancellation_policy: `Extract how many hours before an appointment the customer wants to allow cancellations.
 If they say "any time", "no restriction", "ללא הגבלה", "כל עת", "0", "whenever", etc. → hours: 0.
@@ -747,6 +763,54 @@ export async function parseOnboardingAnswer(
   const raw = await callWithSchema(systemPrompt, safeMessage, escalationSchema)
   if (!raw.ok) return raw
   return { ok: true, data: { step: 'escalation_policy', ...raw.data } }
+}
+
+export type OnboardingServiceItem = z.infer<typeof onboardingServiceItemSchema>
+
+// Onboarding "services" step — parses a LIST of services from one message.
+// The single-service classifyManagerInstruction schema cannot represent multiple
+// services, but the onboarding prompt explicitly invites a list.
+export async function parseOnboardingServices(
+  message: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<{ understood: boolean; services: OnboardingServiceItem[] }>> {
+  const langNote = lang === 'he' ? 'The manager is writing in Hebrew.' : 'The manager is writing in English.'
+  const systemPrompt = `${langNote}
+
+The manager is setting up their business PA and was asked to list the services they offer, each with a duration. The message may contain ONE service or MANY (one per line, comma-separated, or free text).
+
+For each service extract:
+- name: the service name only, cleaned (no duration, no price). Keep it in the manager's language.
+- durationMinutes: convert any stated duration to whole minutes. "שעה"/"hour"/"שעה אחת" = 60. "חצי שעה"/"half an hour" = 30. "שעה וחצי"/"an hour and a half"/"hour and 30" = 90. "45 דקות"/"45 min" = 45. "שעתיים"/"two hours" = 120. If no duration is stated for a service, use 60.
+- maxParticipants: a group/class capacity if stated (e.g. "(מקס 12)", "up to 10", "group of 8", "סדנה ל-8") → that number. For 1-on-1 / private services use null.
+- paymentAmount: a price if stated (number only), otherwise null.
+- category: a short logical grouping inferred from the name (e.g. "יוגה", "פילאטיס", "תספורת"), or null.
+
+understood: set false ONLY if the message contains no service at all — i.e. it is a greeting, a question, an expression of confusion, or otherwise not a list of services. In that case return services: [].
+If it contains at least one service, set understood: true.
+
+Return JSON: { "understood": boolean, "services": [ { "name": string, "durationMinutes": number, "maxParticipants": number|null, "paymentAmount": number|null, "category": string|null } ] }`
+  const safeMessage = sanitizeUserInput(message)
+  return callWithSchema(systemPrompt, safeMessage, onboardingServicesSchema)
+}
+
+// Onboarding "business_name" step — validates that the manager actually gave a
+// name, rather than a greeting/question that would otherwise be stored verbatim.
+export async function parseBusinessName(
+  message: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<{ isBusinessName: boolean; name: string | null }>> {
+  const langNote = lang === 'he' ? 'The manager is writing in Hebrew.' : 'The manager is writing in English.'
+  const systemPrompt = `${langNote}
+
+The manager was just asked: what display name should customers see for their business? Decide whether this message actually provides a business name, or whether it is something else — a greeting, a question (e.g. "are you connected?", "מחובר?", "מי זה?"), an expression of confusion, or small talk.
+
+- If the message provides a business name, set isBusinessName: true and put the cleaned name in "name" (strip greetings like "שלום"/"hi", strip surrounding quotes, keep it in the manager's language). A plausible business name is a short noun phrase (e.g. "מספרת ליאד", "Studio Flow", "יוגה עם דנה").
+- If the message is a greeting, a question, confusion, or clearly not a business name, set isBusinessName: false and name: null.
+
+Return JSON: { "isBusinessName": boolean, "name": string | null }`
+  const safeMessage = sanitizeUserInput(message)
+  return callWithSchema(systemPrompt, safeMessage, businessNameSchema)
 }
 
 // ── Proactive customer message generator ─────────────────────────────────────

@@ -5,7 +5,7 @@ import { businesses, importTokens, managerInstructions, serviceTypes, availabili
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
 import type { ResolvedIdentity } from '../identity/types.js'
-import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
@@ -82,7 +82,21 @@ async function handleBusinessNameStep(
   lang: Lang,
   log: FastifyBaseLogger,
 ): Promise<OnboardingResult> {
-  const displayName = msg.body.trim().slice(0, 100)
+  const parsed = await parseBusinessName(msg.body, lang)
+  const displayName = parsed.ok && parsed.data.isBusinessName && parsed.data.name?.trim()
+    ? parsed.data.name.trim().slice(0, 100)
+    : null
+
+  if (!displayName) {
+    // Not a name — a greeting, question, or confusion. Re-ask instead of storing it.
+    log.info({ businessId: business.id }, 'Onboarding: business_name input was not a name, re-prompting')
+    const retryQ = await onboardingQuestion('business_name', business.name ?? '', lang, {
+      isRetry: true,
+      extraContext: 'The manager replied with a greeting or question instead of a business name. Briefly reassure them (yes, you are set up and listening), then ask again for the name customers should see.',
+    })
+    return { reply: retryQ }
+  }
+
   await db
     .update(businesses)
     .set({ name: displayName, onboardingStep: 'services' })
@@ -105,20 +119,61 @@ async function handleServiceStep(
 ): Promise<OnboardingResult> {
   const retryPrompt = await onboardingQuestion('services', business.name, lang, { isRetry: true })
 
-  return applyOnboardingInstruction(
-    db, msg, identity, business,
-    'service_change',
-    retryPrompt,
-    async (confirmationMessage) => {
-      await db.update(businesses).set({ onboardingStep: 'hours' }).where(eq(businesses.id, business.id))
-      log.info({ businessId: business.id }, 'Onboarding: services step complete')
-      const nextQ = await onboardingQuestion('hours', business.name, lang, {
-        justConfirmed: confirmationMessage,
+  // The manager may list several services in one message. Parse them all, then
+  // apply each through the deterministic core (applyInstruction → applyServiceChange).
+  const parsed = await parseOnboardingServices(msg.body, lang)
+  if (!parsed.ok || !parsed.data.understood || parsed.data.services.length === 0) {
+    return { reply: retryPrompt }
+  }
+
+  const created: string[] = []
+  for (const svc of parsed.data.services) {
+    const params = {
+      action: 'create' as const,
+      name: svc.name,
+      durationMinutes: svc.durationMinutes,
+      maxParticipants: svc.maxParticipants ?? 1,
+      paymentAmount: svc.paymentAmount,
+      requiresPayment: svc.paymentAmount != null && svc.paymentAmount > 0,
+      category: svc.category,
+    }
+
+    const [saved] = await db
+      .insert(managerInstructions)
+      .values({
+        businessId: business.id,
+        identityId: identity.id,
+        rawMessage: msg.body,
+        receivedAt: msg.timestamp,
+        classifiedAs: 'service_change',
+        structuredOutput: { instructionType: 'service_change', structuredParams: params } as unknown as Record<string, unknown>,
+        applyStatus: 'pending',
       })
-      return { reply: nextQ }
-    },
-    lang,
-  )
+      .returning({ id: managerInstructions.id })
+
+    if (!saved) continue
+
+    const applyResult = await applyInstruction(
+      db, saved.id, business.id, identity.id, 'service_change', params, lang,
+    )
+    if (applyResult.ok) created.push(svc.name)
+    else log.warn({ businessId: business.id, service: svc.name, reason: applyResult.reason }, 'Onboarding: service create failed')
+  }
+
+  if (created.length === 0) {
+    return { reply: retryPrompt }
+  }
+
+  await db.update(businesses).set({ onboardingStep: 'hours' }).where(eq(businesses.id, business.id))
+  log.info({ businessId: business.id, count: created.length }, 'Onboarding: services step complete')
+
+  const confirmation = lang === 'he'
+    ? `נוספו השירותים: ${created.join(', ')}`
+    : `Added: ${created.join(', ')}`
+  const nextQ = await onboardingQuestion('hours', business.name, lang, {
+    justConfirmed: confirmation,
+  })
+  return { reply: nextQ }
 }
 
 async function handleHoursStep(
