@@ -6,8 +6,9 @@ export default defineConfig({
     environment: 'node',
     include: ['tests/quality/**/*.test.ts'],
     setupFiles: ['tests/quality/env-setup.ts'],
-    // Live Pro calls (generation + judge) per scenario — generous timeouts.
-    testTimeout: 120_000,
+    // Live Pro calls (generation + judge) per scenario, each wrapped in quota
+    // backoff-retry — a throttled scenario can wait minutes before succeeding.
+    testTimeout: 600_000,
     hookTimeout: 60_000,
   },
 })

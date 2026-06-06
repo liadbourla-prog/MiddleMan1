@@ -12,6 +12,36 @@ import type { Lang } from './assertions.js'
 
 const ai = new GoogleGenAI({ apiKey: process.env['LLM_API_KEY'] ?? '', apiVersion: 'v1beta' })
 
+// Pro free-tier RPM is low; a full eval run bursts well past it. Retry quota/
+// transient errors with exponential backoff so the suite is reliable, not flaky.
+function isQuotaOrTransient(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase()
+  return (
+    msg.includes('resource_exhausted') ||
+    msg.includes('429') ||
+    msg.includes('quota') ||
+    msg.includes('rate limit') ||
+    msg.includes('503') ||
+    msg.includes('unavailable') ||
+    msg.includes('overloaded')
+  )
+}
+
+export async function withQuotaRetry<T>(fn: () => Promise<T>, retries = 5, baseDelayMs = 6000): Promise<T> {
+  let lastErr: unknown
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      lastErr = err
+      if (attempt === retries || !isQuotaOrTransient(err)) throw err
+      const delay = baseDelayMs * 2 ** attempt + Math.floor(Math.random() * 1000)
+      await new Promise((r) => setTimeout(r, delay))
+    }
+  }
+  throw lastErr
+}
+
 export interface GradeRubric {
   // Plain-English description of what the reply is responding to, given to the judge.
   context: string
@@ -61,25 +91,27 @@ THE REPLY TO GRADE:
 ${reply}
 """`
 
-  const result = await ai.models.generateContent({
-    model: MODELS.pro,
-    contents: userContent,
-    config: {
-      systemInstruction: RUBRIC,
-      temperature: 0,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          score: { type: Type.INTEGER },
-          humanlike: { type: Type.BOOLEAN },
-          botTells: { type: Type.ARRAY, items: { type: Type.STRING } },
-          reasoning: { type: Type.STRING },
+  const result = await withQuotaRetry(() =>
+    ai.models.generateContent({
+      model: MODELS.pro,
+      contents: userContent,
+      config: {
+        systemInstruction: RUBRIC,
+        temperature: 0,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            score: { type: Type.INTEGER },
+            humanlike: { type: Type.BOOLEAN },
+            botTells: { type: Type.ARRAY, items: { type: Type.STRING } },
+            reasoning: { type: Type.STRING },
+          },
+          required: ['score', 'humanlike', 'botTells', 'reasoning'],
         },
-        required: ['score', 'humanlike', 'botTells', 'reasoning'],
       },
-    },
-  })
+    }),
+  )
 
   const text = result.text
   if (!text) throw new Error('grader returned empty response')

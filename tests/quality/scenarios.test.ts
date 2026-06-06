@@ -29,13 +29,41 @@ const llmEnabled = !!process.env['LLM_API_KEY']
 const SAMPLES = parseInt(process.env['QUALITY_SAMPLES'] ?? '1', 10)
 const PASS_RATE = parseFloat(process.env['QUALITY_PASS_RATE'] ?? '1')
 const MIN_SCORE = parseInt(process.env['QUALITY_MIN_SCORE'] ?? '4', 10)
+// Generation retry: the production generators swallow LLM errors and return a
+// static fallback. Under Pro free-tier quota a burst run hits 429s, so a returned
+// fallback usually means "the call was throttled" rather than a quality failure.
+// Retry generation with backoff until we get a real reply (or give up and let the
+// assertion fail loudly with the fallback visible).
+const GEN_RETRIES = parseInt(process.env['QUALITY_GEN_RETRIES'] ?? '5', 10)
+const GEN_BACKOFF_MS = parseInt(process.env['QUALITY_GEN_BACKOFF_MS'] ?? '6000', 10)
+
+// Mirror of FALLBACK_REPLIES in client.ts (not exported) — used to detect a
+// throttled customer-reply generation so we can retry it.
+const CUSTOMER_FALLBACK = {
+  he: 'רגע, משהו נתקע לי כאן — אפשר לכתוב לי שוב?',
+  en: 'Hang on, something got stuck on my end — mind sending that again?',
+} as const
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 interface Scenario {
   name: string
   branch: 'customer' | 'manager' | 'onboarding' | 'operator' | 'proactive'
   generate: () => Promise<string>
+  // The exact string the generator returns if its LLM call fails. A reply equal to
+  // this means the call was throttled/errored, not that the model produced it.
+  fallback: string
   checks: DeterministicChecks
   rubric: GradeRubric
+}
+
+async function generateResilient(scenario: Scenario): Promise<string> {
+  let reply = await scenario.generate()
+  for (let attempt = 0; attempt < GEN_RETRIES && reply.trim() === scenario.fallback.trim(); attempt++) {
+    await sleep(GEN_BACKOFF_MS * 2 ** attempt + Math.floor(Math.random() * 1000))
+    reply = await scenario.generate()
+  }
+  return reply
 }
 
 const scenarios: Scenario[] = [
@@ -51,6 +79,7 @@ const scenarios: Scenario[] = [
           'The customer asked to book a haircut. The slot Sunday at 14:00 is confirmed and booked.',
         transcript: [{ role: 'customer', text: 'אפשר תספורת ביום ראשון אחה"צ?' }],
       }),
+    fallback: CUSTOMER_FALLBACK.he,
     checks: { expectedLang: 'he', forbiddenVerbatim: ['התור נקבע', 'הבקשה שלך עובדה'] },
     rubric: {
       lang: 'he',
@@ -69,6 +98,7 @@ const scenarios: Scenario[] = [
           'The customer wanted Thursday 15:00 but it is already taken. Thursday 16:30 and Friday 10:00 are open.',
         transcript: [{ role: 'customer', text: 'Can I get a cut Thursday at 3?' }],
       }),
+    fallback: CUSTOMER_FALLBACK.en,
     checks: { expectedLang: 'en', forbiddenVerbatim: ['that time is unavailable', 'no slots available'] },
     rubric: {
       lang: 'en',
@@ -87,6 +117,7 @@ const scenarios: Scenario[] = [
           'The customer wants to cancel but has two upcoming bookings: a haircut on Tuesday 10:00 and a manicure on Thursday 17:00. Ask which one, naturally — not as a numbered menu.',
         transcript: [{ role: 'customer', text: 'אני צריכה לבטל תור' }],
       }),
+    fallback: CUSTOMER_FALLBACK.he,
     checks: { expectedLang: 'he', forbiddenVerbatim: ['השב 1', 'השיבו 1 או 2'] },
     rubric: {
       lang: 'he',
@@ -105,6 +136,7 @@ const scenarios: Scenario[] = [
         transcript: [{ role: 'customer', text: 'is there parking nearby?' }],
         faqs: [{ question: 'Is there parking?', answer: 'Free street parking on Allenby, and a paid lot one block away.' }],
       }),
+    fallback: CUSTOMER_FALLBACK.en,
     checks: { expectedLang: 'en' },
     rubric: {
       lang: 'en',
@@ -122,6 +154,7 @@ const scenarios: Scenario[] = [
         situation: 'The customer asks whether they are talking to a bot. Stay in character, deflect warmly, redirect to helping.',
         transcript: [{ role: 'customer', text: 'אני מדבר עם בוט?' }],
       }),
+    fallback: CUSTOMER_FALLBACK.he,
     checks: { expectedLang: 'he' },
     rubric: {
       lang: 'he',
@@ -140,6 +173,7 @@ const scenarios: Scenario[] = [
         situation: 'The owner asked to change Friday hours to 09:00–13:00. The change was applied successfully.',
         fallback: 'שעות עודכנו עבור יום שישי.',
       }),
+    fallback: 'שעות עודכנו עבור יום שישי.',
     checks: { expectedLang: 'he', forbiddenVerbatim: ['שעות עודכנו עבור יום שישי', 'שעות עודכנו'] },
     rubric: {
       lang: 'he',
@@ -158,6 +192,7 @@ const scenarios: Scenario[] = [
           "The owner cancelled Dana's haircut on Wednesday 11:00. It is done. The customer has NOT been told yet.",
         fallback: 'The booking was cancelled.',
       }),
+    fallback: 'The booking was cancelled.',
     checks: { expectedLang: 'en', forbiddenVerbatim: ['the booking was cancelled', 'the event was deleted'] },
     rubric: {
       lang: 'en',
@@ -175,6 +210,7 @@ const scenarios: Scenario[] = [
         lang: 'en',
         fallback: 'What is the name of your business?',
       }),
+    fallback: 'What is the name of your business?',
     checks: { expectedLang: 'en' },
     rubric: {
       lang: 'en',
@@ -193,6 +229,7 @@ const scenarios: Scenario[] = [
         extraContext: 'The owner replied "מה זאת אומרת?" — they did not understand the previous question about services. Explain simply, then re-ask.',
         fallback: 'אילו שירותים אתם מציעים וכמה זמן כל אחד לוקח?',
       }),
+    fallback: 'אילו שירותים אתם מציעים וכמה זמן כל אחד לוקח?',
     checks: { expectedLang: 'he' },
     rubric: {
       lang: 'he',
@@ -212,6 +249,7 @@ const scenarios: Scenario[] = [
           'Royal Barbers — status: live, calendar: connected\nGlow Clinic — status: onboarding, calendar: not connected\nZen Spa — status: paused, calendar: connected',
         fallback: 'Royal Barbers: live. Glow Clinic: onboarding. Zen Spa: paused.',
       }),
+    fallback: 'Royal Barbers: live. Glow Clinic: onboarding. Zen Spa: paused.',
     checks: { expectedLang: 'en' },
     rubric: {
       lang: 'en',
@@ -231,6 +269,7 @@ const scenarios: Scenario[] = [
           'Remind the customer about their haircut tomorrow at 10:00. If they need to cancel, invite them to just tell you in their own words — never tell them to "reply CANCEL".',
         fallback: 'תזכורת: יש לך תור מחר ב-10:00. לביטול ענו CANCEL.',
       }),
+    fallback: 'תזכורת: יש לך תור מחר ב-10:00. לביטול ענו CANCEL.',
     checks: { expectedLang: 'he', forbiddenVerbatim: ['ענו CANCEL', 'לביטול ענו'] },
     rubric: {
       lang: 'he',
@@ -249,6 +288,7 @@ const scenarios: Scenario[] = [
           'A haircut slot just opened on Friday at 16:00. Share the good news warmly and invite them to just tell you if they want it — never say "reply YES/NO". You are holding it for 15 minutes.',
         fallback: 'Good news! A slot opened Friday 16:00. Reply YES to take it or NO to pass.',
       }),
+    fallback: 'Good news! A slot opened Friday 16:00. Reply YES to take it or NO to pass.',
     checks: { expectedLang: 'en', forbiddenVerbatim: ['reply YES', 'reply NO', 'YES/NO'] },
     rubric: {
       lang: 'en',
@@ -267,7 +307,7 @@ describe.skipIf(!llmEnabled)('conversation quality eval', () => {
         const diagnostics: string[] = []
 
         for (let i = 0; i < SAMPLES; i++) {
-          const reply = await scenario.generate()
+          const reply = await generateResilient(scenario)
           const det = runDeterministicChecks(reply, scenario.checks)
           let grade
           try {
