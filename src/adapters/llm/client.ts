@@ -359,8 +359,8 @@ const STEP_GOALS: Record<string, Record<'he' | 'en', string>> = {
     en: 'Ask when the business is open — days and hours. They can say 24/7 if always open.',
   },
   cancellation_policy: {
-    he: 'שאל כמה שעות לפני תור לקוחות יכולים לבטל. אם אין הגבלה — יכולים לומר "ללא הגבלה" או "0".',
-    en: 'Ask how many hours before an appointment customers can cancel. They can say "no restriction" for unrestricted.',
+    he: 'שאל עד כמה שעות מראש לקוחות יכולים לבטל תור. נסח את השאלה עם הביטוי "עד כמה שעות מראש". אם אין הגבלה — יכולים לומר "ללא הגבלה" או "0".',
+    en: 'Ask up to how many hours in advance customers can cancel an appointment. They can say "no restriction" for unrestricted.',
   },
   payment: {
     he: 'שאל אם לקוחות צריכים לשלם לפני שהתור מאושר, ואם כן — באיזו שיטה (ביט, PayPal, העברה בנקאית וכו\'). שאלה אחת.',

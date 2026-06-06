@@ -139,8 +139,8 @@ const strings = {
     en: `Got it — you're open 24/7 ⏰`,
   },
   ob_cancellation: {
-    he: `כמה שעות לפני תור לקוחות יכולים לבטל? כתבו מספר — למשל "24". אם אין הגבלה ולקוחות יכולים לבטל בכל עת, כתבו "0".`,
-    en: `How many hours before an appointment can customers cancel? Write a number — like "24". If there's no restriction and customers can cancel any time, write "0".`,
+    he: `עד כמה שעות מראש לקוחות יכולים לבטל תור? כתבו מספר — למשל "24". אם אין הגבלה ולקוחות יכולים לבטל בכל עת, כתבו "0".`,
+    en: `Up to how many hours in advance can customers cancel an appointment? Write a number — like "24". If there's no restriction and customers can cancel any time, write "0".`,
   },
   ob_cancellation_retry: {
     he: `אנא כתבו מספר שעות, למשל "24", "48", או "0" ללא הגבלה.`,
