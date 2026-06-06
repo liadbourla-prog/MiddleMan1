@@ -335,6 +335,26 @@ Every PR to `main` must pass all three:
 
 Failing CI blocks merge regardless of approvals.
 
+### Conversation-Quality Eval Harness
+
+The product's value is that every reply reads like a sharp, warm human — never a bot.
+`tests/quality/` locks that bar in as an automated gate.
+
+- **Run:** `npm run test:quality` (separate from `npm test`, which stays unit-only and CI-fast).
+- **What it does:** drives the real reply generators (customer, manager, onboarding,
+  operator, proactive) with bilingual golden scenarios, then gates each output two ways:
+  1. **Deterministic assertions** (`assertions.ts`) — single language, at most one question,
+     no stray markdown/HTML, no forbidden bot-tell phrases (`voice.ts` `BOT_TELLS`), no
+     verbatim echo of internal templates/tool results, URLs on their own line. Cheap, every run.
+  2. **LLM-as-judge** (`grader.ts`) — Pro scores human-vs-bot against the voice-bible rubric.
+- **Live LLM calls.** Gated behind `LLM_API_KEY` (auto-loaded from `.env.local`); without it
+  the suite skips, matching the integration-test convention. So it is **not** a blocking CI gate.
+- **Tunables:** `QUALITY_SAMPLES` (samples per scenario, default 1), `QUALITY_PASS_RATE`
+  (fraction that must pass, default 1), `QUALITY_MIN_SCORE` (judge score for a "good" sample,
+  default 4). Raise `QUALITY_SAMPLES` to absorb nondeterminism when tightening the bar.
+- **When to run:** after any change to an LLM prompt, persona, the voice core (`voice.ts`),
+  `CHAT_LEVEL_LAWBOOK.md`, situation strings, or model routing.
+
 ### Proposing a New Skill (Developer B workflow)
 
 1. Describe the skill idea and desired user outcome to Developer A
