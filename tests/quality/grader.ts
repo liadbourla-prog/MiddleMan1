@@ -16,14 +16,25 @@ const ai = new GoogleGenAI({ apiKey: process.env['LLM_API_KEY'] ?? '', apiVersio
 // transient errors with exponential backoff so the suite is reliable, not flaky.
 function isQuotaOrTransient(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase()
+  // Also treat the cause chain — undici surfaces network errors as `fetch failed`
+  // with the real reason (ECONNRESET, ETIMEDOUT…) tucked into err.cause.
+  const cause = err instanceof Error && err.cause ? String(err.cause).toLowerCase() : ''
+  const haystack = `${msg} ${cause}`
   return (
-    msg.includes('resource_exhausted') ||
-    msg.includes('429') ||
-    msg.includes('quota') ||
-    msg.includes('rate limit') ||
-    msg.includes('503') ||
-    msg.includes('unavailable') ||
-    msg.includes('overloaded')
+    haystack.includes('resource_exhausted') ||
+    haystack.includes('429') ||
+    haystack.includes('quota') ||
+    haystack.includes('rate limit') ||
+    haystack.includes('503') ||
+    haystack.includes('unavailable') ||
+    haystack.includes('overloaded') ||
+    haystack.includes('fetch failed') ||
+    haystack.includes('econnreset') ||
+    haystack.includes('etimedout') ||
+    haystack.includes('econnrefused') ||
+    haystack.includes('socket') ||
+    haystack.includes('network') ||
+    haystack.includes('terminated')
   )
 }
 

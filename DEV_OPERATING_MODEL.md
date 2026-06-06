@@ -350,10 +350,10 @@ The product's value is that every reply reads like a sharp, warm human — never
 - **Live LLM calls.** Gated behind `LLM_API_KEY` (auto-loaded from `.env.local`); without it
   the suite skips, matching the integration-test convention. So it is **not** a blocking CI gate.
 - **Tunables:** `QUALITY_SAMPLES` (samples per scenario, default 3), `QUALITY_PASS_RATE`
-  (fraction that must pass, default 0.67), `QUALITY_MIN_SCORE` (judge score for a "good"
-  sample, default 4). The 3@0.67 default absorbs LLM-judge roll-to-roll variance (one harsh
-  roll won't fail a good reply) while still catching consistent failures (0/3). For a fast,
-  cheap smoke during iteration, run with `QUALITY_SAMPLES=1`.
+  (fraction that must pass, default 0.66), `QUALITY_MIN_SCORE` (judge score for a "good"
+  sample, default 4). The 3@0.66 default absorbs LLM-judge roll-to-roll variance (one harsh
+  roll won't fail a good reply — 2/3 = 0.67 clears the gate) while still catching consistent
+  failures (0/3, 1/3). For a fast, cheap smoke during iteration, run with `QUALITY_SAMPLES=1`.
 - **Cost/runtime:** each sample is 2 Pro calls (generate + judge), so a full default run is
   ~72 Pro calls and several minutes; generation/judge both retry on quota with backoff, so a
   throttled run paces itself rather than failing. Needs sufficient Gemini Pro quota.

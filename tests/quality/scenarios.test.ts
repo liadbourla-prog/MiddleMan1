@@ -10,9 +10,9 @@
 //
 // Live LLM calls. Gated behind LLM_API_KEY so CI without it skips (matches the
 // integration-test convention). Tune volume/strictness with env:
-//   QUALITY_SAMPLES   (default 1)   samples generated + graded per scenario
-//   QUALITY_PASS_RATE (default 1)   fraction of samples that must be "good"
-//   QUALITY_MIN_SCORE (default 4)   judge score a sample needs to count as "good"
+//   QUALITY_SAMPLES   (default 3)    samples generated + graded per scenario
+//   QUALITY_PASS_RATE (default 0.66) fraction of samples that must be "good"
+//   QUALITY_MIN_SCORE (default 4)    judge score a sample needs to count as "good"
 
 import { describe, it, expect } from 'vitest'
 import {
@@ -27,11 +27,13 @@ import { gradeReply, type GradeRubric } from './grader.js'
 
 const llmEnabled = !!process.env['LLM_API_KEY']
 // Default to 3 samples @ 2/3 pass-rate: the LLM judge has roll-to-roll variance,
-// so a single sample is too brittle (one harsh roll fails a good reply). 3@0.67
-// catches consistent failures (0/3) while tolerating one outlier roll. Set
-// QUALITY_SAMPLES=1 for a fast, cheap smoke during iteration.
+// so a single sample is too brittle (one harsh roll fails a good reply). 3 samples
+// at this threshold catches consistent failures (0/3 or 1/3) while tolerating one
+// outlier roll (2/3 passes). The threshold is 0.66, not 0.67, on purpose: 2/3 is
+// 0.6667, so a 0.67 gate would reject the very "one outlier" case it's meant to
+// allow. Set QUALITY_SAMPLES=1 for a fast, cheap smoke during iteration.
 const SAMPLES = parseInt(process.env['QUALITY_SAMPLES'] ?? '3', 10)
-const PASS_RATE = parseFloat(process.env['QUALITY_PASS_RATE'] ?? '0.67')
+const PASS_RATE = parseFloat(process.env['QUALITY_PASS_RATE'] ?? '0.66')
 const MIN_SCORE = parseInt(process.env['QUALITY_MIN_SCORE'] ?? '4', 10)
 // Generation retry: the production generators swallow LLM errors and return a
 // static fallback. Under Pro free-tier quota a burst run hits 429s, so a returned
