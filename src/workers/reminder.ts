@@ -131,7 +131,7 @@ async function processReminder(job: { data: ReminderJob }) {
     : i18n.reminder_1h[lang](serviceName, biz.name, timeStr)
 
   const situation = type === '24h'
-    ? `Send a friendly 24-hour reminder: the customer has "${serviceName}" at ${biz.name} tomorrow, ${dateStr} at ${timeStr}. Tell them to reply CANCEL if they need to cancel.`
+    ? `Send a friendly 24-hour reminder: the customer has "${serviceName}" at ${biz.name} tomorrow, ${dateStr} at ${timeStr}. If they need to change or cancel, invite them to just tell you in their own words — never tell them to "reply CANCEL".`
     : `Send a friendly 1-hour reminder: the customer has "${serviceName}" at ${biz.name} in 1 hour at ${timeStr}. Warm and brief.`
 
   const freeFormAllowed = await canSendFreeForm(customerId)

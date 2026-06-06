@@ -8,16 +8,16 @@ export function detectLang(text: string): Lang {
 const strings = {
   // ── MiddleMan (provider onboarding) ─────────────────────────────────────────
   mm_welcome: {
-    he: `היי! 👋 אני MiddleMan — אגדיר לכם PA ב-WhatsApp תוך כמה דקות בדיוק.\n\nמה שם העסק שלכם?`,
-    en: `Hey! 👋 I'm MiddleMan — I'll get your WhatsApp PA running in just a few minutes.\n\nWhat's the name of your business?`,
+    he: `היי! 👋 נגדיר לך עוזר אישי ב-WhatsApp תוך כמה דקות.\n\nאיך קוראים לעסק?`,
+    en: `Hey! 👋 Let's get your WhatsApp assistant up and running — takes just a few minutes.\n\nWhat's your business called?`,
   },
   mm_ask_timezone: {
     he: `מעולה! באיזו אזור זמן נמצא העסק שלכם?\n\nדוגמאות: "ירושלים", "תל אביב", "ניו יורק" — או שם IANA כמו "Asia/Jerusalem".`,
     en: `Perfect! What timezone is your business in?\n\nExamples: "Tel Aviv", "New York", "London" — or an IANA name like "Asia/Jerusalem".`,
   },
   mm_bad_timezone: {
-    he: `לא הצלחתי לזהות את אזור הזמן. נסו שם IANA, למשל:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
-    en: `I didn't recognise that timezone. Please use an IANA name, for example:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
+    he: `רגע, לא תפסתי את אזור הזמן. אפשר לכתוב שם עיר או אזור IANA — למשל:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
+    en: `Hmm, that timezone didn't land. Try a city or an IANA name — for example:\n"Asia/Jerusalem", "America/New_York", "Europe/London"`,
   },
   mm_ask_calendar_mode: {
     he: `האם יש לכם Google Calendar שתרצו לחבר, או שנתחיל עם יומן פנימי בינתיים? (אפשר לחבר Google בכל עת מאוחר יותר)`,
@@ -32,8 +32,8 @@ const strings = {
     en: `What's your main service and what do you call it? Include how long it takes — like "Haircut, 30 minutes". You can list multiple services together.`,
   },
   mm_bad_services: {
-    he: `לא הצלחתי לפענח. נסו שוב — למשל: *תספורת, 30 דקות*`,
-    en: `I didn't catch that. Please try again — for example: *Haircut, 30 minutes*`,
+    he: `רגע, לא תפסתי. נסו שוב — למשל: *תספורת, 30 דקות*`,
+    en: `Didn't quite catch that — try again, like: *Haircut, 30 minutes*`,
   },
   mm_embedded_signup_link: {
     he: (url: string) => `כמעט סיימנו! לחצו על הקישור כדי לחבר את מספר ה-WhatsApp שלכם — לוקח כ-30 שניות:\n${url}`,
@@ -44,8 +44,8 @@ const strings = {
     en: `Once you complete the link, I'll get a confirmation automatically and finish setup.`,
   },
   mm_embedded_signup_error: {
-    he: (err: string) => `משהו השתבש בחיבור (${err}). נסו שוב או פנו לתמיכה.`,
-    en: (err: string) => `Something went wrong with the connection (${err}). Please try again or contact support.`,
+    he: (err: string) => `החיבור לא תפס הפעם (${err}). ננסה שוב? אם זה חוזר, אני כאן לעזור.`,
+    en: (err: string) => `The connection didn't go through this time (${err}). Want to try again? If it keeps happening, I'm here to help.`,
   },
   mm_no_number_linked: {
     he: `לא חובר מספר WhatsApp. מטא החזירה התחברות אך ללא מספר — סימן שכבר יש חיבור קודם לחשבון.\n\nכדי לתקן: היכנסו לפייסבוק → הגדרות → אינטגרציות עסקיות (Business Integrations) → MiddleMan → הסירו. ואז נסו שוב את הקישור — הפעם יופיע שלב סריקת ה-QR לחיבור המספר.`,
@@ -123,16 +123,16 @@ const strings = {
     en: `What services do you offer? Send the name and duration for each — like "Haircut 30 min, Beard trim 20 min". For group classes add "(max 12)". You can always change these later.`,
   },
   ob_services_retry: {
-    he: `לא הצלחתי לפענח את זה. רשמו את השירותים עם משך לכל אחד — למשל:\n"תספורת 30 דקות, תספורת זקן 20 דקות"`,
-    en: `I didn't quite catch that. Please list your services with a duration for each — for example:\n"Haircut 30 min, Beard trim 20 min"`,
+    he: `רגע, לא תפסתי. רשמו לי כל שירות עם משך — למשל:\n"תספורת 30 דקות, תספורת זקן 20 דקות"`,
+    en: `Didn't quite catch that — list each service with a duration, like:\n"Haircut 30 min, Beard trim 20 min"`,
   },
   ob_hours: {
     he: `מתי אתם פתוחים? שלחו ימים ושעות — למשל "ראשון-חמישי 9:00-19:00, שישי 9:00-14:00". אם תמיד פתוחים, פשוט אמרו "24/7".`,
     en: `When are you open? Send your days and hours — like "Mon–Fri 9am–7pm, Saturday 9am–2pm, closed Sunday". If you're always open, just say "24/7".`,
   },
   ob_hours_retry: {
-    he: `לא הצלחתי לפענח את השעות. נסו שוב — למשל:\n"א'-ה' 9:00–18:00, שישי 9:00–14:00, שבת סגור"\nאו פשוט "24/7" אם אתם תמיד פתוחים.`,
-    en: `I couldn't parse those hours. Please try again — for example:\n"Mon–Fri 9:00–18:00, Saturday 9:00–14:00, closed Sunday"\nOr just say "24/7" if you're always open.`,
+    he: `רגע, לא תפסתי את השעות. נסו שוב — למשל:\n"א'-ה' 9:00–18:00, שישי 9:00–14:00, שבת סגור"\nאו פשוט "24/7" אם אתם תמיד פתוחים.`,
+    en: `Didn't quite catch those hours — try again, like:\n"Mon–Fri 9:00–18:00, Saturday 9:00–14:00, closed Sunday"\nOr just say "24/7" if you're always open.`,
   },
   ob_247: {
     he: `מובן — אתם פתוחים 24/7 ⏰`,
@@ -276,14 +276,6 @@ const strings = {
   status_unknown: { he: `לא ידוע`, en: `Unknown` },
 
   // ── Customer-facing system messages ─────────────────────────────────────────
-  closed_queued: {
-    he: (name: string, opens: string) => `${name} סגור כרגע. ${opens ? `אנחנו פותחים ב-${opens}.` : ''} ההודעה שלכם נשמרה ונחזור אליכם כשנפתח.`,
-    en: (name: string, opens: string) => `${name} is currently closed.${opens ? ` We open at ${opens}.` : ''} Your message has been saved and we'll reply when we open.`,
-  },
-  closed_drop: {
-    he: (name: string, opens: string) => `${name} סגור כרגע.${opens ? ` אנחנו פותחים ב-${opens}.` : ''} שלחו לנו הודעה ונחזור אליכם.`,
-    en: (name: string, opens: string) => `${name} is currently closed.${opens ? ` We open at ${opens}.` : ''} Feel free to message us and we'll get back to you soon.`,
-  },
   paused_msg: {
     he: (name: string) => `${name} מנהל תורים ישירות כרגע. צרו קשר איתנו לבדיקת זמינות.`,
     en: (name: string) => `${name} is currently handling appointments directly. Please contact us for availability.`,
@@ -309,20 +301,20 @@ const strings = {
 
   // ── Manager error / system messages ──────────────────────────────────────────
   manager_classify_error: {
-    he: `לא הצלחתי לפענח את ההנחיה. נסו שוב.`,
-    en: `I couldn't process that instruction. Please try again.`,
+    he: `רגע, לא תפסתי מה לעשות. אפשר לנסח קצת אחרת?`,
+    en: `Hmm, didn't quite catch that — mind putting it another way?`,
   },
   manager_apply_error: {
-    he: (r: string) => `הבנתי אבל לא הצלחתי להחיל: ${r}. נסו לנסח מחדש.`,
-    en: (r: string) => `I understood but couldn't apply it: ${r}. Please try rephrasing.`,
+    he: (r: string) => `הבנתי מה ביקשת, אבל זה לא עבר: ${r}. ננסה שוב?`,
+    en: (r: string) => `Got what you meant, but it didn't go through: ${r}. Want to try again?`,
   },
   manager_save_error: {
-    he: `לא הצלחתי לשמור את ההנחיה. נסו שוב.`,
-    en: `I couldn't save that instruction. Please try again.`,
+    he: `זה לא נשמר לי כרגע. ננסה שוב?`,
+    en: `That didn't save just now — want to try again?`,
   },
   manager_unknown_instruction: {
-    he: `לא הצלחתי לזהות את סוג ההנחיה. ניתן לשלוח הנחיות בנושאים הבאים: שינוי שעות פתיחה, מדיניות ביטול, הוספה/הסרה של שירותים, הרשאות, ושאלות כלליות.`,
-    en: `I couldn't identify the instruction type. You can send instructions about: availability/hours changes, cancellation policy, adding or removing services, permissions, and general questions.`,
+    he: `לא בטוח מה לשנות פה. אני יכול לעזור עם שעות פתיחה, מדיניות ביטול, הוספה או הסרה של שירותים, הרשאות, וגם שאלות כלליות — מה בא לך?`,
+    en: `Not sure what to change there. I can help with hours, cancellation policy, adding or removing services, permissions, or general questions — what are you after?`,
   },
   revoked_access: {
     he: `הגישה שלך בוטלה. פנו לעסק ישירות.`,
@@ -391,24 +383,24 @@ const strings = {
     en: (label: string) => `Got it — ${label} is open again.`,
   },
   apply_hours_set: {
-    he: (label: string, open: string, close: string) => `שעות עודכנו עבור ${label}: ${open}–${close}.`,
-    en: (label: string, open: string, close: string) => `Hours set for ${label}: ${open}–${close}.`,
+    he: (label: string, open: string, close: string) => `עדכנתי את השעות ל${label}: ${open}–${close}.`,
+    en: (label: string, open: string, close: string) => `Updated ${label} to ${open}–${close}.`,
   },
   apply_bulk_close: {
-    he: (start: string, end: string) => `סגור מ-${start} עד ${end}.`,
-    en: (start: string, end: string) => `Closed from ${start} to ${end}.`,
+    he: (start: string, end: string) => `סגרתי מ-${start} עד ${end}.`,
+    en: (start: string, end: string) => `Closed you off from ${start} to ${end}.`,
   },
   apply_service_created: {
-    he: (name: string, dur: number, extra: string) => `שירות "${name}" נוצר (${dur} דקות${extra}).`,
-    en: (name: string, dur: number, extra: string) => `Service "${name}" created (${dur} min${extra}).`,
+    he: (name: string, dur: number, extra: string) => `הוספתי את "${name}" (${dur} דקות${extra}).`,
+    en: (name: string, dur: number, extra: string) => `Added "${name}" (${dur} min${extra}).`,
   },
   apply_service_deactivated: {
-    he: (name: string) => `שירות "${name}" הושבת.`,
-    en: (name: string) => `Service "${name}" deactivated.`,
+    he: (name: string) => `כיביתי את "${name}".`,
+    en: (name: string) => `Turned off "${name}".`,
   },
   apply_service_updated: {
-    he: (name: string) => `שירות "${name}" עודכן.`,
-    en: (name: string) => `Service "${name}" updated.`,
+    he: (name: string) => `עדכנתי את "${name}".`,
+    en: (name: string) => `Updated "${name}".`,
   },
   apply_service_not_found: {
     he: (name: string) => `שירות "${name}" לא נמצא.`,
@@ -421,12 +413,12 @@ const strings = {
       `Cannot deactivate "${name}" — ${count} future booking(s) still active (earliest: ${date}). Cancel them first.`,
   },
   apply_permission_granted: {
-    he: (who: string) => `${who} קיבל גישה כמשתמש מורשה.`,
-    en: (who: string) => `${who} granted delegated access.`,
+    he: (who: string) => `נתתי ל${who} גישה כמשתמש מורשה.`,
+    en: (who: string) => `Gave ${who} delegated access.`,
   },
   apply_permission_revoked: {
-    he: (who: string) => `גישה בוטלה עבור ${who}.`,
-    en: (who: string) => `Access revoked for ${who}.`,
+    he: (who: string) => `ביטלתי את הגישה של ${who}.`,
+    en: (who: string) => `Revoked ${who}'s access.`,
   },
   apply_permission_not_found: {
     he: (phone: string) => `לא נמצאה זהות עבור ${phone}.`,
@@ -437,20 +429,20 @@ const strings = {
     en: `Policy instruction noted and saved.`,
   },
   apply_policy_cancellation_cutoff: {
-    he: (hours: number) => `מדיניות ביטול עודכנה: ניתן לבטל עד ${hours} שעות לפני התור.`,
-    en: (hours: number) => `Cancellation policy updated: customers can cancel up to ${hours} hours before the appointment.`,
+    he: (hours: number) => `עדכנתי — לקוחות יכולים לבטל עד ${hours} שעות לפני התור.`,
+    en: (hours: number) => `Done — customers can now cancel up to ${hours} hours before the appointment.`,
   },
   apply_policy_booking_buffer: {
-    he: (hours: number) => `זמן מינימלי להזמנה עודכן: ${hours} שעות מראש לפחות.`,
-    en: (hours: number) => `Minimum booking buffer updated: at least ${hours} hours in advance.`,
+    he: (hours: number) => `עדכנתי — צריך להזמין לפחות ${hours} שעות מראש.`,
+    en: (hours: number) => `Done — bookings now need at least ${hours} hours' notice.`,
   },
   apply_policy_max_days: {
-    he: (days: number) => `טווח הזמנות עודכן: ניתן להזמין עד ${days} ימים קדימה.`,
-    en: (days: number) => `Booking window updated: customers can book up to ${days} days ahead.`,
+    he: (days: number) => `עדכנתי — אפשר להזמין עד ${days} ימים קדימה.`,
+    en: (days: number) => `Done — customers can now book up to ${days} days ahead.`,
   },
   apply_policy_cancellation_fee: {
-    he: (amount: number, currency: string) => `עמלת ביטול עודכנה: ${amount} ${currency}.`,
-    en: (amount: number, currency: string) => `Cancellation fee updated: ${amount} ${currency}.`,
+    he: (amount: number, currency: string) => `עדכנתי את עמלת הביטול ל-${amount} ${currency}.`,
+    en: (amount: number, currency: string) => `Set the cancellation fee to ${amount} ${currency}.`,
   },
   apply_policy_unsupported: {
     he: `הנחיה זו אינה ניתנת לביצוע אוטומטי. ניתן לעדכן: זמן ביטול, זמן הזמנה מינימלי, טווח הזמנות, עמלת ביטול.`,
@@ -478,17 +470,17 @@ const strings = {
   // ── Booking cancellation (schedule change) ──────────────────────────────────
   booking_cancelled_schedule: {
     he: (date: string) =>
-      `מצטערים — התור שלכם ב-${date} בוטל בשל שינוי בלוח הזמנים.\n\nענו REBOOK למציאת מועד חדש, או צרו קשר ישירות לתיאום מחדש.`,
+      `סליחה על ההפתעה — נאלצנו לבטל את התור שלכם ב-${date} בגלל שינוי בלו״ז. רוצים שאמצא לכם מועד אחר? רק תגידו לי מתי נוח ונסדר.`,
     en: (date: string) =>
-      `We're sorry — your appointment on ${date} has been cancelled due to a schedule change.\n\nReply REBOOK to find a new slot, or contact us directly to reschedule.`,
+      `Sorry for the surprise — we had to cancel your ${date} appointment because of a schedule change. Want me to find you another time? Just tell me when works and I'll sort it.`,
   },
 
   // ── Reminders ────────────────────────────────────────────────────────────────
   reminder_24h: {
     he: (service: string, biz: string, date: string, time: string) =>
-      `תזכורת: ${service} ב-${biz} מחר, ${date} בשעה ${time}. ענו CANCEL אם ברצונכם לבטל.`,
+      `תזכורת קטנה — ${service} ב${biz} מחר (${date}) ב-${time}. אם משהו השתנה, רק תכתבו לי ונסדר. נתראה!`,
     en: (service: string, biz: string, date: string, time: string) =>
-      `Reminder: ${service} at ${biz} is tomorrow, ${date} at ${time}. Reply CANCEL if you need to cancel.`,
+      `Quick reminder — ${service} at ${biz} tomorrow (${date}) at ${time}. If anything's changed, just let me know and we'll sort it. See you!`,
   },
   reminder_1h: {
     he: (service: string, biz: string, time: string) =>
@@ -500,9 +492,9 @@ const strings = {
   // ── Waitlist offer ────────────────────────────────────────────────────────────
   waitlist_offer: {
     he: (biz: string, service: string, date: string, ttl: number) =>
-      `בשורות טובות! נפתח מקום ב-${biz}: ${service} ב-${date}. ענו כן לתפיסת המקום או לא לוויתור. ההצעה פגה בעוד ${ttl} דקות.`,
+      `התפנה מקום! ${service} ב${biz} ב-${date}. רוצים אותו? רק תגידו לי ואני תופס לכם — שמרתי אותו ל-${ttl} הדקות הקרובות.`,
     en: (biz: string, service: string, date: string, ttl: number) =>
-      `Great news! A slot opened up at ${biz}: ${service} on ${date}. Reply YES to book it or NO to pass. This offer expires in ${ttl} minutes.`,
+      `A spot just opened — ${service} at ${biz} on ${date}. Want it? Just say the word and it's yours — I'm holding it for the next ${ttl} minutes.`,
   },
 
   // ── Payment confirmation to customer ────────────────────────────────────────
@@ -515,8 +507,8 @@ const strings = {
 
   // ── Operator console ─────────────────────────────────────────────────────────
   op_help: {
-    he: `🤖 *MiddleMan Operator Console*\n\nפקודות:\n• \`סטטוס הכל\` — מצב כל העסקים הפעילים\n• \`סטטוס [שם]\` — דוח מפורט לעסק אחד\n• \`מיומנויות [שם]\` — מצב זרימות המיומנויות לעסק\n• \`פניות\` — 10 פניות פתוחות אחרונות\n• \`פיצ'רים\` — בקשות פיצ'רים נדחות\n• \`הפעל מחדש [שם]\` — רשימת סקילים שניתן להפעיל מחדש\n• \`הפעל מחדש [שם] [סקיל]\` — הפעלת סקיל ספציפי מחדש\n• \`עדכן הכל: [הנחיה]\` — דחוף שינוי לכל הסוכנים`,
-    en: `🤖 *MiddleMan Operator Console*\n\nCommands:\n• \`STATUS ALL\` — health of all live businesses\n• \`STATUS [name]\` — detailed report for one business\n• \`SKILLS [name]\` — skill workflow state for one business\n• \`ESCALATIONS\` — last 10 unresolved customer escalations\n• \`FEATURES\` — deferred feature requests queue\n• \`RETRIGGER [name]\` — list retriggerable skills for a business\n• \`RETRIGGER [name] [skill]\` — re-create a specific skill workflow\n• \`UPDATE ALL: [instruction]\` — push a change to every live agent`,
+    he: `הנה מה שאני יכול לעשות לך מכאן:\n\n• \`סטטוס הכל\` — מצב כל העסקים הפעילים\n• \`סטטוס [שם]\` — דוח מפורט לעסק אחד\n• \`מיומנויות [שם]\` — מצב זרימות המיומנויות לעסק\n• \`פניות\` — 10 פניות פתוחות אחרונות\n• \`פיצ'רים\` — בקשות פיצ'רים נדחות\n• \`הפעל מחדש [שם]\` — רשימת סקילים שניתן להפעיל מחדש\n• \`הפעל מחדש [שם] [סקיל]\` — הפעלת סקיל ספציפי מחדש\n• \`עדכן הכל: [הנחיה]\` — דחוף שינוי לכל הסוכנים\n\nפשוט תכתוב מה שאתה צריך.`,
+    en: `Here's what I can pull up for you:\n\n• \`STATUS ALL\` — health of all live businesses\n• \`STATUS [name]\` — detailed report for one business\n• \`SKILLS [name]\` — skill workflow state for one business\n• \`ESCALATIONS\` — last 10 unresolved customer escalations\n• \`FEATURES\` — deferred feature requests queue\n• \`RETRIGGER [name]\` — list retriggerable skills for a business\n• \`RETRIGGER [name] [skill]\` — re-create a specific skill workflow\n• \`UPDATE ALL: [instruction]\` — push a change to every live agent\n\nJust tell me what you need.`,
   },
   op_status_no_businesses: {
     he: `לא נרשמו עסקים עדיין.`,
@@ -554,8 +546,8 @@ const strings = {
     en: (msg: string) => `Clarification needed before applying to all agents: ${msg}`,
   },
   op_update_classify_fail: {
-    he: `לא הצלחתי לסווג את ההנחיה. נסו לנסח מחדש.`,
-    en: `Couldn't classify that instruction. Please rephrase.`,
+    he: `רגע, לא תפסתי מה לעדכן. אפשר לנסח קצת אחרת?`,
+    en: `Hmm, I didn't catch what to update there — mind rephrasing?`,
   },
 
   // ── Operator — knowledge setup status ────────────────────────────────────────
@@ -634,8 +626,8 @@ const strings = {
     en: `Your Google Calendar connection has expired and could not be refreshed automatically. Please reconnect your calendar.`,
   },
   calendar_mirror_divergence: {
-    he: `⚠️ לא הצלחתי לעדכן אירוע ב-Google Calendar שלך אחרי כמה ניסיונות. המערכת הפנימית מעודכנת ונכונה, אבל ייתכן שתצוגת Google שלך אינה מסונכרנת כרגע. אבדוק שוב אוטומטית — אם זה נמשך, כדאי לחבר מחדש את לוח השנה.`,
-    en: `⚠️ I couldn't update an event in your Google Calendar after several attempts. Your internal schedule is correct and up to date, but your Google view may be temporarily out of sync. I'll keep retrying automatically — if this persists, reconnecting your calendar will fix it.`,
+    he: `⚠️ אירוע אחד לא נכנס ל-Google Calendar שלך אחרי כמה ניסיונות. אצלי הלו״ז מעודכן ונכון — רק תצוגת Google אולי לא מסונכרנת כרגע. אני ממשיך לנסות ברקע, ואם זה נמשך — חיבור מחדש של היומן יסדר את זה.`,
+    en: `⚠️ One event didn't make it into your Google Calendar after a few tries. Your actual schedule with me is correct and current — it's just the Google view that may be out of sync right now. I'm still retrying in the background, and if it keeps up, reconnecting the calendar will fix it.`,
   },
   hold_expired: {
     he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
