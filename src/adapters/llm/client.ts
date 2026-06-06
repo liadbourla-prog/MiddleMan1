@@ -15,13 +15,30 @@ const MODEL = MODELS.fast
 const ai = new GoogleGenAI({ apiKey: LLM_API_KEY, apiVersion: 'v1beta' })
 
 // Conversational generation on Pro, with a graceful Flash fallback so a slow or
-// failed Pro call never drops a reply. Pro reasons by default — callers must NOT
-// pass thinkingConfig; the Flash fallback re-adds thinkingBudget:0 (valid on Flash).
+// failed Pro call never drops a reply.
+//
+// Pro reasons by default and its thinking tokens draw down maxOutputTokens. A
+// short reply with a small budget (e.g. 512) gets starved — Pro spends the whole
+// budget thinking and returns EMPTY text, silently triggering the caller's robotic
+// fallback. So for Pro we bound thinking with a positive thinkingBudget (valid on
+// Pro; only 0 is invalid) and guarantee headroom for the actual answer. Flash
+// doesn't reason, so its fallback disables thinking and keeps the caller's budget.
+const PRO_THINKING_BUDGET = 1024
+const PRO_MIN_OUTPUT_TOKENS = 3072
 type GenRequest = Omit<Parameters<typeof ai.models.generateContent>[0], 'model'>
 
 async function generateConversational(request: GenRequest) {
+  const requestedMax = request.config?.maxOutputTokens ?? 1024
   try {
-    return await ai.models.generateContent({ ...request, model: MODELS.pro })
+    return await ai.models.generateContent({
+      ...request,
+      model: MODELS.pro,
+      config: {
+        ...request.config,
+        thinkingConfig: { thinkingBudget: PRO_THINKING_BUDGET },
+        maxOutputTokens: Math.max(requestedMax, PRO_MIN_OUTPUT_TOKENS),
+      },
+    })
   } catch (err) {
     console.warn('[llm] Pro generation failed, falling back to Flash', {
       error: err instanceof Error ? err.message : String(err),

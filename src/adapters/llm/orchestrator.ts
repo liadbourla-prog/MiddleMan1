@@ -38,13 +38,25 @@ const MAX_ITERATIONS = 5
 
 const ai = new GoogleGenAI({ apiKey: LLM_API_KEY ?? '', apiVersion: 'v1beta' })
 
-// Branch 3 runs on Pro for conversational fluency. Pro reasons by default, so we
-// must NOT pass thinkingConfig. If a Pro call fails, fall back to Flash (which
-// needs thinkingBudget:0) so a slow/failed Pro call never drops a manager reply.
+// Branch 3 runs on Pro for conversational fluency. Pro reasons by default and its
+// thinking draws down maxOutputTokens, so we bound thinking with a positive budget
+// (only 0 is invalid on Pro) and guarantee headroom for the reply — otherwise a
+// short budget gets fully spent on thinking and Pro returns empty text. If a Pro
+// call fails, fall back to Flash (thinkingBudget:0) so a turn is never dropped.
+const PRO_THINKING_BUDGET = 1024
+const PRO_MIN_OUTPUT_TOKENS = 3072
 type OrchestratorConfig = NonNullable<Parameters<typeof ai.models.generateContent>[0]['config']>
 async function generateOrchestratorTurn(contents: Content[], config: OrchestratorConfig) {
   try {
-    return await ai.models.generateContent({ model: MODELS.pro, contents, config })
+    return await ai.models.generateContent({
+      model: MODELS.pro,
+      contents,
+      config: {
+        ...config,
+        thinkingConfig: { thinkingBudget: PRO_THINKING_BUDGET },
+        maxOutputTokens: Math.max(config.maxOutputTokens ?? 1024, PRO_MIN_OUTPUT_TOKENS),
+      },
+    })
   } catch (err) {
     console.warn('[orchestrator] Pro turn failed, falling back to Flash', {
       error: err instanceof Error ? err.message : String(err),
