@@ -757,15 +757,16 @@ When isAnswer is true:
 - If they say "yes", "כן", "תשלום מראש", "pay first" etc. → requiresPayment: true.
 - If they say "no", "לא", "immediately", "מיידי" etc. → requiresPayment: false, paymentMethod: null.
 - Extract the payment method if mentioned (e.g. "Bit", "PayPal", "bank transfer", "ביט", "כרטיס אשראי").
+Keep paymentMethod in the manager's own language exactly as they expressed it — do NOT translate. "מזומן" stays "מזומן" (never "cash"), "העברה בנקאית" stays "העברה בנקאית" (never "bank transfer"). Brand names like Bit/PayPal stay as-is.
 Return JSON: { "isAnswer": boolean, "requiresPayment": boolean | null, "paymentMethod": string | null }`,
 
   escalation_policy: `Extract when the PA should escalate/hand off a conversation to the business owner, and what to tell the customer.
 First decide isAnswer: true only if the message actually describes when/how to escalate. Set isAnswer: false if the message is a counter-question (e.g. "what is an escalation?", "what do you mean?", "מה זה הסלמה?"), a refusal/deferral, or confusion. When isAnswer is false, return triggers: [], minimalEscalation: false, customerMessage: "passed_to_owner", customText: null.
 When isAnswer is true:
-- triggers: list of topic keywords or situations to escalate (empty array if minimal escalation)
+- triggers: list of SHORT topic keywords or phrases to escalate (empty array if minimal escalation). Keep each trigger in the manager's own language exactly as they would appear in a customer message — do NOT translate and do NOT paraphrase into full sentences. If the manager says customers asking to reach a human should escalate, use a concise Hebrew keyword like "לדבר עם נציג" or "בן אדם" — never English like "talk to a human", and never a mangled phrase like "talk to speak with a human". These triggers are matched against real customer messages, so they must be in the customers' language.
 - minimalEscalation: true if they want to escalate only truly unrecognizable requests
 - customerMessage: "silent" if notify owner silently, "passed_to_owner" if tell customer someone will be in touch, "owner_callback" if tell customer the owner will call back, "custom" if they specified custom wording
-- customText: their custom message text, or null
+- customText: their custom message text in the manager's own language, or null
 Return JSON: { "isAnswer": boolean, "triggers": string[], "minimalEscalation": boolean, "customerMessage": "silent"|"passed_to_owner"|"owner_callback"|"custom", "customText": string|null }`,
 }
 
