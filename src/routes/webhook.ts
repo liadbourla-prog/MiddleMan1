@@ -36,8 +36,6 @@ import { confirmPaymentReceived } from '../domain/booking/engine.js'
 import { enqueueMessage } from '../workers/message-retry.js'
 import { loadCustomerMemory } from '../domain/customer/profile.js'
 import { buildHydratedContext } from '../domain/session/hydration.js'
-import { checkBusinessHours, computeNextOpenMs } from '../domain/hours/gate.js'
-import { queueMessageForLater } from '../workers/queued-messages.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply } from '../adapters/llm/client.js'
@@ -272,38 +270,6 @@ async function routeCustomerMessage(
   const waCredentials = business.whatsappPhoneNumberId && business.whatsappAccessToken
     ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
     : undefined
-
-  // Business hours gate — queue messages when closed; managers always pass through
-  if (!business.available247) {
-    const hoursCheck = await checkBusinessHours(db, business)
-    if (!hoursCheck.open) {
-      const delayMs = await computeNextOpenMs(db, business)
-      const opensAt = hoursCheck.opensAt ?? ''
-      if (delayMs !== null && delayMs > 0) {
-        await queueMessageForLater(business.id, msg.fromNumber, msg.toNumber, msg.body, delayMs)
-        const closedQueuedFallback = i18n.closed_queued[lang](business.name, opensAt)
-        const closedQueuedReply = await generateProactiveCustomerMessage({
-          businessName: business.name,
-          language: lang,
-          situation: `The business is currently closed${opensAt ? ` and reopens at ${opensAt}` : ''}. The customer's message has been saved and we'll reply when we open. Let them know warmly.`,
-          fallback: closedQueuedFallback,
-          timeoutMs: 3000,
-        })
-        await sendMessage({ toNumber: msg.fromNumber, body: closedQueuedReply }, waCredentials)
-      } else {
-        const closedDropFallback = i18n.closed_drop[lang](business.name, opensAt)
-        const closedDropReply = await generateProactiveCustomerMessage({
-          businessName: business.name,
-          language: lang,
-          situation: `The business is currently closed${opensAt ? ` and reopens at ${opensAt}` : ''}. Acknowledge briefly and invite the customer to message again when we're open.`,
-          fallback: closedDropFallback,
-          timeoutMs: 3000,
-        })
-        await sendMessage({ toNumber: msg.fromNumber, body: closedDropReply }, waCredentials)
-      }
-      return
-    }
-  }
 
   // Paused gate — PA is silent when owner has manually paused it
   if (business.paused) {
