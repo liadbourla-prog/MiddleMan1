@@ -12,7 +12,8 @@ import type { CalendarClient } from '../calendar/client.js'
 import type { TranscriptTurn } from './types.js'
 import type { Lang } from '../../domain/i18n/t.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
-import { middlemanExplainBlock } from './middleman-identity.js'
+import { buildVoiceCore } from './voice.js'
+import { MODELS } from './models.js'
 import {
   executeListCalendarEvents,
   executeCreateCalendarEvent,
@@ -33,10 +34,28 @@ import {
 } from '../../domain/orchestrator-log.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
-const MODEL = 'gemini-2.5-flash'
 const MAX_ITERATIONS = 5
 
 const ai = new GoogleGenAI({ apiKey: LLM_API_KEY ?? '', apiVersion: 'v1beta' })
+
+// Branch 3 runs on Pro for conversational fluency. Pro reasons by default, so we
+// must NOT pass thinkingConfig. If a Pro call fails, fall back to Flash (which
+// needs thinkingBudget:0) so a slow/failed Pro call never drops a manager reply.
+type OrchestratorConfig = NonNullable<Parameters<typeof ai.models.generateContent>[0]['config']>
+async function generateOrchestratorTurn(contents: Content[], config: OrchestratorConfig) {
+  try {
+    return await ai.models.generateContent({ model: MODELS.pro, contents, config })
+  } catch (err) {
+    console.warn('[orchestrator] Pro turn failed, falling back to Flash', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return await ai.models.generateContent({
+      model: MODELS.fast,
+      contents,
+      config: { ...config, thinkingConfig: { thinkingBudget: 0 } },
+    })
+  }
+}
 
 // ── Tool declarations ─────────────────────────────────────────────────────────
 
@@ -270,9 +289,14 @@ function buildSystemPrompt(params: {
     ? conversationHistory.map((t) => `${t.role === 'customer' ? 'Manager' : 'Assistant'}: ${t.text}`).join('\n')
     : ''
 
-  return `You are the PA admin assistant for ${businessName}. Today is ${currentDateTime} in ${timezone}.
+  return `You are the PA admin assistant for ${businessName}, texting the business owner as the business. Today is ${currentDateTime} in ${timezone}.
+
+${buildVoiceCore('manager')}
 
 The manager is texting you on WhatsApp. You have access to tools. Use them when the manager needs information or action. For straightforward questions you can answer from context, reply directly without calling any tool.
+
+## Tool results are raw data — never echo them
+Every tool returns structured facts FOR YOU, not text to send. Never quote a tool's fields, status strings, or confirmation text back to the manager. Read what happened, then say it in your own fresh, human words — varied each time (see the voice rules above). A passive "X was created / updated / deleted" is a failure; say "added X", "moved it to…", "done — that's off the calendar".
 
 ## Language
 Reply entirely in ${language}. All WhatsApp formatting rules apply:
@@ -290,10 +314,8 @@ Reply entirely in ${language}. All WhatsApp formatting rules apply:
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 
-${middlemanExplainBlock(lang, 'brief')}
-
 ## After completing actions
-If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them. Do not notify customers automatically — ask first.
+If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them — phrased naturally, never the same way twice. Do not notify customers automatically — ask first.
 
 ## Memory
 Cross-session context:
@@ -390,22 +412,17 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
 
   let iterations = 0
   const loopStart = Date.now()
-  const fallback = lang === 'he' ? 'אירעה שגיאה בעיבוד הבקשה.' : 'Something went wrong processing your request.'
+  const fallback = lang === 'he' ? 'רגע, משהו נתקע לי — אפשר לנסות שוב?' : 'Hmm, something got stuck on my end — mind trying that again?'
 
   while (iterations < MAX_ITERATIONS) {
     const iterStart = Date.now()
     let result
     try {
-      result = await ai.models.generateContent({
-        model: MODEL,
-        contents,
-        config: {
-          systemInstruction: systemPrompt,
-          tools,
-          toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
-          thinkingConfig: { thinkingBudget: 0 },
-          maxOutputTokens: 1024,
-        },
+      result = await generateOrchestratorTurn(contents, {
+        systemInstruction: systemPrompt,
+        tools,
+        toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.AUTO } },
+        maxOutputTokens: 1024,
       })
     } catch (err) {
       logOrchestratorError({ businessId, sessionId, messageId, error: err, iteration: iterations })
