@@ -730,6 +730,10 @@ const onboardingHoursSchema = z.object({
   days: z.array(onboardingHourEntrySchema),
 })
 
+const calendarChoiceSchema = z.object({
+  choice: z.enum(['skip', 'connect', 'unclear']),
+})
+
 const PARSE_PROMPTS: Record<ParseableOnboardingStep, string> = {
   cancellation_policy: `Extract how many hours before an appointment the customer wants to allow cancellations.
 If they say "any time", "no restriction", "ללא הגבלה", "כל עת", "0", "whenever", etc. → hours: 0.
@@ -852,6 +856,27 @@ Rules:
 Return JSON: { "understood": boolean, "always247": boolean, "days": [ { "dayOfWeek": number, "openTime": "HH:MM", "closeTime": "HH:MM" } ] }`
   const safeMessage = sanitizeUserInput(message)
   return callWithSchema(systemPrompt, safeMessage, onboardingHoursSchema)
+}
+
+// Onboarding "calendar" step — the manager was sent a Google OAuth link and asked
+// to connect their calendar. They reply in free text. Decide whether they want to
+// SKIP Google and run on the internal calendar, or are still going to CONNECT.
+export async function parseCalendarChoice(
+  message: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<{ choice: 'skip' | 'connect' | 'unclear' }>> {
+  const langNote = lang === 'he' ? 'The manager is writing in Hebrew.' : 'The manager is writing in English.'
+  const systemPrompt = `${langNote}
+
+The manager was sent a Google Calendar connection link and asked to connect their calendar. Classify their reply:
+
+- "skip": they decline, defer, or prefer NOT to connect Google now — they want to work without Google / use the internal calendar. Examples: "כרגע לא", "לא עכשיו", "בלי גוגל", "רוצה לעבוד ללא גוגל", "אין לי גוגל", "דלג", "אחר כך", "not now", "skip", "without Google", "I'll do it later", "no thanks".
+- "connect": they confirm they want to / did connect, or ask where the link is. Examples: "כן", "מחובר", "חיברתי", "איפה הקישור?", "yes", "connected", "done", "send the link".
+- "unclear": anything else — a greeting, an unrelated question, or confusion.
+
+Return JSON: { "choice": "skip" | "connect" | "unclear" }`
+  const safeMessage = sanitizeUserInput(message)
+  return callWithSchema(systemPrompt, safeMessage, calendarChoiceSchema)
 }
 
 // ── Proactive customer message generator ─────────────────────────────────────

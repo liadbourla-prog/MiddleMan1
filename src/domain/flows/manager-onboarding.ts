@@ -5,7 +5,7 @@ import { businesses, importTokens, managerInstructions, serviceTypes, availabili
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
 import type { ResolvedIdentity } from '../identity/types.js'
-import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, type OnboardingHourEntry } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, parseCalendarChoice, type OnboardingHourEntry } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
@@ -458,7 +458,19 @@ export async function handleCalendarStepWithBody(
   body: string,
   lang: Lang = 'he',
 ): Promise<OnboardingResult> {
-  if (body.trim().toLowerCase() === 'internal' || body.trim() === 'פנימי') {
+  const lower = body.trim().toLowerCase()
+  let wantsInternal = lower === 'internal' || body.trim() === 'פנימי'
+
+  // The manager replies in free text — detect a "skip Google / work without
+  // calendar" intent so we don't loop re-sending the OAuth link forever.
+  if (!wantsInternal) {
+    const choice = await parseCalendarChoice(body, lang)
+    if (choice.ok && choice.data.choice === 'skip') {
+      wantsInternal = true
+    }
+  }
+
+  if (wantsInternal) {
     await db.update(businesses)
       .set({ onboardingStep: 'customer_import', calendarMode: 'internal' })
       .where(eq(businesses.id, business.id))
