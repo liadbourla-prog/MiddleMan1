@@ -92,7 +92,7 @@ export async function executeListCalendarEvents(
 
       const slots = await getOpenSlots(ctx.db, business, { start: from, end: to }, duration, { maxSlots: 12 })
       if (slots.length === 0) {
-        return { freeSlots: [], summary: ctx.lang === 'he' ? 'אין משבצות פנויות בשבוע הקרוב.' : 'No open slots in the next 7 days.' }
+        return { freeSlots: [], count: 0 }
       }
       return {
         freeSlots: slots.map((s) => ({
@@ -137,7 +137,7 @@ export async function executeListCalendarEvents(
       .map(({ _sortTs: _omit, ...rest }) => rest)
 
     if (formatted.length === 0) {
-      return { events: [], summary: ctx.lang === 'he' ? 'אין אירועים בתקופה זו.' : 'No events in this period.' }
+      return { events: [], count: 0 }
     }
 
     return { events: formatted, count: formatted.length }
@@ -185,10 +185,12 @@ export async function executeCreateCalendarEvent(
     .limit(5)
 
   if (actualConflicts.length > 0) {
-    const msg = ctx.lang === 'he'
-      ? `אותה שעה כוללת ${actualConflicts.length} תור/ים מאושר/ים. יצירת האירוע תגרום לחפיפה. האם לבטל את התורים קודם, או לבחור שעה אחרת?`
-      : `That slot has ${actualConflicts.length} confirmed booking(s). Creating the event anyway would show as double-booked. Do you want to cancel the booking(s) first, or choose a different time?`
-    return { success: false, message: msg }
+    return {
+      success: false,
+      reason: 'conflicts_with_bookings',
+      conflictCount: actualConflicts.length,
+      guidance: 'Tell the manager the slot already has confirmed booking(s) and ask whether to cancel those first or pick another time. Phrase it naturally.',
+    }
   }
 
   // Persist to calendar_blocks — the internal source of truth. This is the fix
@@ -296,13 +298,10 @@ export async function executeScheduleGroupSession(
 
   const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
   const when = start.toLocaleString(locale, { timeZone: ctx.timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
-  const capStr = maxParticipants ? (ctx.lang === 'he' ? ` (עד ${maxParticipants} משתתפים)` : ` (up to ${maxParticipants} participants)`) : ''
   return {
     success: true,
     eventId: `${BLOCK_ID_PREFIX}${block.id}`,
-    confirmation: ctx.lang === 'he'
-      ? `✅ ${title} נקבע ל-${when}${capStr}.`
-      : `✅ ${title} scheduled for ${when}${capStr}.`,
+    scheduled: { title, when, maxParticipants: maxParticipants ?? null },
   }
 }
 
@@ -323,14 +322,13 @@ export async function executeDeleteCalendarEvent(
   if (blockId) {
     const removed = await deleteBlockById(ctx.db, ctx.businessId, blockId)
     if (!removed) {
-      return { success: false, message: ctx.lang === 'he' ? 'האירוע לא נמצא.' : 'Event not found.' }
+      return { success: false, reason: 'not_found' }
     }
     // Durable mirror: remove the corresponding Google event when one was created.
     if (removed.googleEventId) {
       await enqueueBlockDeletion(ctx.businessId, removed.id, removed.googleEventId)
     }
-    const hint = args.confirmationHint ? ` (${args.confirmationHint})` : ''
-    return { success: true, message: ctx.lang === 'he' ? `האירוע${hint} נמחק.` : `Event${hint} deleted.` }
+    return { success: true, deleted: { what: args.confirmationHint ?? null } }
   }
 
   // Guard: refuse to delete events that correspond to active customer bookings
@@ -345,20 +343,20 @@ export async function executeDeleteCalendarEvent(
     .limit(1)
 
   if (bookingRow.length > 0) {
-    const msg = ctx.lang === 'he'
-      ? 'לא ניתן למחוק אירוע זה — הוא מכיל תור לקוח מאושר. השתמש ב"ביטול תור" דרך הגדרות העסק.'
-      : 'Cannot delete this event — it contains an active customer booking. Use manageBusinessSettings to cancel bookings.'
-    return { success: false, message: msg }
+    return {
+      success: false,
+      reason: 'contains_active_booking',
+      guidance: 'This event is an active customer booking — it cannot be deleted here. Tell the manager they can cancel the booking via business settings instead. Phrase it naturally.',
+    }
   }
 
   const result = await ctx.calendar.deleteEvent(args.eventId)
 
   if (result.status === 'deleted') {
-    const hint = args.confirmationHint ? ` (${args.confirmationHint})` : ''
-    return { success: true, message: ctx.lang === 'he' ? `האירוע${hint} נמחק.` : `Event${hint} deleted.` }
+    return { success: true, deleted: { what: args.confirmationHint ?? null } }
   }
   if (result.status === 'not_found') {
-    return { success: false, message: ctx.lang === 'he' ? 'האירוע לא נמצא.' : 'Event not found.' }
+    return { success: false, reason: 'not_found' }
   }
   return { success: false, error: result.status === 'error' ? result.reason : 'Unknown error' }
 }
@@ -388,7 +386,7 @@ export async function executeManageBusinessSettings(
   }
 
   if (classified.data.instructionType === 'unknown') {
-    return { success: false, error: ctx.lang === 'he' ? 'לא הצלחתי להבין את ההוראה.' : 'Could not understand the instruction.' }
+    return { success: false, reason: 'unclear_instruction', guidance: 'You could not tell what config change the manager wants. Ask them to clarify, in your own words. Phrase it naturally.' }
   }
 
   const [saved] = await ctx.db
@@ -405,7 +403,7 @@ export async function executeManageBusinessSettings(
     .returning({ id: managerInstructions.id })
 
   if (!saved) {
-    return { success: false, error: ctx.lang === 'he' ? 'שגיאה בשמירת ההוראה.' : 'Failed to save instruction.' }
+    return { success: false, reason: 'save_failed', guidance: 'The change could not be saved. Tell the manager it did not go through and offer to try again. Phrase it naturally.' }
   }
 
   const result = await applyInstruction(
@@ -419,10 +417,10 @@ export async function executeManageBusinessSettings(
   )
 
   if (!result.ok) {
-    return { success: false, error: result.reason }
+    return { success: false, reason: 'apply_failed', detail: result.reason, guidance: 'The change did not apply. Tell the manager plainly and offer to retry. detail is raw — phrase it naturally, never echo it verbatim.' }
   }
 
-  return { success: true, confirmation: result.confirmationMessage }
+  return { success: true, fact: result.confirmationMessage, guidance: 'The change is live. fact is raw data describing what changed — confirm it to the manager in your own words, never quote it. After a customer-facing change, offer to notify customers.' }
 }
 
 // ── searchWeb ─────────────────────────────────────────────────────────────────
@@ -443,7 +441,7 @@ export async function executeSearchWeb(
     })
 
     if (response.results.length === 0) {
-      return { results: [], summary: ctx.lang === 'he' ? 'לא נמצאו תוצאות.' : 'No results found.' }
+      return { results: [], count: 0 }
     }
 
     return {
@@ -455,13 +453,9 @@ export async function executeSearchWeb(
     }
   } catch (err) {
     if (err instanceof TavilyRateLimitError) {
-      return {
-        error: ctx.lang === 'he'
-          ? 'הגעת למגבלת החיפוש היומית. נסה שוב מחר.'
-          : 'Daily web search limit reached. Try again tomorrow.',
-      }
+      return { success: false, reason: 'rate_limited', guidance: "The daily web-search limit is reached. Tell the manager it'll be available again tomorrow, in your own words." }
     }
-    return { error: err instanceof Error ? err.message : String(err) }
+    return { success: false, reason: 'search_failed', guidance: 'The web search failed. Tell the manager plainly and offer to try again. Never surface the raw error.' }
   }
 }
 
@@ -498,7 +492,7 @@ export async function executeLookupCustomer(
       .limit(5)
 
     if (rows.length === 0) {
-      return { found: false, message: ctx.lang === 'he' ? 'לא נמצא לקוח.' : 'No customer found.' }
+      return { found: false }
     }
 
     // Fetch profile notes for each result
@@ -525,7 +519,7 @@ export async function executeLookupCustomer(
         .from(identities)
         .where(and(eq(identities.businessId, ctx.businessId), eq(identities.phoneNumber, identifier)))
         .limit(1)
-      if (!id) return { found: false, message: ctx.lang === 'he' ? 'לא נמצא לקוח.' : 'No customer found.' }
+      if (!id) return { found: false }
       identityId = id.id
     }
 
@@ -612,7 +606,7 @@ export async function executeSaveContactNote(
       }).onConflictDoNothing()
     }
 
-    return { success: true, message: ctx.lang === 'he' ? 'הערה נשמרה.' : 'Note saved.' }
+    return { success: true, saved: { target: 'customer' }, guidance: 'Note saved. Confirm briefly in your own words, never quote this.' }
   }
 
   if (args.targetType === 'business_contact') {
@@ -637,7 +631,7 @@ export async function executeSaveContactNote(
       })
     }
 
-    return { success: true, message: ctx.lang === 'he' ? 'הערה נשמרה לאיש הקשר.' : 'Note saved to contact.' }
+    return { success: true, saved: { target: 'business_contact', name: args.identifier }, guidance: 'Note saved to the contact. Confirm briefly in your own words, never quote this.' }
   }
 
   return { error: 'Unknown targetType' }
