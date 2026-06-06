@@ -36,10 +36,11 @@ export type LlmResult<T> =
 export type ParseableOnboardingStep = 'cancellation_policy' | 'payment' | 'escalation_policy'
 
 export type OnboardingAnswerOutput =
-  | { step: 'cancellation_policy'; hours: number }
-  | { step: 'payment'; requiresPayment: boolean; paymentMethod: string | null }
+  | { step: 'cancellation_policy'; isAnswer: boolean; hours: number | null }
+  | { step: 'payment'; isAnswer: boolean; requiresPayment: boolean | null; paymentMethod: string | null }
   | {
       step: 'escalation_policy'
+      isAnswer: boolean
       triggers: string[]
       minimalEscalation: boolean
       customerMessage: 'silent' | 'passed_to_owner' | 'owner_callback' | 'custom'

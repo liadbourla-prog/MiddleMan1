@@ -691,12 +691,17 @@ Output: the explanation message ONLY. No quotes, no labels, no preamble.`
 
 // ── Onboarding: structured answer parser ─────────────────────────────────────
 
-const cancellationSchema = z.object({ hours: z.number().int().min(0) })
+const cancellationSchema = z.object({
+  isAnswer: z.boolean(),
+  hours: z.number().int().min(0).nullable(),
+})
 const paymentSchema = z.object({
-  requiresPayment: z.boolean(),
+  isAnswer: z.boolean(),
+  requiresPayment: z.boolean().nullable(),
   paymentMethod: z.string().nullable(),
 })
 const escalationSchema = z.object({
+  isAnswer: z.boolean(),
   triggers: z.array(z.string()),
   minimalEscalation: z.boolean(),
   customerMessage: z.enum(['silent', 'passed_to_owner', 'owner_callback', 'custom']),
@@ -736,22 +741,28 @@ const calendarChoiceSchema = z.object({
 
 const PARSE_PROMPTS: Record<ParseableOnboardingStep, string> = {
   cancellation_policy: `Extract how many hours before an appointment the customer wants to allow cancellations.
-If they say "any time", "no restriction", "ללא הגבלה", "כל עת", "0", "whenever", etc. → hours: 0.
-If they mention days (e.g. "two days") convert to hours (48).
-Return JSON: { "hours": number }`,
+First decide isAnswer: true only if the message actually answers the cancellation-cutoff question. Set isAnswer: false if the message is a counter-question (e.g. "what do you mean by cutoff?", "מה זה בעצם?"), a refusal/deferral ("not now", "later", "אחר כך"), or confusion. When isAnswer is false, return hours: null.
+When isAnswer is true:
+- If they say "any time", "no restriction", "ללא הגבלה", "כל עת", "0", "whenever", etc. → hours: 0.
+- If they mention days (e.g. "two days") convert to hours (48).
+Return JSON: { "isAnswer": boolean, "hours": number | null }`,
 
   payment: `Extract whether customers must pay before their booking is confirmed, and if so what payment method.
-If they say "yes", "כן", "תשלום מראש", "pay first" etc. → requiresPayment: true.
-If they say "no", "לא", "immediately", "מיידי" etc. → requiresPayment: false, paymentMethod: null.
-Extract the payment method if mentioned (e.g. "Bit", "PayPal", "bank transfer", "ביט", "כרטיס אשראי").
-Return JSON: { "requiresPayment": boolean, "paymentMethod": string | null }`,
+First decide isAnswer: true only if the message actually answers the prepayment question. Set isAnswer: false if the message is a counter-question (e.g. "which do you recommend?", "מה אתה ממליץ?"), a refusal/deferral, or confusion. When isAnswer is false, return requiresPayment: null and paymentMethod: null.
+When isAnswer is true:
+- If they say "yes", "כן", "תשלום מראש", "pay first" etc. → requiresPayment: true.
+- If they say "no", "לא", "immediately", "מיידי" etc. → requiresPayment: false, paymentMethod: null.
+- Extract the payment method if mentioned (e.g. "Bit", "PayPal", "bank transfer", "ביט", "כרטיס אשראי").
+Return JSON: { "isAnswer": boolean, "requiresPayment": boolean | null, "paymentMethod": string | null }`,
 
   escalation_policy: `Extract when the PA should escalate/hand off a conversation to the business owner, and what to tell the customer.
+First decide isAnswer: true only if the message actually describes when/how to escalate. Set isAnswer: false if the message is a counter-question (e.g. "what is an escalation?", "what do you mean?", "מה זה הסלמה?"), a refusal/deferral, or confusion. When isAnswer is false, return triggers: [], minimalEscalation: false, customerMessage: "passed_to_owner", customText: null.
+When isAnswer is true:
 - triggers: list of topic keywords or situations to escalate (empty array if minimal escalation)
 - minimalEscalation: true if they want to escalate only truly unrecognizable requests
 - customerMessage: "silent" if notify owner silently, "passed_to_owner" if tell customer someone will be in touch, "owner_callback" if tell customer the owner will call back, "custom" if they specified custom wording
 - customText: their custom message text, or null
-Return JSON: { "triggers": string[], "minimalEscalation": boolean, "customerMessage": "silent"|"passed_to_owner"|"owner_callback"|"custom", "customText": string|null }`,
+Return JSON: { "isAnswer": boolean, "triggers": string[], "minimalEscalation": boolean, "customerMessage": "silent"|"passed_to_owner"|"owner_callback"|"custom", "customText": string|null }`,
 }
 
 export async function parseOnboardingAnswer(

@@ -73,6 +73,19 @@ async function onboardingQuestion(
   return q || getPrompt(step as OnboardingStep, lang)
 }
 
+// The manager replied with something that is NOT an answer to the current step —
+// a counter-question, a refusal/deferral, or confusion. Acknowledge it and re-ask
+// in plain language instead of either silently advancing with a fabricated value
+// or repeating the identical prompt verbatim.
+async function notAnswerReply(
+  step: string,
+  businessName: string,
+  lang: Lang,
+  guidance: string,
+): Promise<OnboardingResult> {
+  return { reply: await onboardingQuestion(step, businessName, lang, { isRetry: true, extraContext: guidance }) }
+}
+
 // ── Step handlers ─────────────────────────────────────────────────────────────
 
 async function handleBusinessNameStep(
@@ -122,6 +135,12 @@ async function handleServiceStep(
   // The manager may list several services in one message. Parse them all, then
   // apply each through the deterministic core (applyInstruction → applyServiceChange).
   const parsed = await parseOnboardingServices(msg.body, lang)
+  if (parsed.ok && parsed.data.understood === false) {
+    // A counter-question or confusion rather than a service list. Explain instead
+    // of repeating the same prompt.
+    return notAnswerReply('services', business.name, lang,
+      'The manager did not list any services — they asked a question or seem unsure what counts. In one or two sentences explain that a service is anything a customer can book (e.g. a haircut, a 60-minute yoga class, a consultation), that they can list several at once with rough durations, then ask again what they offer.')
+  }
   if (!parsed.ok || !parsed.data.understood || parsed.data.services.length === 0) {
     return { reply: retryPrompt }
   }
@@ -215,6 +234,13 @@ async function handleHoursStep(
     return { reply: nextQ }
   }
 
+  if (parsed.ok && parsed.data.understood === false) {
+    // Comprehension miss — a counter-question, confusion, or "by appointment only"
+    // with no concrete hours. Explain rather than repeating the same prompt.
+    return notAnswerReply('hours', business.name, lang,
+      'The manager did not give usable opening hours — they asked a question, expressed confusion, or said something like "by appointment only" / "flexible". In one or two sentences explain that the PA needs general weekly hours to know when customers may book (e.g. "Sun–Thu 9:00–18:00"), and that they can simply say "24/7" if always available, then ask again. If they work strictly by appointment with no fixed hours, ask for the broad window they are typically reachable.')
+  }
+
   if (!parsed.ok || !parsed.data.understood || parsed.data.days.length === 0) {
     return { reply: retryPrompt }
   }
@@ -286,6 +312,11 @@ async function handleCancellationPolicyStep(
   let hours: number | null = null
   const parsed = await parseOnboardingAnswer('cancellation_policy', body, lang)
   if (parsed.ok && parsed.data.step === 'cancellation_policy') {
+    if (!parsed.data.isAnswer) {
+      // Counter-question / confusion / deferral — don't fabricate a cutoff.
+      return notAnswerReply('cancellation_policy', business.name, lang,
+        'The manager did not answer the cancellation-cutoff question — they asked what it means, expressed confusion, or deferred. In one or two sentences explain plainly that this is the latest a customer can cancel before their appointment without penalty (e.g. "up to 2 hours before"), then ask again. Note they can say "any time" if they allow cancellations with no restriction.')
+    }
     hours = parsed.data.hours
   } else {
     const n = parseInt(body.replace(/\D/g, ''), 10)
@@ -323,7 +354,29 @@ async function handlePaymentStep(
 
   // Sub-step: waiting for payment method after "yes" without method
   if (business.paymentMethod === 'pending' || (business.confirmationGate === 'post_payment' && !business.paymentMethod?.trim())) {
-    const method = body.slice(0, 100)
+    const parsedMethod = await parseOnboardingAnswer('payment', body, lang)
+    const p = parsedMethod.ok && parsedMethod.data.step === 'payment' ? parsedMethod.data : null
+
+    // Reversal: "actually, no prepayment needed" — switch to immediate gate.
+    if (p?.isAnswer && p.requiresPayment === false) {
+      await db.update(businesses)
+        .set({ onboardingStep: 'escalation_policy', confirmationGate: 'immediate', paymentMethod: null })
+        .where(eq(businesses.id, business.id))
+      log.info({ businessId: business.id }, 'Onboarding: payment gate reversed to immediate at method sub-step')
+      const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
+        justConfirmed: i18n.ob_payment_immediate[lang],
+      })
+      return { reply: nextQ }
+    }
+
+    // A counter-question / confusion with no extractable method — re-ask instead
+    // of storing the question text verbatim as the payment method.
+    if (p && !p.isAnswer && !p.paymentMethod) {
+      return notAnswerReply('payment_method', business.name, lang,
+        'The manager was asked which payment method they accept but replied with a question or unclear text rather than a method. Briefly answer or clarify, then ask again which method they accept, listing examples (bank transfer, Bit, credit card, cash).')
+    }
+
+    const method = (p?.paymentMethod ?? body.trim()).slice(0, 100)
     await db.update(businesses)
       .set({ onboardingStep: 'escalation_policy', paymentMethod: method })
       .where(eq(businesses.id, business.id))
@@ -340,6 +393,11 @@ async function handlePaymentStep(
 
   const parsed = await parseOnboardingAnswer('payment', body, lang)
   if (parsed.ok && parsed.data.step === 'payment') {
+    if (!parsed.data.isAnswer) {
+      // Counter-question / confusion / deferral — don't fabricate a payment gate.
+      return notAnswerReply('payment', business.name, lang,
+        'The manager did not answer the prepayment question — they asked a question back, expressed confusion, or deferred. In one or two sentences explain plainly that this is about whether a customer must pay before their booking is confirmed (vs. confirming immediately and paying later/in person), then ask again. If they ask which method to use, briefly mention common options (Bit, bank transfer, credit card, cash) but still ask whether prepayment is required.')
+    }
     requiresPayment = parsed.data.requiresPayment
     paymentMethod = parsed.data.paymentMethod
   } else {
@@ -400,6 +458,13 @@ async function handleEscalationPolicyStep(
   // Try LLM extraction, fall back to regex
   let rules: EscalationRule[]
   const parsed = await parseOnboardingAnswer('escalation_policy', body, lang)
+
+  if (parsed.ok && parsed.data.step === 'escalation_policy' && !parsed.data.isAnswer) {
+    // Not an answer (a counter-question / confusion / deferral) — don't fabricate
+    // escalation rules and silently advance. Explain and re-ask.
+    return notAnswerReply('escalation_policy', business.name, lang,
+      'The manager did not answer the escalation question — they asked what it means, expressed confusion, or deferred. In one or two sentences explain plainly that escalation means handing the conversation to the owner for things the PA should not handle (e.g. complaints, refunds, or anything it does not understand), give a concrete example, then ask again what should trigger a hand-off. You may note they can simply say "only things you don\'t understand" for a minimal setup.')
+  }
 
   if (parsed.ok && parsed.data.step === 'escalation_policy') {
     const d = parsed.data
@@ -463,10 +528,12 @@ export async function handleCalendarStepWithBody(
 
   // The manager replies in free text — detect a "skip Google / work without
   // calendar" intent so we don't loop re-sending the OAuth link forever.
+  let choiceKind: 'skip' | 'connect' | 'unclear' | null = null
   if (!wantsInternal) {
     const choice = await parseCalendarChoice(body, lang)
-    if (choice.ok && choice.data.choice === 'skip') {
-      wantsInternal = true
+    if (choice.ok) {
+      choiceKind = choice.data.choice
+      if (choiceKind === 'skip') wantsInternal = true
     }
   }
 
@@ -480,15 +547,20 @@ export async function handleCalendarStepWithBody(
     return { reply: nextQ }
   }
 
-  // Step advances via OAuth callback — resend the link with real URL
+  // Step advances via OAuth callback — resend the link with real URL.
+  // When the reply was a question/confusion (unclear), address it instead of
+  // re-pushing a bare "click the link".
   const calendarLink = buildCalendarLink(business, baseUrl)
   const calWaitFallback = i18n.ob_calendar_waiting[lang](calendarLink)
+  const calWaitContext = choiceKind === 'unclear'
+    ? `The manager replied with a question or confusion about connecting Google Calendar rather than connecting or declining. In one or two sentences reassure them: the link is a standard Google sign-in that lets the PA read and sync their calendar so bookings never clash, it is safe and they can disconnect any time, and they can instead choose to work without Google on the internal calendar if they prefer (they can just say so). Then share the link on its own line. The OAuth link is: ${calendarLink}`
+    : `The business has not connected Google Calendar yet. Remind them the link is waiting and they need to click it. The OAuth link is: ${calendarLink}`
   const calWaitQ = await generateOnboardingReply({
     step: 'calendar',
     businessName: business.name,
     lang,
     isRetry: false,
-    extraContext: `The business has not connected Google Calendar yet. Remind them the link is waiting and they need to click it. The OAuth link is: ${calendarLink}`,
+    extraContext: calWaitContext,
   })
   const calWaitReply = calWaitQ || calWaitFallback
   const calWaitWithUrl = calWaitReply.includes(calendarLink) ? calWaitReply : `${calWaitReply}\n${calendarLink}`
@@ -523,6 +595,14 @@ async function handleCustomerImportStep(
     const importLinkReply = importLinkQ || importLinkFallback
     const importLinkWithUrl = importLinkReply.includes(uploadUrl) ? importLinkReply : `${importLinkReply}\n${uploadUrl}`
     return { reply: importLinkWithUrl }
+  }
+
+  // Only an explicit "no" skips the import. A counter-question or confusion must
+  // NOT be read as a decline — otherwise the manager loses the whole step by
+  // asking "what format?". Explain and re-ask, staying on this step.
+  if (!isNegative(msg.body)) {
+    return notAnswerReply('customer_import', business.name, lang,
+      'The manager neither clearly accepted nor declined importing their existing customers — they asked a question or seem unsure. In one or two sentences explain that you can bulk-import their existing customer list or booking history from a CSV/Excel file so people are recognized from day one, that it is optional, then ask again whether they want to import now or skip. If they asked about the file format, mention it accepts a contacts CSV (name, phone) or booking history (name, phone, date, service).')
   }
 
   await db.update(businesses).set({ onboardingStep: 'verify' }).where(eq(businesses.id, business.id))
@@ -582,9 +662,21 @@ async function handleVerifyStep(
     timezone: business.timezone,
   }, lang)
 
-  if (!classifyResult.ok || classifyResult.data.ambiguous) {
+  if (!classifyResult.ok || classifyResult.data.ambiguous || classifyResult.data.instructionType === 'unknown') {
+    // Not a clear change instruction — most often a review/meta question
+    // ("did everything save?", "what does GO do?", "is the calendar connected?").
+    // Answer it by re-showing the saved setup instead of trying to apply it as a
+    // correction (or silently dropping an "unknown" instruction).
     const clarification = classifyResult.ok ? classifyResult.data.clarificationNeeded : null
-    return { reply: clarification ?? t('ob_verify_go_prompt', lang) }
+    const summary = await buildVerifySummary(db, business, lang)
+    const reply = await generateOnboardingReply({
+      step: 'verify',
+      businessName: business.name,
+      lang,
+      isRetry: false,
+      extraContext: `The manager replied with something that is not a clear change instruction — most likely a question about their setup or about what happens next, not a correction. ${clarification ? `If relevant, address this: ${clarification}. ` : ''}Briefly reassure them their setup is saved, then show this summary and ask them to reply GO to launch, or tell you what to change:\n${summary}`,
+    })
+    return { reply: reply || `${summary}\n\n${t('ob_verify_go_prompt', lang)}` }
   }
 
   const instruction = classifyResult.data
