@@ -12,6 +12,7 @@ import type { CalendarClient } from '../calendar/client.js'
 import type { TranscriptTurn } from './types.js'
 import type { Lang } from '../../domain/i18n/t.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
+import { middlemanExplainBlock } from './middleman-identity.js'
 import {
   executeListCalendarEvents,
   executeCreateCalendarEvent,
@@ -288,6 +289,8 @@ Reply entirely in ${language}. All WhatsApp formatting rules apply:
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
+
+${middlemanExplainBlock(lang, 'brief')}
 
 ## After completing actions
 If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them. Do not notify customers automatically — ask first.

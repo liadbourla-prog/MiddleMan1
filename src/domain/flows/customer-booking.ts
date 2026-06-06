@@ -7,6 +7,7 @@ import type { ActiveSession } from '../session/types.js'
 import { updateSessionContext, completeSession, failSession } from '../session/manager.js'
 import { requestBooking, confirmBooking, cancelBooking } from '../booking/engine.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
+import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { parseConfirmation } from './types.js'
 import type { FlowResult, BookingFlowContext } from './types.js'
@@ -386,6 +387,26 @@ export async function handleBookingFlow(
           ...knowledgeFields,
         })
         return { reply: inquiryReply, sessionComplete: true }
+      }
+
+      case 'system_explanation': {
+        await completeSession(db, session.id)
+        const oneLiner = middlemanOneLiner(detectedLanguage, businessName)
+        const situation = `${firstMsgPrefix}The customer EXPLICITLY asked what system, platform, or technology powers this assistant. Authorized platform explanation — give exactly this one fact, phrased naturally, and nothing more (no marketing, no extra detail): "${oneLiner}". Then briefly invite them back to booking.`
+        const knowledgeFields = businessKnowledge ? {
+          brandVoice: businessKnowledge.brandVoice,
+          ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
+          faqs: businessKnowledge.faqs,
+        } : {}
+        const explainReply = await generateCustomerReply({
+          businessName,
+          language: detectedLanguage,
+          situation,
+          transcript,
+          customerMemory: extractMemory(updatedCtx),
+          ...knowledgeFields,
+        })
+        return { reply: explainReply, sessionComplete: true }
       }
 
       default: {

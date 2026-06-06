@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai'
 import { z } from 'zod'
 import type { CustomerIntentOutput, ManagerInstructionOutput, OperatorActionOutput, LlmResult, GenerateReplyInput, ParseableOnboardingStep, OnboardingAnswerOutput } from './types.js'
+import { middlemanExplainBlock } from './middleman-identity.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
@@ -10,7 +11,7 @@ const MODEL = 'gemini-2.5-flash'
 const ai = new GoogleGenAI({ apiKey: LLM_API_KEY, apiVersion: 'v1beta' })
 
 const customerIntentSchema = z.object({
-  intent: z.enum(['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'unknown']).catch('unknown'),
+  intent: z.enum(['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'system_explanation', 'unknown']).catch('unknown'),
   slotRequest: z
     .object({
       hasSpecificDate: z.boolean().catch(false),
@@ -62,7 +63,7 @@ Conversation so far: ${JSON.stringify(sessionContext)}.
 
 Return a JSON object with EXACTLY this structure (all fields required):
 {
-  "intent": "booking" | "rescheduling" | "cancellation" | "inquiry" | "list_bookings" | "unknown",
+  "intent": "booking" | "rescheduling" | "cancellation" | "inquiry" | "list_bookings" | "system_explanation" | "unknown",
   "slotRequest": {
     "hasSpecificDate": boolean,
     "hasSpecificTime": boolean,
@@ -81,6 +82,7 @@ Return a JSON object with EXACTLY this structure (all fields required):
 
 Rules:
 - intent: use "list_bookings" when the customer asks to see their appointments (e.g. "what are my bookings?", "מה התורים שלי").
+- intent: use "system_explanation" ONLY when the customer explicitly asks what system, platform, app, or technology powers this assistant, or who built it / how it works technically (e.g. "are you a bot?", "what app is this?", "מי בנה אותך?", "על איזו מערכת זה רץ?"). Questions about the BUSINESS, its services, prices, or hours are "inquiry", NOT this. Transactional intents win: if the same message also asks to book, reschedule, cancel, or list bookings, return that intent instead — system_explanation is the lowest priority.
 - slotRequest: set to an object when a booking date/time is mentioned; set to null for non-booking intents.
   - hasSpecificDate: true if a specific calendar date is given (e.g. "May 2", "2 במאי", "Tuesday the 5th"). false for vague ("sometime next week").
   - hasSpecificTime: true if a specific time is given (e.g. "10:00", "3pm", "10:00"). false for vague ("morning").
@@ -243,7 +245,7 @@ Tone and voice:
 - Ask exactly one question per message — never stack questions.
 - No bullet points unless listing multiple bookings.
 - Emoji: one per key moment maximum (✅ booking confirmed, reminder sent). None in questions or clarifications.
-- Never say "I am an AI", "as an AI", or reference the underlying technology.
+- Never say "I am an AI", "as an AI", or reference the underlying technology. The ONLY exception: when the situation explicitly authorizes a platform explanation, give the single one-line platform fact it provides — nothing more — then return to helping.
 - If you know the customer's name and they are returning, you may acknowledge warmly once per session ("קיבלתי, [שם]!" / "Good to hear from you, [name]!") — once only, not repeated.
 
 You receive:
@@ -415,6 +417,8 @@ ${ackLine}
 ${retryNote}
 ${input.collectedSummary ? `Already configured: ${input.collectedSummary}` : ''}
 ${input.extraContext ? `Context: ${input.extraContext}` : ''}
+
+${middlemanExplainBlock(input.lang, 'brief')}
 
 Current step task: ${stepGoal}
 
@@ -1061,6 +1065,8 @@ ${ackLine}
 ${retryNote}
 ${nameCtx}
 ${input.extraContext ? `Extra context: ${input.extraContext}` : ''}
+
+${middlemanExplainBlock(lang, 'full')}
 
 Current step: ${stepGoal}
 

@@ -1,5 +1,5 @@
 export interface CustomerIntentOutput {
-  intent: 'booking' | 'rescheduling' | 'cancellation' | 'inquiry' | 'list_bookings' | 'unknown'
+  intent: 'booking' | 'rescheduling' | 'cancellation' | 'inquiry' | 'list_bookings' | 'system_explanation' | 'unknown'
   slotRequest: {
     hasSpecificDate: boolean
     hasSpecificTime: boolean
