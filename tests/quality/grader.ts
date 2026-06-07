@@ -38,7 +38,9 @@ function isQuotaOrTransient(err: unknown): boolean {
   )
 }
 
-export async function withQuotaRetry<T>(fn: () => Promise<T>, retries = 5, baseDelayMs = 6000): Promise<T> {
+// retries defaults to 3 (not 5) so the worst-case judge backoff chain stays within
+// the per-test budget — see the retry-budget math in vitest.quality.config.ts.
+export async function withQuotaRetry<T>(fn: () => Promise<T>, retries = 3, baseDelayMs = 6000): Promise<T> {
   let lastErr: unknown
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {

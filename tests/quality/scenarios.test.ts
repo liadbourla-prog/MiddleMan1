@@ -40,7 +40,9 @@ const MIN_SCORE = parseInt(process.env['QUALITY_MIN_SCORE'] ?? '4', 10)
 // fallback usually means "the call was throttled" rather than a quality failure.
 // Retry generation with backoff until we get a real reply (or give up and let the
 // assertion fail loudly with the fallback visible).
-const GEN_RETRIES = parseInt(process.env['QUALITY_GEN_RETRIES'] ?? '5', 10)
+// Bounded at 3 (not 5) so the worst-case backoff chain fits under the per-test
+// timeout — see the retry-budget math in vitest.quality.config.ts.
+const GEN_RETRIES = parseInt(process.env['QUALITY_GEN_RETRIES'] ?? '3', 10)
 const GEN_BACKOFF_MS = parseInt(process.env['QUALITY_GEN_BACKOFF_MS'] ?? '6000', 10)
 
 // Mirror of FALLBACK_REPLIES in client.ts (not exported) — used to detect a
