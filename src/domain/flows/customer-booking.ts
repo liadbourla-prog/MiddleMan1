@@ -316,17 +316,22 @@ export async function handleBookingFlow(
   // Offer when: detected language differs from default, no override locked yet.
   const shouldOfferSwitch = !ctx.languageOverride && detectedLanguage !== defaultLang
 
+  // Greet at most once per session. firstMsgPrefix is the ONLY thing that licenses
+  // a greeting/intro; every later turn must continue without re-introducing.
+  const mayGreet = isFirstMessage && !ctx.greeted
+
   // Persist language detection into context so all subsequent branches use it
   const updatedCtx: BookingFlowContext = {
     ...ctx,
     detectedLanguage,
+    ...(mayGreet ? { greeted: true } : {}),
     ...(shouldOfferSwitch ? { languageSwitchOfferPending: true } : {}),
   }
 
   // Prefix injected into situation strings for first-message targeted intents
-  const firstMsgPrefix = isFirstMessage
+  const firstMsgPrefix = mayGreet
     ? 'This is the customer\'s first message — include a brief warm greeting before addressing their request. '
-    : ''
+    : 'Do NOT greet or re-introduce yourself — continue the conversation directly. '
 
   const intentResult2 = await (async (): Promise<FlowResult> => {
     switch (intent.intent) {
@@ -433,12 +438,14 @@ export async function handleBookingFlow(
         await updateSessionContext(db, session.id, ctxWithCount)
 
         const hasFaqs = (businessKnowledge?.faqs?.length ?? 0) > 0
-        // First-message generic/ambiguous: welcome + introduce the PA
-        const unknownSituation = isFirstMessage
-          ? `This is the customer's first message and it is unclear or generic. Welcome them warmly, introduce yourself as the booking assistant for ${businessName}, briefly explain what you can help with (booking, cancellations, rescheduling${hasFaqs ? ', and questions about the business' : ''}), and ask how you can help.`
+        // ONLY the genuine first message of a session may introduce the PA. Every
+        // later turn continues the conversation — it must never re-greet or
+        // re-announce identity (that was the verbatim-reintroduction bug).
+        const unknownSituation = mayGreet
+          ? `This is the customer's first message and it is unclear or generic. Greet them warmly as ${businessName}, say in one line you can help with booking, changing, or cancelling appointments${hasFaqs ? ' and answer questions about the business' : ''}, and ask how you can help. Keep it short and human.`
           : hasFaqs
-            ? `Customer sent a message the system couldn't classify as booking, cancellation, or rescheduling. Their message: "${messageText}". Check the FAQs above — if one is relevant, answer it directly. If not, politely explain the assistant handles bookings and invite them to ask about that.`
-            : `Customer sent something that couldn't be understood or is out of scope. Respond warmly — acknowledge you didn't quite follow, then in 1–2 friendly sentences let them know you can help with booking, cancelling, rescheduling, or checking upcoming appointments. Invite them to try.`
+            ? `Mid-conversation: the customer said "${messageText}", which isn't a clear booking/cancel/reschedule. Do NOT greet or re-introduce yourself. If a FAQ above answers it, answer directly; otherwise reply like a person — briefly acknowledge, then nudge toward what you can help with (booking, changing, cancelling, checking appointments).`
+            : `Mid-conversation: the customer said "${messageText}", which you couldn't map to a booking action. Do NOT greet or re-introduce yourself and do NOT repeat a canned capability list. Reply like a human employee — a short, warm acknowledgement that keeps things moving toward booking, changing, cancelling, or checking an appointment.`
 
         const unknownKnowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
@@ -462,8 +469,8 @@ export async function handleBookingFlow(
   // Append once per turn when we detected a different language and no override is set yet.
   if (shouldOfferSwitch && intentResult2.reply && !intentResult2.sessionComplete) {
     const offerSuffix = detectedLanguage === 'en'
-      ? '\n\nWould you like me to continue in English? (YES / NO)'
-      : '\n\nרוצה שאמשיך בעברית? (כן / לא)'
+      ? '\n\nWant me to keep going in English? Just say the word.'
+      : '\n\nרוצה שאמשיך בעברית? פשוט תכתוב לי כן.'
     return { ...intentResult2, reply: intentResult2.reply + offerSuffix }
   }
 
@@ -709,7 +716,7 @@ async function handleHoldConfirmation(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: 'Customer sent an unclear reply. Ask them again to reply YES to confirm the booking or NO to cancel.',
+      situation: "Customer's reply was unclear. Gently ask again whether they want to go ahead with the booking or not — in plain words, no menu.",
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -829,7 +836,7 @@ async function handleHoldConfirmation(
     return { reply, sessionComplete: true }
   }
 
-  // Private session — hold placed, ask for final YES to confirm
+  // Private session — hold placed, ask for a final confirmation (plain words)
   const newCtx: BookingFlowContext = {
     ...ctx,
     pendingBookingId: result.bookingId,
@@ -842,7 +849,7 @@ async function handleHoldConfirmation(
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
-    situation: `Slot successfully held for ${pendingSlot.serviceName} on ${heldDate} at ${heldTime}. Ask customer to reply YES to finalize and confirm the booking.`,
+    situation: `Slot successfully held for ${pendingSlot.serviceName} on ${heldDate} at ${heldTime}. Ask the customer to confirm they want it locked in — naturally, no menu.`,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -955,7 +962,7 @@ async function handleCancellationIntent(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: `Customer wants to cancel their booking on ${date}. Ask YES to confirm cancellation or NO to keep it.`,
+      situation: `Customer wants to cancel their booking on ${date}. Ask them to confirm they want it cancelled — naturally, no menu.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -1000,7 +1007,7 @@ async function enterCancellationSelection(
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
-    situation: `Customer wants to ${action} but has ${activeBookings.length} active bookings. List them numbered and ask which number to ${action}: ${numberedList}`,
+    situation: `Customer wants to ${action} but has ${activeBookings.length} upcoming bookings. List them as a bullet list (numbered for easy reference) and ask, like a person, which one they mean — they can just reply with its number. Bookings: ${numberedList}`,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -1026,7 +1033,7 @@ async function handleCancellationSelection(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: `Customer sent an invalid selection. Ask them to reply with a number between 1 and ${candidates.length}.`,
+      situation: `That wasn't a clear pick. Warmly ask which of their ${candidates.length} bookings they mean — they can reply with its number.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -1046,7 +1053,7 @@ async function handleCancellationSelection(
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
-    situation: `Customer selected booking #${n} to cancel. Ask them to confirm (YES) to cancel it or NO to keep it.`,
+    situation: `Customer selected booking #${n} to cancel. Ask them to confirm the cancellation — naturally, no menu.`,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -1070,7 +1077,7 @@ async function handleCancellationConfirmation(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: 'Customer sent an unclear reply. Ask them again to reply YES to confirm cancellation or NO to keep the booking.',
+      situation: "Customer's reply was unclear. Ask again whether they want to cancel it or keep it — in plain words, no menu.",
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),

@@ -136,17 +136,17 @@ When confirming a booking to a customer, always include:
 2. Day of week
 3. Date
 4. Time
-5. Confirmation prompt
+5. A plain-words confirmation prompt — **never a `(כן / לא)` / `(YES / NO)` menu** (see §9.3 and §11). Ask the way a person would and vary the wording.
 
 ```
-תספורת — יום שלישי, 13 במאי, 10:00.
-לאשר? (כן / לא)
+תספורת — יום שלישי, 13 במאי, 10:00. סוגר לך?
 ```
 
 ```
-Haircut — Tuesday, 13 May, 10:00 AM.
-Confirm? (YES / NO)
+Haircut — Tuesday, 13 May, 10:00 AM. Want me to lock it in?
 ```
+
+> Note: an earlier version of this section appended `(כן / לא)` / `(YES / NO)`. That is now forbidden — the Voice Bible (§9.3, §11) overrides it. The system still parses natural yes/no replies, so no menu is needed.
 
 ---
 

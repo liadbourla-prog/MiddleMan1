@@ -70,6 +70,9 @@ export const BOT_TELLS: Record<Lang, string[]> = {
     'your request has been processed',
     'i apologize for the inconvenience',
     'i sincerely apologize',
+    // Menu/IVR tells — confirmations must ask in plain words, never a menu.
+    '(yes / no)',
+    '(yes/no)',
   ],
   he: [
     'אני בוט',
@@ -80,5 +83,13 @@ export const BOT_TELLS: Record<Lang, string[]> = {
     'לא הצלחתי להבין',
     'אירעה שגיאה',
     'הבקשה שלך עובדה',
+    // Menu/IVR tells.
+    '(כן / לא)',
+    '(כן/לא)',
+    // Split-gender hedging — always address the customer in one (masculine) form.
+    'תרצה/תרצי',
+    'תרצה/י',
+    // Canned self-introduction repeated mid-conversation.
+    'העוזרת האישית',
   ],
 }
