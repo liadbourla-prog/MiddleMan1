@@ -340,7 +340,14 @@ Failing CI blocks merge regardless of approvals.
 The product's value is that every reply reads like a sharp, warm human — never a bot.
 `tests/quality/` locks that bar in as an automated gate.
 
-- **Run:** `npm run test:quality` (separate from `npm test`, which stays unit-only and CI-fast).
+- **Routine gate:** `npm run test:quality:smoke` — single sample per scenario
+  (`QUALITY_SAMPLES=1`), ~5 min, ~24 Pro calls. This is the canonical gate to run after
+  any LLM/voice change. It catches consistent quality regressions cheaply.
+- **Deep check (opt-in):** `npm run test:quality` — the full 3-sample run that absorbs
+  LLM-judge roll-to-roll variance via a pass-rate threshold. It is heavier (~72 Pro calls)
+  and needs adequate Gemini **Pro** quota; on free-tier throttling it paces itself with
+  backoff and may run long. Run it before a release or when a smoke result looks marginal.
+- Both are separate from `npm test`, which stays unit-only and CI-fast.
 - **What it does:** drives the real reply generators (customer, manager, onboarding,
   operator, proactive) with bilingual golden scenarios, then gates each output two ways:
   1. **Deterministic assertions** (`assertions.ts`) — single language, at most one question,
@@ -353,7 +360,8 @@ The product's value is that every reply reads like a sharp, warm human — never
   (fraction that must pass, default 0.66), `QUALITY_MIN_SCORE` (judge score for a "good"
   sample, default 4). The 3@0.66 default absorbs LLM-judge roll-to-roll variance (one harsh
   roll won't fail a good reply — 2/3 = 0.67 clears the gate) while still catching consistent
-  failures (0/3, 1/3). For a fast, cheap smoke during iteration, run with `QUALITY_SAMPLES=1`.
+  failures (0/3, 1/3). For a fast, cheap smoke during iteration, use `npm run test:quality:smoke`
+(`QUALITY_SAMPLES=1`).
 - **Cost/runtime:** each sample is 2 Pro calls (generate + judge), so a full default run is
   ~72 Pro calls and several minutes; generation/judge both retry on quota with backoff, so a
   throttled run paces itself rather than failing. Needs sufficient Gemini Pro quota.
