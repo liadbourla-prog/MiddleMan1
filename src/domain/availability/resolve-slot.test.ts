@@ -5,7 +5,7 @@ import {
   resolveSlotStart,
   type RequestedDateParts,
 } from './resolve-slot.js'
-import { isSlotBookable, type AvailabilityModel } from './compute.js'
+import { isSlotBookable, getOpenSlots, localParts, type AvailabilityModel } from './compute.js'
 
 // Anchor "now" deterministically. 2026-06-07 is a Sunday in Asia/Jerusalem.
 const TZ = 'Asia/Jerusalem'
@@ -98,6 +98,31 @@ describe('deterministic gate — resolve + business-hours (the 5:00 AM bug)', ()
     const start = resolveSlotStart('2026-06-09', { hour: 9, minute: 0 }, TZ)
     const end = new Date(start.getTime() + 60 * 60_000)
     expect(isSlotBookable(model, { start, end })).toEqual({ bookable: true, reason: 'ok' })
+  })
+})
+
+describe('availability inquiry window — "is Monday open?" reports MONDAY, not Sunday', () => {
+  // Studio open Sun/Mon/Tue 09:00–17:00 (the screenshot studio).
+  const model: AvailabilityModel = {
+    timezone: TZ,
+    available247: false,
+    weeklyHours: [0, 1, 2].map((d) => ({ dayOfWeek: d, openTime: '09:00', closeTime: '17:00' })),
+    dateOverrides: [],
+    busy: [],
+  }
+
+  it('resolves a Monday-scoped window and only returns Monday openings', () => {
+    const resolved = resolveRequestedDate({ ...empty, weekday: 1 }, TZ, NOW) // Monday
+    expect(resolved).toEqual({ ok: true, dateStr: '2026-06-08' })
+    if (!resolved.ok) return
+    const from = resolveSlotStart(resolved.dateStr, { hour: 0, minute: 0 }, TZ)
+    const to = resolveSlotStart(addDaysToDateStr(resolved.dateStr, 1), { hour: 0, minute: 0 }, TZ)
+    const slots = getOpenSlots(model, { start: from, end: to }, 60, { now: NOW, maxSlots: 6 })
+    expect(slots.length).toBeGreaterThan(0)
+    // Every returned slot must fall on Monday 2026-06-08 — never the parroted Sunday.
+    for (const s of slots) {
+      expect(localParts(s.start, TZ).dateStr).toBe('2026-06-08')
+    }
   })
 })
 

@@ -18,7 +18,8 @@ import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/eng
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
-import { resolveRequestedDate, resolveSlotStart, type RequestedDateParts } from '../availability/resolve-slot.js'
+import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, type RequestedDateParts } from '../availability/resolve-slot.js'
+import { localParts } from '../availability/compute.js'
 import { validateSlotTiming } from '../booking/engine.js'
 
 type CustomerMemoryInput = {
@@ -135,6 +136,66 @@ async function suggestOpenSlotsText(
     return slots
       .map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`)
       .join(', ')
+  } catch {
+    return null
+  }
+}
+
+// Answer an availability INQUIRY ("is Monday open?", "what's later this week?")
+// from the canonical spine instead of parroting one slot. If the customer named a
+// day/range we report THAT window; otherwise the next real openings. The returned
+// string is already human-formatted (G2: no raw dates/enums leak).
+async function buildInquiryAvailabilityText(
+  db: Db,
+  business: Business,
+  slot: CustomerIntentOutput['slotRequest'],
+  activeServices: Array<{ durationMinutes: number }>,
+  tz: string,
+): Promise<string | null> {
+  const now = new Date()
+  const duration = activeServices.length > 0
+    ? Math.min(...activeServices.map((s) => s.durationMinutes))
+    : 60
+  const dayStartOf = (dateStr: string): Date => resolveSlotStart(dateStr, { hour: 0, minute: 0 }, tz)
+
+  let from = now
+  let to = new Date(now.getTime() + 14 * 86_400_000)
+  let scoped = false // customer named a specific day/week
+
+  if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
+    const parts: RequestedDateParts = {
+      relativeDay: slot.relativeDay ?? null,
+      weekday: slot.weekday ?? null,
+      explicitDate: slot.explicitDate ?? null,
+    }
+    const resolved = resolveRequestedDate(parts, tz, now)
+    if (resolved.ok) {
+      const start = dayStartOf(resolved.dateStr)
+      from = start < now ? now : start
+      to = dayStartOf(addDaysToDateStr(resolved.dateStr, 1))
+      scoped = true
+    } else if (slot.relativeDay === 'this_week' || slot.relativeDay === 'next_week') {
+      const today = localParts(now, tz).dateStr
+      const base = slot.relativeDay === 'next_week' ? addDaysToDateStr(today, 7) : today
+      const start = dayStartOf(base)
+      from = start < now ? now : start
+      to = dayStartOf(addDaysToDateStr(base, 7))
+      scoped = true
+    }
+  }
+
+  try {
+    const slots = await getOpenSlots(db, business, { start: from, end: to }, duration, { maxSlots: 6 })
+    if (slots.length > 0) {
+      const list = slots.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
+      return `Actual open times in the window the customer asked about: ${list}.`
+    }
+    if (!scoped) return 'No open times in the next two weeks.'
+    // Specific day/week had nothing — offer the next real opening overall, honestly.
+    const fallback = await getOpenSlots(db, business, { start: now, end: new Date(now.getTime() + 14 * 86_400_000) }, duration, { maxSlots: 3 })
+    if (fallback.length === 0) return 'Nothing open in the window they asked about, and nothing in the next two weeks.'
+    const list = fallback.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
+    return `Nothing open in the window they asked about. The next real openings are: ${list}.`
   } catch {
     return null
   }
@@ -365,31 +426,22 @@ export async function handleBookingFlow(
           .where(and(eq(bookings.customerId, identity.id), eq(bookings.state, 'confirmed'), gte(bookings.slotStart, ninetyDaysAgo)))
         const recentBookingCount = Number(countRow?.total ?? 0)
 
-        const availRows = await db
-          .select({ dayOfWeek: availability.dayOfWeek, openTime: availability.openTime })
-          .from(availability)
-          .where(and(eq(availability.businessId, identity.businessId), isNull(availability.specificDate), eq(availability.isBlocked, false)))
-        let nextAvailableSlot: string | null = null
-        const now = new Date()
-        for (let i = 1; i <= 7; i++) {
-          const d = new Date(now)
-          d.setDate(d.getDate() + i)
-          const dow = d.getDay()
-          const dayAvail = availRows.find((r) => r.dayOfWeek === dow)
-          if (dayAvail) {
-            const dayLabel = formatSlotDate(d, businessTimezone)
-            nextAvailableSlot = dayAvail.openTime ? `${dayLabel} from ${dayAvail.openTime}` : dayLabel
-            break
-          }
-        }
+        // Real availability — answer the day/range the customer asked about from the
+        // canonical spine, not a single parroted slot. Plus the full hours summary so
+        // "what hours are you open this week?" can be answered honestly.
+        const availabilityText = business
+          ? await buildInquiryAvailabilityText(db, business, intent.slotRequest, activeServices, businessTimezone)
+          : null
+        const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
 
         const customerCtx = recentBookingCount > 0
           ? `Returning customer with ${recentBookingCount} booking(s) in the last 90 days.`
           : 'First-time or lapsed customer.'
-        const slotCtx = nextAvailableSlot ? ` Next open window: ${nextAvailableSlot}.` : ''
+        const slotCtx = availabilityText ? ` ${availabilityText}` : ''
+        const hoursCtx = hoursSummary ? ` ${hoursSummary}` : ''
 
         const situation = activeServices.length > 0
-          ? `${firstMsgPrefix}Customer asked a question about the business or services. ${customerCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above if relevant, then invite them to book.`
+          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the hours, real open times, FAQs, and service info above. If they asked which times/days are open, give the actual open times above as a short bullet list and invite them to pick one — never invent times. We do not track individual staff members' personal schedules; if asked about a specific instructor's hours, answer with the studio's hours/openings and say bookings go through here.`
           : `${firstMsgPrefix}Customer asked about the business. ${customerCtx} No services are configured yet. Direct them to contact the business directly.`
         const knowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
@@ -571,6 +623,27 @@ async function handleBookingIntent(
 
   // ── All pieces present: compose the absolute slot, then the DETERMINISTIC gate ─
   const svc = activeServices.find((s) => s.id === draft.serviceTypeId)!
+
+  // Party-size vs service model: don't silently confirm "yoga for 3" on a 1-on-1.
+  if (draft.participants != null && draft.participants > 1 && svc.maxParticipants === 1) {
+    const { participants: _dropParticipants, ...draftKeep } = draft
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
+    const reply = await generateCustomerReply({
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${svc.name} is a private, one-on-one session — it can't take ${draft.participants} people on a single booking. Ask whether they'd like to go ahead with just one spot, or if they meant something else.`,
+    })
+    return { reply, sessionComplete: false }
+  }
+  if (draft.participants != null && draft.participants > svc.maxParticipants && svc.maxParticipants > 1) {
+    const { participants: _dropParticipants, ...draftKeep } = draft
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
+    const reply = await generateCustomerReply({
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${svc.name} holds at most ${svc.maxParticipants} people, and they asked for ${draft.participants}. Let them know the limit and ask how they'd like to proceed.`,
+    })
+    return { reply, sessionComplete: false }
+  }
+
   const slotStart = resolveSlotStart(draft.dateStr, draft.time, businessTimezone)
   const slotEnd = new Date(slotStart.getTime() + svc.durationMinutes * 60_000)
 
