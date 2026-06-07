@@ -23,6 +23,18 @@ export function parseConfirmation(text: string): ConfirmationParse {
 export interface BookingFlowContext {
   pendingBookingId?: string
   pendingSlot?: { start: string; end: string; serviceTypeId: string; serviceName: string; providerHint?: string | null }
+  // Incremental slot memory: partial booking facts gathered across clarification
+  // turns so we never re-ask something already known. Internal state only — never
+  // echoed verbatim to the customer (G2). Resolved into pendingSlot once complete.
+  slotDraft?: {
+    dateStr?: string // 'YYYY-MM-DD' business-local, already deterministically resolved
+    time?: { hour: number; minute: number }
+    serviceTypeId?: string
+    serviceName?: string
+    participants?: number
+  }
+  // Set once a session greeting/intro has been delivered, so we never re-introduce.
+  greeted?: boolean
   awaitingConfirmationFor?: 'hold' | 'cancellation' | 'cancellation_selection'
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'

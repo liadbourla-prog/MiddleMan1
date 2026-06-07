@@ -3,6 +3,15 @@ export interface CustomerIntentOutput {
   slotRequest: {
     hasSpecificDate: boolean
     hasSpecificTime: boolean
+    // Structured date/time CLASSIFICATION — the LLM reports what the customer said;
+    // the deterministic core (availability/resolve-slot.ts) computes the absolute
+    // instant. The LLM never does calendar arithmetic. (resolvedStart/End are kept
+    // for back-compat only and are IGNORED by Branch 4.)
+    relativeDay: 'today' | 'tomorrow' | 'day_after_tomorrow' | 'this_week' | 'next_week' | null
+    weekday: number | null // 0=Sun … 6=Sat
+    explicitDate: { year: number | null; month: number | null; day: number | null } | null
+    time: { hour: number; minute: number } | null
+    timeOfDay: 'morning' | 'afternoon' | 'evening' | null
     resolvedStart: string | null
     resolvedEnd: string | null
     dateHint: string | null
@@ -11,6 +20,7 @@ export interface CustomerIntentOutput {
   } | null
   serviceTypeHint: string | null
   providerHint: string | null
+  participantsHint: number | null
   summary: string | null
   rawEntities: Record<string, string>
   detectedLanguage: 'he' | 'en'

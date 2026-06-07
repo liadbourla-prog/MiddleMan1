@@ -57,6 +57,21 @@ const customerIntentSchema = z.object({
     .object({
       hasSpecificDate: z.boolean().catch(false),
       hasSpecificTime: z.boolean().catch(false),
+      relativeDay: z.enum(['today', 'tomorrow', 'day_after_tomorrow', 'this_week', 'next_week']).nullable().catch(null),
+      weekday: z.number().int().min(0).max(6).nullable().catch(null),
+      explicitDate: z
+        .object({
+          year: z.number().int().nullable().catch(null),
+          month: z.number().int().min(1).max(12).nullable().catch(null),
+          day: z.number().int().min(1).max(31).nullable().catch(null),
+        })
+        .nullable()
+        .catch(null),
+      time: z
+        .object({ hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59) })
+        .nullable()
+        .catch(null),
+      timeOfDay: z.enum(['morning', 'afternoon', 'evening']).nullable().catch(null),
       resolvedStart: z.string().nullable().catch(null),
       resolvedEnd: z.string().nullable().catch(null),
       dateHint: z.string().nullable().catch(null),
@@ -67,6 +82,7 @@ const customerIntentSchema = z.object({
     .catch(null),
   serviceTypeHint: z.string().nullable().catch(null),
   providerHint: z.string().nullable().catch(null),
+  participantsHint: z.number().int().positive().nullable().catch(null),
   summary: z.string().nullable().catch(null),
   rawEntities: z.record(z.unknown()).transform((v) =>
     Object.fromEntries(Object.entries(v).map(([k, val]) => [k, String(val)])),
@@ -108,14 +124,18 @@ Return a JSON object with EXACTLY this structure (all fields required):
   "slotRequest": {
     "hasSpecificDate": boolean,
     "hasSpecificTime": boolean,
-    "resolvedStart": "ISO8601 datetime in business timezone" | null,
-    "resolvedEnd": "ISO8601 datetime in business timezone" | null,
+    "relativeDay": "today" | "tomorrow" | "day_after_tomorrow" | "this_week" | "next_week" | null,
+    "weekday": 0-6 | null,
+    "explicitDate": { "year": number|null, "month": 1-12|null, "day": 1-31|null } | null,
+    "time": { "hour": 0-23, "minute": 0-59 } | null,
+    "timeOfDay": "morning" | "afternoon" | "evening" | null,
     "dateHint": "original date text" | null,
     "timeHint": "original time text" | null,
     "dateAmbiguous": boolean
   } | null,
   "serviceTypeHint": "service name from message" | null,
   "providerHint": "staff name from message" | null,
+  "participantsHint": number | null,
   "summary": "one sentence summary" | null,
   "rawEntities": {},
   "detectedLanguage": "he" | "en"
@@ -124,12 +144,18 @@ Return a JSON object with EXACTLY this structure (all fields required):
 Rules:
 - intent: use "list_bookings" when the customer asks to see their appointments (e.g. "what are my bookings?", "מה התורים שלי").
 - intent: use "system_explanation" ONLY when the customer explicitly asks what system, platform, app, or technology powers this assistant, or who built it / how it works technically (e.g. "are you a bot?", "what app is this?", "מי בנה אותך?", "על איזו מערכת זה רץ?"). Questions about the BUSINESS, its services, prices, or hours are "inquiry", NOT this. Transactional intents win: if the same message also asks to book, reschedule, cancel, or list bookings, return that intent instead — system_explanation is the lowest priority.
-- slotRequest: set to an object when a booking date/time is mentioned; set to null for non-booking intents.
-  - hasSpecificDate: true if a specific calendar date is given (e.g. "May 2", "2 במאי", "Tuesday the 5th"). false for vague ("sometime next week").
-  - hasSpecificTime: true if a specific time is given (e.g. "10:00", "3pm", "10:00"). false for vague ("morning").
-  - resolvedStart/resolvedEnd: ISO 8601 in business timezone when both date AND time are specific. Null otherwise. Use service duration (default 60 min) for resolvedEnd.
-  - dateAmbiguous: true ONLY for purely relative expressions that could match two weeks (e.g. "next Wednesday"). Explicit day+month dates like "May 2", "2 במאי", "ב-2 למאי" are NEVER ambiguous — set false.
+- DATE/TIME — CLASSIFY ONLY, NEVER COMPUTE. You only report what the customer literally said as structured pieces. Do NOT compute, resolve, or output any absolute/ISO date. Do NOT invent a year. A separate deterministic system turns your pieces into the real date.
+  - slotRequest: set to an object when a booking date/time is mentioned; set to null for non-booking intents.
+  - relativeDay: map relative phrasing — "today"/"היום"→today, "tomorrow"/"מחר"→tomorrow, "day after tomorrow"/"מחרתיים"→day_after_tomorrow, "this week"/"השבוע"→this_week, "next week"/"שבוע הבא"→next_week. Otherwise null.
+  - weekday: 0=Sunday … 6=Saturday when a named day is given ("Tuesday"/"יום שלישי"→2). Otherwise null.
+  - explicitDate: fill day and month when a calendar date is stated ("May 2"/"2 במאי"/"10.01"→{month,day}); include year ONLY if the customer explicitly stated it (e.g. "10.01.2016"→year:2016). Never fill year yourself. null if no explicit date.
+  - time: fill {hour,minute} in 24-hour form when a clock time is given ("3pm"→{15,0}, "9:30"→{9,30}, "תשע בבוקר"→{9,0}). null for vague.
+  - timeOfDay: "morning"/"afternoon"/"evening" (or Hebrew בוקר/צהריים/ערב) when only a part of day is given; otherwise null.
+  - hasSpecificDate: true if any concrete day is identifiable (relativeDay other than this_week/next_week, a weekday, or an explicitDate with day+month). false for vague ("sometime next week").
+  - hasSpecificTime: true only when "time" is filled. false for vague ("morning").
+  - dateAmbiguous: true ONLY for "this_week"/"next_week" with no weekday. Explicit day+month dates and named weekdays are NEVER ambiguous — set false.
 - serviceTypeHint: extract the service name the customer mentions (e.g. "תספורת" → "תספורת", "haircut" → "Haircut"). null if none.
+- participantsHint: number of people if the customer states a party size ("for 3 people"/"לשלושה אנשים"→3). null if not stated.
 - detectedLanguage: "he" if message is in Hebrew; "en" for English or any other language.
 - Respond only with valid JSON matching the structure above. No explanation.`
 
