@@ -343,6 +343,13 @@ The product's value is that every reply reads like a sharp, warm human — never
 - **Routine gate:** `npm run test:quality:smoke` — single sample per scenario
   (`QUALITY_SAMPLES=1`), ~5 min, ~24 Pro calls. This is the canonical gate to run after
   any LLM/voice change. It catches consistent quality regressions cheaply.
+  - **Expect occasional single-scenario flicker.** Generation runs at non-zero temperature
+    and the judge has roll-to-roll variance, so on any given smoke run *one* borderline
+    scenario may trip a single roll (e.g. a reply with two `?`, or a judge "narrates the
+    system" call on an otherwise-good line). This is the inherent brittleness of a single
+    sample — a red on *one* scenario is **not** a regression by itself. Re-run smoke, or
+    escalate to the 3-sample deep check; only a scenario that fails *consistently* across
+    rolls is a real quality regression worth a prompt/voice fix.
 - **Deep check (opt-in):** `npm run test:quality` — the full 3-sample run that absorbs
   LLM-judge roll-to-roll variance via a pass-rate threshold. It is heavier (~72 Pro calls)
   and needs adequate Gemini **Pro** quota; on free-tier throttling it paces itself with
