@@ -1,7 +1,7 @@
 import { eq, and, or, gt, gte, isNull, count } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { serviceTypes, bookings, identities, availability } from '../../db/schema.js'
-import type { Business } from '../../db/schema.js'
+import type { Business, CalendarBlockType } from '../../db/schema.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import type { ActiveSession } from '../session/types.js'
 import { updateSessionContext, completeSession, failSession } from '../session/manager.js'
@@ -17,7 +17,10 @@ import type { HydratedContext } from '../session/hydration.js'
 import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/engine.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
-import { getOpenSlots } from '../availability/service.js'
+import { getOpenSlots, isSlotBookable } from '../availability/service.js'
+import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, type RequestedDateParts } from '../availability/resolve-slot.js'
+import { localParts } from '../availability/compute.js'
+import { validateSlotTiming } from '../booking/engine.js'
 
 type CustomerMemoryInput = {
   returningCustomer: boolean
@@ -38,6 +41,11 @@ const REASON_MAP: Record<string, string> = {
   cutoff_passed: 'the cancellation window has already closed',
   max_days_ahead: 'the requested date is too far in advance',
   min_buffer: 'bookings require more advance notice',
+  // Deterministic date-resolution reasons (resolve-slot.ts) — phrased for customers.
+  past_year: 'that date looks like it has already passed',
+  past_date: 'that date has already passed',
+  ambiguous_date: 'it is not clear which day was meant',
+  impossible_date: 'that date does not exist on the calendar',
 }
 
 function sanitiseReason(reason: string | undefined | null): string {
@@ -55,6 +63,12 @@ function formatSlotTime(date: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
   }).format(date)
+}
+
+// Render a resolved 'YYYY-MM-DD' business-local date for use inside situation
+// strings (G2: the customer never sees the raw YYYY-MM-DD form).
+function formatLocalDate(dateStr: string, tz: string): string {
+  return formatSlotDate(resolveSlotStart(dateStr, { hour: 12, minute: 0 }, tz), tz)
 }
 
 function checkDSTGap(isoString: string, businessTz: string): boolean {
@@ -122,6 +136,66 @@ async function suggestOpenSlotsText(
     return slots
       .map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`)
       .join(', ')
+  } catch {
+    return null
+  }
+}
+
+// Answer an availability INQUIRY ("is Monday open?", "what's later this week?")
+// from the canonical spine instead of parroting one slot. If the customer named a
+// day/range we report THAT window; otherwise the next real openings. The returned
+// string is already human-formatted (G2: no raw dates/enums leak).
+async function buildInquiryAvailabilityText(
+  db: Db,
+  business: Business,
+  slot: CustomerIntentOutput['slotRequest'],
+  activeServices: Array<{ durationMinutes: number }>,
+  tz: string,
+): Promise<string | null> {
+  const now = new Date()
+  const duration = activeServices.length > 0
+    ? Math.min(...activeServices.map((s) => s.durationMinutes))
+    : 60
+  const dayStartOf = (dateStr: string): Date => resolveSlotStart(dateStr, { hour: 0, minute: 0 }, tz)
+
+  let from = now
+  let to = new Date(now.getTime() + 14 * 86_400_000)
+  let scoped = false // customer named a specific day/week
+
+  if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
+    const parts: RequestedDateParts = {
+      relativeDay: slot.relativeDay ?? null,
+      weekday: slot.weekday ?? null,
+      explicitDate: slot.explicitDate ?? null,
+    }
+    const resolved = resolveRequestedDate(parts, tz, now)
+    if (resolved.ok) {
+      const start = dayStartOf(resolved.dateStr)
+      from = start < now ? now : start
+      to = dayStartOf(addDaysToDateStr(resolved.dateStr, 1))
+      scoped = true
+    } else if (slot.relativeDay === 'this_week' || slot.relativeDay === 'next_week') {
+      const today = localParts(now, tz).dateStr
+      const base = slot.relativeDay === 'next_week' ? addDaysToDateStr(today, 7) : today
+      const start = dayStartOf(base)
+      from = start < now ? now : start
+      to = dayStartOf(addDaysToDateStr(base, 7))
+      scoped = true
+    }
+  }
+
+  try {
+    const slots = await getOpenSlots(db, business, { start: from, end: to }, duration, { maxSlots: 6 })
+    if (slots.length > 0) {
+      const list = slots.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
+      return `Actual open times in the window the customer asked about: ${list}.`
+    }
+    if (!scoped) return 'No open times in the next two weeks.'
+    // Specific day/week had nothing — offer the next real opening overall, honestly.
+    const fallback = await getOpenSlots(db, business, { start: now, end: new Date(now.getTime() + 14 * 86_400_000) }, duration, { maxSlots: 3 })
+    if (fallback.length === 0) return 'Nothing open in the window they asked about, and nothing in the next two weeks.'
+    const list = fallback.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
+    return `Nothing open in the window they asked about. The next real openings are: ${list}.`
   } catch {
     return null
   }
@@ -244,7 +318,7 @@ export async function handleBookingFlow(
 
   // ── Branch: waiting for clarification on vague slot ──────────────────────
   if (session.state === 'waiting_clarification') {
-    return handleClarification(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript)
+    return handleClarification(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, business)
   }
 
   // ── Default: new message, extract intent ─────────────────────────────────
@@ -303,25 +377,30 @@ export async function handleBookingFlow(
   // Offer when: detected language differs from default, no override locked yet.
   const shouldOfferSwitch = !ctx.languageOverride && detectedLanguage !== defaultLang
 
+  // Greet at most once per session. firstMsgPrefix is the ONLY thing that licenses
+  // a greeting/intro; every later turn must continue without re-introducing.
+  const mayGreet = isFirstMessage && !ctx.greeted
+
   // Persist language detection into context so all subsequent branches use it
   const updatedCtx: BookingFlowContext = {
     ...ctx,
     detectedLanguage,
+    ...(mayGreet ? { greeted: true } : {}),
     ...(shouldOfferSwitch ? { languageSwitchOfferPending: true } : {}),
   }
 
   // Prefix injected into situation strings for first-message targeted intents
-  const firstMsgPrefix = isFirstMessage
+  const firstMsgPrefix = mayGreet
     ? 'This is the customer\'s first message — include a brief warm greeting before addressing their request. '
-    : ''
+    : 'Do NOT greet or re-introduce yourself — continue the conversation directly. '
 
   const intentResult2 = await (async (): Promise<FlowResult> => {
     switch (intent.intent) {
       case 'booking':
-        return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, firstMsgPrefix)
+        return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, firstMsgPrefix, business)
 
       case 'rescheduling':
-        return handleReschedulingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript)
+        return handleReschedulingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, business)
 
       case 'cancellation':
         return handleCancellationIntent(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript)
@@ -347,31 +426,22 @@ export async function handleBookingFlow(
           .where(and(eq(bookings.customerId, identity.id), eq(bookings.state, 'confirmed'), gte(bookings.slotStart, ninetyDaysAgo)))
         const recentBookingCount = Number(countRow?.total ?? 0)
 
-        const availRows = await db
-          .select({ dayOfWeek: availability.dayOfWeek, openTime: availability.openTime })
-          .from(availability)
-          .where(and(eq(availability.businessId, identity.businessId), isNull(availability.specificDate), eq(availability.isBlocked, false)))
-        let nextAvailableSlot: string | null = null
-        const now = new Date()
-        for (let i = 1; i <= 7; i++) {
-          const d = new Date(now)
-          d.setDate(d.getDate() + i)
-          const dow = d.getDay()
-          const dayAvail = availRows.find((r) => r.dayOfWeek === dow)
-          if (dayAvail) {
-            const dayLabel = formatSlotDate(d, businessTimezone)
-            nextAvailableSlot = dayAvail.openTime ? `${dayLabel} from ${dayAvail.openTime}` : dayLabel
-            break
-          }
-        }
+        // Real availability — answer the day/range the customer asked about from the
+        // canonical spine, not a single parroted slot. Plus the full hours summary so
+        // "what hours are you open this week?" can be answered honestly.
+        const availabilityText = business
+          ? await buildInquiryAvailabilityText(db, business, intent.slotRequest, activeServices, businessTimezone)
+          : null
+        const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
 
         const customerCtx = recentBookingCount > 0
           ? `Returning customer with ${recentBookingCount} booking(s) in the last 90 days.`
           : 'First-time or lapsed customer.'
-        const slotCtx = nextAvailableSlot ? ` Next open window: ${nextAvailableSlot}.` : ''
+        const slotCtx = availabilityText ? ` ${availabilityText}` : ''
+        const hoursCtx = hoursSummary ? ` ${hoursSummary}` : ''
 
         const situation = activeServices.length > 0
-          ? `${firstMsgPrefix}Customer asked a question about the business or services. ${customerCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above if relevant, then invite them to book.`
+          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the hours, real open times, FAQs, and service info above. If they asked which times/days are open, give the actual open times above as a short bullet list and invite them to pick one — never invent times. We do not track individual staff members' personal schedules; if asked about a specific instructor's hours, answer with the studio's hours/openings and say bookings go through here.`
           : `${firstMsgPrefix}Customer asked about the business. ${customerCtx} No services are configured yet. Direct them to contact the business directly.`
         const knowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
@@ -420,12 +490,14 @@ export async function handleBookingFlow(
         await updateSessionContext(db, session.id, ctxWithCount)
 
         const hasFaqs = (businessKnowledge?.faqs?.length ?? 0) > 0
-        // First-message generic/ambiguous: welcome + introduce the PA
-        const unknownSituation = isFirstMessage
-          ? `This is the customer's first message and it is unclear or generic. Welcome them warmly, introduce yourself as the booking assistant for ${businessName}, briefly explain what you can help with (booking, cancellations, rescheduling${hasFaqs ? ', and questions about the business' : ''}), and ask how you can help.`
+        // ONLY the genuine first message of a session may introduce the PA. Every
+        // later turn continues the conversation — it must never re-greet or
+        // re-announce identity (that was the verbatim-reintroduction bug).
+        const unknownSituation = mayGreet
+          ? `This is the customer's first message and it is unclear or generic. Greet them warmly as ${businessName}, say in one line you can help with booking, changing, or cancelling appointments${hasFaqs ? ' and answer questions about the business' : ''}, and ask how you can help. Keep it short and human.`
           : hasFaqs
-            ? `Customer sent a message the system couldn't classify as booking, cancellation, or rescheduling. Their message: "${messageText}". Check the FAQs above — if one is relevant, answer it directly. If not, politely explain the assistant handles bookings and invite them to ask about that.`
-            : `Customer sent something that couldn't be understood or is out of scope. Respond warmly — acknowledge you didn't quite follow, then in 1–2 friendly sentences let them know you can help with booking, cancelling, rescheduling, or checking upcoming appointments. Invite them to try.`
+            ? `Mid-conversation: the customer said "${messageText}", which isn't a clear booking/cancel/reschedule. Do NOT greet or re-introduce yourself. If a FAQ above answers it, answer directly; otherwise reply like a person — briefly acknowledge, then nudge toward what you can help with (booking, changing, cancelling, checking appointments).`
+            : `Mid-conversation: the customer said "${messageText}", which you couldn't map to a booking action. Do NOT greet or re-introduce yourself and do NOT repeat a canned capability list. Reply like a human employee — a short, warm acknowledgement that keeps things moving toward booking, changing, cancelling, or checking an appointment.`
 
         const unknownKnowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
@@ -449,8 +521,8 @@ export async function handleBookingFlow(
   // Append once per turn when we detected a different language and no override is set yet.
   if (shouldOfferSwitch && intentResult2.reply && !intentResult2.sessionComplete) {
     const offerSuffix = detectedLanguage === 'en'
-      ? '\n\nWould you like me to continue in English? (YES / NO)'
-      : '\n\nרוצה שאמשיך בעברית? (כן / לא)'
+      ? '\n\nWant me to keep going in English? Just say the word.'
+      : '\n\nרוצה שאמשיך בעברית? פשוט תכתוב לי כן.'
     return { ...intentResult2, reply: intentResult2.reply + offerSuffix }
   }
 
@@ -471,101 +543,168 @@ async function handleBookingIntent(
   businessName: string,
   transcript: TranscriptTurn[],
   firstMsgPrefix: string = '',
+  business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
+  const now = new Date()
   const slot = intent.slotRequest
-
-  // Max clarification attempts guard — prevent infinite loops
   const attempts = (ctx.clarificationAttempts as number | undefined) ?? 0
-  if (attempts >= 3 && (!slot || !slot.hasSpecificDate || !slot.hasSpecificTime || !slot.resolvedStart)) {
+  const persona = ctx.botPersona ? { botPersona: ctx.botPersona } : {}
+
+  // ── Merge newly-extracted pieces into the incremental slot draft ──────────
+  // We never re-ask something already captured. Internal state only (G2).
+  const draft: NonNullable<BookingFlowContext['slotDraft']> = { ...(ctx.slotDraft ?? {}) }
+
+  // Date — resolved DETERMINISTICALLY from structured pieces; LLM never computes.
+  let dateProblem: string | null = null
+  if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
+    const parts: RequestedDateParts = {
+      relativeDay: slot.relativeDay ?? null,
+      weekday: slot.weekday ?? null,
+      explicitDate: slot.explicitDate ?? null,
+    }
+    const resolved = resolveRequestedDate(parts, businessTimezone, now)
+    if (resolved.ok) draft.dateStr = resolved.dateStr
+    else if (resolved.reason !== 'no_date') dateProblem = resolved.reason
+  }
+  if (slot?.time) draft.time = { hour: slot.time.hour, minute: slot.time.minute }
+
+  const service =
+    resolveService(intent.serviceTypeHint, activeServices) ??
+    (draft.serviceTypeId ? activeServices.find((s) => s.id === draft.serviceTypeId) ?? null : null)
+  if (service) {
+    draft.serviceTypeId = service.id
+    draft.serviceName = service.name
+  }
+  if (intent.participantsHint != null) draft.participants = intent.participantsHint
+
+  const failAfterThreeTries = async (): Promise<FlowResult> => {
     await failSession(db, session.id)
     const reply = await generateCustomerReply({
-      businessName,
-      language: lang,
-      situation: 'Customer has failed to provide a valid booking date/time after 3 attempts. Apologize, end the conversation gracefully, and ask them to call the business directly.',
-      transcript,
-      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: 'The customer has not landed on a workable date/time after several tries. Wrap up warmly and suggest they call the business directly.',
     })
     return { reply, sessionComplete: true, sessionFailed: true }
   }
 
-  // Vague slot — ask for clarification
-  if (!slot || !slot.hasSpecificDate || !slot.hasSpecificTime || !slot.resolvedStart) {
-    const missing = !slot?.hasSpecificDate ? 'date' : 'time'
+  // ── A bad date (past / impossible / ambiguous): clarify, don't echo it back ─
+  if (dateProblem) {
     const newAttempts = attempts + 1
-    await updateSessionContext(db, session.id, { ...ctx, clarificationAttempts: newAttempts }, 'waiting_clarification')
+    if (newAttempts >= 3) return failAfterThreeTries()
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draft, clarificationAttempts: newAttempts }, 'waiting_clarification')
     const reply = await generateCustomerReply({
-      businessName,
-      language: lang,
-      situation: `Booking intent detected but the ${missing} is missing or vague. Ask for a specific ${missing}.`,
-      transcript,
-      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${firstMsgPrefix}The customer wants to book but ${sanitiseReason(dateProblem)}. Without repeating the unusable date back, ask which upcoming day they'd like.`,
     })
     return { reply, sessionComplete: false }
   }
 
-  // Resolve service type
-  const service = resolveService(intent.serviceTypeHint, activeServices)
-  if (!service) {
-    await updateSessionContext(db, session.id, { ...ctx, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
-    const list = activeServices.map((s) => s.name).join(', ')
+  // ── Still missing one of {service, date, time}? Ask for exactly one ────────
+  if (!draft.serviceTypeId || !draft.dateStr || !draft.time) {
+    const newAttempts = attempts + 1
+    if (newAttempts >= 3) return failAfterThreeTries()
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draft, clarificationAttempts: newAttempts }, 'waiting_clarification')
+
+    let ask: string
+    if (!draft.serviceTypeId) {
+      const list = activeServices.map((s) => s.name).join(', ')
+      ask = `The customer wants to book but hasn't said which service. Available: ${list}. Ask which one — one question, naturally.`
+    } else if (!draft.dateStr) {
+      ask = `Booking ${draft.serviceName}. Still need the day — ask which day works. Do NOT re-ask the service.`
+    } else {
+      ask = `Booking ${draft.serviceName} on ${formatLocalDate(draft.dateStr, businessTimezone)}. Still need the time — ask what time. Do NOT re-ask the day or service.`
+    }
     const reply = await generateCustomerReply({
-      businessName,
-      language: lang,
-      situation: `Customer wants to book but did not specify a service. Available services: ${list}. Ask which one they want.`,
-      transcript,
-      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${firstMsgPrefix}${ask}`,
     })
     return { reply, sessionComplete: false }
   }
 
-  const slotStart = new Date(slot.resolvedStart)
-  const slotEnd = slot.resolvedEnd
-    ? new Date(slot.resolvedEnd)
-    : new Date(slotStart.getTime() + service.durationMinutes * 60 * 1000)
+  // ── All pieces present: compose the absolute slot, then the DETERMINISTIC gate ─
+  const svc = activeServices.find((s) => s.id === draft.serviceTypeId)!
 
-  if (isNaN(slotStart.getTime())) {
-    await updateSessionContext(db, session.id, { ...ctx, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
+  // Party-size vs service model: don't silently confirm "yoga for 3" on a 1-on-1.
+  if (draft.participants != null && draft.participants > 1 && svc.maxParticipants === 1) {
+    const { participants: _dropParticipants, ...draftKeep } = draft
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
     const reply = await generateCustomerReply({
-      businessName,
-      language: lang,
-      situation: "Could not parse the date or time the customer provided. Ask them to try again with a specific date and time, e.g. 'Tuesday 3 May at 3pm'.",
-      transcript,
-      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${svc.name} is a private, one-on-one session — it can't take ${draft.participants} people on a single booking. Ask whether they'd like to go ahead with just one spot, or if they meant something else.`,
+    })
+    return { reply, sessionComplete: false }
+  }
+  if (draft.participants != null && draft.participants > svc.maxParticipants && svc.maxParticipants > 1) {
+    const { participants: _dropParticipants, ...draftKeep } = draft
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
+    const reply = await generateCustomerReply({
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${svc.name} holds at most ${svc.maxParticipants} people, and they asked for ${draft.participants}. Let them know the limit and ask how they'd like to proceed.`,
     })
     return { reply, sessionComplete: false }
   }
 
-  // DST gap check — if stored UTC formats back to a different hour in business TZ, the slot fell in a DST gap
-  if (checkDSTGap(slot.resolvedStart, businessTimezone)) {
-    await updateSessionContext(db, session.id, { ...ctx, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
+  const slotStart = resolveSlotStart(draft.dateStr, draft.time, businessTimezone)
+  const slotEnd = new Date(slotStart.getTime() + svc.durationMinutes * 60_000)
+
+  // DST gap — the requested wall-clock time doesn't exist that day.
+  if (isNaN(slotStart.getTime()) || checkDSTGap(slotStart.toISOString(), businessTimezone)) {
+    const { time: _dropTime, ...draftKeep } = draft
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
     const reply = await generateCustomerReply({
-      businessName,
-      language: lang,
-      situation: 'The requested time falls in a daylight saving time transition gap and does not exist on the clock. Ask the customer to choose a different time.',
-      transcript,
-      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: 'That exact time does not exist on the clock that day (a daylight-saving shift). Ask the customer to pick a different time.',
     })
     return { reply, sessionComplete: false }
   }
 
+  // Timing policy (past / buffer / max-days) + business hours — BEFORE confirming.
+  const buffer = business?.minBookingBufferMinutes ?? 30
+  const maxDays = business?.maxBookingDaysAhead ?? 365
+  const timingError = validateSlotTiming(slotStart, slotEnd, buffer, maxDays)
+  let outsideHours = false
+  if (!timingError && business) {
+    const blockTypes: CalendarBlockType[] = svc.maxParticipants > 1 ? ['block', 'personal'] : ['block', 'personal', 'class']
+    const bookable = await isSlotBookable(db, business, { start: slotStart, end: slotEnd }, { includeBookings: false, blockTypes })
+    if (!bookable.bookable && (bookable.reason === 'outside_hours' || bookable.reason === 'invalid_slot')) outsideHours = true
+  }
+
+  if (timingError || outsideHours) {
+    // Drop the bad time, keep date + service, and offer real openings immediately.
+    const { time: _dropTime, ...draftKeep } = draft
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: 0 }, 'waiting_clarification')
+    const openSlotsText = business
+      ? await suggestOpenSlotsText(db, business, svc.id, slotStart, slotEnd, businessTimezone)
+      : null
+    const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
+    const problemReason = timingError ? sanitiseReason(timingError) : sanitiseReason('outside_hours')
+    const situation = [
+      `The customer asked to book ${svc.name} at a time that won't work — ${problemReason}.`,
+      hoursSummary ?? '',
+      openSlotsText
+        ? `Offer these actual open times and ask which they'd like: ${openSlotsText}.`
+        : 'Ask them to pick a time within business hours.',
+    ].filter(Boolean).join(' ')
+    const reply = await generateCustomerReply({
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation,
+    })
+    return { reply, sessionComplete: false }
+  }
+
+  // ── Passed every gate: confirmation built from the RESOLVED slot (never the LLM's date) ─
   const displayDate = formatSlotDate(slotStart, businessTimezone)
   const displayTime = formatSlotTime(slotStart, businessTimezone)
-  const summary = intent.summary ?? `${service.name} on ${displayDate} at ${displayTime}`
 
+  const { slotDraft: _clearDraft, ...ctxWithoutDraft } = ctx
   const newCtx: BookingFlowContext = {
-    ...ctx,
+    ...ctxWithoutDraft,
     clarificationAttempts: 0,
     pendingSlot: {
       start: slotStart.toISOString(),
       end: slotEnd.toISOString(),
-      serviceTypeId: service.id,
-      serviceName: service.name,
+      serviceTypeId: svc.id,
+      serviceName: svc.name,
       providerHint: intent.providerHint ?? null,
     },
     awaitingConfirmationFor: 'hold',
@@ -573,11 +712,8 @@ async function handleBookingIntent(
 
   await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
   const reply = await generateCustomerReply({
-    businessName,
-    language: lang,
-    situation: `${firstMsgPrefix}Customer wants to book: ${summary}. Ask them to confirm (YES) or decline (NO).`,
-    transcript,
-    customerMemory: extractMemory(ctx),
+    businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+    situation: `${firstMsgPrefix}Customer wants to book ${svc.name} on ${displayDate} at ${displayTime}. Restate the service, day, date and time clearly, then ask them to confirm.`,
   })
   return { reply, sessionComplete: false }
 }
@@ -593,6 +729,7 @@ async function handleReschedulingIntent(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
 
@@ -608,7 +745,7 @@ async function handleReschedulingIntent(
     )
 
   if (activeBookings.length === 0) {
-    return handleBookingIntent(db, calendar, identity, session, ctx, intent, activeServices, businessTimezone, businessName, transcript)
+    return handleBookingIntent(db, calendar, identity, session, ctx, intent, activeServices, businessTimezone, businessName, transcript, '', business)
   }
 
   if (activeBookings.length > 1) {
@@ -630,7 +767,7 @@ async function handleReschedulingIntent(
   }
 
   const newCtx: BookingFlowContext = { ...ctx, rescheduledFrom: existing.id }
-  return handleBookingIntent(db, calendar, identity, session, newCtx, intent, activeServices, businessTimezone, businessName, transcript)
+  return handleBookingIntent(db, calendar, identity, session, newCtx, intent, activeServices, businessTimezone, businessName, transcript, '', business)
 }
 
 async function handleHoldConfirmation(
@@ -652,7 +789,7 @@ async function handleHoldConfirmation(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: 'Customer sent an unclear reply. Ask them again to reply YES to confirm the booking or NO to cancel.',
+      situation: "Customer's reply was unclear. Gently ask again whether they want to go ahead with the booking or not — in plain words, no menu.",
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -772,7 +909,7 @@ async function handleHoldConfirmation(
     return { reply, sessionComplete: true }
   }
 
-  // Private session — hold placed, ask for final YES to confirm
+  // Private session — hold placed, ask for a final confirmation (plain words)
   const newCtx: BookingFlowContext = {
     ...ctx,
     pendingBookingId: result.bookingId,
@@ -785,7 +922,7 @@ async function handleHoldConfirmation(
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
-    situation: `Slot successfully held for ${pendingSlot.serviceName} on ${heldDate} at ${heldTime}. Ask customer to reply YES to finalize and confirm the booking.`,
+    situation: `Slot successfully held for ${pendingSlot.serviceName} on ${heldDate} at ${heldTime}. Ask the customer to confirm they want it locked in — naturally, no menu.`,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -802,6 +939,7 @@ async function handleClarification(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
 
@@ -847,7 +985,7 @@ async function handleClarification(
   return handleBookingIntent(
     db, calendar, identity,
     { ...session, state: 'active', context: mergedCtx },
-    mergedCtx, intentResult.data, activeServices, businessTimezone, businessName, transcript,
+    mergedCtx, intentResult.data, activeServices, businessTimezone, businessName, transcript, '', business,
   )
 }
 
@@ -897,7 +1035,7 @@ async function handleCancellationIntent(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: `Customer wants to cancel their booking on ${date}. Ask YES to confirm cancellation or NO to keep it.`,
+      situation: `Customer wants to cancel their booking on ${date}. Ask them to confirm they want it cancelled — naturally, no menu.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -942,7 +1080,7 @@ async function enterCancellationSelection(
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
-    situation: `Customer wants to ${action} but has ${activeBookings.length} active bookings. List them numbered and ask which number to ${action}: ${numberedList}`,
+    situation: `Customer wants to ${action} but has ${activeBookings.length} upcoming bookings. List them as a bullet list (numbered for easy reference) and ask, like a person, which one they mean — they can just reply with its number. Bookings: ${numberedList}`,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -968,7 +1106,7 @@ async function handleCancellationSelection(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: `Customer sent an invalid selection. Ask them to reply with a number between 1 and ${candidates.length}.`,
+      situation: `That wasn't a clear pick. Warmly ask which of their ${candidates.length} bookings they mean — they can reply with its number.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -988,7 +1126,7 @@ async function handleCancellationSelection(
   const reply = await generateCustomerReply({
     businessName,
     language: lang,
-    situation: `Customer selected booking #${n} to cancel. Ask them to confirm (YES) to cancel it or NO to keep it.`,
+    situation: `Customer selected booking #${n} to cancel. Ask them to confirm the cancellation — naturally, no menu.`,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -1012,7 +1150,7 @@ async function handleCancellationConfirmation(
     const reply = await generateCustomerReply({
       businessName,
       language: lang,
-      situation: 'Customer sent an unclear reply. Ask them again to reply YES to confirm cancellation or NO to keep the booking.',
+      situation: "Customer's reply was unclear. Ask again whether they want to cancel it or keep it — in plain words, no menu.",
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),

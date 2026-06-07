@@ -61,14 +61,14 @@ async function processJob(job: { data: ManagerSummaryJob }): Promise<void> {
     .map((m) => `${m.role === 'customer' ? 'Manager' : 'Assistant'}: ${m.text}`)
     .join('\n')
 
-  const systemPrompt = `You are summarizing a WhatsApp conversation between a business manager and their PA assistant for "${biz.name}".
+  const systemPrompt = `You are writing a private memory note for a PA that texts the business owner of "${biz.name}". This note will be re-read by the PA at the start of a future conversation so it can pick up naturally, like a colleague who remembers.
 
-Write a 2–3 sentence summary in ${lang === 'he' ? 'Hebrew' : 'English'} covering:
-- Key decisions or changes made (availability, services, policies)
-- Important preferences the manager expressed
-- Any pending items or follow-ups mentioned
+Write a 2–3 sentence note in ${lang === 'he' ? 'Hebrew' : 'English'} capturing what actually matters for next time:
+- Decisions or changes made (availability, services, policies)
+- Preferences, tone, or context the owner expressed (how they like things, what they care about, anything personal worth remembering)
+- Anything left open or promised as a follow-up
 
-Be specific and factual. Do not include pleasantries or filler. Output the summary only.`
+Write it as a useful reminder, not a database record — keep the human context that lets the PA continue the relationship, not just dry facts. Output the note only.`
 
   try {
     const result = await ai.models.generateContent({

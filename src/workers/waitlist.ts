@@ -137,7 +137,7 @@ async function processJob(job: { data: WaitlistJob }) {
 
     const freeFormAllowed = await canSendFreeForm(next.customerId)
     if (freeFormAllowed) {
-      const situation = `A slot just opened up at ${biz.name}: "${serviceName}" on ${dateStr}. Tell the customer the good news and ask them to reply YES to book it or NO to pass. The offer expires in ${OFFER_TTL_MINUTES} minutes.`
+      const situation = `A slot just opened up at ${biz.name}: "${serviceName}" on ${dateStr}. Share the good news warmly and invite them to just tell you if they want it — never say "reply YES/NO". Mention you're holding it for ${OFFER_TTL_MINUTES} minutes.`
       const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: offerBody, timeoutMs: 2500 })
       await sendMessage({ toNumber: customer.phoneNumber, body: llmBody }, waCredentials)
         .catch(() => { /* retry queue handles failures */ })

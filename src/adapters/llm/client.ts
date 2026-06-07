@@ -2,13 +2,54 @@ import { GoogleGenAI } from '@google/genai'
 import { z } from 'zod'
 import type { CustomerIntentOutput, ManagerInstructionOutput, OperatorActionOutput, LlmResult, GenerateReplyInput, ParseableOnboardingStep, OnboardingAnswerOutput } from './types.js'
 import { middlemanExplainBlock } from './middleman-identity.js'
+import { buildVoiceCore } from './voice.js'
+import { MODELS } from './models.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
 
-const MODEL = 'gemini-2.5-flash'
+// Classification/extraction default. Conversational generators use MODELS.pro via
+// generateConversational() below.
+const MODEL = MODELS.fast
 
 const ai = new GoogleGenAI({ apiKey: LLM_API_KEY, apiVersion: 'v1beta' })
+
+// Conversational generation on Pro, with a graceful Flash fallback so a slow or
+// failed Pro call never drops a reply.
+//
+// Pro reasons by default and its thinking tokens draw down maxOutputTokens. A
+// short reply with a small budget (e.g. 512) gets starved — Pro spends the whole
+// budget thinking and returns EMPTY text, silently triggering the caller's robotic
+// fallback. So for Pro we bound thinking with a positive thinkingBudget (valid on
+// Pro; only 0 is invalid) and guarantee headroom for the actual answer. Flash
+// doesn't reason, so its fallback disables thinking and keeps the caller's budget.
+const PRO_THINKING_BUDGET = 1024
+const PRO_MIN_OUTPUT_TOKENS = 3072
+type GenRequest = Omit<Parameters<typeof ai.models.generateContent>[0], 'model'>
+
+async function generateConversational(request: GenRequest) {
+  const requestedMax = request.config?.maxOutputTokens ?? 1024
+  try {
+    return await ai.models.generateContent({
+      ...request,
+      model: MODELS.pro,
+      config: {
+        ...request.config,
+        thinkingConfig: { thinkingBudget: PRO_THINKING_BUDGET },
+        maxOutputTokens: Math.max(requestedMax, PRO_MIN_OUTPUT_TOKENS),
+      },
+    })
+  } catch (err) {
+    console.warn('[llm] Pro generation failed, falling back to Flash', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return await ai.models.generateContent({
+      ...request,
+      model: MODELS.fast,
+      config: { ...request.config, thinkingConfig: { thinkingBudget: 0 } },
+    })
+  }
+}
 
 const customerIntentSchema = z.object({
   intent: z.enum(['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'system_explanation', 'unknown']).catch('unknown'),
@@ -16,6 +57,21 @@ const customerIntentSchema = z.object({
     .object({
       hasSpecificDate: z.boolean().catch(false),
       hasSpecificTime: z.boolean().catch(false),
+      relativeDay: z.enum(['today', 'tomorrow', 'day_after_tomorrow', 'this_week', 'next_week']).nullable().catch(null),
+      weekday: z.number().int().min(0).max(6).nullable().catch(null),
+      explicitDate: z
+        .object({
+          year: z.number().int().nullable().catch(null),
+          month: z.number().int().min(1).max(12).nullable().catch(null),
+          day: z.number().int().min(1).max(31).nullable().catch(null),
+        })
+        .nullable()
+        .catch(null),
+      time: z
+        .object({ hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59) })
+        .nullable()
+        .catch(null),
+      timeOfDay: z.enum(['morning', 'afternoon', 'evening']).nullable().catch(null),
       resolvedStart: z.string().nullable().catch(null),
       resolvedEnd: z.string().nullable().catch(null),
       dateHint: z.string().nullable().catch(null),
@@ -26,6 +82,7 @@ const customerIntentSchema = z.object({
     .catch(null),
   serviceTypeHint: z.string().nullable().catch(null),
   providerHint: z.string().nullable().catch(null),
+  participantsHint: z.number().int().positive().nullable().catch(null),
   summary: z.string().nullable().catch(null),
   rawEntities: z.record(z.unknown()).transform((v) =>
     Object.fromEntries(Object.entries(v).map(([k, val]) => [k, String(val)])),
@@ -67,14 +124,18 @@ Return a JSON object with EXACTLY this structure (all fields required):
   "slotRequest": {
     "hasSpecificDate": boolean,
     "hasSpecificTime": boolean,
-    "resolvedStart": "ISO8601 datetime in business timezone" | null,
-    "resolvedEnd": "ISO8601 datetime in business timezone" | null,
+    "relativeDay": "today" | "tomorrow" | "day_after_tomorrow" | "this_week" | "next_week" | null,
+    "weekday": 0-6 | null,
+    "explicitDate": { "year": number|null, "month": 1-12|null, "day": 1-31|null } | null,
+    "time": { "hour": 0-23, "minute": 0-59 } | null,
+    "timeOfDay": "morning" | "afternoon" | "evening" | null,
     "dateHint": "original date text" | null,
     "timeHint": "original time text" | null,
     "dateAmbiguous": boolean
   } | null,
   "serviceTypeHint": "service name from message" | null,
   "providerHint": "staff name from message" | null,
+  "participantsHint": number | null,
   "summary": "one sentence summary" | null,
   "rawEntities": {},
   "detectedLanguage": "he" | "en"
@@ -83,12 +144,18 @@ Return a JSON object with EXACTLY this structure (all fields required):
 Rules:
 - intent: use "list_bookings" when the customer asks to see their appointments (e.g. "what are my bookings?", "מה התורים שלי").
 - intent: use "system_explanation" ONLY when the customer explicitly asks what system, platform, app, or technology powers this assistant, or who built it / how it works technically (e.g. "are you a bot?", "what app is this?", "מי בנה אותך?", "על איזו מערכת זה רץ?"). Questions about the BUSINESS, its services, prices, or hours are "inquiry", NOT this. Transactional intents win: if the same message also asks to book, reschedule, cancel, or list bookings, return that intent instead — system_explanation is the lowest priority.
-- slotRequest: set to an object when a booking date/time is mentioned; set to null for non-booking intents.
-  - hasSpecificDate: true if a specific calendar date is given (e.g. "May 2", "2 במאי", "Tuesday the 5th"). false for vague ("sometime next week").
-  - hasSpecificTime: true if a specific time is given (e.g. "10:00", "3pm", "10:00"). false for vague ("morning").
-  - resolvedStart/resolvedEnd: ISO 8601 in business timezone when both date AND time are specific. Null otherwise. Use service duration (default 60 min) for resolvedEnd.
-  - dateAmbiguous: true ONLY for purely relative expressions that could match two weeks (e.g. "next Wednesday"). Explicit day+month dates like "May 2", "2 במאי", "ב-2 למאי" are NEVER ambiguous — set false.
+- DATE/TIME — CLASSIFY ONLY, NEVER COMPUTE. You only report what the customer literally said as structured pieces. Do NOT compute, resolve, or output any absolute/ISO date. Do NOT invent a year. A separate deterministic system turns your pieces into the real date.
+  - slotRequest: set to an object when a booking date/time is mentioned; set to null for non-booking intents.
+  - relativeDay: map relative phrasing — "today"/"היום"→today, "tomorrow"/"מחר"→tomorrow, "day after tomorrow"/"מחרתיים"→day_after_tomorrow, "this week"/"השבוע"→this_week, "next week"/"שבוע הבא"→next_week. Otherwise null.
+  - weekday: 0=Sunday … 6=Saturday when a named day is given ("Tuesday"/"יום שלישי"→2). Otherwise null.
+  - explicitDate: fill day and month when a calendar date is stated ("May 2"/"2 במאי"/"10.01"→{month,day}); include year ONLY if the customer explicitly stated it (e.g. "10.01.2016"→year:2016). Never fill year yourself. null if no explicit date.
+  - time: fill {hour,minute} in 24-hour form when a clock time is given ("3pm"→{15,0}, "9:30"→{9,30}, "תשע בבוקר"→{9,0}). null for vague.
+  - timeOfDay: "morning"/"afternoon"/"evening" (or Hebrew בוקר/צהריים/ערב) when only a part of day is given; otherwise null.
+  - hasSpecificDate: true if any concrete day is identifiable (relativeDay other than this_week/next_week, a weekday, or an explicitDate with day+month). false for vague ("sometime next week").
+  - hasSpecificTime: true only when "time" is filled. false for vague ("morning").
+  - dateAmbiguous: true ONLY for "this_week"/"next_week" with no weekday. Explicit day+month dates and named weekdays are NEVER ambiguous — set false.
 - serviceTypeHint: extract the service name the customer mentions (e.g. "תספורת" → "תספורת", "haircut" → "Haircut"). null if none.
+- participantsHint: number of people if the customer states a party size ("for 3 people"/"לשלושה אנשים"→3). null if not stated.
 - detectedLanguage: "he" if message is in Hebrew; "en" for English or any other language.
 - Respond only with valid JSON matching the structure above. No explanation.`
 
@@ -222,7 +289,9 @@ function sanitizeUserInput(text: string): string {
     .slice(0, 2000) // hard cap on message length to prevent context overflow
 }
 
-const PA_PERSONA_TEMPLATE = `You are the booking assistant for {businessName}. You speak as the business — not as an AI, not as a bot, not as a third party.
+const PA_PERSONA_TEMPLATE = `You are the booking assistant for {businessName}, speaking as the business itself.
+
+${buildVoiceCore('customer')}
 
 LANGUAGE RULE — strictly enforced: reply ENTIRELY in {language}. If {language} is "he", write only in Hebrew. If {language} is "en", write only in English. Never mix languages in one reply.
 
@@ -231,33 +300,26 @@ WHATSAPP FORMATTING — strictly enforced:
 - Bullet lists: use • (U+2022) with a space after. Never use -, *, or numbered lists.
 - URLs: place on their own line, never inside parentheses or as markdown [text](url).
 - No HTML tags, no markdown headers (#, ##), no tables.
-- Maximum one question per message — never stack two questions.
-- Confirmations and simple answers: 1–2 sentences. Complex explanations: up to 4 sentences. Never pad with filler.
-- Emoji: maximum one per message at a key moment (✅ confirmed, 📅 date info). None in questions or clarifications.
+- Emoji: maximum one per message at a key moment (✅ confirmed, ⏰ reminder). None in questions or clarifications.
 
-Tone and voice:
-- Warm and direct. Think of the competent person at a business you trust — not a chatbot, not a call centre.
-- Short replies: 1–2 sentences for confirmations and simple answers; up to 4 sentences for complex situations. Never pad with filler words.
-- A brief acknowledgement opener is natural for confirmations: Hebrew "קיבלתי —", English "Got it —". Keep it small — never sycophantic ("בטח! אשמח מאוד!", "Absolutely! I'd be happy to help!").
-- Hebrew-specific: use natural Israeli phrasing. Dates as "ב-13 במאי", "ביום שלישי". Numbers as digits. Complete but colloquial sentences.
-- English-specific: use contractions always ("you're", "it's", "that's taken"). WhatsApp rhythm, not formal writing.
-- When confirming a booking: always restate the service name, day, date, and time clearly — then end with the action ("לאשר? (כן / לא)" / "Confirm? (YES / NO)").
-- Ask exactly one question per message — never stack questions.
-- No bullet points unless listing multiple bookings.
-- Emoji: one per key moment maximum (✅ booking confirmed, reminder sent). None in questions or clarifications.
-- Never say "I am an AI", "as an AI", or reference the underlying technology. The ONLY exception: when the situation explicitly authorizes a platform explanation, give the single one-line platform fact it provides — nothing more — then return to helping.
-- If you know the customer's name and they are returning, you may acknowledge warmly once per session ("קיבלתי, [שם]!" / "Good to hear from you, [name]!") — once only, not repeated.
+BOOKING CONFIRMATIONS: when confirming a booking, restate the service name, day, date, and time clearly, then ask for a yes/no IN PLAIN WORDS — never append a menu. NEVER write "(כן / לא)", "(YES / NO)", "השב כן/לא", or any option list; just ask naturally ("מתאים?" / "סוגר?" / "sound good?" / "shall I lock it in?"). Vary the wording — don't template the whole message.
+
+GREETING — at most ONCE per conversation. Only the very first message of a session may open with a greeting/﻿hello or a self-introduction. On every later turn, do NOT open with "שלום"/"היי"/"hi"/"hello", do NOT re-introduce yourself ("אני העוזרת…"), and do NOT open with an offer to help ("אשמח לעזור"/"בטח"). Continue the conversation directly.
+
+ADDRESSING THE CUSTOMER (Hebrew): always address the customer in masculine second-person form (פנייה בלשון זכר). NEVER write split-gender forms like "תרצה/תרצי" or "תרצה/י" — pick the masculine form. (This is separate from how you refer to yourself, which the persona note below governs.)
+
+PLATFORM EXCEPTION: never reference AI or the underlying technology. The ONLY exception: when the situation explicitly authorizes a platform explanation, give the single one-line platform fact it provides — nothing more — then return to helping.
 
 You receive:
 1. A "situation" description in English (internal context — never quote this back verbatim to the customer).
-2. The recent conversation transcript (up to 8 turns, current session only).
+2. The recent conversation transcript (up to 20 turns, current session only).
 3. Optional customer profile (returning status, preferred service, display name — factual only, not chat history).
 
 Output: one reply message only. No preamble, no quotation marks, no explanation.`
 
 const FALLBACK_REPLIES: Record<'he' | 'en', string> = {
-  he: 'אירעה שגיאה. אנא נסה שנית.',
-  en: 'Something went wrong. Please try again.',
+  he: 'רגע, משהו נתקע לי כאן — אפשר לכתוב לי שוב?',
+  en: "Hang on, something got stuck on my end — mind sending that again?",
 }
 
 function buildKnowledgeAddendum(input: GenerateReplyInput): string {
@@ -325,14 +387,12 @@ ${transcriptText}
 Customer profile: ${memoryText}`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: userTurn,
       config: {
         systemInstruction: systemPrompt,
         maxOutputTokens: 1024,
         temperature: 0.3,
-        thinkingConfig: { thinkingBudget: 0 },
       },
     })
 
@@ -405,14 +465,13 @@ export async function generateOnboardingReply(input: {
       : "This is a retry — they didn't answer clearly. Rephrase patiently, slightly different wording.")
     : ''
 
-  const systemPrompt = `You are helping "${input.businessName}" set up their WhatsApp PA. Guide them conversationally, like a real person texting — warm, direct, short.
+  const systemPrompt = `You are helping "${input.businessName}" set up their WhatsApp PA, texting them as the service.
+
+${buildVoiceCore('onboarding')}
 
 Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
 Rules:
-- 1–3 sentences maximum
 - No bullet points. No numbered lists. No markdown.
-- Ask exactly ONE thing per message
-- Sound like a real person, not a form or bot
 ${ackLine}
 ${retryNote}
 ${input.collectedSummary ? `Already configured: ${input.collectedSummary}` : ''}
@@ -425,10 +484,9 @@ Current step task: ${stepGoal}
 Output: the message text ONLY. No quotes, no labels, no preamble.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: 'Generate the next onboarding message.',
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.45, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.45 },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -459,7 +517,9 @@ export async function generateManagerReply(input: {
     ? input.transcript.map((t) => `${t.role === 'customer' ? 'Manager' : 'Assistant'}: ${t.text}`).join('\n')
     : '(no prior messages this session)'
 
-  const systemPrompt = `You are the admin assistant for "${input.businessName}" on the MiddleMan platform. The manager is texting you on WhatsApp.
+  const systemPrompt = `You are the admin assistant for "${input.businessName}", texting the business owner as the business.
+
+${buildVoiceCore('manager')}
 
 Business state:
 - Timezone: ${input.businessState.timezone}
@@ -468,12 +528,10 @@ Business state:
 
 Language: reply ENTIRELY in ${input.language === 'he' ? 'Hebrew (עברית)' : 'English'}.
 
-Tone: direct and warm — like a competent admin assistant, not a bot.
-- 1–3 sentences. Never pad with filler.
-- If you can answer the question from the business state above, answer it directly.
-- If the question is about something you don't know (e.g. specific booking counts, customer data), say so honestly and suggest they use STATUS or UPCOMING commands.
+Extra rules:
+- If you can answer from the business state above, answer it directly.
+- If it's something you don't know (specific booking counts, customer data), say so plainly and point them to STATUS or UPCOMING.
 - Never make up facts.
-- Do not expose internal system details or raw field names.
 
 Recent conversation:
 ${transcriptText}
@@ -481,10 +539,9 @@ ${transcriptText}
 Output: reply text ONLY. No preamble, no quotes.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: safeQuestion,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.35, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.35 },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -555,13 +612,14 @@ export async function answerOperatorQuestion(input: {
 
   const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. You have full real-time access to the platform data below.
 
+${buildVoiceCore('operator')}
+
 Platform stats: ${statsLine}
 
 Business list:
 ${bizListText}
 ${notesBlock}
 Language: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
-Tone: direct, warm, competent — like an admin assistant who knows the platform data.
 
 WhatsApp formatting — strictly enforced:
 - No HTML tags. No markdown headers (#, ##). No markdown links [text](url).
@@ -585,10 +643,9 @@ ${transcriptText}
 Output: reply text ONLY. No preamble, no quotes.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: safeQuestion,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.3 },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -616,9 +673,10 @@ export async function generateOperatorReply(input: {
     : '(start of session)'
 
   const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. The operator (platform owner) is texting you on WhatsApp.
+
+${buildVoiceCore('operator')}
 ${statsLine ? `\n${statsLine}` : ''}
 Language: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
-Tone: direct and warm — like a competent admin assistant. 1–3 sentences. No filler.
 
 Available commands (always suggest the most relevant one when you can't answer directly):
 - STATUS — overview of all businesses
@@ -637,10 +695,9 @@ ${transcriptText}
 Output: reply text ONLY. No preamble, no quotes.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: safeQuestion,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.35, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.35 },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -666,24 +723,23 @@ export async function explainOnboardingConcept(input: {
 }): Promise<string> {
   const context = CONCEPT_CONTEXT[input.step] ?? input.concept
 
-  const systemPrompt = `You are helping a business owner set up their WhatsApp PA. They seem confused or are asking a question at the "${input.step}" step.
+  const systemPrompt = `You are helping a business owner set up their WhatsApp PA, texting them as the service. They seem confused or are asking a question at the "${input.step}" step.
+
+${buildVoiceCore('onboarding')}
 
 Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
-Rules:
-- 1–3 sentences maximum
+Extra rules:
 - Plain language — no jargon, no markdown, no bullet points
 - Explain the concept clearly, then end with a direct question asking them to provide the information (your last sentence MUST be a question ending with ?)
-- Sound like a helpful human, not a bot
 
 The concept to explain: ${context}
 
 Output: the explanation message ONLY. No quotes, no labels, no preamble.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: `User message: "${input.userMessage}"`,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.4 },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -900,7 +956,9 @@ Return JSON: { "choice": "skip" | "connect" | "unclear" }`
 // waitlist offers, schedule-change cancellations, payment confirmations, and
 // the business-hours / paused / revoked gates in the webhook.
 
-const PROACTIVE_PERSONA = `You are sending a WhatsApp message on behalf of {businessName}. Speak as the business — not as an AI, not as a bot.
+const PROACTIVE_PERSONA = `You are sending a WhatsApp message on behalf of {businessName}, speaking as the business itself.
+
+${buildVoiceCore('proactive')}
 
 LANGUAGE: write ENTIRELY in {language}. Never mix languages.
 
@@ -910,10 +968,7 @@ WHATSAPP FORMATTING (hard rules):
 - URLs: on their own line, never inline.
 - No HTML, no markdown headers (#, ##), no tables.
 - One question maximum per message.
-- Confirmations / notices: 1–3 sentences. Never pad.
 - Emoji: one maximum at a key moment (✅ confirmed, ⏰ reminder, ❌ cancelled). None in questions.
-
-TONE: Warm and direct — like a trusted local business texting you. Hebrew: natural Israeli phrasing, 24h times. English: contractions always ("it's", "we'll"). Never reference AI or technology.
 
 Output: one message ONLY. No preamble, no quotation marks.`
 
@@ -937,10 +992,9 @@ export async function generateProactiveCustomerMessage(input: {
 
   const call = (async (): Promise<string> => {
     try {
-      const result = await ai.models.generateContent({
-        model: MODEL,
+      const result = await generateConversational({
         contents: `Situation: ${input.situation}`,
-        config: { systemInstruction: systemPrompt, maxOutputTokens: 512, temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } },
+        config: { systemInstruction: systemPrompt, maxOutputTokens: 512, temperature: 0.3 },
       })
       return result.text?.trim() || input.fallback
     } catch {
@@ -1054,14 +1108,14 @@ export async function generateProviderOnboardingReply(input: {
 
   const nameCtx = input.collectedData?.businessName ? `Business name: "${input.collectedData.businessName}".` : ''
 
-  const systemPrompt = `You are MiddleMan — a WhatsApp platform that sets up AI booking assistants for local businesses. You are onboarding a new business owner via WhatsApp.
+  const systemPrompt = `You are MiddleMan — a WhatsApp service that sets up booking assistants for local businesses. You are onboarding a new business owner via WhatsApp, texting them as the service.
+
+${buildVoiceCore('onboarding')}
 
 ${langInstruction}
-Rules:
-- 1–3 sentences maximum
+Extra rules:
 - No bullet points. No numbered lists. No markdown.
-- Ask exactly ONE thing per message (in bilingual mode: one thing per language block)
-- Sound like a real helpful service texting them, not a form or bot
+- In bilingual mode (language unknown): ask one thing per language block.
 ${ackLine}
 ${retryNote}
 ${nameCtx}
@@ -1074,10 +1128,9 @@ Current step: ${stepGoal}
 Output: the message text ONLY. No quotes, no labels, no preamble.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: 'Generate the next onboarding message.',
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 512, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 512, temperature: 0.4 },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -1098,7 +1151,9 @@ export async function generateManagerCommandReply(input: {
   dataBlock?: string
   fallback: string
 }): Promise<string> {
-  const systemPrompt = `You are the PA admin assistant for "${input.businessName}". The business manager just ran a command and you are responding on WhatsApp.
+  const systemPrompt = `You are the PA admin assistant for "${input.businessName}", texting the business owner as the business. They just ran a command and you're responding on WhatsApp.
+
+${buildVoiceCore('manager')}
 
 LANGUAGE: reply ENTIRELY in ${input.language === 'he' ? 'Hebrew (עברית)' : 'English'}.
 
@@ -1109,17 +1164,15 @@ WHATSAPP FORMATTING:
 - Emoji for status: ✅ active/ok, ⏸ paused, ❌ error/missing, 📅 calendar, 💳 payment.
 - Maximum 15 lines for data reports.
 
-TONE: Direct and informative — a competent admin assistant reporting data. No filler. No "I hope this helps." Never expose internal field names or UUIDs. Present the data naturally, not as raw key-value pairs.
-
+The data below is raw — present it naturally in your own words, never as raw key-value pairs and never quoted verbatim.
 ${input.dataBlock ? `Data to present:\n${input.dataBlock}` : ''}
 
 Output: the reply ONLY. No preamble, no quotes.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: `Command context: ${input.situation}`,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.25, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.25 },
     })
     const text = result.text?.trim()
     if (text) return text
@@ -1140,6 +1193,8 @@ export async function formatOperatorDataReply(input: {
 }): Promise<string> {
   const systemPrompt = `You are the MiddleMan admin assistant. The operator (platform owner) ran a command and you need to present the results clearly on WhatsApp.
 
+${buildVoiceCore('operator')}
+
 LANGUAGE: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
 
 WHATSAPP FORMATTING:
@@ -1149,7 +1204,7 @@ WHATSAPP FORMATTING:
 - Emoji for status: ✅ live/ok, ⏸ paused, ⏳ onboarding, ❌ error, 📅 calendar, 🌐 website.
 - Maximum 25 lines. Group intelligently for long lists.
 
-TONE: Clear and efficient. Operator is the platform admin — they need data at a glance. No filler. Lead with the key number or finding, then the detail. Use the exact data provided — do not add, infer, or invent anything.
+Use the exact data provided — do not add, infer, or invent anything. Present it in your own words, never quoted verbatim as raw key-value pairs.
 
 Data to present:
 ${input.dataBlock}
@@ -1157,10 +1212,9 @@ ${input.dataBlock}
 Output: the formatted reply ONLY. No preamble, no quotes.`
 
   try {
-    const result = await ai.models.generateContent({
-      model: MODEL,
+    const result = await generateConversational({
       contents: `Operator command: ${input.question}`,
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.2, thinkingConfig: { thinkingBudget: 0 } },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 1024, temperature: 0.2 },
     })
     const text = result.text?.trim()
     if (text) return text

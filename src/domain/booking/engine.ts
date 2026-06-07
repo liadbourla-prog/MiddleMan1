@@ -23,7 +23,11 @@ export type BookingEngineResult =
   | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean; pendingPayment?: boolean }
   | { ok: false; reason: string }
 
-function validateSlotTiming(
+// Temporal policy gate: past-slot, min-buffer, max-days-ahead. Returns a human
+// English sentence (sanitised into customer wording downstream) or null when OK.
+// Exported so Branch 4 can run the SAME check at slot-resolution time — catching
+// out-of-policy times BEFORE the customer is asked to confirm, not after YES.
+export function validateSlotTiming(
   slotStart: Date,
   slotEnd: Date,
   bufferMinutes: number,

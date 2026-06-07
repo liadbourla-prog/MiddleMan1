@@ -335,6 +335,46 @@ Every PR to `main` must pass all three:
 
 Failing CI blocks merge regardless of approvals.
 
+### Conversation-Quality Eval Harness
+
+The product's value is that every reply reads like a sharp, warm human — never a bot.
+`tests/quality/` locks that bar in as an automated gate.
+
+- **Routine gate:** `npm run test:quality:smoke` — single sample per scenario
+  (`QUALITY_SAMPLES=1`), ~5 min, ~24 Pro calls. This is the canonical gate to run after
+  any LLM/voice change. It catches consistent quality regressions cheaply.
+  - **Expect occasional single-scenario flicker.** Generation runs at non-zero temperature
+    and the judge has roll-to-roll variance, so on any given smoke run *one* borderline
+    scenario may trip a single roll (e.g. a reply with two `?`, or a judge "narrates the
+    system" call on an otherwise-good line). This is the inherent brittleness of a single
+    sample — a red on *one* scenario is **not** a regression by itself. Re-run smoke, or
+    escalate to the 3-sample deep check; only a scenario that fails *consistently* across
+    rolls is a real quality regression worth a prompt/voice fix.
+- **Deep check (opt-in):** `npm run test:quality` — the full 3-sample run that absorbs
+  LLM-judge roll-to-roll variance via a pass-rate threshold. It is heavier (~72 Pro calls)
+  and needs adequate Gemini **Pro** quota; on free-tier throttling it paces itself with
+  backoff and may run long. Run it before a release or when a smoke result looks marginal.
+- Both are separate from `npm test`, which stays unit-only and CI-fast.
+- **What it does:** drives the real reply generators (customer, manager, onboarding,
+  operator, proactive) with bilingual golden scenarios, then gates each output two ways:
+  1. **Deterministic assertions** (`assertions.ts`) — single language, at most one question,
+     no stray markdown/HTML, no forbidden bot-tell phrases (`voice.ts` `BOT_TELLS`), no
+     verbatim echo of internal templates/tool results, URLs on their own line. Cheap, every run.
+  2. **LLM-as-judge** (`grader.ts`) — Pro scores human-vs-bot against the voice-bible rubric.
+- **Live LLM calls.** Gated behind `LLM_API_KEY` (auto-loaded from `.env.local`); without it
+  the suite skips, matching the integration-test convention. So it is **not** a blocking CI gate.
+- **Tunables:** `QUALITY_SAMPLES` (samples per scenario, default 3), `QUALITY_PASS_RATE`
+  (fraction that must pass, default 0.66), `QUALITY_MIN_SCORE` (judge score for a "good"
+  sample, default 4). The 3@0.66 default absorbs LLM-judge roll-to-roll variance (one harsh
+  roll won't fail a good reply — 2/3 = 0.67 clears the gate) while still catching consistent
+  failures (0/3, 1/3). For a fast, cheap smoke during iteration, use `npm run test:quality:smoke`
+(`QUALITY_SAMPLES=1`).
+- **Cost/runtime:** each sample is 2 Pro calls (generate + judge), so a full default run is
+  ~72 Pro calls and several minutes; generation/judge both retry on quota with backoff, so a
+  throttled run paces itself rather than failing. Needs sufficient Gemini Pro quota.
+- **When to run:** after any change to an LLM prompt, persona, the voice core (`voice.ts`),
+  `CHAT_LEVEL_LAWBOOK.md`, situation strings, or model routing.
+
 ### Proposing a New Skill (Developer B workflow)
 
 1. Describe the skill idea and desired user outcome to Developer A
