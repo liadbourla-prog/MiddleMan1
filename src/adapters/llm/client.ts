@@ -351,6 +351,41 @@ function buildKnowledgeAddendum(input: GenerateReplyInput): string {
   return parts.join('\n\n')
 }
 
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'] as const
+
+/**
+ * Build a compact DATE FACTS block for the conversational reply LLM so it never
+ * invents dates. Pure and timezone-aware via Intl (no domain imports — keeps the
+ * adapter layer free of core dependencies). The block lists today..today+7 as real
+ * calendar facts; the LLM renders them into the reply's language. These are human
+ * dates the LLM phrases, not internal codes/enums (G2 stays satisfied).
+ *
+ * Exported for unit testing without an LLM round-trip.
+ */
+export function buildDateFactsBlock(timezone: string, now: Date = new Date()): string {
+  // Today's calendar date in the business timezone (en-CA → YYYY-MM-DD parts).
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now)
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value)
+  const y = get('year'); const m = get('month'); const d = get('day')
+
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const lines: string[] = []
+  for (let offset = 0; offset <= 7; offset++) {
+    // Pure calendar arithmetic on Y-M-D via UTC — no tz/DST involvement, correct
+    // across month/year boundaries. getUTCDay() gives the weekday for that date.
+    const dt = new Date(Date.UTC(y, m - 1, d + offset))
+    const iso = `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())}`
+    const weekday = WEEKDAY_NAMES[dt.getUTCDay()]
+    const label = offset === 0 ? 'Today: ' : offset === 1 ? 'Tomorrow: ' : ''
+    lines.push(`- ${label}${weekday}, ${iso}`)
+  }
+
+  return `CURRENT DATE — use these exact facts for any date you state or the customer asks about. NEVER compute, guess, or invent a date; if asked about a day beyond this list, offer to check rather than guess. Render dates in the reply's language and the formatting rules above (e.g. Hebrew 'יום ראשון, 7 ביוני').
+${lines.join('\n')}`
+}
+
 export async function generateCustomerReply(input: GenerateReplyInput): Promise<string> {
   const personaNotes = input.botPersona === 'female'
     ? 'Write in grammatically feminine form (Hebrew: use feminine verb conjugations and adjectives).'
@@ -359,10 +394,12 @@ export async function generateCustomerReply(input: GenerateReplyInput): Promise<
     : ''
 
   const knowledgeAddendum = buildKnowledgeAddendum(input)
+  const dateFacts = input.businessTimezone ? buildDateFactsBlock(input.businessTimezone) : ''
 
   const systemPrompt = (
     PA_PERSONA_TEMPLATE
     + (personaNotes ? `\n\n${personaNotes}` : '')
+    + (dateFacts ? `\n\n${dateFacts}` : '')
     + (knowledgeAddendum ? `\n\n${knowledgeAddendum}` : '')
   )
     .replace('{businessName}', input.businessName)
