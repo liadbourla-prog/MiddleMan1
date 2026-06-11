@@ -17,9 +17,11 @@ import {
   loadActiveSession,
   createSession,
   completeSession,
+  updateSessionContext,
   SESSION_EXPIRY,
 } from '../domain/session/manager.js'
 import { handleBookingFlow } from '../domain/flows/customer-booking.js'
+import { parseConfirmation, type ManagerFlowContext } from '../domain/flows/types.js'
 import { handleOnboardingMessage } from '../domain/flows/manager-onboarding.js'
 import { handleProviderOnboarding } from '../domain/flows/provider-onboarding.js'
 import { runManagerOrchestratorLoop } from '../adapters/llm/orchestrator.js'
@@ -37,7 +39,7 @@ import { enqueueMessage } from '../workers/message-retry.js'
 import { loadCustomerMemory } from '../domain/customer/profile.js'
 import { buildHydratedContext } from '../domain/session/hydration.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
-import { i18n, type Lang } from '../domain/i18n/t.js'
+import { i18n, detectLang, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply } from '../adapters/llm/client.js'
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
@@ -467,7 +469,11 @@ async function routeManagerMessage(
   // Keyword commands — intercepted before LLM to ensure they always work
   const upper = msg.body.trim().toUpperCase()
   const raw = msg.body.trim()
-  const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+  // Keyword-command language: honor a persisted preference, else the business default.
+  // Keywords are ASCII (STATUS/PAUSE/…), so per-message script detection is meaningless
+  // here — that lives on the conversational orchestrator path below (§3.4).
+  const defaultLang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const lang: Lang = identity.preferredLanguage ?? defaultLang
 
   if (upper === 'STATUS') {
     const rawReport = await buildStatusReport(db, business.id, lang)
@@ -641,6 +647,50 @@ async function routeManagerMessage(
     }
   }
 
+  // ── Language-switch protocol (§3.4, Branch 3) ─────────────────────────────
+  // Per-message detection, reply in the detected language, one appended inline
+  // switch offer, persisted preference on confirmation. Mirrors Branch 4
+  // (customer-booking.ts). Runs only on the conversational orchestrator path —
+  // keyword commands and skills above keep their own language handling.
+  const mgCtx = (mgSession.context as ManagerFlowContext | undefined) ?? {}
+  // A locked override (persisted identity preference, or a session-level decline) wins.
+  let sessionOverride: Lang | undefined = mgCtx.languageOverride
+
+  // Answer to a previously-appended switch offer, before any orchestration.
+  if (mgCtx.languageSwitchOfferPending && !identity.preferredLanguage && !sessionOverride) {
+    const answer = parseConfirmation(msg.body)
+    if (answer === 'yes') {
+      // Offer only fires when detected !== default, and there are two languages,
+      // so the accepted language is the opposite of the business default.
+      const chosen: Lang = defaultLang === 'he' ? 'en' : 'he'
+      await db.update(identities).set({ preferredLanguage: chosen }).where(eq(identities.id, identity.id)).catch(() => { /* non-fatal */ })
+      await updateSessionContext(db, mgSession.id, { ...mgCtx, languageOverride: chosen, languageSwitchOfferPending: false }, undefined, SESSION_EXPIRY.manager)
+      const ack = await generateManagerCommandReply({
+        businessName: business.name,
+        language: chosen,
+        situation: 'The manager confirmed switching the conversation language. Acknowledge briefly in the new language and ask how you can help — do not re-introduce yourself.',
+        fallback: chosen === 'he' ? 'מעולה, ממשיכים בעברית. במה אפשר לעזור?' : 'Great, switching to English. How can I help?',
+      })
+      await saveMessage(db, mgSession.id, 'assistant', ack).catch((err) => {
+        app.log.warn({ err }, 'Failed to save manager language-switch ack to transcript')
+      })
+      await sendMessage({ toNumber: msg.fromNumber, body: ack }, waCredentials)
+      return
+    }
+    if (answer === 'no') {
+      // Decline locks the session to the default and re-processes the message in it.
+      sessionOverride = defaultLang
+      await updateSessionContext(db, mgSession.id, { ...mgCtx, languageOverride: defaultLang, languageSwitchOfferPending: false }, undefined, SESSION_EXPIRY.manager)
+    }
+    // 'unclear' — fall through; the offer is recomputed below and may be re-appended.
+  }
+
+  const effectiveOverride: Lang | undefined = identity.preferredLanguage ?? sessionOverride
+  const detected = detectLang(msg.body)
+  const turnLang: Lang = effectiveOverride ?? detected
+  // Offer a switch when this turn's language differs from the default and nothing is locked.
+  const shouldOfferSwitch = !effectiveOverride && detected !== defaultLang
+
   // Load business knowledge for orchestrator system prompt injection
   const [mgBusinessKnowledgeForOrchestrator] = await Promise.all([
     loadBusinessKnowledge(db, business.id, business.currency),
@@ -652,7 +702,7 @@ async function routeManagerMessage(
     calendarId: business.googleCalendarId,
     businessId: business.id,
     calendarMode: business.calendarMode,
-    lang,
+    lang: turnLang,
   })
 
   const lockResult = await withBusinessLock(business.id, msg.messageId, async () => {
@@ -664,19 +714,34 @@ async function routeManagerMessage(
       identityId: identity.id,
       businessName: business.name,
       timezone: business.timezone,
-      lang,
+      lang: turnLang,
       calendar,
       transcript: mgTranscript,
       businessKnowledge: mgBusinessKnowledgeForOrchestrator,
     }).catch((err) => {
       app.log.error({ err, businessId: business.id }, 'Orchestrator loop threw')
-      return i18n.manager_classify_error[lang]
+      return i18n.manager_classify_error[turnLang]
     })
 
-    await saveMessage(db, mgSession.id, 'assistant', reply).catch((err) => {
+    // Append a single inline switch offer (§3.4) in the detected language — never bilingual.
+    const finalReply = shouldOfferSwitch
+      ? reply + (detected === 'en'
+        ? '\n\n(Want me to switch to English? Reply YES)'
+        : '\n\n(רוצה שאמשיך בעברית? כתוב/י כן)')
+      : reply
+
+    // Persist the resolved language state: offer-pending for next turn, plus any
+    // session-level override from a decline. Keep the 4h manager session window.
+    await updateSessionContext(db, mgSession.id, {
+      ...mgCtx,
+      languageSwitchOfferPending: shouldOfferSwitch,
+      ...(sessionOverride ? { languageOverride: sessionOverride } : {}),
+    }, undefined, SESSION_EXPIRY.manager)
+
+    await saveMessage(db, mgSession.id, 'assistant', finalReply).catch((err) => {
       app.log.warn({ err }, 'Failed to save manager orchestrator reply to transcript')
     })
-    await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
+    await sendMessage({ toNumber: msg.fromNumber, body: finalReply }, waCredentials)
   })
 
   if (lockResult === null) {

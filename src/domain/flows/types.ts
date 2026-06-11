@@ -49,3 +49,15 @@ export interface BookingFlowContext {
   languageSwitchOfferPending?: boolean
   [key: string]: unknown
 }
+
+// Branch 3 manager session context. The orchestrator is stateless per turn, so the
+// only state the manager session carries is the language-switch protocol (§3.4):
+// a locked override and whether an inline switch offer was appended last turn.
+// Mirrors the language fields of BookingFlowContext (Branch 4).
+export interface ManagerFlowContext {
+  // Locks the session language once the manager accepts/declines a switch offer.
+  languageOverride?: 'he' | 'en'
+  // True when the previous reply appended an inline switch offer awaiting a yes/no.
+  languageSwitchOfferPending?: boolean
+  [key: string]: unknown
+}
