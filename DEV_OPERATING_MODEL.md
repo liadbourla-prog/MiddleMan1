@@ -361,6 +361,14 @@ The product's value is that every reply reads like a sharp, warm human — never
      no stray markdown/HTML, no forbidden bot-tell phrases (`voice.ts` `BOT_TELLS`), no
      verbatim echo of internal templates/tool results, URLs on their own line. Cheap, every run.
   2. **LLM-as-judge** (`grader.ts`) — Pro scores human-vs-bot against the voice-bible rubric.
+- **Branch 3 orchestrator coverage:** four scenarios drive the real
+  `runManagerOrchestratorLoop` (real system prompt + Gemini function-calling) against fixed
+  tool results via the production-inert `dispatchToolFn` seam — clear date (human confirm,
+  no echoed eventId/ISO), ambiguous and past/impossible date (asks, no menu, no leaked reason
+  code), and a non-default-language reply. The deterministic date core is unit-tested
+  separately (`resolve-slot.test.ts`, `orchestrator-tools.test.ts` — every fail-closed reason
+  asserts `needsClarification` with no write) and the §3.4 manager switch-offer is pinned in
+  `tests/flows/manager-language-switch.test.ts`. Those run in `npm test`, no LLM/DB needed.
 - **Live LLM calls.** Gated behind `LLM_API_KEY` (auto-loaded from `.env.local`); without it
   the suite skips, matching the integration-test convention. So it is **not** a blocking CI gate.
 - **Tunables:** `QUALITY_SAMPLES` (samples per scenario, default 3), `QUALITY_PASS_RATE`
