@@ -438,6 +438,13 @@ export interface OrchestratorParams {
   calendar: CalendarClient
   transcript: TranscriptTurn[]
   businessKnowledge: BusinessKnowledge | null
+  // ── Test seams (optional; production never sets these) ─────────────────────
+  // Let the quality harness grade the real Gemini function-calling loop + the
+  // real system prompt against FIXED tool results, with no DB or calendar. When
+  // omitted, the loop uses the production dispatcher and DB-backed memory loader,
+  // so runtime behaviour is unchanged. See tests/quality/scenarios.test.ts.
+  dispatchToolFn?: (name: string, args: Record<string, unknown>, ctx: ToolContext) => Promise<object>
+  loadMemoryFn?: (identityId: string) => Promise<string[]>
 }
 
 export async function runManagerOrchestratorLoop(params: OrchestratorParams): Promise<string> {
@@ -446,7 +453,10 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     businessName, timezone, lang, calendar, transcript, businessKnowledge,
   } = params
 
-  const managerMemorySummaries = await loadManagerMemorySummaries(identityId)
+  const loadMemory = params.loadMemoryFn ?? loadManagerMemorySummaries
+  const dispatch = params.dispatchToolFn ?? dispatchTool
+
+  const managerMemorySummaries = await loadMemory(identityId)
 
   const systemPrompt = buildSystemPrompt({
     businessName,
@@ -508,7 +518,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
         let toolResult: object
         let status: 'ok' | 'error' = 'ok'
         try {
-          toolResult = await dispatchTool(toolName, toolArgs, ctx)
+          toolResult = await dispatch(toolName, toolArgs, ctx)
           if ('error' in toolResult) status = 'error'
         } catch (err) {
           toolResult = { error: err instanceof Error ? err.message : String(err) }
