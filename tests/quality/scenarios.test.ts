@@ -22,6 +22,8 @@ import {
   formatOperatorDataReply,
   generateProactiveCustomerMessage,
 } from '../../src/adapters/llm/client.js'
+import { runManagerOrchestratorLoop } from '../../src/adapters/llm/orchestrator.js'
+import type { CalendarClient } from '../../src/adapters/calendar/client.js'
 import { runDeterministicChecks, type DeterministicChecks } from './assertions.js'
 import { gradeReply, type GradeRubric } from './grader.js'
 
@@ -53,6 +55,48 @@ const CUSTOMER_FALLBACK = {
 } as const
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// ── Branch 3 orchestrator harness ─────────────────────────────────────────────
+// The manager orchestrator (runManagerOrchestratorLoop) is the real Gemini
+// function-calling loop with the real system prompt. We grade its *phrasing*, so
+// we feed FIXED tool results via the production-inert dispatchToolFn seam and stub
+// memory loading — no DB, no calendar. This exercises the loop end-to-end (model
+// decides to call a tool → gets our fixed result → phrases a reply) the way it
+// runs in production, minus the side effects. The fixed results mirror exactly
+// what orchestrator-tools.ts returns (success shape, or the clarifyDate shape on
+// an unresolvable date — same fields and guidance strings).
+const STUB_CALENDAR = {} as unknown as CalendarClient
+// Mirror of the orchestrator's static error fallback (orchestrator.ts) — a reply
+// equal to this means the loop errored/exhausted, not that the model phrased it.
+const ORCHESTRATOR_FALLBACK = {
+  he: 'רגע, משהו נתקע לי — אפשר לנסות שוב?',
+  en: 'Hmm, something got stuck on my end — mind trying that again?',
+} as const
+
+function runOrchestrator(opts: {
+  message: string
+  businessName: string
+  lang: 'he' | 'en'
+  toolResult: object
+}): Promise<string> {
+  return runManagerOrchestratorLoop({
+    messageId: 'test-msg',
+    message: opts.message,
+    sessionId: 'test-session',
+    businessId: 'test-biz',
+    identityId: 'test-identity',
+    businessName: opts.businessName,
+    timezone: 'Asia/Jerusalem',
+    lang: opts.lang,
+    calendar: STUB_CALENDAR,
+    transcript: [],
+    businessKnowledge: null,
+    loadMemoryFn: async () => [],
+    // Any calendar tool the model picks gets the same fixed result — we're grading
+    // how it phrases the outcome, not which tool it chose.
+    dispatchToolFn: async () => opts.toolResult,
+  })
+}
 
 interface Scenario {
   name: string
@@ -206,6 +250,119 @@ const scenarios: Scenario[] = [
       lang: 'en',
       context: "Owner cancelled Dana's Wednesday 11:00 haircut; done, but the customer hasn't been notified.",
       extraCriteria: ['Confirms in first person ("I cancelled" not "the booking was cancelled")', 'Offers to notify the customer rather than doing it silently'],
+    },
+  },
+  // ── Branch 3: Manager orchestrator loop (real function-calling, fixed tools) ─
+  {
+    // Clear date → the deterministic core resolves it, the tool succeeds, and the
+    // model must confirm like a human WITHOUT echoing the raw eventId/fields.
+    name: 'orchestrator schedules a class, clear date (he)',
+    branch: 'manager',
+    generate: () =>
+      runOrchestrator({
+        message: 'תקבעי שיעור ויניאסה ביום שלישי הבא מ-11:00 עד 12:00, 10 מקומות',
+        businessName: 'סטודיו פלואו',
+        lang: 'he',
+        toolResult: {
+          success: true,
+          eventId: 'block:7f3a9c21',
+          scheduled: { title: 'ויניאסה', when: 'שלישי, 16 ביוני, 11:00', maxParticipants: 10 },
+        },
+      }),
+    fallback: ORCHESTRATOR_FALLBACK.he,
+    checks: { expectedLang: 'he', forbiddenVerbatim: ['block:7f3a9c21', 'eventId', 'maxParticipants', 'scheduled'] },
+    rubric: {
+      lang: 'he',
+      context: 'The owner asked to put a Vinyasa class on the calendar next Tuesday 11:00–12:00 with 10 spots. It was scheduled successfully.',
+      extraCriteria: [
+        'Confirms in active first person ("קבעתי" / "הוספתי"), not "the class was created"',
+        'Does NOT echo the raw eventId, field names, or an ISO/absolute date — restates the day/time in human words',
+      ],
+    },
+  },
+  {
+    // Ambiguous date → the tool returns needsClarification. The model must ask for
+    // a specific day, no menu, and never leak the internal reason code/guidance.
+    name: 'orchestrator ambiguous date asks which day (he)',
+    branch: 'manager',
+    generate: () =>
+      runOrchestrator({
+        message: 'תקבעי שיעור ויניאסה לשבוע הבא, מ-11:00 עד 12:00',
+        businessName: 'סטודיו פלואו',
+        lang: 'he',
+        toolResult: {
+          success: false,
+          reason: 'ambiguous_date',
+          needsClarification: true,
+          guidance: "The day is ambiguous (a vague 'this/next week' with no weekday). Ask which specific day they mean, without repeating the vague phrase.",
+        },
+      }),
+    fallback: ORCHESTRATOR_FALLBACK.he,
+    checks: { expectedLang: 'he', forbiddenVerbatim: ['ambiguous_date', 'needsClarification', 'guidance'] },
+    rubric: {
+      lang: 'he',
+      context: "The owner asked to schedule a class 'next week' with no specific day, so the day can't be pinned down yet.",
+      extraCriteria: [
+        'Asks which specific day they mean — exactly one question, conversational, NOT a numbered/yes-no menu',
+        'Never exposes an internal code or system wording (no "ambiguous", no field names)',
+      ],
+    },
+  },
+  {
+    // Past date → needsClarification (the 2016 bug, but for a manager write). The
+    // reply must be matter-of-fact + forward-moving and must NOT repeat the bad date.
+    name: 'orchestrator past date is matter-of-fact, no leak (en)',
+    branch: 'manager',
+    generate: () =>
+      runOrchestrator({
+        message: 'put a team meeting on January 10th 2016 from 10 to 11',
+        businessName: 'Royal Barbers',
+        lang: 'en',
+        toolResult: {
+          success: false,
+          reason: 'past_year',
+          needsClarification: true,
+          guidance: 'That date looks like it has already passed. Ask which upcoming day they want, without repeating the past date.',
+        },
+      }),
+    fallback: ORCHESTRATOR_FALLBACK.en,
+    checks: { expectedLang: 'en', forbiddenVerbatim: ['past_year', 'needsClarification', '2016', 'guidance'] },
+    rubric: {
+      lang: 'en',
+      context: 'The owner asked to put a meeting on a date that has already passed (year 2016).',
+      extraCriteria: [
+        'Matter-of-fact and forward-moving — asks which upcoming day they want',
+        'Does NOT repeat the past date, surface an error code, or read like a robotic error',
+      ],
+    },
+  },
+  {
+    // Non-default language (Session B): the business default is Hebrew but the owner
+    // texted in English, so turnLang is English and the orchestrator must reply in
+    // English. (The single inline switch offer is appended deterministically by the
+    // webhook — covered by the unit test; here we grade the language-threaded reply.)
+    name: 'orchestrator replies in the owner\'s non-default language (en)',
+    branch: 'manager',
+    generate: () =>
+      runOrchestrator({
+        message: 'can you put a yoga class on the calendar for next Tuesday 11 to 12, ten spots?',
+        businessName: 'Flow Studio',
+        lang: 'en',
+        toolResult: {
+          success: true,
+          eventId: 'block:aa12bb34',
+          scheduled: { title: 'Yoga', when: 'Tue, 16 Jun, 11:00', maxParticipants: 10 },
+        },
+      }),
+    fallback: ORCHESTRATOR_FALLBACK.en,
+    checks: { expectedLang: 'en', forbiddenVerbatim: ['block:aa12bb34', 'eventId', 'maxParticipants'] },
+    rubric: {
+      lang: 'en',
+      context: "The business default language is Hebrew, but the owner texted in English asking to add a yoga class next Tuesday 11:00–12:00 with 10 spots. It was scheduled.",
+      extraCriteria: [
+        'Replies entirely in English (matching the language the owner wrote in), not the Hebrew default',
+        'Human first-person confirmation; no raw eventId/fields echoed',
+      ],
     },
   },
   // ── Branch 2: Onboarding ────────────────────────────────────────────────────

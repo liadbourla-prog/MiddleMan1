@@ -5,6 +5,16 @@ export function detectLang(text: string): Lang {
   return /[֐-׿]/.test(text) ? 'he' : 'en'
 }
 
+// The single inline language-switch offer suffix (CHAT_LEVEL_LAWBOOK §3.4),
+// appended to a Branch 3 reply when the message arrived in a language other than
+// the configured default. Worded in the DETECTED language, never bilingual.
+// Returned with a leading blank line so it reads as a separate trailing line.
+export function managerSwitchOfferSuffix(detected: Lang): string {
+  return detected === 'en'
+    ? '\n\n(Want me to switch to English? Reply YES)'
+    : '\n\n(רוצה שאמשיך בעברית? כתוב/י כן)'
+}
+
 const strings = {
   // ── MiddleMan (provider onboarding) ─────────────────────────────────────────
   mm_welcome: {

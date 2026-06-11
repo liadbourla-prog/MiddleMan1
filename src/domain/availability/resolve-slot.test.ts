@@ -201,3 +201,37 @@ describe('resolveSlotStart — UTC composition', () => {
     expect(start.toISOString()).toBe('2026-01-10T06:00:00.000Z')
   })
 })
+
+// The whole point of the deterministic core is that resolution is anchored to the
+// BUSINESS timezone, not UTC and not the server's zone. These cases use a zone far
+// from Israel so a UTC/local confusion would visibly break them.
+describe('cross-timezone resolution — anchored to business-local, not UTC', () => {
+  const NY = 'America/New_York'
+  const LA = 'America/Los_Angeles'
+
+  it('composes the correct UTC instant in a western zone, summer and winter', () => {
+    // 2026-06-09 09:00 EDT (UTC-4 in June) → 13:00Z
+    expect(resolveSlotStart('2026-06-09', { hour: 9, minute: 0 }, NY).toISOString()).toBe('2026-06-09T13:00:00.000Z')
+    // 2026-01-12 09:00 EST (UTC-5 in winter) → 14:00Z
+    expect(resolveSlotStart('2026-01-12', { hour: 9, minute: 0 }, NY).toISOString()).toBe('2026-01-12T14:00:00.000Z')
+  })
+
+  it('anchors "today" to the business calendar day even when UTC has already rolled over', () => {
+    // NOW is 2026-06-07T06:00:00Z. In Los Angeles (UTC-7, PDT) that is still
+    // 23:00 on 2026-06-06 — so business-local "today" must be the 6th, not the 7th.
+    expect(resolveRequestedDate({ ...empty, relativeDay: 'today' }, LA, NOW)).toEqual({ ok: true, dateStr: '2026-06-06' })
+    // …and "tomorrow" follows from that local anchor.
+    expect(resolveRequestedDate({ ...empty, relativeDay: 'tomorrow' }, LA, NOW)).toEqual({ ok: true, dateStr: '2026-06-07' })
+  })
+
+  it('resolveSlotRange yields a positive UTC range in a western zone', () => {
+    const r = resolveSlotRange(
+      { date: { ...empty, explicitDate: { year: 2026, month: 6, day: 9 } }, startTime: { hour: 9, minute: 0 }, endTime: { hour: 10, minute: 30 } },
+      NY, NOW,
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.start.toISOString()).toBe('2026-06-09T13:00:00.000Z')
+    expect(r.end.toISOString()).toBe('2026-06-09T14:30:00.000Z')
+  })
+})
