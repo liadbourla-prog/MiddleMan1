@@ -143,3 +143,62 @@ function pad(n: number): string {
 export function resolveSlotStart(dateStr: string, time: RequestedTime, tz: string): Date {
   return localTimeToUtc(dateStr, `${pad(time.hour)}:${pad(time.minute)}`, tz)
 }
+
+/**
+ * True iff the requested wall-clock time does not exist on the local calendar
+ * that day — the spring-forward DST gap (e.g. 02:30 when the clocks jump
+ * 02:00→03:00). We resolve the instant, render it BACK to business-local time,
+ * and compare to what was asked: a gap means the resolved instant lands on a
+ * different local minute-of-day than requested. Shared by Branch 4 (customer
+ * booking) and Branch 3 (manager calendar writes) so both use one correct check.
+ */
+export function isDstGap(slotStart: Date, time: RequestedTime, tz: string): boolean {
+  if (isNaN(slotStart.getTime())) return true
+  return localParts(slotStart, tz).minutes !== time.hour * 60 + time.minute
+}
+
+// ── slot-range resolution (manager calendar writes need start AND end) ───────
+
+export type SlotRangeReason = DateResolutionReason | 'dst_gap' | 'end_before_start' | 'no_time'
+
+export interface RequestedSlotRange {
+  date: RequestedDateParts
+  startTime: RequestedTime
+  endTime?: RequestedTime | null
+  durationMinutes?: number | null
+}
+
+export type SlotRangeResolution =
+  | { ok: true; start: Date; end: Date; dateStr: string }
+  | { ok: false; reason: SlotRangeReason }
+
+/**
+ * Resolve a manager-stated date + start/end into an absolute UTC range, fully
+ * deterministically. The LLM only ever supplies the structured pieces — this is
+ * the calendar arithmetic (Principle #1). Applies the same guards as Branch 4:
+ * past-year, impossible-date, ambiguous-week, and DST gap all fail closed so the
+ * caller asks for clarification instead of writing a wrong instant.
+ *
+ * End is taken from `endTime` when given, else `durationMinutes`. Either one is
+ * required; the range must be strictly positive.
+ */
+export function resolveSlotRange(req: RequestedSlotRange, tz: string, now: Date): SlotRangeResolution {
+  const dateRes = resolveRequestedDate(req.date, tz, now)
+  if (!dateRes.ok) return { ok: false, reason: dateRes.reason }
+
+  const start = resolveSlotStart(dateRes.dateStr, req.startTime, tz)
+  if (isDstGap(start, req.startTime, tz)) return { ok: false, reason: 'dst_gap' }
+
+  let end: Date
+  if (req.endTime) {
+    end = resolveSlotStart(dateRes.dateStr, req.endTime, tz)
+    if (isDstGap(end, req.endTime, tz)) return { ok: false, reason: 'dst_gap' }
+  } else if (req.durationMinutes != null && req.durationMinutes > 0) {
+    end = new Date(start.getTime() + req.durationMinutes * 60_000)
+  } else {
+    return { ok: false, reason: 'no_time' }
+  }
+
+  if (end.getTime() <= start.getTime()) return { ok: false, reason: 'end_before_start' }
+  return { ok: true, start, end, dateStr: dateRes.dateStr }
+}

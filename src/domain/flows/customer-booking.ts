@@ -18,7 +18,7 @@ import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/eng
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
-import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, type RequestedDateParts } from '../availability/resolve-slot.js'
+import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
 import { validateSlotTiming } from '../booking/engine.js'
 
@@ -69,21 +69,6 @@ function formatSlotTime(date: Date, tz: string): string {
 // strings (G2: the customer never sees the raw YYYY-MM-DD form).
 function formatLocalDate(dateStr: string, tz: string): string {
   return formatSlotDate(resolveSlotStart(dateStr, { hour: 12, minute: 0 }, tz), tz)
-}
-
-function checkDSTGap(isoString: string, businessTz: string): boolean {
-  const date = new Date(isoString)
-  // Detect DST gap: format back to local and parse — if hour shifts > 0 we hit a gap
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: businessTz, hour: 'numeric', minute: 'numeric', hour12: false,
-  }).formatToParts(date)
-  const h = parseInt(parts.find((p) => p.type === 'hour')?.value ?? '0', 10)
-  const m = parseInt(parts.find((p) => p.type === 'minute')?.value ?? '0', 10)
-  // Also parse from the original ISO to get requested local hour
-  const requestedH = parseInt(isoString.slice(11, 13), 10)
-  const requestedM = parseInt(isoString.slice(14, 16), 10)
-  // If diff > 30min (DST is typically 1h), flag it
-  return Math.abs((h * 60 + m) - (requestedH * 60 + requestedM)) > 30
 }
 
 function extractMemory(ctx: BookingFlowContext): CustomerMemoryInput {
@@ -648,7 +633,7 @@ async function handleBookingIntent(
   const slotEnd = new Date(slotStart.getTime() + svc.durationMinutes * 60_000)
 
   // DST gap — the requested wall-clock time doesn't exist that day.
-  if (isNaN(slotStart.getTime()) || checkDSTGap(slotStart.toISOString(), businessTimezone)) {
+  if (isNaN(slotStart.getTime()) || isDstGap(slotStart, draft.time, businessTimezone)) {
     const { time: _dropTime, ...draftKeep } = draft
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
     const reply = await generateCustomerReply({
