@@ -67,4 +67,49 @@ describe('manager calendar writes — deterministic date guard (no write on bad 
     expect(res.needsClarification).toBe(true)
     expect(res.reason).toBe('dst_gap')
   })
+
+  it('createCalendarEvent: impossible calendar date (30 Feb) → needsClarification, no DB write', async () => {
+    const res = await executeCreateCalendarEvent(
+      {
+        title: 'Inventory',
+        date: { explicitDate: { year: 2026, month: 2, day: 30 } },
+        startTime: { hour: 10, minute: 0 },
+        endTime: { hour: 11, minute: 0 },
+      },
+      noWriteCtx(),
+    ) as { success: boolean; needsClarification?: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.needsClarification).toBe(true)
+    expect(res.reason).toBe('impossible_date')
+  })
+
+  it('createCalendarEvent: end at/before start → needsClarification, no DB write', async () => {
+    const res = await executeCreateCalendarEvent(
+      {
+        title: 'Backwards block',
+        date: { relativeDay: 'tomorrow' },
+        startTime: { hour: 12, minute: 0 },
+        endTime: { hour: 11, minute: 0 },
+      },
+      noWriteCtx(),
+    ) as { success: boolean; needsClarification?: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.needsClarification).toBe(true)
+    expect(res.reason).toBe('end_before_start')
+  })
+
+  it('scheduleGroupSession: no end time or duration → needsClarification, no DB write', async () => {
+    const res = await executeScheduleGroupSession(
+      {
+        serviceName: 'Vinyasa',
+        date: { relativeDay: 'tomorrow' },
+        startTime: { hour: 11, minute: 0 },
+        // neither endTime nor durationMinutes
+      },
+      noWriteCtx(),
+    ) as { success: boolean; needsClarification?: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.needsClarification).toBe(true)
+    expect(res.reason).toBe('no_time')
+  })
 })
