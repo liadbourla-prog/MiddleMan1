@@ -3,6 +3,8 @@ import {
   addDaysToDateStr,
   resolveRequestedDate,
   resolveSlotStart,
+  resolveSlotRange,
+  isDstGap,
   type RequestedDateParts,
 } from './resolve-slot.js'
 import { isSlotBookable, getOpenSlots, localParts, type AvailabilityModel } from './compute.js'
@@ -123,6 +125,66 @@ describe('availability inquiry window — "is Monday open?" reports MONDAY, not 
     for (const s of slots) {
       expect(localParts(s.start, TZ).dateStr).toBe('2026-06-08')
     }
+  })
+})
+
+describe('isDstGap — spring-forward wall-clock that does not exist', () => {
+  it('flags 02:30 on the Israeli spring-forward day (02:00→03:00)', () => {
+    // 2027-03-26 is the Friday clocks jump forward; 02:30 does not exist.
+    const start = resolveSlotStart('2027-03-26', { hour: 2, minute: 30 }, TZ)
+    expect(isDstGap(start, { hour: 2, minute: 30 }, TZ)).toBe(true)
+  })
+
+  it('does NOT flag a normal time, summer or winter', () => {
+    expect(isDstGap(resolveSlotStart('2026-06-09', { hour: 10, minute: 0 }, TZ), { hour: 10, minute: 0 }, TZ)).toBe(false)
+    expect(isDstGap(resolveSlotStart('2026-01-10', { hour: 8, minute: 0 }, TZ), { hour: 8, minute: 0 }, TZ)).toBe(false)
+    expect(isDstGap(resolveSlotStart('2027-03-26', { hour: 3, minute: 30 }, TZ), { hour: 3, minute: 30 }, TZ)).toBe(false)
+  })
+})
+
+describe('resolveSlotRange — deterministic manager calendar writes', () => {
+  it('resolves a clear weekday + start/end into the correct UTC range', () => {
+    // Tuesday from a Sunday → 2026-06-09; 11:00–12:00 local (UTC+3 in June) → 08:00–09:00Z
+    const r = resolveSlotRange(
+      { date: { ...empty, weekday: 2 }, startTime: { hour: 11, minute: 0 }, endTime: { hour: 12, minute: 0 } },
+      TZ, NOW,
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.dateStr).toBe('2026-06-09')
+    expect(r.start.toISOString()).toBe('2026-06-09T08:00:00.000Z')
+    expect(r.end.toISOString()).toBe('2026-06-09T09:00:00.000Z')
+  })
+
+  it('derives end from durationMinutes when no endTime is given', () => {
+    const r = resolveSlotRange(
+      { date: { ...empty, relativeDay: 'tomorrow' }, startTime: { hour: 9, minute: 0 }, durationMinutes: 90 },
+      TZ, NOW,
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.end.getTime() - r.start.getTime()).toBe(90 * 60_000)
+  })
+
+  it('propagates date guards: past year, impossible date, ambiguous week', () => {
+    expect(resolveSlotRange({ date: { ...empty, explicitDate: { year: 2016, month: 1, day: 10 } }, startTime: { hour: 10, minute: 0 }, endTime: { hour: 11, minute: 0 } }, TZ, NOW))
+      .toEqual({ ok: false, reason: 'past_year' })
+    expect(resolveSlotRange({ date: { ...empty, explicitDate: { year: 2026, month: 2, day: 30 } }, startTime: { hour: 10, minute: 0 }, endTime: { hour: 11, minute: 0 } }, TZ, NOW))
+      .toEqual({ ok: false, reason: 'impossible_date' })
+    expect(resolveSlotRange({ date: { ...empty, relativeDay: 'next_week' }, startTime: { hour: 10, minute: 0 }, endTime: { hour: 11, minute: 0 } }, TZ, NOW))
+      .toEqual({ ok: false, reason: 'ambiguous_date' })
+  })
+
+  it('rejects a DST-gap start time', () => {
+    expect(resolveSlotRange({ date: { ...empty, explicitDate: { year: 2027, month: 3, day: 26 } }, startTime: { hour: 2, minute: 30 }, endTime: { hour: 4, minute: 0 } }, TZ, NOW))
+      .toEqual({ ok: false, reason: 'dst_gap' })
+  })
+
+  it('rejects end <= start and missing end', () => {
+    expect(resolveSlotRange({ date: { ...empty, relativeDay: 'tomorrow' }, startTime: { hour: 12, minute: 0 }, endTime: { hour: 11, minute: 0 } }, TZ, NOW))
+      .toEqual({ ok: false, reason: 'end_before_start' })
+    expect(resolveSlotRange({ date: { ...empty, relativeDay: 'tomorrow' }, startTime: { hour: 12, minute: 0 } }, TZ, NOW))
+      .toEqual({ ok: false, reason: 'no_time' })
   })
 })
 
