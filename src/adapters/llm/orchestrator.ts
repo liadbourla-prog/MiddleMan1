@@ -71,6 +71,43 @@ async function generateOrchestratorTurn(contents: Content[], config: Orchestrato
 
 // ── Tool declarations ─────────────────────────────────────────────────────────
 
+// Structured date pieces — the manager-facing equivalent of customerIntentSchema.
+// The LLM CLASSIFIES what the manager said into these pieces; resolveSlotRange
+// (deterministic core) turns them into an absolute instant. The LLM never does
+// calendar arithmetic (Principle #1), so "tomorrow"/"next Tuesday"/"the 9th" can
+// never resolve to the wrong weekday/month or a past year on a write.
+const DATE_PIECES_SCHEMA = {
+  type: Type.OBJECT,
+  description: 'The date the manager stated, as structured pieces. CLASSIFY ONLY — never compute an absolute or ISO date. Use relativeDay for "today/tomorrow/this week", weekday for a named day, explicitDate for a calendar date. Include year ONLY if the manager explicitly stated it.',
+  properties: {
+    relativeDay: {
+      type: Type.STRING,
+      enum: ['today', 'tomorrow', 'day_after_tomorrow', 'this_week', 'next_week'],
+      description: 'Relative phrasing if used (e.g. "tomorrow" → tomorrow). Omit if a weekday or explicit date is given.',
+    },
+    weekday: { type: Type.NUMBER, description: '0=Sunday … 6=Saturday when a named day is given ("Tuesday" → 2). Omit otherwise.' },
+    explicitDate: {
+      type: Type.OBJECT,
+      description: 'When a calendar date is stated (day + month required; year optional and only if explicitly said).',
+      properties: {
+        year: { type: Type.NUMBER },
+        month: { type: Type.NUMBER },
+        day: { type: Type.NUMBER },
+      },
+    },
+  },
+}
+
+const timeSchema = (description: string) => ({
+  type: Type.OBJECT,
+  description,
+  properties: {
+    hour: { type: Type.NUMBER, description: '0–23' },
+    minute: { type: Type.NUMBER, description: '0–59' },
+  },
+  required: ['hour', 'minute'],
+})
+
 const MANAGER_TOOLS: FunctionDeclaration[] = [
   {
     name: 'listCalendarEvents',
@@ -83,39 +120,42 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
           enum: ['list_today', 'list_week', 'list_range', 'check_free_slots'],
           description: 'What calendar data to retrieve',
         },
-        dateFrom: { type: Type.STRING, description: 'Start date ISO 8601 (for list_range)' },
-        dateTo: { type: Type.STRING, description: 'End date ISO 8601 (for list_range)' },
+        dateFrom: { ...DATE_PIECES_SCHEMA, description: 'Range start, as structured date pieces (for list_range). NEVER an ISO/absolute date — report what the manager said.' },
+        dateTo: { ...DATE_PIECES_SCHEMA, description: 'Range end, as structured date pieces (for list_range). NEVER an ISO/absolute date.' },
       },
       required: ['intent'],
     },
   },
   {
     name: 'createCalendarEvent',
-    description: 'Create a personal or business event on the calendar (team meetings, blocks, personal appointments). This is for non-customer events. To block time from customer bookings, use manageBusinessSettings instead.',
+    description: 'Create a personal or business event on the calendar (team meetings, blocks, personal appointments). This is for non-customer events. To block time from customer bookings, use manageBusinessSettings instead. Report the date/time the manager said as structured pieces — NEVER compute an absolute or ISO date yourself; a deterministic system resolves them.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         title: { type: Type.STRING },
-        startDatetime: { type: Type.STRING, description: 'ISO 8601 in business timezone' },
-        endDatetime: { type: Type.STRING, description: 'ISO 8601 in business timezone' },
+        date: DATE_PIECES_SCHEMA,
+        startTime: timeSchema('Start clock time the manager said, 24-hour'),
+        endTime: timeSchema('End clock time the manager said, 24-hour'),
         notes: { type: Type.STRING },
       },
-      required: ['title', 'startDatetime', 'endDatetime'],
+      required: ['title', 'date', 'startTime', 'endTime'],
     },
   },
   {
     name: 'scheduleGroupSession',
-    description: 'Proactively place a group session / class on the calendar (e.g. "schedule a Vinyasa class Tuesday 11:00–12:00, 10 spots"). Use this when the manager wants to put a class on the calendar BEFORE any customer books it. Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours use manageBusinessSettings.',
+    description: 'Proactively place a group session / class on the calendar (e.g. "schedule a Vinyasa class Tuesday 11:00–12:00, 10 spots"). Use this when the manager wants to put a class on the calendar BEFORE any customer books it. Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours use manageBusinessSettings. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         serviceName: { type: Type.STRING, description: 'Name of the existing group service this class is an instance of (optional; matched fuzzily)' },
         title: { type: Type.STRING, description: 'Display title if no service is linked (optional)' },
-        startDatetime: { type: Type.STRING, description: 'ISO 8601 in business timezone' },
-        endDatetime: { type: Type.STRING, description: 'ISO 8601 in business timezone' },
+        date: DATE_PIECES_SCHEMA,
+        startTime: timeSchema('Start clock time the manager said, 24-hour'),
+        endTime: timeSchema('End clock time, 24-hour. Provide this OR durationMinutes.'),
+        durationMinutes: { type: Type.NUMBER, description: 'Session length in minutes, if the manager gave a duration instead of an end time (e.g. "a 1-hour class" → 60). Provide this OR endTime.' },
         maxParticipants: { type: Type.NUMBER, description: 'Capacity for this session (optional; defaults to the linked service capacity)' },
       },
-      required: ['startDatetime', 'endDatetime'],
+      required: ['date', 'startTime'],
     },
   },
   {
@@ -315,6 +355,9 @@ Reply entirely in ${language}. All WhatsApp formatting rules apply:
 - No HTML. No markdown except *bold* and line breaks.
 - Numbered lists for sequences. Line break separation between items.
 - URLs on their own line.
+
+## Dates and times — classify, never compute
+For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range), report the date/time the manager said as structured pieces (relativeDay / weekday / explicitDate, and {hour,minute} times). NEVER compute or output an absolute or ISO date — a deterministic system resolves the pieces and validates them. If a calendar tool returns needsClarification: true, the date/time couldn't be resolved (ambiguous, already past, impossible, or a clock time that doesn't exist that day) — do NOT retry the tool with a guessed date; ask the manager for a workable day/time in your own words, without echoing the unusable value.
 
 ## Tool usage rules
 - manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Never handle these as conversational replies.

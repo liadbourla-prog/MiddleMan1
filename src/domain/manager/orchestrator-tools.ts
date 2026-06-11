@@ -15,6 +15,43 @@ import type { Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
 import { getOpenSlots } from '../availability/service.js'
+import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
+
+// ── Structured date/time pieces from the orchestrator (classify-only) ────────
+// The LLM supplies these; the deterministic core (resolveSlotRange) computes the
+// absolute instant and validates it. The LLM never does calendar arithmetic.
+interface DatePieces {
+  relativeDay?: RelativeDay
+  weekday?: number
+  explicitDate?: { year?: number; month?: number; day?: number }
+}
+interface TimePieces { hour: number; minute: number }
+
+function toDateParts(d: DatePieces | undefined | null): RequestedDateParts {
+  return {
+    relativeDay: d?.relativeDay ?? null,
+    weekday: d?.weekday ?? null,
+    explicitDate: d?.explicitDate
+      ? { year: d.explicitDate.year ?? null, month: d.explicitDate.month ?? null, day: d.explicitDate.day ?? null }
+      : null,
+  }
+}
+
+// Internal resolution reason → plain-language guidance for the model to phrase.
+// Raw codes stay internal (no-leak, §7.3 / §12); the model never echoes them.
+const DATE_CLARIFY_GUIDANCE: Record<SlotRangeReason, string> = {
+  no_date: 'No usable day was given. Ask the manager which day they mean — naturally, no menu.',
+  ambiguous_date: "The day is ambiguous (a vague 'this/next week' with no weekday). Ask which specific day they mean, without repeating the vague phrase.",
+  impossible_date: "That date doesn't exist on the calendar. Tell the manager plainly and ask for a real date — don't repeat the bad one.",
+  past_year: 'That date looks like it has already passed. Ask which upcoming day they want, without repeating the past date.',
+  dst_gap: "That exact clock time doesn't exist that day (a daylight-saving shift). Ask the manager to pick a slightly different time.",
+  end_before_start: 'The end time is not after the start time. Ask the manager for a valid start and end — phrase it naturally.',
+  no_time: 'No end time or duration was given. Ask the manager how long it runs, or for an end time.',
+}
+
+function clarifyDate(reason: SlotRangeReason): object {
+  return { success: false, reason, needsClarification: true, guidance: DATE_CLARIFY_GUIDANCE[reason] }
+}
 
 export interface ToolContext {
   db: Db
@@ -29,8 +66,8 @@ export interface ToolContext {
 
 interface ListCalendarEventsArgs {
   intent: 'list_today' | 'list_week' | 'list_range' | 'check_free_slots'
-  dateFrom?: string
-  dateTo?: string
+  dateFrom?: DatePieces
+  dateTo?: DatePieces
 }
 
 export async function executeListCalendarEvents(
@@ -56,11 +93,15 @@ export async function executeListCalendarEvents(
       break
     }
     case 'list_range': {
-      if (!args.dateFrom || !args.dateTo) {
-        return { error: 'dateFrom and dateTo are required for list_range' }
-      }
-      from = new Date(args.dateFrom)
-      to = new Date(args.dateTo + 'T23:59:59')
+      // Resolve range bounds deterministically from classified pieces. A read is
+      // low-stakes, so unresolvable bounds clamp to a sane default rather than
+      // hard-failing (the LLM still never computes the absolute dates itself).
+      const fromRes = resolveRequestedDate(toDateParts(args.dateFrom), tz, now)
+      const toRes = resolveRequestedDate(toDateParts(args.dateTo), tz, now)
+      from = fromRes.ok ? resolveSlotStart(fromRes.dateStr, { hour: 0, minute: 0 }, tz) : now
+      to = toRes.ok
+        ? resolveSlotStart(addDaysToDateStr(toRes.dateStr, 1), { hour: 0, minute: 0 }, tz)
+        : new Date(from.getTime() + 14 * 24 * 60 * 60_000)
       break
     }
     case 'check_free_slots': {
@@ -150,8 +191,9 @@ export async function executeListCalendarEvents(
 
 interface CreateCalendarEventArgs {
   title: string
-  startDatetime: string
-  endDatetime: string
+  date: DatePieces
+  startTime: TimePieces
+  endTime: TimePieces
   notes?: string
 }
 
@@ -159,15 +201,16 @@ export async function executeCreateCalendarEvent(
   args: CreateCalendarEventArgs,
   ctx: ToolContext,
 ): Promise<object> {
-  const start = new Date(args.startDatetime)
-  const end = new Date(args.endDatetime)
-
-  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-    return { success: false, error: 'Invalid datetime format. Use ISO 8601.' }
-  }
-  if (end <= start) {
-    return { success: false, error: 'End time must be after start time.' }
-  }
+  // Deterministic resolution — the LLM only classified the pieces. Past-year,
+  // impossible-date, ambiguous-week, and DST gaps all fail closed so we never
+  // write a wrong instant (Principle #1; parity with Branch 4).
+  const resolved = resolveSlotRange(
+    { date: toDateParts(args.date), startTime: args.startTime, endTime: args.endTime },
+    ctx.timezone,
+    new Date(),
+  )
+  if (!resolved.ok) return clarifyDate(resolved.reason)
+  const { start, end } = resolved
 
   // Guard: refuse to create if it overlaps an active customer booking. Precise
   // overlap predicate: existing.start < new.end AND existing.end > new.start.
@@ -218,8 +261,10 @@ export async function executeCreateCalendarEvent(
 interface ScheduleGroupSessionArgs {
   serviceName?: string
   title?: string
-  startDatetime: string
-  endDatetime: string
+  date: DatePieces
+  startTime: TimePieces
+  endTime?: TimePieces
+  durationMinutes?: number
   maxParticipants?: number
 }
 
@@ -233,14 +278,19 @@ export async function executeScheduleGroupSession(
   args: ScheduleGroupSessionArgs,
   ctx: ToolContext,
 ): Promise<object> {
-  const start = new Date(args.startDatetime)
-  const end = new Date(args.endDatetime)
-  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-    return { success: false, error: 'Invalid datetime format. Use ISO 8601.' }
-  }
-  if (end <= start) {
-    return { success: false, error: 'End time must be after start time.' }
-  }
+  // Deterministic resolution from classified pieces (end via endTime or duration).
+  const resolved = resolveSlotRange(
+    {
+      date: toDateParts(args.date),
+      startTime: args.startTime,
+      endTime: args.endTime ?? null,
+      durationMinutes: args.durationMinutes ?? null,
+    },
+    ctx.timezone,
+    new Date(),
+  )
+  if (!resolved.ok) return clarifyDate(resolved.reason)
+  const { start, end } = resolved
 
   // Resolve the linked service (gives capacity + a canonical title) if named.
   let serviceTypeId: string | null = null
