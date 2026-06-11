@@ -166,6 +166,10 @@ async function routeOperatorMessage(
   const openEscalationsTotal = Number(escCountRow?.total ?? 0)
   const liveStats = { businessCount: bizSummaries.length, openEscalations: openEscalationsTotal }
 
+  // transcript is the pre-append snapshot (the inbound turn is written to redis but
+  // not into this object), so an empty transcript is a genuine first-message signal.
+  const isFirstMessage = operatorSession.transcript.length === 0
+
   async function smartAnswer(): Promise<OperatorResult> {
     const reply = await answerOperatorQuestion({
       question: text,
@@ -174,6 +178,7 @@ async function routeOperatorMessage(
       businesses: bizSummaries,
       openEscalationsTotal,
       sessionNotes,
+      firstMessage: isFirstMessage,
     })
     return { reply: reply || i18n.op_help[lang] }
   }

@@ -573,6 +573,7 @@ export async function answerOperatorQuestion(input: {
   businesses: CompactBusinessSummary[]
   openEscalationsTotal: number
   sessionNotes?: string[]
+  firstMessage?: boolean
 }): Promise<string> {
   const safeQuestion = sanitizeUserInput(input.question)
 
@@ -610,6 +611,12 @@ export async function answerOperatorQuestion(input: {
     ? `\nCross-session context (previous operator sessions):\n${input.sessionNotes.map((s, i) => `[Session ${i + 1}] ${s}`).join('\n')}`
     : ''
 
+  // Hard greet-once gate (parity with Branch 4 mayGreet). The deterministic caller
+  // knows whether this is the session's first message; do not leave it to inference.
+  const greetDirective = input.firstMessage
+    ? 'This is the FIRST message of the session — a brief, warm greeting is allowed before you answer.'
+    : 'This is NOT the first message of the session — do NOT greet, do NOT open with hi/hello/שלום/היי, and do NOT re-introduce yourself. Continue the conversation directly.'
+
   const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. You have full real-time access to the platform data below.
 
 ${buildVoiceCore('operator')}
@@ -636,6 +643,7 @@ Rules:
 - Never say you lack the data — you have full data above
 - Never expose internal field names or raw system values
 - Casual greetings: respond warmly and briefly, suggest a command
+- ${greetDirective}
 
 Recent conversation:
 ${transcriptText}
