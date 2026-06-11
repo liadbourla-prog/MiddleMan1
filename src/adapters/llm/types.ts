@@ -94,6 +94,10 @@ export interface GenerateReplyInput {
   language: 'he' | 'en'
   situation: string
   transcript: TranscriptTurn[]
+  // IANA timezone of the business. When present, generateCustomerReply injects a
+  // DATE FACTS block so the conversational replier states real dates instead of
+  // inventing them. Real human dates the LLM phrases — not internal codes (G2).
+  businessTimezone?: string | undefined
   botPersona?: 'female' | 'male' | 'neutral' | undefined
   customerMemory?: {
     returningCustomer: boolean
