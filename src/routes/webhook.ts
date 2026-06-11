@@ -39,7 +39,7 @@ import { enqueueMessage } from '../workers/message-retry.js'
 import { loadCustomerMemory } from '../domain/customer/profile.js'
 import { buildHydratedContext } from '../domain/session/hydration.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
-import { i18n, detectLang, type Lang } from '../domain/i18n/t.js'
+import { i18n, detectLang, managerSwitchOfferSuffix, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply } from '../adapters/llm/client.js'
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
@@ -724,11 +724,7 @@ async function routeManagerMessage(
     })
 
     // Append a single inline switch offer (§3.4) in the detected language — never bilingual.
-    const finalReply = shouldOfferSwitch
-      ? reply + (detected === 'en'
-        ? '\n\n(Want me to switch to English? Reply YES)'
-        : '\n\n(רוצה שאמשיך בעברית? כתוב/י כן)')
-      : reply
+    const finalReply = shouldOfferSwitch ? reply + managerSwitchOfferSuffix(detected) : reply
 
     // Persist the resolved language state: offer-pending for next turn, plus any
     // session-level override from a decline. Keep the 4h manager session window.
