@@ -18,6 +18,7 @@ import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/eng
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
+import { listDayOptions } from '../availability/day-options.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
 import { validateSlotTiming } from '../booking/engine.js'
@@ -184,6 +185,40 @@ async function buildInquiryAvailabilityText(
   } catch {
     return null
   }
+}
+
+// Render the options of a specific day — scheduled classes (with remaining spots)
+// and open private slots — into a compact, human-readable facts string the reply
+// LLM phrases. Already human-formatted (G2: no raw IDs/ISO/enums leak). Returns
+// null when the day has nothing to offer so the caller can fall back.
+async function buildDayOptionsText(
+  db: Db,
+  business: Business,
+  dateStr: string,
+  tz: string,
+  serviceTypeId: string | undefined,
+): Promise<string | null> {
+  const day = await listDayOptions(db, business, dateStr, tz, serviceTypeId ? { serviceTypeId } : {})
+  const dayLabel = formatLocalDate(dateStr, tz)
+  const parts: string[] = []
+
+  if (day.classes.length > 0) {
+    const items = day.classes.slice(0, 10).map((c) => {
+      const cap = c.spotsLeft <= 0 ? 'full' : `${c.spotsLeft} spot${c.spotsLeft === 1 ? '' : 's'} left`
+      return `${c.serviceName} at ${formatSlotTime(c.start, tz)} (${cap})`
+    })
+    parts.push(`Classes on ${dayLabel}: ${items.join('; ')}.`)
+  }
+
+  if (day.privateOpenings.length > 0) {
+    const items = day.privateOpenings.slice(0, 6).map((p) => {
+      const times = p.slots.slice(0, 4).map((s) => formatSlotTime(s, tz)).join(', ')
+      return `${p.serviceName} at ${times}`
+    })
+    parts.push(`Open private times on ${dayLabel}: ${items.join('; ')}.`)
+  }
+
+  return parts.length > 0 ? parts.join(' ') : null
 }
 
 export async function handleBookingFlow(
@@ -418,12 +453,30 @@ export async function handleBookingFlow(
           .where(and(eq(bookings.customerId, identity.id), eq(bookings.state, 'confirmed'), gte(bookings.slotStart, ninetyDaysAgo)))
         const recentBookingCount = Number(countRow?.total ?? 0)
 
-        // Real availability — answer the day/range the customer asked about from the
-        // canonical spine, not a single parroted slot. Plus the full hours summary so
-        // "what hours are you open this week?" can be answered honestly.
-        const availabilityText = business
-          ? await buildInquiryAvailabilityText(db, business, intent.slotRequest, activeServices, businessTimezone)
-          : null
+        // Real availability. When the customer scoped a specific DAY ("what's on
+        // Monday?"), enumerate that day's actual options — scheduled classes (with
+        // spots left) + open private slots — narrowed to a named service only when
+        // they concretely asked for one. Otherwise fall back to the general
+        // next-openings answer. Never a single parroted slot. (G2: all human-rendered.)
+        let availabilityText: string | null = null
+        if (business) {
+          const inquiryService = resolveService(intent.serviceTypeHint, activeServices)
+          const dayParts: RequestedDateParts | null =
+            intent.slotRequest && (intent.slotRequest.relativeDay || intent.slotRequest.weekday != null || intent.slotRequest.explicitDate)
+              ? {
+                  relativeDay: intent.slotRequest.relativeDay ?? null,
+                  weekday: intent.slotRequest.weekday ?? null,
+                  explicitDate: intent.slotRequest.explicitDate ?? null,
+                }
+              : null
+          const resolvedDay = dayParts ? resolveRequestedDate(dayParts, businessTimezone, new Date()) : null
+          if (resolvedDay && resolvedDay.ok) {
+            availabilityText = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id)
+          }
+          if (!availabilityText) {
+            availabilityText = await buildInquiryAvailabilityText(db, business, intent.slotRequest, activeServices, businessTimezone)
+          }
+        }
         const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
 
         const customerCtx = recentBookingCount > 0
