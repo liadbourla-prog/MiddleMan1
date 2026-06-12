@@ -37,7 +37,7 @@ import {
 import { confirmPaymentReceived } from '../domain/booking/engine.js'
 import { enqueueMessage } from '../workers/message-retry.js'
 import { loadCustomerMemory } from '../domain/customer/profile.js'
-import { buildHydratedContext } from '../domain/session/hydration.js'
+import { buildHydratedContext, loadSessionCarryover } from '../domain/session/hydration.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
 import { i18n, detectLang, managerSwitchOfferSuffix, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply } from '../adapters/llm/client.js'
@@ -290,16 +290,31 @@ async function routeCustomerMessage(
   // Load or create session — hydrate new sessions with customer memory
   let session = await loadActiveSession(db, identity.id)
   let isFirstMessage = false
+  // Tail of the customer's most recent prior session, when recent enough — gives a
+  // continuing conversation its thread back across a terminal action or short gap.
+  let carriedTurns: Array<{ role: 'customer' | 'assistant'; text: string }> = []
   if (!session) {
     isFirstMessage = true
-    const memory = await loadCustomerMemory(db, identity.id)
+    const [memory, carryover] = await Promise.all([
+      loadCustomerMemory(db, identity.id),
+      loadSessionCarryover(db, identity.id),
+    ])
     const hydratedContext = await buildHydratedContext(db, identity.id, business.id, memory)
+    // Carry forward conversational flags only (never booking state) so the PA
+    // doesn't re-greet and keeps the chosen language.
+    const seededContext: Record<string, unknown> = {
+      ...(hydratedContext as unknown as Record<string, unknown>),
+      ...(carryover?.greeted ? { greeted: true } : {}),
+      ...(carryover?.detectedLanguage ? { detectedLanguage: carryover.detectedLanguage } : {}),
+      ...(carryover?.languageOverride ? { languageOverride: carryover.languageOverride } : {}),
+    }
+    carriedTurns = carryover?.priorTurns ?? []
     session = await createSession(db, business.id, identity.id, 'booking')
     // Seed context so the flow handler and LLM have full customer picture from message 1
     await import('../domain/session/manager.js').then(({ updateSessionContext }) =>
-      updateSessionContext(db, session!.id, hydratedContext as unknown as Record<string, unknown>)
+      updateSessionContext(db, session!.id, seededContext)
     )
-    session = { ...session, context: hydratedContext as unknown as Record<string, unknown> }
+    session = { ...session, context: seededContext }
   }
 
   const [managerIdentity] = await db
@@ -322,7 +337,10 @@ async function routeCustomerMessage(
   await saveMessage(db, session.id, 'customer', msg.body).catch((err) => {
     app.log.warn({ err }, 'Failed to save inbound message to transcript')
   })
-  const transcript = await loadTranscript(db, session.id, 8).catch(() => [])
+  const sessionTranscript = await loadTranscript(db, session.id, 8).catch(() => [])
+  // Prepend carried-over turns from the prior session (if any) so the PA's reply
+  // has the recent thread. These are context only — not re-persisted as messages.
+  const transcript = carriedTurns.length > 0 ? [...carriedTurns, ...sessionTranscript] : sessionTranscript
 
   // Skills dispatch — runs before booking engine; first matching skill short-circuits
   const [businessKnowledge, workflowState] = await Promise.all([
