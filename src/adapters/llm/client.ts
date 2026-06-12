@@ -412,8 +412,24 @@ export async function generateCustomerReply(input: GenerateReplyInput): Promise<
           .join('\n')
       : '(no prior messages in this session)'
 
+  const recent = input.customerMemory?.recentBookings
+  const recentText =
+    recent && recent.length > 0
+      ? ' Recent bookings (newest first): ' +
+        recent
+          .slice(0, 5)
+          .map((b) => {
+            const when = input.businessTimezone
+              ? new Intl.DateTimeFormat('en-GB', { timeZone: input.businessTimezone, weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(b.slotStart))
+              : b.slotStart.slice(0, 10)
+            return `${b.serviceName} (${when}${b.state === 'cancelled' ? ', cancelled' : ''})`
+          })
+          .join(', ') +
+        '. Reference this naturally only if relevant — never recite it like a record.'
+      : ''
+
   const memoryText = input.customerMemory
-    ? `Returning customer: ${input.customerMemory.returningCustomer}. Preferred service: ${input.customerMemory.preferredServiceName ?? 'none'}. Name: ${input.customerMemory.displayName ?? 'unknown'}.`
+    ? `Returning customer: ${input.customerMemory.returningCustomer}. Preferred service: ${input.customerMemory.preferredServiceName ?? 'none'}. Name: ${input.customerMemory.displayName ?? 'unknown'}.${recentText}`
     : 'First-time customer (no profile data).'
 
   const userTurn = `Situation: ${input.situation}
