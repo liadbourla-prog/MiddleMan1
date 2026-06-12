@@ -523,6 +523,23 @@ export const managerMemory = pgTable(
   (t) => [index('manager_memory_identity_idx').on(t.identityId, t.createdAt)],
 )
 
+// Cross-session customer conversation summaries (Branch 4 memory). Distinct from
+// customer_profiles (booking-derived facts): these capture what was DISCUSSED so
+// the PA can pick up across visits, mirroring manager_memory.
+export const customerSessionNotes = pgTable(
+  'customer_session_notes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    identityId: uuid('identity_id').notNull().references(() => identities.id),
+    periodStart: timestamp('period_start', { withTimezone: true }).notNull(),
+    periodEnd: timestamp('period_end', { withTimezone: true }).notNull(),
+    summary: text('summary').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('customer_session_notes_identity_idx').on(t.identityId, t.createdAt)],
+)
+
 // Non-customer contacts: suppliers, partners, staff
 export const businessContacts = pgTable(
   'business_contacts',
@@ -614,6 +631,7 @@ export type SkillWorkflow = typeof skillWorkflows.$inferSelect
 export type WorkflowStepLog = typeof workflowStepLogs.$inferSelect
 export type DeferredFeatureRequest = typeof deferredFeatureRequests.$inferSelect
 export type ManagerMemory = typeof managerMemory.$inferSelect
+export type CustomerSessionNote = typeof customerSessionNotes.$inferSelect
 export type BusinessContact = typeof businessContacts.$inferSelect
 export type OperatorSessionNote = typeof operatorSessionNotes.$inferSelect
 export type CalendarSyncChannel = typeof calendarSyncChannels.$inferSelect

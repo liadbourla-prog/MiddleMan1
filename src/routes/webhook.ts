@@ -36,6 +36,7 @@ import {
 } from '../domain/manager/apply.js'
 import { confirmPaymentReceived } from '../domain/booking/engine.js'
 import { enqueueMessage } from '../workers/message-retry.js'
+import { enqueueCustomerSummary } from '../workers/generate-customer-summary.js'
 import { loadCustomerMemory } from '../domain/customer/profile.js'
 import { buildHydratedContext, loadSessionCarryover } from '../domain/session/hydration.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
@@ -460,6 +461,12 @@ async function routeCustomerMessage(
 
   if (result.sessionComplete && !result.sessionFailed) {
     await completeSession(db, session.id)
+    // Summarize the just-ended conversation for cross-session memory (best-effort).
+    // Customer sessions usually end via this terminal path (a booking/cancel), so
+    // the idle-expiry sweep alone would miss them.
+    enqueueCustomerSummary(session.id, business.id, identity.id).catch((err) =>
+      app.log.warn({ err }, 'Failed to enqueue customer summary'),
+    )
   }
 }
 

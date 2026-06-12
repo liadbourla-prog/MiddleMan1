@@ -28,6 +28,7 @@ type CustomerMemoryInput = {
   preferredServiceName: string | null
   displayName: string | null
   recentBookings?: Array<{ serviceName: string; slotStart: string; state: string }>
+  sessionSummaries?: string[]
 } | null
 
 const REASON_MAP: Record<string, string> = {
@@ -76,12 +77,14 @@ function formatLocalDate(dateStr: string, tz: string): string {
 function extractMemory(ctx: BookingFlowContext): CustomerMemoryInput {
   const hydrated = ctx as unknown as Partial<HydratedContext>
   const recentBookings = hydrated.recentBookings ?? []
-  if (!hydrated.customerMemory && !hydrated.returningCustomer && recentBookings.length === 0) return null
+  const sessionSummaries = hydrated.sessionSummaries ?? []
+  if (!hydrated.customerMemory && !hydrated.returningCustomer && recentBookings.length === 0 && sessionSummaries.length === 0) return null
   return {
     returningCustomer: hydrated.returningCustomer ?? false,
     preferredServiceName: hydrated.preferredServiceName ?? null,
     displayName: hydrated.customerMemory?.displayName ?? null,
     ...(recentBookings.length > 0 ? { recentBookings } : {}),
+    ...(sessionSummaries.length > 0 ? { sessionSummaries } : {}),
   }
 }
 
