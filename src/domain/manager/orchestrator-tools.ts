@@ -7,6 +7,8 @@
 import { and, desc, eq, gt, gte, ilike, inArray, lt, or } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes } from '../../db/schema.js'
+import type { IdentityRole } from '../../db/schema.js'
+import type { Action } from '../authorization/check.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
 import { applyInstruction, pauseConversation, resumeConversation } from './apply.js'
@@ -60,6 +62,10 @@ export interface ToolContext {
   timezone: string
   lang: Lang
   calendar: CalendarClient
+  // Caller role + granted actions — used to gate config changes for delegated
+  // staff at the apply seam. Optional so existing test contexts default to manager.
+  role?: IdentityRole
+  delegatedPermissions?: Set<Action>
 }
 
 // ── listCalendarEvents ────────────────────────────────────────────────────────
@@ -464,6 +470,7 @@ export async function executeManageBusinessSettings(
     classified.data.instructionType,
     classified.data.structuredParams as Record<string, unknown>,
     ctx.lang,
+    ctx.role ? { role: ctx.role, ...(ctx.delegatedPermissions ? { permissions: ctx.delegatedPermissions } : {}) } : undefined,
   )
 
   if (!result.ok) {

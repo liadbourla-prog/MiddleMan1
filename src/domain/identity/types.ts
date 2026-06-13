@@ -1,4 +1,5 @@
 import type { IdentityRole } from '../../db/schema.js'
+import type { Action } from '../authorization/check.js'
 
 export interface ResolvedIdentity {
   id: string
@@ -9,6 +10,8 @@ export interface ResolvedIdentity {
   messagingOptOut: boolean
   preferredLanguage: 'he' | 'en' | null
   conversationPausedUntil: Date | null
+  // Granted manager-level actions for delegated_user identities (empty otherwise).
+  delegatedPermissions?: Set<Action>
 }
 
 export type ResolveResult =

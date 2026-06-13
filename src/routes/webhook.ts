@@ -25,6 +25,7 @@ import { parseConfirmation, type ManagerFlowContext } from '../domain/flows/type
 import { handleOnboardingMessage } from '../domain/flows/manager-onboarding.js'
 import { handleProviderOnboarding } from '../domain/flows/provider-onboarding.js'
 import { runManagerOrchestratorLoop } from '../adapters/llm/orchestrator.js'
+import { loadDelegatedPermissions } from '../domain/authorization/permissions.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
 import {
@@ -730,6 +731,12 @@ async function routeManagerMessage(
     lang: turnLang,
   })
 
+  // For delegated staff, load the actions the owner granted so config changes are
+  // gated to exactly those. Managers are unrestricted (empty set is ignored).
+  const delegatedPermissions = identity.role === 'delegated_user'
+    ? await loadDelegatedPermissions(db, identity.id)
+    : undefined
+
   const lockResult = await withBusinessLock(business.id, msg.messageId, async () => {
     const reply = await runManagerOrchestratorLoop({
       messageId: msg.messageId,
@@ -743,6 +750,8 @@ async function routeManagerMessage(
       calendar,
       transcript: mgTranscript,
       businessKnowledge: mgBusinessKnowledgeForOrchestrator,
+      role: identity.role,
+      ...(delegatedPermissions ? { delegatedPermissions } : {}),
     }).catch((err) => {
       app.log.error({ err, businessId: business.id }, 'Orchestrator loop threw')
       return i18n.manager_classify_error[turnLang]

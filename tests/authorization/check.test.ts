@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest'
-import { authorize } from '../../src/domain/authorization/check.js'
+import {
+  authorize,
+  requiredActionForInstruction,
+  DEFAULT_DELEGATED_CALENDAR_ACTIONS,
+} from '../../src/domain/authorization/check.js'
 import type { Action } from '../../src/domain/authorization/check.js'
 
 describe('authorization', () => {
@@ -74,6 +78,35 @@ describe('authorization', () => {
         expect(typeof result.reason).toBe('string')
         expect(result.reason.length).toBeGreaterThan(0)
       }
+    })
+  })
+
+  // The apply-seam gate: a delegated_user with the default calendar grant can run
+  // scheduling/cancellation changes but is blocked from pricing, policy, and staff.
+  describe('requiredActionForInstruction (apply-seam gate)', () => {
+    it('maps each config instruction type to its required manager action', () => {
+      expect(requiredActionForInstruction('availability_change')).toBe('schedule.set_availability')
+      expect(requiredActionForInstruction('recurring_class_change')).toBe('schedule.set_availability')
+      expect(requiredActionForInstruction('service_change')).toBe('service.modify')
+      expect(requiredActionForInstruction('policy_change')).toBe('policy.change')
+      expect(requiredActionForInstruction('permission_change')).toBe('permission.manage')
+      expect(requiredActionForInstruction('booking_cancellation')).toBe('booking.cancel_any')
+      expect(requiredActionForInstruction('unknown')).toBeNull()
+    })
+
+    it('default calendar grant authorizes schedule + recurring class changes but NOT pricing/policy/permissions', () => {
+      const granted = new Set<Action>(DEFAULT_DELEGATED_CALENDAR_ACTIONS)
+      const allowed = (type: string) => {
+        const req = requiredActionForInstruction(type)
+        return req === null || granted.has(req)
+      }
+      expect(allowed('availability_change')).toBe(true)
+      expect(allowed('recurring_class_change')).toBe(true)
+      expect(allowed('booking_cancellation')).toBe(true)
+      // owner-only powers stay blocked for a plain calendar editor
+      expect(allowed('service_change')).toBe(false)
+      expect(allowed('policy_change')).toBe(false)
+      expect(allowed('permission_change')).toBe(false)
     })
   })
 })

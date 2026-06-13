@@ -164,6 +164,31 @@ export const providerAssignments = pgTable(
   ],
 )
 
+// Which manager-level actions a delegated_user has been granted by the owner.
+// One row per (identity, action). The owner declares exactly what a staff member
+// may do (e.g. edit the calendar but not change pricing); authorize() enforces it
+// at the apply seam. Closes the "in-memory only" gap in authorization/check.ts.
+export const delegatedPermissions = pgTable(
+  'delegated_permissions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    identityId: uuid('identity_id')
+      .notNull()
+      .references(() => identities.id),
+    action: text('action').notNull(), // matches the Action union in authorization/check.ts
+    grantedBy: uuid('granted_by'),
+    grantedAt: timestamp('granted_at', { withTimezone: true }).notNull().defaultNow(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('delegated_permissions_identity_action_idx').on(t.identityId, t.action),
+    index('delegated_permissions_identity_idx').on(t.identityId),
+  ],
+)
+
 export const bookings = pgTable(
   'bookings',
   {
@@ -230,6 +255,10 @@ export const calendarBlocks = pgTable(
     // For type='class': the group service this session instances, and its capacity
     serviceTypeId: uuid('service_type_id').references(() => serviceTypes.id),
     maxParticipants: integer('max_participants'),
+    // For type='class' materialized from a recurring series: links back to the
+    // parent series so the materializer can detect already-created occurrences
+    // (idempotency) and a single-instance edit can become a series exception.
+    seriesId: uuid('series_id'),
     // Optional owner/staff scoping
     providerId: uuid('provider_id').references(() => identities.id),
     // Google mirror linkage (Google mode only)
@@ -243,7 +272,63 @@ export const calendarBlocks = pgTable(
   (t) => [
     index('calendar_blocks_business_range_idx').on(t.businessId, t.startTs, t.endTs),
     index('calendar_blocks_google_event_idx').on(t.businessId, t.googleEventId),
+    index('calendar_blocks_series_idx').on(t.seriesId),
   ],
+)
+
+// Recurring weekly class definition. Recurrence lives ABOVE the canonical
+// availability spine: a series is expanded by the materializer into concrete
+// `calendar_blocks` instances (type='class', seriesId set), and the booking
+// engine / availability compute keep operating on those instances unchanged.
+// Mirrors Google's master + materialized-instances + EXDATE model.
+// See CALENDAR_UX_DESIGN.md §8 (recurrence) and PLAN Track 1A.
+export const classSeries = pgTable(
+  'class_series',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    serviceTypeId: uuid('service_type_id')
+      .notNull()
+      .references(() => serviceTypes.id),
+    // Optional instructor scoping for the whole series.
+    providerId: uuid('provider_id').references(() => identities.id),
+    dayOfWeek: integer('day_of_week').notNull(), // 0=Sun … 6=Sat (business-local)
+    startTime: time('start_time').notNull(), // 'HH:MM' business-local wall clock
+    durationMinutes: integer('duration_minutes').notNull(),
+    maxParticipants: integer('max_participants').notNull().default(1),
+    title: text('title'),
+    startDate: date('start_date').notNull(), // first eligible local date (YYYY-MM-DD)
+    endDate: date('end_date'), // null = open-ended
+    // Timezone snapshot at creation — each weekly instance is resolved at this
+    // local clock time via localTimeToUtc(), so a 10:00 class stays 10:00 local
+    // across DST regardless of later business-timezone edits.
+    timezone: text('timezone').notNull(),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('class_series_business_idx').on(t.businessId, t.isActive),
+    check('class_series_day_of_week_range', sql`${t.dayOfWeek} BETWEEN 0 AND 6`),
+  ],
+)
+
+// EXDATE-style exceptions: a single occurrence of a series that was cancelled or
+// detached. The materializer never (re)creates an instance for an excepted date.
+export const classSeriesExceptions = pgTable(
+  'class_series_exceptions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    seriesId: uuid('series_id')
+      .notNull()
+      .references(() => classSeries.id),
+    occurrenceDate: date('occurrence_date').notNull(), // business-local YYYY-MM-DD
+    reason: text('reason'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('class_series_exceptions_series_date_idx').on(t.seriesId, t.occurrenceDate)],
 )
 
 export const conversationSessions = pgTable(
@@ -281,7 +366,7 @@ export const managerInstructions = pgTable('manager_instructions', {
   rawMessage: text('raw_message').notNull(),
   receivedAt: timestamp('received_at', { withTimezone: true }).notNull(),
   classifiedAs: text('classified_as', {
-    enum: ['availability_change', 'policy_change', 'service_change', 'permission_change', 'booking_cancellation', 'unknown'],
+    enum: ['availability_change', 'policy_change', 'service_change', 'permission_change', 'booking_cancellation', 'recurring_class_change', 'unknown'],
   }),
   structuredOutput: jsonb('structured_output'),
   appliedAt: timestamp('applied_at', { withTimezone: true }),
@@ -612,9 +697,12 @@ export type Identity = typeof identities.$inferSelect
 export type ServiceType = typeof serviceTypes.$inferSelect
 export type Availability = typeof availability.$inferSelect
 export type ProviderAssignment = typeof providerAssignments.$inferSelect
+export type DelegatedPermission = typeof delegatedPermissions.$inferSelect
 export type Booking = typeof bookings.$inferSelect
 export type CalendarBlock = typeof calendarBlocks.$inferSelect
 export type CalendarBlockType = CalendarBlock['type']
+export type ClassSeries = typeof classSeries.$inferSelect
+export type ClassSeriesException = typeof classSeriesExceptions.$inferSelect
 export type ConversationSession = typeof conversationSessions.$inferSelect
 export type ManagerInstruction = typeof managerInstructions.$inferSelect
 export type AuditLogEntry = typeof auditLog.$inferSelect

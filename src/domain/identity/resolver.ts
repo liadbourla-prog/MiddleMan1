@@ -2,6 +2,7 @@ import { eq, and } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { identities } from '../../db/schema.js'
 import type { ResolveResult } from './types.js'
+import { loadDelegatedPermissions } from '../authorization/permissions.js'
 
 // E.164: + followed by 7–15 digits
 const E164_REGEX = /^\+[1-9]\d{6,14}$/
@@ -25,6 +26,12 @@ export async function resolveIdentity(
   if (!identity) return { found: false, reason: 'unknown_number' }
   if (identity.revokedAt !== null) return { found: false, reason: 'revoked' }
 
+  // Hydrate granted actions for delegated staff so authorize() enforces exactly
+  // what the owner declared (persisted, not in-memory). Managers/customers skip this.
+  const delegatedPermissions = identity.role === 'delegated_user'
+    ? await loadDelegatedPermissions(db, identity.id)
+    : undefined
+
   return {
     found: true,
     identity: {
@@ -36,6 +43,7 @@ export async function resolveIdentity(
       messagingOptOut: identity.messagingOptOut,
       preferredLanguage: (identity.preferredLanguage as 'he' | 'en' | null) ?? null,
       conversationPausedUntil: identity.conversationPausedUntil ?? null,
+      ...(delegatedPermissions ? { delegatedPermissions } : {}),
     },
   }
 }

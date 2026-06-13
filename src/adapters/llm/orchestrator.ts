@@ -8,6 +8,8 @@ import type { Content, FunctionDeclaration } from '@google/genai'
 import { desc, eq } from 'drizzle-orm'
 import { db } from '../../db/client.js'
 import { managerMemory } from '../../db/schema.js'
+import type { IdentityRole } from '../../db/schema.js'
+import type { Action } from '../../domain/authorization/check.js'
 import type { CalendarClient } from '../calendar/client.js'
 import type { TranscriptTurn } from './types.js'
 import type { Lang } from '../../domain/i18n/t.js'
@@ -438,6 +440,10 @@ export interface OrchestratorParams {
   calendar: CalendarClient
   transcript: TranscriptTurn[]
   businessKnowledge: BusinessKnowledge | null
+  // Caller role + granted actions — threaded into ToolContext so delegated staff
+  // are gated to the actions the owner declared. Defaults to manager when omitted.
+  role?: IdentityRole
+  delegatedPermissions?: Set<Action>
   // ── Test seams (optional; production never sets these) ─────────────────────
   // Let the quality harness grade the real Gemini function-calling loop + the
   // real system prompt against FIXED tool results, with no DB or calendar. When
@@ -467,7 +473,11 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     conversationHistory: transcript.slice(-20),
   })
 
-  const ctx: ToolContext = { db, businessId, identityId, timezone, lang, calendar }
+  const ctx: ToolContext = {
+    db, businessId, identityId, timezone, lang, calendar,
+    ...(params.role ? { role: params.role } : {}),
+    ...(params.delegatedPermissions ? { delegatedPermissions: params.delegatedPermissions } : {}),
+  }
 
   const tools = [{ functionDeclarations: MANAGER_TOOLS }]
 

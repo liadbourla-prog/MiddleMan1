@@ -18,6 +18,7 @@ import { startCustomerSummaryWorker } from './workers/generate-customer-summary.
 import { startDailyBriefingWorker } from './workers/daily-briefing.js'
 import { startCalendarMirrorWorker } from './workers/calendar-mirror.js'
 import { startCalendarSyncRenewalWorker, scheduleCalendarSyncRenewalJob } from './workers/calendar-sync-renewal.js'
+import { startSeriesMaterializerWorker } from './workers/series-materializer.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
@@ -88,6 +89,7 @@ startCustomerSummaryWorker()
 startDailyBriefingWorker()
 startCalendarMirrorWorker()
 startCalendarSyncRenewalWorker()
+startSeriesMaterializerWorker()
 await scheduleHoldExpiryJob()
 await scheduleCalendarSyncRenewalJob()
 app.log.info('Background workers started')

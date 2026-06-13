@@ -1,13 +1,17 @@
 import { eq, and, or, lte, gte, gt, lt, count, desc, isNull, ilike, inArray } from 'drizzle-orm'
 import { z } from 'zod'
 import type { Db } from '../../db/client.js'
-import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages } from '../../db/schema.js'
+import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages, classSeries } from '../../db/schema.js'
+import { createSeries, stopSeries, cancelOccurrence } from '../scheduling/series.js'
+import { requiredActionForInstruction, DEFAULT_DELEGATED_CALENDAR_ACTIONS, type Action } from '../authorization/check.js'
+import { grantDelegatedPermissions, revokeAllDelegatedPermissions } from '../authorization/permissions.js'
+import type { IdentityRole } from '../../db/schema.js'
 import { logAudit } from '../audit/logger.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { createBlock } from '../availability/blocks.js'
-import { localTimeToUtc } from '../availability/compute.js'
+import { localTimeToUtc, localParts } from '../availability/compute.js'
 import { enqueueBlockMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
 
 // Bilingual day names (Sun=0 … Sat=6)
@@ -16,6 +20,20 @@ function dayName(dayOfWeek: number | null | undefined, lang: Lang): string {
   const daysHe = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת']
   const daysEn = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
   return (lang === 'he' ? daysHe : daysEn)[dayOfWeek] ?? (lang === 'he' ? 'אותו יום' : 'that day')
+}
+
+/**
+ * Business-local calendar-day bounds as absolute UTC instants.
+ * Returns [dayStart, dayEndExclusive) so a query uses gte(start) && lt(endExcl).
+ * Uses localTimeToUtc (DST-correct) — never `${date}T00:00:00Z`, which is UTC midnight.
+ */
+function localDayBounds(dateStr: string, tz: string): { dayStart: Date; dayEndExclusive: Date } {
+  const dayStart = localTimeToUtc(dateStr, '00:00', tz)
+  const [y, m, d] = dateStr.split('-').map(Number)
+  const next = new Date(Date.UTC(y ?? 1970, (m ?? 1) - 1, (d ?? 1) + 1))
+  const nextStr = next.toISOString().slice(0, 10)
+  const dayEndExclusive = localTimeToUtc(nextStr, '00:00', tz)
+  return { dayStart, dayEndExclusive }
 }
 
 function isValidIANATimezone(tz: string): boolean {
@@ -62,6 +80,23 @@ const permissionChangeSchema = z.object({
   displayName: z.string().optional(),
 })
 
+const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/
+
+const recurringClassChangeSchema = z.object({
+  action: z.enum(['create', 'stop', 'cancel_occurrence']),
+  // Service the recurring class instances (matched by name, case-insensitive).
+  serviceName: z.string().optional(),
+  dayOfWeek: z.coerce.number().int().min(0).max(6).nullable().optional(),
+  startTime: z.string().regex(TIME_REGEX, 'startTime must be HH:MM').nullable().optional(),
+  durationMinutes: z.coerce.number().int().positive().nullable().optional(),
+  maxParticipants: z.coerce.number().int().positive().nullable().optional(),
+  startDate: z.string().regex(DATE_REGEX, 'startDate must be YYYY-MM-DD').nullable().optional(),
+  endDate: z.string().regex(DATE_REGEX, 'endDate must be YYYY-MM-DD').nullable().optional(),
+  occurrenceDate: z.string().regex(DATE_REGEX, 'occurrenceDate must be YYYY-MM-DD').nullable().optional(),
+  providerHint: z.string().nullable().optional(),
+  reason: z.string().nullable().optional(),
+})
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 export async function applyInstruction(
@@ -72,7 +107,25 @@ export async function applyInstruction(
   instructionType: string,
   structuredParams: Record<string, unknown>,
   lang: Lang = 'he',
+  auth?: { role: IdentityRole; permissions?: Set<Action> },
 ): Promise<ApplyResult> {
+  // Permission gate: a delegated_user may only apply changes the owner granted
+  // them. Managers always pass; customers never reach this seam. This is the
+  // deterministic enforcement point for owner-declared staff capabilities.
+  if (auth && auth.role === 'delegated_user') {
+    const required = requiredActionForInstruction(instructionType)
+    if (required && !(auth.permissions?.has(required) ?? false)) {
+      const reason = lang === 'he'
+        ? 'אין לך הרשאה לבצע את השינוי הזה. בקש/י מבעל/ת העסק.'
+        : "You don't have permission to make that change — ask the business owner."
+      await db
+        .update(managerInstructions)
+        .set({ applyStatus: 'failed', appliedAt: null })
+        .where(eq(managerInstructions.id, instructionId))
+      return { ok: false, reason }
+    }
+  }
+
   let result: ApplyResult
 
   switch (instructionType) {
@@ -90,6 +143,9 @@ export async function applyInstruction(
       break
     case 'booking_cancellation':
       result = await applyBookingCancellation(db, businessId, actorId, structuredParams, lang)
+      break
+    case 'recurring_class_change':
+      result = await applyRecurringClassChange(db, businessId, actorId, structuredParams, lang)
       break
     default:
       result = { ok: false, reason: i18n.apply_unknown_type[lang](instructionType) }
@@ -136,6 +192,16 @@ async function applyAvailabilityChange(
     return { ok: false, reason: `Invalid timezone "${p.timezone}". Use an IANA timezone name, e.g. "Asia/Jerusalem".` }
   }
 
+  // Business-local timezone — affected-booking day windows and out-of-hours
+  // comparisons below must use this, never server-UTC, or off-zero businesses
+  // detect the wrong bookings as affected by a block / hours change.
+  const [tzRow] = await db
+    .select({ timezone: businesses.timezone })
+    .from(businesses)
+    .where(eq(businesses.id, businessId))
+    .limit(1)
+  const bizTz = tzRow?.timezone ?? 'UTC'
+
   // Intra-day block (a specific date with explicit start/end times) is a
   // time-ranged block, not a whole-day closure. It lives in calendar_blocks, not
   // the availability table — this is what makes "block 2–4pm Tuesday" possible
@@ -147,8 +213,7 @@ async function applyAvailabilityChange(
   if (p.action === 'block' || p.action === 'bulk_close') {
     // For specific-date blocks, check for affected confirmed bookings first
     if (p.specificDate) {
-      const dayStart = new Date(`${p.specificDate}T00:00:00Z`)
-      const dayEnd = new Date(`${p.specificDate}T23:59:59Z`)
+      const { dayStart, dayEndExclusive } = localDayBounds(p.specificDate, bizTz)
       const affected = await db
         .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId })
         .from(bookings)
@@ -157,7 +222,7 @@ async function applyAvailabilityChange(
             eq(bookings.businessId, businessId),
             or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held')),
             gte(bookings.slotStart, dayStart),
-            lte(bookings.slotStart, dayEnd),
+            lt(bookings.slotStart, dayEndExclusive),
           ),
         )
 
@@ -239,10 +304,11 @@ async function applyAvailabilityChange(
     }
 
     if (p.action === 'bulk_close' && p.dateRangeStart && p.dateRangeEnd) {
-      // Block each day in the range
-      const start = new Date(p.dateRangeStart)
-      const end = new Date(p.dateRangeEnd)
-      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      // Block each calendar day in the range. Iterate purely on the UTC calendar
+      // (getUTCDate, not getDate) so the date strings never drift on a non-UTC server.
+      const start = new Date(`${p.dateRangeStart}T00:00:00Z`)
+      const end = new Date(`${p.dateRangeEnd}T00:00:00Z`)
+      for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
         const dateStr = d.toISOString().slice(0, 10)
         await db.insert(availability).values({
           businessId,
@@ -292,8 +358,7 @@ async function applyAvailabilityChange(
   if (p.specificDate) {
     const newOpenMs = timeToMs(p.openTime)
     const newCloseMs = timeToMs(p.closeTime)
-    const dayStart = new Date(`${p.specificDate}T00:00:00Z`)
-    const dayEnd = new Date(`${p.specificDate}T23:59:59Z`)
+    const { dayStart, dayEndExclusive } = localDayBounds(p.specificDate, bizTz)
     const affectedByHoursChange = await db
       .select({ id: bookings.id, slotStart: bookings.slotStart })
       .from(bookings)
@@ -302,12 +367,13 @@ async function applyAvailabilityChange(
           eq(bookings.businessId, businessId),
           or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held')),
           gte(bookings.slotStart, dayStart),
-          lte(bookings.slotStart, dayEnd),
+          lt(bookings.slotStart, dayEndExclusive),
         ),
       )
 
     const outsideHours = affectedByHoursChange.filter((b) => {
-      const slotMs = (b.slotStart.getHours() * 60 + b.slotStart.getMinutes()) * 60_000
+      // Compare in business-local minutes — newOpen/newClose are local 'HH:MM'.
+      const slotMs = localParts(b.slotStart, bizTz).minutes * 60_000
       return slotMs < newOpenMs || slotMs >= newCloseMs
     })
 
@@ -556,6 +622,22 @@ async function applyPermissionChange(
         grantedAt: new Date(),
       })
       .onConflictDoNothing()
+
+    // Resolve the identity (existing or just-created) and ensure it is an active
+    // delegated_user, then persist WHICH actions the owner is delegating so the
+    // grant survives restarts and is enforced deterministically at the apply seam.
+    const [granted] = await db
+      .select({ id: identities.id })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), eq(identities.phoneNumber, p.phoneNumber)))
+      .limit(1)
+    if (granted) {
+      await db
+        .update(identities)
+        .set({ role: 'delegated_user', revokedAt: null, grantedBy: actorId, grantedAt: new Date() })
+        .where(eq(identities.id, granted.id))
+      await grantDelegatedPermissions(db, businessId, granted.id, DEFAULT_DELEGATED_CALENDAR_ACTIONS, actorId)
+    }
     return { ok: true, confirmationMessage: i18n.apply_permission_granted[lang](p.displayName ?? p.phoneNumber) }
   }
 
@@ -572,8 +654,103 @@ async function applyPermissionChange(
     .update(identities)
     .set({ revokedAt: new Date() })
     .where(eq(identities.id, target.id))
+  await revokeAllDelegatedPermissions(db, target.id)
 
   return { ok: true, confirmationMessage: i18n.apply_permission_revoked[lang](p.displayName ?? p.phoneNumber) }
+}
+
+// ── Recurring class change ──────────────────────────────────────────────────
+// Recurrence is a scheduling primitive (affects what customers can book and when),
+// so it flows through the apply pipeline per MULTI_AGENT_DESIGN.md §1.7 — never a
+// direct tool write. The deterministic series engine lives in domain/scheduling.
+
+async function applyRecurringClassChange(
+  db: Db,
+  businessId: string,
+  _actorId: string,
+  params: Record<string, unknown>,
+  lang: Lang = 'he',
+): Promise<ApplyResult> {
+  const parsed = recurringClassChangeSchema.safeParse(params)
+  if (!parsed.success) {
+    return { ok: false, reason: `Invalid recurring class params: ${parsed.error.message}` }
+  }
+  const p = parsed.data
+
+  const [biz] = await db.select({ timezone: businesses.timezone }).from(businesses).where(eq(businesses.id, businessId)).limit(1)
+  const tz = biz?.timezone ?? 'UTC'
+
+  // Resolve the service this class instances (by name, case-insensitive).
+  async function resolveService() {
+    if (!p.serviceName) return null
+    const [svc] = await db
+      .select({ id: serviceTypes.id, name: serviceTypes.name, durationMinutes: serviceTypes.durationMinutes, maxParticipants: serviceTypes.maxParticipants })
+      .from(serviceTypes)
+      .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.isActive, true), ilike(serviceTypes.name, p.serviceName)))
+      .limit(1)
+    return svc ?? null
+  }
+
+  if (p.action === 'create') {
+    if (p.dayOfWeek === null || p.dayOfWeek === undefined || !p.startTime) {
+      return { ok: false, reason: lang === 'he' ? 'יצירת שיעור קבוע דורשת יום ושעה.' : 'Creating a recurring class requires a day and a start time.' }
+    }
+    const svc = await resolveService()
+    if (!svc) {
+      return { ok: false, reason: lang === 'he' ? `לא מצאתי שירות בשם "${p.serviceName ?? ''}".` : `No service named "${p.serviceName ?? ''}" found.` }
+    }
+    const startDate = p.startDate ?? localParts(new Date(), tz).dateStr
+    const { created } = await createSeries(db, {
+      businessId,
+      serviceTypeId: svc.id,
+      dayOfWeek: p.dayOfWeek,
+      startTime: p.startTime,
+      durationMinutes: p.durationMinutes ?? svc.durationMinutes,
+      maxParticipants: p.maxParticipants ?? svc.maxParticipants ?? 1,
+      title: svc.name,
+      startDate,
+      endDate: p.endDate ?? null,
+      timezone: tz,
+    })
+    const dn = dayName(p.dayOfWeek, lang)
+    const msg = lang === 'he'
+      ? `✅ קבעתי ${svc.name} כל ${dn} ב-${p.startTime}. נוצרו ${created} מפגשים בהמשך.`
+      : `✅ Set up ${svc.name} every ${dn} at ${p.startTime}. ${created} upcoming session(s) created.`
+    return { ok: true, confirmationMessage: msg }
+  }
+
+  // stop / cancel_occurrence both need to locate the series.
+  const svc = await resolveService()
+  const seriesConds = [eq(classSeries.businessId, businessId), eq(classSeries.isActive, true)]
+  if (svc) seriesConds.push(eq(classSeries.serviceTypeId, svc.id))
+  if (p.dayOfWeek !== null && p.dayOfWeek !== undefined) seriesConds.push(eq(classSeries.dayOfWeek, p.dayOfWeek))
+  const matches = await db.select({ id: classSeries.id }).from(classSeries).where(and(...seriesConds))
+
+  if (matches.length === 0) {
+    return { ok: false, reason: lang === 'he' ? 'לא מצאתי שיעור קבוע תואם.' : 'No matching recurring class found.' }
+  }
+  if (matches.length > 1) {
+    return { ok: false, reason: lang === 'he' ? 'יש כמה שיעורים קבועים תואמים — איזה מהם?' : 'Several recurring classes match — which one?' }
+  }
+  const seriesId = matches[0]!.id
+
+  if (p.action === 'stop') {
+    const { deletedInstances } = await stopSeries(db, seriesId)
+    const msg = lang === 'he'
+      ? `✅ הפסקתי את השיעור הקבוע. ${deletedInstances} מפגשים עתידיים (ללא הרשמות) הוסרו.`
+      : `✅ Stopped the recurring class. ${deletedInstances} future unbooked session(s) removed.`
+    return { ok: true, confirmationMessage: msg }
+  }
+
+  // cancel_occurrence
+  if (!p.occurrenceDate) {
+    return { ok: false, reason: lang === 'he' ? 'ביטול מפגש בודד דורש תאריך.' : 'Cancelling a single session requires a date.' }
+  }
+  await cancelOccurrence(db, seriesId, p.occurrenceDate, p.reason ?? null)
+  const msg = lang === 'he'
+    ? `✅ ביטלתי את המפגש בתאריך ${p.occurrenceDate}. שאר השיעורים הקבועים נשארים.`
+    : `✅ Cancelled the session on ${p.occurrenceDate}. The rest of the recurring series stays.`
+  return { ok: true, confirmationMessage: msg }
 }
 
 // ── Policy change ─────────────────────────────────────────────────────────────

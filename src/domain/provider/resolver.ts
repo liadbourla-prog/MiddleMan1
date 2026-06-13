@@ -13,6 +13,7 @@
 import { eq, and, isNull, or, lte, gt, lt, gte } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { providerAssignments, identities, availability, bookings } from '../../db/schema.js'
+import { localParts } from '../availability/compute.js'
 
 export interface ResolvedProvider {
   identityId: string
@@ -27,6 +28,7 @@ export async function resolveProvider(
   slotStart: Date,
   slotEnd: Date,
   providerHint?: string | null,
+  timezone: string = 'UTC',
 ): Promise<ResolvedProvider | null> {
   // Get all active providers assigned to this service
   const assignments = await db
@@ -62,7 +64,7 @@ export async function resolveProvider(
 
   // For each candidate, check they have availability in the slot and no conflicting booking
   for (const candidate of candidates) {
-    const available = await isProviderAvailable(db, businessId, candidate.identityId, slotStart, slotEnd)
+    const available = await isProviderAvailable(db, businessId, candidate.identityId, slotStart, slotEnd, timezone)
     if (available) return candidate
   }
 
@@ -75,6 +77,7 @@ async function isProviderAvailable(
   providerId: string,
   slotStart: Date,
   slotEnd: Date,
+  timezone: string,
 ): Promise<boolean> {
   // Check for conflicting confirmed/held bookings for this provider
   const conflicts = await db
@@ -100,10 +103,15 @@ async function isProviderAvailable(
 
   if (conflicts.length > 0) return false
 
-  // Check provider has availability rules covering this slot
-  const dayOfWeek = slotStart.getDay()
-  const dateStr = slotStart.toISOString().slice(0, 10)
-  const slotTimeMs = (slotStart.getHours() * 60 + slotStart.getMinutes()) * 60_000
+  // Check provider has availability rules covering this slot. Decompose the slot
+  // in BUSINESS-LOCAL time, not server-UTC — otherwise a Friday-09:00 local rule
+  // is checked against the UTC weekday/hour and silently mismatches off-zero zones
+  // and across DST. localParts() is the canonical, DST-correct decomposition.
+  const startLocal = localParts(slotStart, timezone)
+  const endLocal = localParts(slotEnd, timezone)
+  const dayOfWeek = startLocal.dayOfWeek
+  const dateStr = startLocal.dateStr
+  const slotTimeMs = startLocal.minutes * 60_000
 
   // Provider-specific block check (specific date)
   const blocked = await db
@@ -143,7 +151,7 @@ async function isProviderAvailable(
     if (!hrs.openTime || !hrs.closeTime) return true
     const openMs = timeToMs(hrs.openTime)
     const closeMs = timeToMs(hrs.closeTime)
-    const slotEndMs = (slotEnd.getHours() * 60 + slotEnd.getMinutes()) * 60_000
+    const slotEndMs = endLocal.minutes * 60_000
     return slotTimeMs >= openMs && slotEndMs <= closeMs
   }
 
