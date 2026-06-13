@@ -428,8 +428,16 @@ export async function generateCustomerReply(input: GenerateReplyInput): Promise<
         '. Reference this naturally only if relevant — never recite it like a record.'
       : ''
 
+  const summaries = input.customerMemory?.sessionSummaries
+  const summariesText =
+    summaries && summaries.length > 0
+      ? ' Notes from past conversations (newest first): ' +
+        summaries.map((s, i) => `[${i + 1}] ${s}`).join(' ') +
+        ' Use this like a person who remembers — naturally and only if relevant. Never recite it or say "according to my notes".'
+      : ''
+
   const memoryText = input.customerMemory
-    ? `Returning customer: ${input.customerMemory.returningCustomer}. Preferred service: ${input.customerMemory.preferredServiceName ?? 'none'}. Name: ${input.customerMemory.displayName ?? 'unknown'}.${recentText}`
+    ? `Returning customer: ${input.customerMemory.returningCustomer}. Preferred service: ${input.customerMemory.preferredServiceName ?? 'none'}. Name: ${input.customerMemory.displayName ?? 'unknown'}.${recentText}${summariesText}`
     : 'First-time customer (no profile data).'
 
   const userTurn = `Situation: ${input.situation}

@@ -14,6 +14,7 @@ import { startReminderWorker } from './workers/reminder.js'
 import { startQueuedMessageWorker } from './workers/queued-messages.js'
 import { startManagerSummaryWorker } from './workers/generate-manager-summary.js'
 import { startOperatorSummaryWorker } from './workers/generate-operator-summary.js'
+import { startCustomerSummaryWorker } from './workers/generate-customer-summary.js'
 import { startDailyBriefingWorker } from './workers/daily-briefing.js'
 import { startCalendarMirrorWorker } from './workers/calendar-mirror.js'
 import { startCalendarSyncRenewalWorker, scheduleCalendarSyncRenewalJob } from './workers/calendar-sync-renewal.js'
@@ -83,6 +84,7 @@ startReminderWorker()
 startQueuedMessageWorker()
 startManagerSummaryWorker()
 startOperatorSummaryWorker()
+startCustomerSummaryWorker()
 startDailyBriefingWorker()
 startCalendarMirrorWorker()
 startCalendarSyncRenewalWorker()

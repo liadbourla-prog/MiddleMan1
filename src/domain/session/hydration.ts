@@ -1,6 +1,6 @@
 import { eq, and, or, desc, gte } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { bookings, serviceTypes, conversationSessions, conversationMessages } from '../../db/schema.js'
+import { bookings, serviceTypes, conversationSessions, conversationMessages, customerSessionNotes } from '../../db/schema.js'
 import type { CustomerMemory } from '../customer/profile.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 
@@ -25,6 +25,9 @@ export interface HydratedContext {
   // Last ~6 months of this customer's bookings, newest first — lets the PA
   // reference history naturally ("the usual?") without reciting a database.
   recentBookings: RecentBooking[]
+  // Last few cross-session conversation summaries (newest first) — what was
+  // DISCUSSED across prior visits, so the PA picks up like a regular.
+  sessionSummaries: string[]
 }
 
 export async function buildHydratedContext(
@@ -83,6 +86,21 @@ export async function buildHydratedContext(
     state: r.state,
   }))
 
+  // Cross-session conversation summaries (last 3). Defensive: if the table is
+  // not present yet (migration not applied), degrade to none rather than throw.
+  let sessionSummaries: string[] = []
+  try {
+    const noteRows = await db
+      .select({ summary: customerSessionNotes.summary })
+      .from(customerSessionNotes)
+      .where(eq(customerSessionNotes.identityId, identityId))
+      .orderBy(desc(customerSessionNotes.createdAt))
+      .limit(3)
+    sessionSummaries = noteRows.map((r) => r.summary)
+  } catch {
+    sessionSummaries = []
+  }
+
   const daysSinceLastBooking =
     memory?.lastBookingAt != null
       ? Math.floor((now.getTime() - memory.lastBookingAt.getTime()) / (1000 * 60 * 60 * 24))
@@ -102,6 +120,7 @@ export async function buildHydratedContext(
         }
       : null,
     recentBookings,
+    sessionSummaries,
   }
 }
 

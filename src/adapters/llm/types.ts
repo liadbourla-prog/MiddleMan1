@@ -105,6 +105,8 @@ export interface GenerateReplyInput {
     displayName: string | null
     // Last few bookings (newest first) so the PA can reference history naturally.
     recentBookings?: Array<{ serviceName: string; slotStart: string; state: string }>
+    // Notes from prior conversations (newest first) — what was discussed across visits.
+    sessionSummaries?: string[]
   } | null
   // Business knowledge — injected when available, absent for bootstrap/fallback paths
   brandVoice?: string | null

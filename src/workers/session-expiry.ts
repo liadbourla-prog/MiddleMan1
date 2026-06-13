@@ -4,6 +4,7 @@ import { db } from '../db/client.js'
 import { conversationSessions, identities } from '../db/schema.js'
 import { expireOldSessions } from '../domain/session/manager.js'
 import { enqueueManagerSummary } from './generate-manager-summary.js'
+import { enqueueCustomerSummary } from './generate-customer-summary.js'
 import { redisConnection } from '../redis.js'
 
 const QUEUE_NAME = 'session-expiry'
@@ -24,6 +25,7 @@ export function startSessionExpiryWorker() {
           identityId: conversationSessions.identityId,
           createdAt: conversationSessions.createdAt,
           lastMessageAt: conversationSessions.lastMessageAt,
+          role: identities.role,
         })
         .from(conversationSessions)
         .innerJoin(identities, eq(identities.id, conversationSessions.identityId))
@@ -35,23 +37,23 @@ export function startSessionExpiryWorker() {
               eq(conversationSessions.state, 'waiting_confirmation'),
               eq(conversationSessions.state, 'waiting_clarification'),
             ),
-            eq(identities.role, 'manager'),
+            or(eq(identities.role, 'manager'), eq(identities.role, 'customer')),
           ),
         )
 
+      // Summarize each expiring session for cross-session memory before sweeping.
+      // (Terminal customer sessions already summarized at completion; those are
+      // 'completed' and not in the active/waiting set, so no double-summary.)
       for (const session of expiringSessions) {
-        await enqueueManagerSummary(
-          session.id,
-          session.businessId,
-          session.identityId,
-          session.createdAt,
-          session.lastMessageAt,
-        ).catch((err) => console.warn('[session-expiry] Failed to enqueue summary', { sessionId: session.id, err }))
+        const enqueue = session.role === 'customer'
+          ? enqueueCustomerSummary(session.id, session.businessId, session.identityId)
+          : enqueueManagerSummary(session.id, session.businessId, session.identityId, session.createdAt, session.lastMessageAt)
+        await enqueue.catch((err) => console.warn('[session-expiry] Failed to enqueue summary', { sessionId: session.id, err }))
       }
 
       const count = await expireOldSessions(db)
       if (count > 0) {
-        console.info(`[session-expiry] Expired ${count} stale session(s), enqueued ${expiringSessions.length} manager summary job(s)`)
+        console.info(`[session-expiry] Expired ${count} stale session(s), enqueued ${expiringSessions.length} summary job(s)`)
       }
     },
     { connection: redisConnection },
