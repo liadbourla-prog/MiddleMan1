@@ -56,6 +56,27 @@ function sanitiseReason(reason: string | undefined | null): string {
   return REASON_MAP[reason] ?? reason.replace(/_/g, ' ').toLowerCase()
 }
 
+// Greetings / social pleasantries that classify as 'unknown' (there is no
+// dedicated greeting intent) but must NOT count toward unknown-intent escalation.
+// A message qualifies only when it is SHORT and essentially just a pleasantry —
+// "hi can I book tomorrow?" classifies as booking and never reaches this check.
+const GREETING_SOCIAL_RE =
+  /^(?:hi+|hey+|hello+|yo|sup|hiya|good\s*(?:morning|afternoon|evening|night)|how\s*(?:are|r)\s*(?:you|u)|how's\s*it\s*going|what'?s\s*up|thanks?|thank\s*you|thx|ty|ok(?:ay)?|cool|nice|great|bye+|goodbye|see\s*you|cheers|שלום|היי+|הי|הלו|אהלן|אהל[ןן]|בוקר\s*טוב|צהריים\s*טובים|ערב\s*טוב|לילה\s*טוב|מה\s*נשמע|מה\s*קורה|מה\s*שלומ(?:ך|ך)|תודה(?:\s*רבה)?|סבבה|אוקיי?|יופי|מגניב|ביי+|להתראות|כל\s*טוב)$/iu
+
+export function looksLikeGreetingOrSocial(text: string): boolean {
+  // Strip emoji, punctuation, and collapse whitespace, then bound the length so a
+  // genuine request that merely opens with "hi" is never swallowed here.
+  const cleaned = text
+    .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '')
+    .replace(/['’]/g, '') // strip apostrophes so "what's" → "whats" (not "what s")
+    .replace(/[!?.,;:"()\-–—]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (cleaned.length === 0) return false
+  if (cleaned.split(' ').length > 4) return false
+  return GREETING_SOCIAL_RE.test(cleaned)
+}
+
 function formatSlotDate(date: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, weekday: 'long', day: 'numeric', month: 'long',
@@ -311,13 +332,17 @@ export async function handleBookingFlow(
     // 'unclear' — fall through and re-process; offer will be appended again
   }
 
-  // ── Owner-rule escalation check (runs before any intent logic) ────────────
+  // ── Owner-rule escalation check (intent-INDEPENDENT rules only) ───────────
+  // Runs before classification, so it can only evaluate rules that don't depend
+  // on the message's intent: keyword and emotional (the latter via body regex).
+  // The unknown_intent rule is evaluated AFTER classification, in the genuine
+  // 'unknown' case below, using the real intent + a consecutive-unknown count —
+  // otherwise every message (a clear booking included) was treated as "unknown"
+  // and escalated on count alone (the over-escalation bug). Sentinel intent
+  // 'pending' ensures the unknown_intent rule cannot match here.
   if (business) {
-    // +1 because sessionUnknownCount is the stored tally from prior turns;
-    // the current message will increment it if it resolves to unknown.
-    const unknownCount = ((ctx.sessionUnknownCount as number | undefined) ?? 0) + 1
     const ownerEscalation = await checkOwnerEscalationRules(
-      db, business, identity.phoneNumber, messageText, 'unknown', unknownCount, lang,
+      db, business, identity.phoneNumber, messageText, 'pending', 0, lang,
     )
     if (ownerEscalation.escalated) {
       await completeSession(db, session.id)
@@ -410,12 +435,16 @@ export async function handleBookingFlow(
   // a greeting/intro; every later turn must continue without re-introducing.
   const mayGreet = isFirstMessage && !ctx.greeted
 
-  // Persist language detection into context so all subsequent branches use it
+  // Persist language detection into context so all subsequent branches use it.
+  // Reset the consecutive-unknown tally on any actionable intent so the count
+  // tracks UNKNOWNS IN A ROW (a customer who's genuinely stuck), not a lifetime
+  // total — handlers receive updatedCtx and persist from it, so the reset sticks.
   const updatedCtx: BookingFlowContext = {
     ...ctx,
     detectedLanguage,
     ...(mayGreet ? { greeted: true } : {}),
     ...(shouldOfferSwitch ? { languageSwitchOfferPending: true } : {}),
+    ...(intent.intent !== 'unknown' ? { sessionUnknownCount: 0 } : {}),
   }
 
   // Prefix injected into situation strings for first-message targeted intents
@@ -534,11 +563,27 @@ export async function handleBookingFlow(
       }
 
       default: {
-        const unknownCount = ((updatedCtx.sessionUnknownCount as number | undefined) ?? 0) + 1
+        // Greetings / social pleasantries land here (no greeting intent exists) but
+        // are benign — they must NOT count toward unknown-intent escalation. Only a
+        // genuine unparseable message advances the consecutive-unknown tally.
+        const isSocial = looksLikeGreetingOrSocial(messageText)
+        const unknownCount = isSocial ? 0 : ((updatedCtx.sessionUnknownCount as number | undefined) ?? 0) + 1
         const ctxWithCount: BookingFlowContext = { ...updatedCtx, sessionUnknownCount: unknownCount }
 
-        if (unknownCount >= 2 && business) {
-          await escalateToPlatform(db, business, identity.phoneNumber, messageText)
+        // Owner unknown_intent escalation — evaluated HERE with the REAL intent and
+        // the consecutive-unknown count (never on a clear request or a greeting).
+        if (!isSocial && business) {
+          const ownerEscalation = await checkOwnerEscalationRules(
+            db, business, identity.phoneNumber, messageText, 'unknown', unknownCount, detectedLanguage,
+          )
+          if (ownerEscalation.escalated) {
+            await completeSession(db, session.id)
+            return { reply: ownerEscalation.customerReply ?? '', sessionComplete: true, escalated: true }
+          }
+          // Platform escalation (operator ping) after repeated consecutive unknowns.
+          if (unknownCount >= 2) {
+            await escalateToPlatform(db, business, identity.phoneNumber, messageText)
+          }
         }
 
         await updateSessionContext(db, session.id, ctxWithCount)
