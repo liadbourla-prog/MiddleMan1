@@ -1,7 +1,7 @@
 import crypto from 'crypto'
 import { sql, eq, and } from 'drizzle-orm'
 import { db } from '../../src/db/client.js'
-import { businesses, identities, serviceTypes, bookings, providerOnboardingSessions } from '../../src/db/schema.js'
+import { businesses, identities, serviceTypes, bookings, providerOnboardingSessions, providerAssignments, availability, classSeries } from '../../src/db/schema.js'
 
 export const integrationEnabled = !!process.env['DATABASE_URL']
 export const llmEnabled = integrationEnabled && !!process.env['LLM_API_KEY']
@@ -26,6 +26,7 @@ export async function seedBusiness(opts: {
   available247?: boolean
   cancellationCutoffMinutes?: number
   paused?: boolean
+  timezone?: string
 } = {}): Promise<TestBusiness> {
   const lang = opts.language ?? 'he'
   const waNumber = nextPhone()
@@ -37,7 +38,7 @@ export async function seedBusiness(opts: {
       name: lang === 'en' ? 'Test Barbershop' : 'מספרת בדיקה',
       whatsappNumber: waNumber,
       googleCalendarId: `test-${crypto.randomUUID()}`,
-      timezone: 'Asia/Jerusalem',
+      timezone: opts.timezone ?? 'Asia/Jerusalem',
       calendarMode: opts.calendarMode ?? 'internal',
       defaultLanguage: lang,
       available247: opts.available247 ?? true,
@@ -166,6 +167,16 @@ export async function teardown(businessId: string): Promise<void> {
   )
   await db.execute(sql`DELETE FROM bookings WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM customer_profiles WHERE business_id = ${businessId}`)
+  // Recurring class series + their materialized instances and exceptions
+  await db.execute(sql`DELETE FROM calendar_blocks WHERE business_id = ${businessId}`)
+  await db.execute(
+    sql`DELETE FROM class_series_exceptions
+        WHERE series_id IN (SELECT id FROM class_series WHERE business_id = ${businessId})`,
+  )
+  await db.execute(sql`DELETE FROM class_series WHERE business_id = ${businessId}`)
+  // Delegated staff permissions + assignments
+  await db.execute(sql`DELETE FROM delegated_permissions WHERE business_id = ${businessId}`)
+  await db.execute(sql`DELETE FROM provider_assignments WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM service_types WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM availability WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM manager_instructions WHERE business_id = ${businessId}`)
@@ -185,6 +196,82 @@ export async function teardown(businessId: string): Promise<void> {
 
 export async function teardownProviderSession(managerPhone: string): Promise<void> {
   await db.delete(providerOnboardingSessions).where(eq(providerOnboardingSessions.managerPhone, managerPhone))
+}
+
+// Seed an instructor: a staff identity, assignment to a service, and (optionally)
+// provider-specific weekly hours. Used by multi-instructor / timezone tests.
+export async function seedProvider(opts: {
+  businessId: string
+  serviceTypeId: string
+  displayName?: string
+  phone?: string
+  weeklyHours?: { dayOfWeek: number; openTime: string; closeTime: string }[]
+}): Promise<{ identityId: string; phone: string }> {
+  const phone = opts.phone ?? nextPhone()
+  const [identity] = await db
+    .insert(identities)
+    .values({
+      businessId: opts.businessId,
+      phoneNumber: phone,
+      role: 'delegated_user',
+      displayName: opts.displayName ?? 'Test Instructor',
+      grantedAt: new Date(),
+    })
+    .returning()
+  if (!identity) throw new Error('seedProvider: identity insert failed')
+
+  await db.insert(providerAssignments).values({
+    businessId: opts.businessId,
+    identityId: identity.id,
+    serviceTypeId: opts.serviceTypeId,
+    isActive: true,
+  })
+
+  for (const h of opts.weeklyHours ?? []) {
+    await db.insert(availability).values({
+      businessId: opts.businessId,
+      providerId: identity.id,
+      dayOfWeek: h.dayOfWeek,
+      openTime: h.openTime,
+      closeTime: h.closeTime,
+      isBlocked: false,
+    })
+  }
+
+  return { identityId: identity.id, phone }
+}
+
+// Seed a recurring weekly class series row (does NOT materialize — call
+// materializeSeries in the test to exercise the rolling-horizon expansion).
+export async function seedClassSeries(opts: {
+  businessId: string
+  serviceTypeId: string
+  dayOfWeek: number
+  startTime: string
+  durationMinutes?: number
+  maxParticipants?: number
+  startDate: string
+  endDate?: string | null
+  timezone: string
+  title?: string
+}): Promise<string> {
+  const [row] = await db
+    .insert(classSeries)
+    .values({
+      businessId: opts.businessId,
+      serviceTypeId: opts.serviceTypeId,
+      dayOfWeek: opts.dayOfWeek,
+      startTime: opts.startTime,
+      durationMinutes: opts.durationMinutes ?? 60,
+      maxParticipants: opts.maxParticipants ?? 10,
+      startDate: opts.startDate,
+      endDate: opts.endDate ?? null,
+      timezone: opts.timezone,
+      title: opts.title ?? null,
+    })
+    .returning({ id: classSeries.id })
+  if (!row) throw new Error('seedClassSeries: insert failed')
+  return row.id
 }
 
 // Returns a date string suitable for LLM slot requests, N days from now

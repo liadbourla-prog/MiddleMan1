@@ -43,6 +43,37 @@ const CUSTOMER_ACTIONS = new Set<Action>([
   'booking.view_availability',
 ])
 
+// Default capability set granted when an owner adds a staff member as a calendar
+// editor without naming specific powers: edit the schedule and manage bookings,
+// but NOT change pricing/services, policy, or other staff permissions.
+export const DEFAULT_DELEGATED_CALENDAR_ACTIONS: Action[] = [
+  'schedule.set_availability',
+  'booking.cancel_any',
+  'booking.reschedule_any',
+]
+
+// Maps a classified manager instruction to the manager-level Action it requires.
+// Used to gate a delegated_user at the apply seam: managers always pass; a
+// delegated_user must hold the mapped action. Returns null for types that need
+// no manager-level grant.
+export function requiredActionForInstruction(instructionType: string): Action | null {
+  switch (instructionType) {
+    case 'availability_change':
+    case 'recurring_class_change':
+      return 'schedule.set_availability'
+    case 'service_change':
+      return 'service.modify'
+    case 'policy_change':
+      return 'policy.change'
+    case 'permission_change':
+      return 'permission.manage'
+    case 'booking_cancellation':
+      return 'booking.cancel_any'
+    default:
+      return null
+  }
+}
+
 export function authorize(ctx: AuthContext, action: Action): AuthResult {
   switch (ctx.role) {
     case 'manager':

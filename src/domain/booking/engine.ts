@@ -74,7 +74,7 @@ export async function requestBooking(
   actor: ResolvedIdentity,
   request: BookingSlotRequest,
 ): Promise<BookingEngineResult> {
-  const auth = authorize({ role: actor.role }, 'booking.request')
+  const auth = authorize({ role: actor.role, ...(actor.delegatedPermissions ? { delegatedPermissions: actor.delegatedPermissions } : {}) }, 'booking.request')
   if (!auth.allowed) return { ok: false, reason: auth.reason }
 
   const [service] = await db
@@ -104,7 +104,7 @@ export async function requestBooking(
   // Resolve provider — may override request.providerId
   const resolvedProvider = request.providerId
     ? { identityId: request.providerId, displayName: null, phoneNumber: '' }
-    : await resolveProvider(db, actor.businessId, request.serviceTypeId, request.slotStart, request.slotEnd, request.providerHint)
+    : await resolveProvider(db, actor.businessId, request.serviceTypeId, request.slotStart, request.slotEnd, request.providerHint, businessTz)
 
   const effectiveProviderId = resolvedProvider?.identityId ?? null
   const effectiveRequest: typeof request = effectiveProviderId
@@ -565,7 +565,7 @@ export async function cancelBooking(
 
   const isOwn = booking.customerId === actor.id
   const action = isOwn ? 'booking.cancel_own' : 'booking.cancel_any'
-  const auth = authorize({ role: actor.role }, action)
+  const auth = authorize({ role: actor.role, ...(actor.delegatedPermissions ? { delegatedPermissions: actor.delegatedPermissions } : {}) }, action)
   if (!auth.allowed) return { ok: false, reason: auth.reason }
 
   // Enforce cancellation cutoff policy for customers
