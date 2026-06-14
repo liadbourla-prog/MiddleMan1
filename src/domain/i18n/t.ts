@@ -434,6 +434,38 @@ const strings = {
     he: (phone: string) => `לא נמצאה זהות עבור ${phone}.`,
     en: (phone: string) => `No identity found for ${phone}.`,
   },
+  apply_provider_added: {
+    he: (name: string, services: string, hours: string) => `הוספתי את ${name} כמדריך/ה ל${services}${hours}.`,
+    en: (name: string, services: string, hours: string) => `Added ${name} as an instructor for ${services}${hours}.`,
+  },
+  apply_provider_hours_set: {
+    he: (name: string, hours: string) => `עדכנתי את השעות של ${name}${hours}.`,
+    en: (name: string, hours: string) => `Updated ${name}'s hours${hours}.`,
+  },
+  apply_provider_assigned: {
+    he: (name: string, service: string) => `${name} מלמד/ת עכשיו גם ${service}.`,
+    en: (name: string, service: string) => `${name} now also teaches ${service}.`,
+  },
+  apply_provider_unassigned: {
+    he: (name: string, service: string) => `${name} כבר לא מלמד/ת ${service}.`,
+    en: (name: string, service: string) => `${name} no longer teaches ${service}.`,
+  },
+  apply_provider_removed: {
+    he: (name: string) => `הסרתי את ${name} מרשימת המדריכים.`,
+    en: (name: string) => `Removed ${name} from the instructor list.`,
+  },
+  apply_provider_not_found: {
+    he: (name: string) => `לא נמצא מדריך/ה בשם ${name}.`,
+    en: (name: string) => `No instructor named ${name} found.`,
+  },
+  apply_provider_ambiguous: {
+    he: (name: string) => `יש יותר ממדריך/ה אחד/ת בשם ${name}. למי מהם התכוונת?`,
+    en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,
+  },
+  apply_provider_service_not_found: {
+    he: (service: string) => `שירות "${service}" לא נמצא. רוצה שאוסיף אותו קודם?`,
+    en: (service: string) => `Service "${service}" not found. Want me to add it first?`,
+  },
   apply_policy_noted: {
     he: `הנחיית מדיניות נשמרה.`,
     en: `Policy instruction noted and saved.`,
