@@ -56,6 +56,26 @@ function sanitiseReason(reason: string | undefined | null): string {
   return REASON_MAP[reason] ?? reason.replace(/_/g, ' ').toLowerCase()
 }
 
+const HE_DAY_NAMES = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת']
+const EN_DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+/** Parse the engine sentinel 'provider_unavailable|Name|1:09:00-13:00;3:09:00-13:00'
+ *  into a readable instructor + hours phrase. Returns null if not that sentinel. */
+export function parseProviderUnavailable(reason: string, lang: 'he' | 'en'): { name: string; hoursPhrase: string } | null {
+  if (!reason.startsWith('provider_unavailable|')) return null
+  const [, name, hoursRaw] = reason.split('|')
+  const days = lang === 'he' ? HE_DAY_NAMES : EN_DAY_NAMES
+  const parts = (hoursRaw ?? '').split(';').filter(Boolean).map((seg) => {
+    // Format is 'dow:HH:MM-HH:MM' — split on the FIRST colon only (times contain colons).
+    const i = seg.indexOf(':')
+    const dow = i >= 0 ? seg.slice(0, i) : seg
+    const range = i >= 0 ? seg.slice(i + 1) : ''
+    const dayLabel = days[Number(dow)] ?? ''
+    return `${dayLabel} ${range}`.trim()
+  })
+  return { name: name ?? '', hoursPhrase: parts.join(', ') }
+}
+
 // Greetings / social pleasantries that classify as 'unknown' (there is no
 // dedicated greeting intent) but must NOT count toward unknown-intent escalation.
 // A message qualifies only when it is SHORT and essentially just a pleasantry —
@@ -521,7 +541,7 @@ export async function handleBookingFlow(
         const hoursCtx = hoursSummary ? ` ${hoursSummary}` : ''
 
         const situation = activeServices.length > 0
-          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the hours, real open times, FAQs, and service info above. If they asked which times/days are open, give the actual open times above as a short bullet list and invite them to pick one — never invent times. We do not track individual staff members' personal schedules; if asked about a specific instructor's hours, answer with the studio's hours/openings and say bookings go through here.`
+          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the hours, real open times, FAQs, and service info above. If they asked which times/days are open, give the actual open times above as a short bullet list and invite them to pick one — never invent times. If the customer asks to book with a specific instructor by name, that is supported — bookings go through here. Do NOT proactively bring up, list, or advertise individual instructors or who teaches what; only engage with instructor specifics if the customer raises them first.`
           : `${firstMsgPrefix}Customer asked about the business. ${customerCtx} No services are configured yet. Direct them to contact the business directly.`
         const knowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
@@ -990,13 +1010,20 @@ async function handleHoldConfirmation(
     const openSlotsText = business
       ? await suggestOpenSlotsText(db, business, pendingSlot.serviceTypeId, new Date(pendingSlot.start), new Date(pendingSlot.end), businessTimezone)
       : null
-    const unavailSituation = [
-      `The requested slot is unavailable because ${sanitiseReason(result.reason)}.`,
-      hoursSummary ?? '',
-      openSlotsText
-        ? `Offer these actual open times and ask which they'd like: ${openSlotsText}.`
-        : 'Suggest the customer pick a different time that falls within business hours.',
-    ].filter(Boolean).join(' ')
+    // Reactive instructor case: the customer named an instructor who teaches this
+    // service but isn't free for the chosen slot. Surface that instructor's hours
+    // (we only volunteer this because the customer raised the instructor first —
+    // never proactively advertise staff schedules).
+    const providerUnavail = parseProviderUnavailable(result.reason, lang)
+    const unavailSituation = providerUnavail
+      ? `The customer asked to book with ${providerUnavail.name}, but ${providerUnavail.name} does not teach at the time they chose. ${providerUnavail.name}'s teaching times are: ${providerUnavail.hoursPhrase}. Reactively offer one of those times OR another instructor — do not invent times, and do not volunteer other staff names unprompted. Keep it warm and brief.`
+      : [
+          `The requested slot is unavailable because ${sanitiseReason(result.reason)}.`,
+          hoursSummary ?? '',
+          openSlotsText
+            ? `Offer these actual open times and ask which they'd like: ${openSlotsText}.`
+            : 'Suggest the customer pick a different time that falls within business hours.',
+        ].filter(Boolean).join(' ')
     const reply = await generateCustomerReply({
       businessTimezone,
       businessName,

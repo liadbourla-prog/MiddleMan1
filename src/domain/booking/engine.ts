@@ -3,6 +3,7 @@ import type { Db } from '../../db/client.js'
 import { bookings, serviceTypes, businesses, identities } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { resolveProvider } from '../provider/resolver.js'
+import { getInstructorHours } from '../provider/roster.js'
 import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import { authorize } from '../authorization/check.js'
@@ -105,6 +106,18 @@ export async function requestBooking(
   const resolvedProvider = request.providerId
     ? { identityId: request.providerId, displayName: null, phoneNumber: '' }
     : await resolveProvider(db, actor.businessId, request.serviceTypeId, request.slotStart, request.slotEnd, request.providerHint, businessTz)
+
+  // Reactive instructor gating: if the customer NAMED an instructor (providerHint)
+  // who actually teaches this service but isn't free for this slot, fail with a
+  // structured reason instead of silently booking provider-less. If no assigned
+  // instructor matches the hint, fall through to normal (provider-agnostic) booking.
+  if (!resolvedProvider && request.providerHint && request.providerHint.trim().length > 0) {
+    const named = await getInstructorHours(db, actor.businessId, request.serviceTypeId, request.providerHint)
+    if (named) {
+      const hours = named.weeklyHours.map((h) => `${h.dayOfWeek}:${h.startTime}-${h.endTime}`).join(';')
+      return { ok: false, reason: `provider_unavailable|${named.name}|${hours}` }
+    }
+  }
 
   const effectiveProviderId = resolvedProvider?.identityId ?? null
   const effectiveRequest: typeof request = effectiveProviderId
