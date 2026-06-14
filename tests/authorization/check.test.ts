@@ -110,3 +110,19 @@ describe('authorization', () => {
     })
   })
 })
+
+describe('staff.manage action', () => {
+  it('managers may staff.manage', () => {
+    expect(authorize({ role: 'manager' }, 'staff.manage')).toEqual({ allowed: true })
+  })
+  it('customers may not staff.manage', () => {
+    expect(authorize({ role: 'customer' }, 'staff.manage').allowed).toBe(false)
+  })
+  it('delegated_user may staff.manage only when granted', () => {
+    expect(authorize({ role: 'delegated_user' }, 'staff.manage').allowed).toBe(false)
+    expect(authorize({ role: 'delegated_user', delegatedPermissions: new Set(['staff.manage']) }, 'staff.manage')).toEqual({ allowed: true })
+  })
+  it('provider_change maps to staff.manage', () => {
+    expect(requiredActionForInstruction('provider_change')).toBe('staff.manage')
+  })
+})

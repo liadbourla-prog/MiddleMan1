@@ -11,6 +11,7 @@ export type Action =
   | 'service.modify'
   | 'permission.manage'
   | 'policy.change'
+  | 'staff.manage'
 
 export type AuthResult =
   | { allowed: true }
@@ -34,6 +35,7 @@ const MANAGER_ACTIONS = new Set<Action>([
   'service.modify',
   'permission.manage',
   'policy.change',
+  'staff.manage',
 ])
 
 const CUSTOMER_ACTIONS = new Set<Action>([
@@ -69,6 +71,8 @@ export function requiredActionForInstruction(instructionType: string): Action | 
       return 'permission.manage'
     case 'booking_cancellation':
       return 'booking.cancel_any'
+    case 'provider_change':
+      return 'staff.manage'
     default:
       return null
   }
@@ -94,5 +98,10 @@ export function authorize(ctx: AuthContext, action: Action): AuthResult {
         reason: `Action '${action}' has not been granted to this delegated user`,
       }
     }
+
+    case 'provider':
+      // Instructors do not operate the PA in V1; grant only the customer baseline.
+      if (CUSTOMER_ACTIONS.has(action)) return { allowed: true }
+      return { allowed: false, reason: `Action '${action}' is not available to providers` }
   }
 }

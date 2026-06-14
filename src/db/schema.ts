@@ -80,7 +80,7 @@ export const identities = pgTable(
       .notNull()
       .references(() => businesses.id),
     phoneNumber: text('phone_number').notNull(),
-    role: text('role', { enum: ['manager', 'delegated_user', 'customer'] }).notNull(),
+    role: text('role', { enum: ['manager', 'delegated_user', 'customer', 'provider'] }).notNull(),
     displayName: text('display_name'),
     grantedBy: uuid('granted_by'),
     grantedAt: timestamp('granted_at', { withTimezone: true }),
