@@ -366,7 +366,7 @@ export const managerInstructions = pgTable('manager_instructions', {
   rawMessage: text('raw_message').notNull(),
   receivedAt: timestamp('received_at', { withTimezone: true }).notNull(),
   classifiedAs: text('classified_as', {
-    enum: ['availability_change', 'policy_change', 'service_change', 'permission_change', 'booking_cancellation', 'recurring_class_change', 'unknown'],
+    enum: ['availability_change', 'policy_change', 'service_change', 'permission_change', 'booking_cancellation', 'recurring_class_change', 'provider_change', 'unknown'],
   }),
   structuredOutput: jsonb('structured_output'),
   appliedAt: timestamp('applied_at', { withTimezone: true }),

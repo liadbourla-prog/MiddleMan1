@@ -34,6 +34,7 @@ export interface ManagerInstructionOutput {
     | 'permission_change'
     | 'booking_cancellation'
     | 'recurring_class_change'
+    | 'provider_change'
     | 'unknown'
   structuredParams: Record<string, unknown>
   ambiguous: boolean

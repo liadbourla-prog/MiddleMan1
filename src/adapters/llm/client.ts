@@ -98,6 +98,7 @@ const managerInstructionSchema = z.object({
     'permission_change',
     'booking_cancellation',
     'recurring_class_change',
+    'provider_change',
     'unknown',
   ]),
   structuredParams: z.record(z.unknown()),
@@ -222,6 +223,15 @@ recurring_class_change:
   - action "stop": manager ends an existing weekly series going forward (e.g. "stop the Monday yoga class", "בטל את שיעור היוגה הקבוע"). Fill serviceName and/or dayOfWeek+startTime to identify the series.
   - action "cancel_occurrence": manager skips ONE date of an otherwise-continuing series (e.g. "no yoga this coming Monday", "cancel just the class on May 18"). Fill occurrenceDate plus serviceName and/or dayOfWeek to identify the series.
   - dayOfWeek: 0=Sunday … 6=Saturday. startTime/openTime are 24-hour "HH:MM".
+
+provider_change:
+  { "action": "add"|"set_hours"|"assign_service"|"unassign_service"|"remove", "instructorName": string, "phone": "+E164"|null, "serviceNames": string[]|null, "weeklyHours": [ { "dayOfWeek": 0-6, "startTime": "HH:MM", "endTime": "HH:MM" } ]|null }
+  Use for managing teaching staff / instructors / trainers (מדריך/ה, מורה, מאמן/ת).
+  - action "add": owner introduces a new instructor, optionally with the services they teach and their weekly hours (e.g. "Add Dana as a yoga instructor, Mon/Wed 9–13", "תוסיף את דנה כמדריכת יוגה בימי שני ורביעי 9 עד 13"). Fill instructorName; serviceNames from the services named; weeklyHours from the days/times. Fill phone ONLY if a number is given (instructors are name-only by default).
+  - action "set_hours": owner changes an existing instructor's weekly hours (e.g. "change Dana's hours to Tue/Thu 10–14"). Fill instructorName + weeklyHours.
+  - action "assign_service" / "unassign_service": owner adds/removes which services an existing instructor teaches (e.g. "Dana also teaches pilates", "Dana no longer does breathing"). Fill instructorName + serviceNames.
+  - action "remove": owner removes an instructor from the team (e.g. "remove Dana", "דנה כבר לא אצלנו"). Fill instructorName.
+  - dayOfWeek: 0=Sunday … 6=Saturday. Times are 24-hour "HH:MM".
 
 If the instruction is ambiguous or missing required detail, set ambiguous=true and clarificationNeeded to the exact question to ask back.
 Respond only with valid JSON matching the schema. No explanation.`

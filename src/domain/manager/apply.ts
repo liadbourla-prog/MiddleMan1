@@ -162,6 +162,9 @@ export async function applyInstruction(
     case 'recurring_class_change':
       result = await applyRecurringClassChange(db, businessId, actorId, structuredParams, lang)
       break
+    case 'provider_change':
+      result = await applyProviderChange(db, businessId, actorId, structuredParams, lang)
+      break
     default:
       result = { ok: false, reason: i18n.apply_unknown_type[lang](instructionType) }
   }
