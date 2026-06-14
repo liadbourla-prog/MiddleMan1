@@ -97,6 +97,7 @@ const managerInstructionSchema = z.object({
     'service_change',
     'permission_change',
     'booking_cancellation',
+    'recurring_class_change',
     'unknown',
   ]),
   structuredParams: z.record(z.unknown()),
@@ -213,6 +214,14 @@ policy_change:
 
   For subtype "other", ALWAYS set ambiguous=true and clarificationNeeded to a message (in the manager's language) explaining:
   "I can automatically enforce: cancellation notice periods, advance booking windows, booking buffer times, and cancellation fees. This request needs to be handled manually. What specifically would you like to change?"
+
+recurring_class_change:
+  { "action": "create"|"stop"|"cancel_occurrence", "serviceName": string|null, "dayOfWeek": 0-6|null, "startTime": "HH:MM"|null, "durationMinutes": number|null, "maxParticipants": number|null, "startDate": "YYYY-MM-DD"|null, "endDate": "YYYY-MM-DD"|null, "occurrenceDate": "YYYY-MM-DD"|null, "providerHint": string|null, "reason": string|null }
+  Use ONLY for a RECURRING weekly class / group session — recurrence phrasing like "every Monday", "weekly", "each week", "כל יום שני", "פעם בשבוע". A single class on one specific date is NOT this (that is handled elsewhere as a one-off).
+  - action "create": manager sets up a new weekly recurring class (e.g. "yoga every Monday at 10:00 for 8 people", "פילאטיס כל רביעי ב-18:00"). Fill dayOfWeek and startTime; fill serviceName, durationMinutes, maxParticipants when stated. startDate = when the series begins if given; endDate = when it stops if given.
+  - action "stop": manager ends an existing weekly series going forward (e.g. "stop the Monday yoga class", "בטל את שיעור היוגה הקבוע"). Fill serviceName and/or dayOfWeek+startTime to identify the series.
+  - action "cancel_occurrence": manager skips ONE date of an otherwise-continuing series (e.g. "no yoga this coming Monday", "cancel just the class on May 18"). Fill occurrenceDate plus serviceName and/or dayOfWeek to identify the series.
+  - dayOfWeek: 0=Sunday … 6=Saturday. startTime/openTime are 24-hour "HH:MM".
 
 If the instruction is ambiguous or missing required detail, set ambiguous=true and clarificationNeeded to the exact question to ask back.
 Respond only with valid JSON matching the schema. No explanation.`

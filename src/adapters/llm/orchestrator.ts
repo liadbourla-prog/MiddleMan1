@@ -145,7 +145,7 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'scheduleGroupSession',
-    description: 'Proactively place a group session / class on the calendar (e.g. "schedule a Vinyasa class Tuesday 11:00–12:00, 10 spots"). Use this when the manager wants to put a class on the calendar BEFORE any customer books it. Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours use manageBusinessSettings. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
+    description: 'Proactively place a SINGLE group session / class on the calendar for one specific date (e.g. "schedule a Vinyasa class this Tuesday 11:00–12:00, 10 spots"). Use this when the manager wants to put a one-off class on the calendar BEFORE any customer books it. Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours OR to set up a class that REPEATS every week ("yoga every Monday"), use manageBusinessSettings. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -362,10 +362,10 @@ Reply entirely in ${language}. All WhatsApp formatting rules apply:
 For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range), report the date/time the manager said as structured pieces (relativeDay / weekday / explicitDate, and {hour,minute} times). NEVER compute or output an absolute or ISO date — a deterministic system resolves the pieces and validates them. If a calendar tool returns needsClarification: true, the date/time couldn't be resolved (ambiguous, already past, impossible, or a clock time that doesn't exist that day) — do NOT retry the tool with a guessed date; ask the manager for a workable day/time in your own words, without echoing the unusable value.
 
 ## Tool usage rules
-- manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Never handle these as conversational replies.
+- manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Use it as well to set up, stop, or skip one date of a RECURRING weekly class / group session (e.g. "yoga every Monday 10am", "stop the weekly pilates class", "no spin class this coming Tuesday"). Never handle these as conversational replies.
 - listCalendarEvents: use for schedule questions. Use intent check_free_slots when the manager asks what times are open/free — it returns real bookable openings. Do not call it unless the manager is asking about their calendar.
 - createCalendarEvent: personal/business 1-on-1 events only (e.g. "dentist 3pm"). Do not use for blocking customer booking slots — that is manageBusinessSettings.
-- scheduleGroupSession: use when the manager wants to put a class/group session on the calendar ahead of bookings (e.g. "add a yoga class Tuesday 11am, 10 spots").
+- scheduleGroupSession: use when the manager wants to put a SINGLE class/group session on the calendar for one specific date ahead of bookings (e.g. "add a yoga class this Tuesday 11am, 10 spots"). For a class that repeats every week ("every Monday", "weekly"), use manageBusinessSettings instead.
 - deleteCalendarEvent: only for personal/business events, blocks, or classes the manager created. NEVER use for customer bookings — use manageBusinessSettings with a cancellation instruction for those.
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
