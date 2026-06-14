@@ -10,6 +10,7 @@ import { db } from '../../db/client.js'
 import { managerMemory } from '../../db/schema.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../../domain/authorization/check.js'
+import { buildInstructorRosterBlock, type InstructorRosterEntry } from '../../domain/provider/roster.js'
 import type { CalendarClient } from '../calendar/client.js'
 import type { TranscriptTurn } from './types.js'
 import type { Lang } from '../../domain/i18n/t.js'
@@ -316,10 +317,11 @@ function buildSystemPrompt(params: {
   timezone: string
   lang: Lang
   businessKnowledge: BusinessKnowledge | null
+  instructorRoster: InstructorRosterEntry[]
   managerMemorySummaries: string[]
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, managerMemorySummaries, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, instructorRoster, managerMemorySummaries, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -334,6 +336,7 @@ function buildSystemPrompt(params: {
   const language = lang === 'he' ? 'Hebrew' : 'English'
 
   const knowledgeBlock = buildBusinessKnowledgeBlock(businessKnowledge)
+  const rosterBlock = buildInstructorRosterBlock(instructorRoster, lang)
 
   const memorySummary = managerMemorySummaries.length > 0
     ? managerMemorySummaries.map((s, i) => `[Session ${i + 1}] ${s}`).join('\n')
@@ -370,6 +373,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
+${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 
 ## After completing actions
 If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them — phrased naturally, never the same way twice. Do not notify customers automatically — ask first.
@@ -440,6 +444,7 @@ export interface OrchestratorParams {
   calendar: CalendarClient
   transcript: TranscriptTurn[]
   businessKnowledge: BusinessKnowledge | null
+  instructorRoster: InstructorRosterEntry[]
   // Caller role + granted actions — threaded into ToolContext so delegated staff
   // are gated to the actions the owner declared. Defaults to manager when omitted.
   role?: IdentityRole
@@ -456,7 +461,7 @@ export interface OrchestratorParams {
 export async function runManagerOrchestratorLoop(params: OrchestratorParams): Promise<string> {
   const {
     messageId, message, sessionId, businessId, identityId,
-    businessName, timezone, lang, calendar, transcript, businessKnowledge,
+    businessName, timezone, lang, calendar, transcript, businessKnowledge, instructorRoster,
   } = params
 
   const loadMemory = params.loadMemoryFn ?? loadManagerMemorySummaries
@@ -469,6 +474,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     timezone,
     lang,
     businessKnowledge,
+    instructorRoster,
     managerMemorySummaries,
     conversationHistory: transcript.slice(-20),
   })

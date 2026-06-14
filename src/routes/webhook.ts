@@ -45,6 +45,7 @@ import { i18n, detectLang, managerSwitchOfferSuffix, type Lang } from '../domain
 import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply } from '../adapters/llm/client.js'
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
+import { loadInstructorRoster } from '../domain/provider/roster.js'
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
 import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
@@ -717,9 +718,10 @@ async function routeManagerMessage(
   // Offer a switch when this turn's language differs from the default and nothing is locked.
   const shouldOfferSwitch = !effectiveOverride && detected !== defaultLang
 
-  // Load business knowledge for orchestrator system prompt injection
-  const [mgBusinessKnowledgeForOrchestrator] = await Promise.all([
+  // Load business knowledge + instructor roster for orchestrator system prompt injection
+  const [mgBusinessKnowledgeForOrchestrator, mgInstructorRoster] = await Promise.all([
     loadBusinessKnowledge(db, business.id, business.currency),
+    loadInstructorRoster(db, business.id),
   ])
 
   const calendar = createCalendarClient({
@@ -750,6 +752,7 @@ async function routeManagerMessage(
       calendar,
       transcript: mgTranscript,
       businessKnowledge: mgBusinessKnowledgeForOrchestrator,
+      instructorRoster: mgInstructorRoster,
       role: identity.role,
       ...(delegatedPermissions ? { delegatedPermissions } : {}),
     }).catch((err) => {

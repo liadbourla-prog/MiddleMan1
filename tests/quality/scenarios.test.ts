@@ -91,6 +91,7 @@ function runOrchestrator(opts: {
     calendar: STUB_CALENDAR,
     transcript: [],
     businessKnowledge: null,
+    instructorRoster: [],
     loadMemoryFn: async () => [],
     // Any calendar tool the model picks gets the same fixed result — we're grading
     // how it phrases the outcome, not which tool it chose.
