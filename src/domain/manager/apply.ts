@@ -1,7 +1,8 @@
 import { eq, and, or, lte, gte, gt, lt, count, desc, isNull, ilike, inArray } from 'drizzle-orm'
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { Db } from '../../db/client.js'
-import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages, classSeries } from '../../db/schema.js'
+import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages, classSeries, providerAssignments } from '../../db/schema.js'
 import { createSeries, stopSeries, cancelOccurrence } from '../scheduling/series.js'
 import { requiredActionForInstruction, DEFAULT_DELEGATED_CALENDAR_ACTIONS, type Action } from '../authorization/check.js'
 import { grantDelegatedPermissions, revokeAllDelegatedPermissions } from '../authorization/permissions.js'
@@ -95,6 +96,20 @@ const recurringClassChangeSchema = z.object({
   occurrenceDate: z.string().regex(DATE_REGEX, 'occurrenceDate must be YYYY-MM-DD').nullable().optional(),
   providerHint: z.string().nullable().optional(),
   reason: z.string().nullable().optional(),
+})
+
+const weeklyHoursSchema = z.object({
+  dayOfWeek: z.coerce.number().int().min(0).max(6),
+  startTime: z.string().regex(TIME_REGEX, 'startTime must be HH:MM'),
+  endTime: z.string().regex(TIME_REGEX, 'endTime must be HH:MM'),
+})
+
+const providerChangeSchema = z.object({
+  action: z.enum(['add', 'set_hours', 'assign_service', 'unassign_service', 'remove']),
+  instructorName: z.string().min(1),
+  phone: z.string().nullable().optional(),
+  serviceNames: z.array(z.string()).optional(),
+  weeklyHours: z.array(weeklyHoursSchema).optional(),
 })
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1245,4 +1260,168 @@ export async function checkServiceDeactivationSafety(
 function timeToMs(time: string): number {
   const [h = '0', m = '0'] = time.split(':')
   return (parseInt(h, 10) * 60 + parseInt(m, 10)) * 60_000
+}
+
+// ── Provider (instructor) change ──────────────────────────────────────────────
+
+/** Build a synthetic, unique, non-null placeholder phone for a name-only instructor. */
+function syntheticProviderPhone(): string {
+  return `provider:${randomUUID()}@local`
+}
+
+/** Resolve a service name (case-insensitive) to its id within the business. */
+async function findServiceByName(db: Db, businessId: string, name: string): Promise<{ id: string; name: string } | null> {
+  const [svc] = await db
+    .select({ id: serviceTypes.id, name: serviceTypes.name })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.businessId, businessId), ilike(serviceTypes.name, name), eq(serviceTypes.isActive, true)))
+    .limit(1)
+  return svc ?? null
+}
+
+/** Resolve an active provider identity by display name within the business.
+ *  Returns 'ambiguous' when more than one matches. */
+async function findProviderByName(
+  db: Db, businessId: string, name: string,
+): Promise<{ status: 'found'; id: string } | { status: 'none' } | { status: 'ambiguous' }> {
+  const rows = await db
+    .select({ id: identities.id })
+    .from(identities)
+    .where(and(
+      eq(identities.businessId, businessId),
+      eq(identities.role, 'provider'),
+      ilike(identities.displayName, name),
+      isNull(identities.revokedAt),
+    ))
+  if (rows.length === 0) return { status: 'none' }
+  if (rows.length > 1) return { status: 'ambiguous' }
+  return { status: 'found', id: rows[0]!.id }
+}
+
+/** Human-readable hours fragment for confirmations, e.g. " (Mon 09:00–13:00, Wed 09:00–13:00)". */
+function hoursFragment(weeklyHours: { dayOfWeek: number; startTime: string; endTime: string }[], lang: Lang): string {
+  if (weeklyHours.length === 0) return ''
+  const parts = weeklyHours.map((h) => `${dayName(h.dayOfWeek, lang)} ${h.startTime}–${h.endTime}`)
+  return ` (${parts.join(', ')})`
+}
+
+export async function applyProviderChange(
+  db: Db,
+  businessId: string,
+  actorId: string,
+  params: Record<string, unknown>,
+  lang: Lang = 'he',
+): Promise<ApplyResult> {
+  const parsed = providerChangeSchema.safeParse(params)
+  if (!parsed.success) {
+    return { ok: false, reason: `Invalid provider params: ${parsed.error.message}` }
+  }
+  const p = parsed.data
+
+  if (p.action === 'add') {
+    // Resolve services first — unknown service → clarify, do not auto-create.
+    const serviceNames = p.serviceNames ?? []
+    const services: { id: string; name: string }[] = []
+    for (const name of serviceNames) {
+      const svc = await findServiceByName(db, businessId, name)
+      if (!svc) return { ok: false, reason: i18n.apply_provider_service_not_found[lang](name) }
+      services.push(svc)
+    }
+
+    // Find-or-create the provider identity (by display name).
+    const existing = await findProviderByName(db, businessId, p.instructorName)
+    if (existing.status === 'ambiguous') return { ok: false, reason: i18n.apply_provider_ambiguous[lang](p.instructorName) }
+
+    let providerId: string
+    if (existing.status === 'found') {
+      providerId = existing.id
+    } else {
+      const phone = p.phone && p.phone.trim().length > 0 ? p.phone.trim() : syntheticProviderPhone()
+      const [created] = await db.insert(identities).values({
+        businessId,
+        phoneNumber: phone,
+        role: 'provider',
+        displayName: p.instructorName,
+        messagingOptOut: !(p.phone && p.phone.trim().length > 0), // name-only → no notifications
+        grantedBy: actorId,
+        grantedAt: new Date(),
+      }).onConflictDoNothing().returning({ id: identities.id })
+      if (created) {
+        providerId = created.id
+      } else {
+        // Conflict on (businessId, phoneNumber) — fetch the existing row.
+        const [row] = await db.select({ id: identities.id }).from(identities)
+          .where(and(eq(identities.businessId, businessId), eq(identities.phoneNumber, phone))).limit(1)
+        providerId = row!.id
+      }
+    }
+
+    // Assign services (idempotent on the unique (identityId, serviceTypeId) index).
+    for (const svc of services) {
+      await db.insert(providerAssignments).values({
+        businessId, identityId: providerId, serviceTypeId: svc.id, isActive: true,
+      }).onConflictDoUpdate({
+        target: [providerAssignments.identityId, providerAssignments.serviceTypeId],
+        set: { isActive: true },
+      })
+    }
+
+    // Set weekly availability (replace any existing weekly rows for this provider).
+    if (p.weeklyHours && p.weeklyHours.length > 0) {
+      await db.delete(availability).where(and(
+        eq(availability.providerId, providerId),
+        isNull(availability.specificDate), // weekly rows only — leave date-specific blocks
+      ))
+      for (const h of p.weeklyHours) {
+        await db.insert(availability).values({
+          businessId, providerId, dayOfWeek: h.dayOfWeek, openTime: h.startTime, closeTime: h.endTime, isBlocked: false,
+        })
+      }
+    }
+
+    const servicesStr = services.map((s) => s.name).join(', ')
+    return { ok: true, confirmationMessage: i18n.apply_provider_added[lang](p.instructorName, servicesStr, hoursFragment(p.weeklyHours ?? [], lang)) }
+  }
+
+  // All non-add actions operate on an existing provider.
+  const found = await findProviderByName(db, businessId, p.instructorName)
+  if (found.status === 'ambiguous') return { ok: false, reason: i18n.apply_provider_ambiguous[lang](p.instructorName) }
+  if (found.status === 'none') return { ok: false, reason: i18n.apply_provider_not_found[lang](p.instructorName) }
+  const providerId = found.id
+
+  if (p.action === 'set_hours') {
+    await db.delete(availability).where(and(eq(availability.providerId, providerId), isNull(availability.specificDate)))
+    for (const h of p.weeklyHours ?? []) {
+      await db.insert(availability).values({
+        businessId, providerId, dayOfWeek: h.dayOfWeek, openTime: h.startTime, closeTime: h.endTime, isBlocked: false,
+      })
+    }
+    return { ok: true, confirmationMessage: i18n.apply_provider_hours_set[lang](p.instructorName, hoursFragment(p.weeklyHours ?? [], lang)) }
+  }
+
+  if (p.action === 'assign_service' || p.action === 'unassign_service') {
+    const names = p.serviceNames ?? []
+    if (names.length === 0) return { ok: false, reason: i18n.apply_provider_service_not_found[lang]('') }
+    const setActive = p.action === 'assign_service'
+    const done: string[] = []
+    for (const name of names) {
+      const svc = await findServiceByName(db, businessId, name)
+      if (!svc) return { ok: false, reason: i18n.apply_provider_service_not_found[lang](name) }
+      await db.insert(providerAssignments).values({
+        businessId, identityId: providerId, serviceTypeId: svc.id, isActive: setActive,
+      }).onConflictDoUpdate({
+        target: [providerAssignments.identityId, providerAssignments.serviceTypeId],
+        set: { isActive: setActive },
+      })
+      done.push(svc.name)
+    }
+    const msg = setActive
+      ? i18n.apply_provider_assigned[lang](p.instructorName, done.join(', '))
+      : i18n.apply_provider_unassigned[lang](p.instructorName, done.join(', '))
+    return { ok: true, confirmationMessage: msg }
+  }
+
+  // remove
+  await db.update(providerAssignments).set({ isActive: false }).where(eq(providerAssignments.identityId, providerId))
+  return { ok: true, confirmationMessage: i18n.apply_provider_removed[lang](p.instructorName) }
 }
