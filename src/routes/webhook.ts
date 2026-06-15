@@ -22,6 +22,7 @@ import {
 } from '../domain/session/manager.js'
 import { handleBookingFlow } from '../domain/flows/customer-booking.js'
 import { parseConfirmation, type ManagerFlowContext } from '../domain/flows/types.js'
+import { resolveTurnLanguage } from '../domain/flows/language-switch.js'
 import { handleOnboardingMessage } from '../domain/flows/manager-onboarding.js'
 import { handleProviderOnboarding } from '../domain/flows/provider-onboarding.js'
 import { runManagerOrchestratorLoop } from '../adapters/llm/orchestrator.js'
@@ -712,11 +713,12 @@ async function routeManagerMessage(
     // 'unclear' — fall through; the offer is recomputed below and may be re-appended.
   }
 
-  const effectiveOverride: Lang | undefined = identity.preferredLanguage ?? sessionOverride
-  const detected = detectLang(msg.body)
-  const turnLang: Lang = effectiveOverride ?? detected
-  // Offer a switch when this turn's language differs from the default and nothing is locked.
-  const shouldOfferSwitch = !effectiveOverride && detected !== defaultLang
+  const { turnLang, detected, shouldOfferSwitch } = resolveTurnLanguage({
+    body: msg.body,
+    defaultLang,
+    preferredLanguage: identity.preferredLanguage,
+    sessionOverride,
+  })
 
   // Load business knowledge + instructor roster for orchestrator system prompt injection
   const [mgBusinessKnowledgeForOrchestrator, mgInstructorRoster] = await Promise.all([
