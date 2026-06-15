@@ -84,4 +84,13 @@ describe('customer_import gate — no more loop', () => {
     const res = await handleOnboardingMessage(makeFakeDb(updates), msg('יש לי קובץ אקסל'), identity, business, 'https://x', log)
     expect(res.reply).toContain('https://x/import/TKN123')
   })
+
+  // Loop-safety: if the intent parser fails (LLM down, after its internal
+  // retries), the step must re-ask — never silently advance and never trap.
+  it('does NOT advance when the parser fails — falls back to a re-ask, not a skip', async () => {
+    parseImportChoice.mockResolvedValue({ ok: false, error: 'quota_exceeded' })
+    const updates: Record<string, unknown>[] = []
+    await handleOnboardingMessage(makeFakeDb(updates), msg('יש לי קובץ אקסל'), identity, business, 'https://x', log)
+    expect(updates.some((u) => u['onboardingStep'] === 'verify')).toBe(false)
+  })
 })
