@@ -263,53 +263,70 @@ export async function oauthRoutes(app: FastifyInstance) {
         .limit(1)
 
       if (managerIdentity && updatedBusiness) {
-        const lang: Lang = (updatedBusiness.defaultLanguage as Lang | null | undefined) ?? 'he'
-        const waCredentials = updatedBusiness.whatsappPhoneNumberId && updatedBusiness.whatsappAccessToken
-          ? { accessToken: updatedBusiness.whatsappAccessToken, phoneNumberId: updatedBusiness.whatsappPhoneNumberId }
-          : undefined
+        // Capture the narrowed values so the async closure below keeps non-null types.
+        // (refresh_token was narrowed to string by the guard above, but TS drops
+        // that property-narrowing inside the nested closure — re-pin it here.)
+        const mgr = managerIdentity
+        const biz = updatedBusiness
+        const refreshToken = tokens.refresh_token
+        // Notify the manager out-of-band: the calendar preview read, the voiced
+        // prompt (an LLM call), and the WhatsApp send all happen AFTER we redirect,
+        // so the OAuth browser redirect returns immediately instead of blocking on
+        // these network round-trips.
+        void (async () => {
+          const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+          const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+            ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+            : undefined
 
-        // Fetch next 7 days of calendar events as a preview
-        let calendarPreview = ''
-        try {
-          const calClient = createCalendarClient({
-            accessToken: tokens.access_token ?? '',
-            refreshToken: tokens.refresh_token,
-            calendarId: updatedBusiness.googleCalendarId,
-            calendarMode: 'google',
-          })
-          const now = new Date()
-          const weekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60_000)
-          const events = await calClient.listEvents(now, weekAhead)
-          if (events.length > 0) {
-            const locale = lang === 'he' ? 'he-IL' : 'en-GB'
-            const tz = updatedBusiness.timezone ?? 'UTC'
-            const lines = events.slice(0, 10).map((ev) => {
-              const dateStr = ev.start.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
-              return `• ${ev.title} — ${dateStr}`
+          // Fetch next 7 days of calendar events as a preview
+          let calendarPreview = ''
+          try {
+            const calClient = createCalendarClient({
+              accessToken: tokens.access_token ?? '',
+              refreshToken,
+              calendarId: biz.googleCalendarId,
+              calendarMode: 'google',
             })
-            const header = lang === 'he'
-              ? `📅 האירועים הקרובים בלוח השנה שלך (7 ימים):`
-              : `📅 Your upcoming calendar events (next 7 days):`
-            calendarPreview = `\n\n${header}\n${lines.join('\n')}`
+            const now = new Date()
+            const weekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60_000)
+            const events = await calClient.listEvents(now, weekAhead)
+            if (events.length > 0) {
+              const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+              const tz = biz.timezone ?? 'UTC'
+              const lines = events.slice(0, 10).map((ev) => {
+                const dateStr = ev.start.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+                return `• ${ev.title} — ${dateStr}`
+              })
+              const header = lang === 'he'
+                ? `📅 האירועים הקרובים בלוח השנה שלך (7 ימים):`
+                : `📅 Your upcoming calendar events (next 7 days):`
+              calendarPreview = `\n\n${header}\n${lines.join('\n')}`
+            }
+          } catch {
+            // non-fatal — skip preview if calendar read fails
           }
-        } catch {
-          // non-fatal — skip preview if calendar read fails
-        }
 
-        const importQ = await generateOnboardingReply({
-          step: 'customer_import',
-          businessName: updatedBusiness.name,
-          lang,
-          isRetry: false,
-          justConfirmed: t('ob_calendar_connected', lang),
-        })
-        await sendMessage(
-          {
-            toNumber: managerIdentity.phoneNumber,
-            body: `${t('ob_calendar_connected', lang)}${calendarPreview}\n\n${importQ || getPrompt('customer_import', lang)}`,
-          },
-          waCredentials,
-        ).catch((err) => app.log.warn({ err }, 'Failed to send calendar confirmation to manager'))
+          // The connection happened via a Google button, not a manager message, so
+          // there is no reply to acknowledge — the ob_calendar_connected line below
+          // already confirms it. Tell the LLM to just ask the import question.
+          const importQ = await generateOnboardingReply({
+            step: 'customer_import',
+            businessName: biz.name,
+            lang,
+            isRetry: false,
+            extraContext: lang === 'he'
+              ? 'המנהל הרגע חיבר את לוח השנה. ההודעה שלפניך כבר אישרה זאת — אל תאשר שוב, פשוט שאל אם יש רשימת לקוחות, היסטוריית תורים או קטלוג שירותים לייבא.'
+              : 'The manager just connected their calendar. The preceding line already confirms it — do not acknowledge it again; simply ask whether they have a customer list, booking history, or service catalog to import.',
+          })
+          await sendMessage(
+            {
+              toNumber: mgr.phoneNumber,
+              body: `${t('ob_calendar_connected', lang)}${calendarPreview}\n\n${importQ || getPrompt('customer_import', lang)}`,
+            },
+            waCredentials,
+          ).catch((err) => app.log.warn({ err }, 'Failed to send calendar confirmation to manager'))
+        })().catch((err) => app.log.warn({ err }, 'Calendar-connected manager notification failed'))
       }
 
       // Inbound sync (Phase 3): open a Google push channel for this business so
