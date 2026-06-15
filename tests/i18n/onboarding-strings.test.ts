@@ -21,4 +21,9 @@ describe('ob_escalation — one question only (§2.2)', () => {
     expect(countQ(i18n.ob_escalation.he)).toBe(1)
     expect(countQ(i18n.ob_escalation.en)).toBe(1)
   })
+
+  it('the retry variant does not re-introduce the dropped second ask', () => {
+    expect(i18n.ob_escalation_retry.he).not.toContain('ומה לומר')
+    expect(i18n.ob_escalation_retry.en).not.toContain('what to say')
+  })
 })

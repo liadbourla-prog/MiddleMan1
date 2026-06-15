@@ -189,8 +189,8 @@ const strings = {
     en: `When should I stop and hand a conversation to you directly — what topics or situations?`,
   },
   ob_escalation_retry: {
-    he: `ספרו לי מתי להעביר שיחות אליכם, ומה לומר ללקוח כשאני מעביר.`,
-    en: `Tell me when I should hand off conversations to you, and what to say to the customer when I do.`,
+    he: `ספרו לי מתי להעביר שיחות אליכם — אילו נושאים או מצבים.`,
+    en: `Tell me when I should hand off a conversation to you — what topics or situations.`,
   },
   ob_escalation_confirm_none: {
     he: `אין כללי העברה ידנית — אעביר רק בקשות שאני ממש לא מצליח להבין.`,
