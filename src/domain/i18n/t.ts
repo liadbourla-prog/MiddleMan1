@@ -185,8 +185,8 @@ const strings = {
     en: (m: string) => `Got it — customers will pay via ${m} before their booking is confirmed. 💳`,
   },
   ob_escalation: {
-    he: `מתי אני צריך לעצור ולהעביר שיחה אליכם ישירות — אילו נושאים או מצבים? ומה לומר ללקוח ברגע כזה — שיצרו איתו קשר, שתתקשרו חזרה, או לא לומר כלום?`,
-    en: `When should I stop and hand a conversation to you directly — what topics or situations? And what should I tell the customer at that point — that someone will be in touch, that you'll call back, or nothing at all?`,
+    he: `מתי אני צריך לעצור ולהעביר שיחה אליכם ישירות — אילו נושאים או מצבים?`,
+    en: `When should I stop and hand a conversation to you directly — what topics or situations?`,
   },
   ob_escalation_retry: {
     he: `ספרו לי מתי להעביר שיחות אליכם, ומה לומר ללקוח כשאני מעביר.`,
@@ -213,8 +213,8 @@ const strings = {
     en: (link: string) => `Waiting for calendar connection...\n\n${link}`,
   },
   ob_import: {
-    he: `כמעט סיימנו! יש לכם רשימת לקוחות, היסטוריית תורים או קטלוג שירותים לייבוא? ענו "כן" לקישור העלאה, או "דלג" להמשך.`,
-    en: `Almost done! Do you have an existing customer list, booking history, or service catalog to import? Reply "Yes" for an upload link, or "Skip" to continue.`,
+    he: `כמעט סיימנו! יש לכם רשימת לקוחות, היסטוריית תורים או קטלוג שירותים שתרצו לייבא? זה לא חובה — אפשר גם פשוט להמשיך.`,
+    en: `Almost done! Do you have an existing customer list, booking history, or service catalog you'd like to import? It's optional — we can just move on if not.`,
   },
   ob_import_link: {
     he: (url: string) => `הנה קישור ההעלאה המאובטח שלכם (תקף 30 דקות):\n${url}\n\nמקבלים CSV של אנשי קשר (שם, טלפון), היסטוריית תורים (שם, טלפון, תאריך, שירות), או קטלוג שירותים (שם, משך_דקות, מחיר). העלו אחד או יותר ואז חזרו לכאן.`,

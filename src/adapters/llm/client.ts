@@ -511,8 +511,8 @@ const STEP_GOALS: Record<string, Record<'he' | 'en', string>> = {
     en: 'Ask only for the payment method — they already said yes.',
   },
   escalation_policy: {
-    he: 'שאל מתי ה-PA צריך לעצור ולהעביר שיחה ישירות לבעל העסק — אילו נושאים או מצבים. גם שאל מה לומר ללקוח: שיצרו איתו קשר, שתתקשרו חזרה, או לא לומר כלום. בלי תפריט מספרים.',
-    en: 'Ask when the PA should stop and hand a conversation to them — what situations or topics. Also ask what to tell the customer: that someone will be in touch, that they\'ll call back, or say nothing. No numbered menus.',
+    he: 'שאל מתי ה-PA צריך לעצור ולהעביר שיחה ישירות לבעל העסק — אילו נושאים או מצבים. שאלה אחת בלבד, בלי תפריט מספרים. אם הם מציינים גם מה לומר ללקוח, קלוט זאת — אך אל תשאל על כך בנפרד.',
+    en: 'Ask when the PA should stop and hand a conversation to them — what situations or topics. Exactly one question, no numbered menu. If they also say what to tell the customer, capture it, but do not ask about it separately.',
   },
   customer_import: {
     he: 'שאל אם יש להם רשימת לקוחות קיימת, היסטוריית תורים, או קטלוג שירותים לייבוא.',
