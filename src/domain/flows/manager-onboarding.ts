@@ -647,7 +647,7 @@ async function handleVerifyStep(
     })
 
     const completionFallback = i18n.ob_complete[lang](business.whatsappNumber) + (lang === 'he'
-      ? `\n\nלפני שהלקוחות מגיעים, בואי נלמד קצת על העסק שלך. איך היית מתארת את *${business.name}* — מה הרגש שאת רוצה שלקוחות יקבלו?`
+      ? `\n\nלפני שהלקוחות מגיעים, בוא נלמד קצת על העסק שלך. איך היית מתאר את *${business.name}* — מה הרגש שאתה רוצה שלקוחות יקבלו?`
       : `\n\nBefore customers arrive, let me learn about your business. How would you describe *${business.name}* — what feeling do you want customers to have?`)
     const completionQ = await generateOnboardingReply({
       step: 'verify',
