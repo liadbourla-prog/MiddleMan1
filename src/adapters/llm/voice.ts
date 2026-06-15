@@ -92,6 +92,7 @@ export const BOT_TELLS: Record<Lang, string[]> = {
     'תרצה/תרצי',
     'תרצה/י',
     'תגיד/י',
+    'מעוניין/ת',
     // Canned self-introduction repeated mid-conversation.
     'העוזרת האישית',
   ],
