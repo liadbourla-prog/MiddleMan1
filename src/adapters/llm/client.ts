@@ -545,7 +545,7 @@ export function buildOnboardingSystemPrompt(input: {
     : ''
 
   const recentBlock = input.transcript && input.transcript.length > 0
-    ? `\nRecent conversation so far (oldest first) — continue it naturally and do NOT reopen with a word you already used this session (if you already opened with "מעולה"/"Great", pick a different opener or none). Vary your phrasing and shape:\n${input.transcript.map((t) => `${t.role === 'customer' ? 'Owner' : 'You'}: ${t.text}`).join('\n')}\n`
+    ? `\nRecent conversation so far (oldest first) — continue it naturally and do NOT reopen with a word you already used this session (if you already opened with "מעולה"/"Great", pick a different opener or none). Vary your phrasing and shape:\n${input.transcript.map((t) => `${t.role === 'customer' ? 'Owner' : 'You'}: ${sanitizeUserInput(t.text)}`).join('\n')}\n`
     : ''
 
   return `You are helping "${input.businessName}" set up their WhatsApp PA, texting them as the service.
