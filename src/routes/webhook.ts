@@ -43,7 +43,7 @@ import { loadCustomerMemory } from '../domain/customer/profile.js'
 import { buildHydratedContext, loadSessionCarryover } from '../domain/session/hydration.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
 import { i18n, managerSwitchOfferSuffix, type Lang } from '../domain/i18n/t.js'
-import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply } from '../adapters/llm/client.js'
+import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply, generateOnboardingReply } from '../adapters/llm/client.js'
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
 import { loadInstructorRoster } from '../domain/provider/roster.js'
@@ -483,11 +483,73 @@ async function routeManagerMessage(
     ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
     : undefined
 
-  // Onboarding gate — intercept all messages until setup is complete
+  // Onboarding gate — intercept all messages until setup is complete. Plugged into
+  // the same chat machinery the live manager path uses: a manager session for
+  // transcript continuity (so replies vary — no repeated openers) + the §3.4
+  // language switch. Reuses loadActiveSession/createSession/saveMessage/
+  // loadTranscript/resolveTurnLanguage — nothing rebuilt.
   if (!business.onboardingCompletedAt) {
     const baseUrl = process.env['PUBLIC_BASE_URL'] ?? 'https://your-domain.com'
-    const result = await handleOnboardingMessage(db, msg, identity, business, baseUrl, app.log)
-    const onboardingSendResult = await sendMessage({ toNumber: msg.fromNumber, body: result.reply }, waCredentials)
+    const defaultLang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+
+    let obSession = await loadActiveSession(db, identity.id)
+    if (!obSession) {
+      obSession = await createSession(db, business.id, identity.id, 'manager_instruction', SESSION_EXPIRY.manager)
+    }
+    const obCtx = (obSession.context as ManagerFlowContext | undefined) ?? {}
+    let sessionOverride: Lang | undefined = obCtx.languageOverride
+
+    // Answer to a previously-appended switch offer, before any step processing.
+    if (obCtx.languageSwitchOfferPending && !identity.preferredLanguage && !sessionOverride) {
+      const answer = parseConfirmation(msg.body)
+      if (answer === 'yes') {
+        const chosen: Lang = defaultLang === 'he' ? 'en' : 'he'
+        await db.update(identities).set({ preferredLanguage: chosen }).where(eq(identities.id, identity.id)).catch(() => { /* non-fatal */ })
+        await updateSessionContext(db, obSession.id, { ...obCtx, languageOverride: chosen, languageSwitchOfferPending: false }, undefined, SESSION_EXPIRY.manager)
+        const ack = await generateOnboardingReply({
+          step: business.onboardingStep ?? 'business_name',
+          businessName: business.name,
+          lang: chosen,
+          isRetry: false,
+          extraContext: 'The owner just confirmed continuing in this language. Acknowledge in one short phrase, then re-ask the current setup question.',
+        })
+        await saveMessage(db, obSession.id, 'assistant', ack).catch(() => { /* non-fatal */ })
+        await sendMessage({ toNumber: msg.fromNumber, body: ack }, waCredentials)
+        return
+      }
+      if (answer === 'no') {
+        sessionOverride = defaultLang
+        await updateSessionContext(db, obSession.id, { ...obCtx, languageOverride: defaultLang, languageSwitchOfferPending: false }, undefined, SESSION_EXPIRY.manager)
+      }
+      // 'unclear' — fall through; offer may be re-appended below.
+    }
+
+    const { turnLang, detected, shouldOfferSwitch } = resolveTurnLanguage({
+      body: msg.body,
+      defaultLang,
+      preferredLanguage: identity.preferredLanguage,
+      sessionOverride,
+    })
+
+    await saveMessage(db, obSession.id, 'customer', msg.body).catch((err) => {
+      app.log.warn({ err }, 'Failed to save onboarding inbound message to transcript')
+    })
+    const obTranscript = await loadTranscript(db, obSession.id, 10).catch(() => [])
+
+    const result = await handleOnboardingMessage(db, msg, identity, business, baseUrl, app.log, turnLang, obTranscript)
+    const reply = shouldOfferSwitch ? result.reply + managerSwitchOfferSuffix(detected) : result.reply
+
+    await updateSessionContext(db, obSession.id, {
+      ...obCtx,
+      languageSwitchOfferPending: shouldOfferSwitch,
+      ...(sessionOverride ? { languageOverride: sessionOverride } : {}),
+    }, undefined, SESSION_EXPIRY.manager).catch(() => { /* non-fatal */ })
+
+    await saveMessage(db, obSession.id, 'assistant', reply).catch((err) => {
+      app.log.warn({ err }, 'Failed to save onboarding outbound message to transcript')
+    })
+
+    const onboardingSendResult = await sendMessage({ toNumber: msg.fromNumber, body: reply }, waCredentials)
     if (!onboardingSendResult.ok) {
       app.log.error({ error: onboardingSendResult.error, toNumber: msg.fromNumber }, 'Manager onboarding send failed')
     }
