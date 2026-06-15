@@ -5,7 +5,7 @@ import { businesses, importTokens, managerInstructions, serviceTypes, availabili
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
 import type { ResolvedIdentity } from '../identity/types.js'
-import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, parseCalendarChoice, type OnboardingHourEntry } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, parseCalendarChoice, parseImportChoice, type OnboardingHourEntry } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
@@ -575,7 +575,10 @@ async function handleCustomerImportStep(
   lang: Lang,
   log: FastifyBaseLogger,
 ): Promise<OnboardingResult> {
-  if (isAffirmative(msg.body)) {
+  const choiceResult = await parseImportChoice(msg.body, lang)
+  const choice = choiceResult.ok ? choiceResult.data.choice : 'unclear'
+
+  if (choice === 'import') {
     const expiresAt = new Date(Date.now() + 30 * 60 * 1000)
     const [token] = await db
       .insert(importTokens)
@@ -597,14 +600,15 @@ async function handleCustomerImportStep(
     return { reply: importLinkWithUrl }
   }
 
-  // Only an explicit "no" skips the import. A counter-question or confusion must
-  // NOT be read as a decline — otherwise the manager loses the whole step by
-  // asking "what format?". Explain and re-ask, staying on this step.
-  if (!isNegative(msg.body)) {
+  // A question or confusion ("what format?") — explain and re-ask, stay on this
+  // step. Never read as a decline (the old isNegative gate trapped the manager
+  // here on any natural phrasing).
+  if (choice === 'unclear') {
     return notAnswerReply('customer_import', business.name, lang,
       'The manager neither clearly accepted nor declined importing their existing customers — they asked a question or seem unsure. In one or two sentences explain that you can bulk-import their existing customer list or booking history from a CSV/Excel file so people are recognized from day one, that it is optional, then ask again whether they want to import now or skip. If they asked about the file format, mention it accepts a contacts CSV (name, phone) or booking history (name, phone, date, service).')
   }
 
+  // choice === 'skip' — they have no list or want to move on.
   await db.update(businesses).set({ onboardingStep: 'verify' }).where(eq(businesses.id, business.id))
   log.info({ businessId: business.id }, 'Onboarding: customer import skipped')
   const summary = await buildVerifySummary(db, business, lang)
