@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai'
 import { z } from 'zod'
-import type { CustomerIntentOutput, ManagerInstructionOutput, OperatorActionOutput, LlmResult, GenerateReplyInput, ParseableOnboardingStep, OnboardingAnswerOutput } from './types.js'
+import type { CustomerIntentOutput, ManagerInstructionOutput, OperatorActionOutput, LlmResult, GenerateReplyInput, ParseableOnboardingStep, OnboardingAnswerOutput, TranscriptTurn } from './types.js'
 import { middlemanExplainBlock } from './middleman-identity.js'
 import { buildVoiceCore } from './voice.js'
 import { MODELS } from './models.js'
@@ -520,15 +520,16 @@ const STEP_GOALS: Record<string, Record<'he' | 'en', string>> = {
   },
 }
 
-export async function generateOnboardingReply(input: {
+export function buildOnboardingSystemPrompt(input: {
   step: string
   businessName: string
-  collectedSummary?: string
-  justConfirmed?: string
-  isRetry: boolean
   lang: 'he' | 'en'
+  isRetry: boolean
+  justConfirmed?: string
+  collectedSummary?: string
   extraContext?: string
-}): Promise<string> {
+  transcript?: TranscriptTurn[]
+}): string {
   const stepGoal = STEP_GOALS[input.step]?.[input.lang] ?? STEP_GOALS[input.step]?.en ?? 'Ask for the next required piece of information.'
 
   const ackLine = input.justConfirmed
@@ -543,7 +544,11 @@ export async function generateOnboardingReply(input: {
       : "This is a retry — they didn't answer clearly. Rephrase patiently, slightly different wording.")
     : ''
 
-  const systemPrompt = `You are helping "${input.businessName}" set up their WhatsApp PA, texting them as the service.
+  const recentBlock = input.transcript && input.transcript.length > 0
+    ? `\nRecent conversation so far (oldest first) — continue it naturally and do NOT reopen with a word you already used this session (if you already opened with "מעולה"/"Great", pick a different opener or none). Vary your phrasing and shape:\n${input.transcript.map((t) => `${t.role === 'customer' ? 'Owner' : 'You'}: ${t.text}`).join('\n')}\n`
+    : ''
+
+  return `You are helping "${input.businessName}" set up their WhatsApp PA, texting them as the service.
 
 ${buildVoiceCore('onboarding')}
 
@@ -554,12 +559,25 @@ ${ackLine}
 ${retryNote}
 ${input.collectedSummary ? `Already configured: ${input.collectedSummary}` : ''}
 ${input.extraContext ? `Context: ${input.extraContext}` : ''}
-
+${recentBlock}
 ${middlemanExplainBlock(input.lang, 'brief')}
 
 Current step task: ${stepGoal}
 
 Output: the message text ONLY. No quotes, no labels, no preamble.`
+}
+
+export async function generateOnboardingReply(input: {
+  step: string
+  businessName: string
+  collectedSummary?: string
+  justConfirmed?: string
+  isRetry: boolean
+  lang: 'he' | 'en'
+  extraContext?: string
+  transcript?: TranscriptTurn[]
+}): Promise<string> {
+  const systemPrompt = buildOnboardingSystemPrompt(input)
 
   try {
     const result = await generateConversational({
