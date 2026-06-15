@@ -513,8 +513,16 @@ async function routeManagerMessage(
           isRetry: false,
           extraContext: 'The owner just confirmed continuing in this language. Acknowledge in one short phrase, then re-ask the current setup question.',
         })
-        await saveMessage(db, obSession.id, 'assistant', ack).catch(() => { /* non-fatal */ })
-        await sendMessage({ toNumber: msg.fromNumber, body: ack }, waCredentials)
+        // generateOnboardingReply returns '' on LLM failure; WhatsApp rejects an
+        // empty body, so fall back to a non-empty line (mirrors the live path).
+        const ackBody = ack || (chosen === 'he'
+          ? 'מעולה, ממשיכים בעברית. בוא נמשיך מאיפה שהפסקנו.'
+          : "Great, switching to English. Let's pick up where we left off.")
+        await saveMessage(db, obSession.id, 'assistant', ackBody).catch(() => { /* non-fatal */ })
+        const ackSendResult = await sendMessage({ toNumber: msg.fromNumber, body: ackBody }, waCredentials)
+        if (!ackSendResult.ok) {
+          app.log.error({ error: ackSendResult.error, toNumber: msg.fromNumber }, 'Manager onboarding language-switch ack send failed')
+        }
         return
       }
       if (answer === 'no') {
