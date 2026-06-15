@@ -37,4 +37,15 @@ describe('resolveTurnLanguage', () => {
     expect(r.turnLang).toBe('he')
     expect(r.shouldOfferSwitch).toBe(false)
   })
+  it('an empty body never flips or offers (WhatsApp empty payloads)', () => {
+    const r = resolveTurnLanguage({ body: '', defaultLang: he, preferredLanguage: null, sessionOverride: undefined })
+    expect(r.turnLang).toBe('he')
+    expect(r.detected).toBe('he')
+    expect(r.shouldOfferSwitch).toBe(false)
+  })
+  it('a Hebrew body on a Hebrew-default business stays Hebrew, no offer', () => {
+    const r = resolveTurnLanguage({ body: 'ראשון עד חמישי 9 עד 18', defaultLang: he, preferredLanguage: null, sessionOverride: undefined })
+    expect(r.turnLang).toBe('he')
+    expect(r.shouldOfferSwitch).toBe(false)
+  })
 })

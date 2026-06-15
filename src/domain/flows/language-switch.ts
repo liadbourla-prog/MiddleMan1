@@ -5,6 +5,13 @@ import { detectLang, type Lang } from '../i18n/t.js'
 // digits — from wrongly flipping the conversation language. A Hebrew letter is
 // always a signal; otherwise we require at least two Latin word-tokens of >=2
 // letters, so single brand/keyword tokens (PayPal, Bit, GO) never trigger a switch.
+//
+// Deliberate tradeoffs of the two-word threshold:
+// - a genuine 1-word English answer ("internal", "Cash", "Yes") will NOT flip the
+//   language (false negative) — acceptable, since real English speakers write more;
+// - a 2-word English-looking business name ("Apple Music") WILL register as signal
+//   (false positive). Both are accepted to keep the rule simple; tightening either
+//   re-introduces the other. The §3.4 offer is reversible, so a wrong flip is cheap.
 export function hasLanguageSignal(text: string): boolean {
   if (/[֐-׿]/.test(text)) return true
   const latinWords = text.match(/[A-Za-z]{2,}/g)
