@@ -7,6 +7,7 @@ import { sendMessage } from '../adapters/whatsapp/sender.js'
 import { getPrompt } from '../domain/onboarding/steps.js'
 import { t, i18n, type Lang } from '../domain/i18n/t.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
+import { generateOnboardingReply } from '../adapters/llm/client.js'
 import { provisionBusiness } from '../domain/flows/provider-onboarding.js'
 import { registerWatchChannel } from '../domain/calendar/inbound-sync.js'
 
@@ -295,10 +296,17 @@ export async function oauthRoutes(app: FastifyInstance) {
           // non-fatal — skip preview if calendar read fails
         }
 
+        const importQ = await generateOnboardingReply({
+          step: 'customer_import',
+          businessName: updatedBusiness.name,
+          lang,
+          isRetry: false,
+          justConfirmed: t('ob_calendar_connected', lang),
+        })
         await sendMessage(
           {
             toNumber: managerIdentity.phoneNumber,
-            body: `${t('ob_calendar_connected', lang)}${calendarPreview}\n\n${getPrompt('customer_import', lang)}`,
+            body: `${t('ob_calendar_connected', lang)}${calendarPreview}\n\n${importQ || getPrompt('customer_import', lang)}`,
           },
           waCredentials,
         ).catch((err) => app.log.warn({ err }, 'Failed to send calendar confirmation to manager'))
