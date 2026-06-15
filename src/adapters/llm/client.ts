@@ -887,6 +887,10 @@ const calendarChoiceSchema = z.object({
   choice: z.enum(['skip', 'connect', 'unclear']),
 })
 
+const importChoiceSchema = z.object({
+  choice: z.enum(['import', 'skip', 'unclear']),
+})
+
 const PARSE_PROMPTS: Record<ParseableOnboardingStep, string> = {
   cancellation_policy: `Extract how many hours before an appointment the customer wants to allow cancellations.
 First decide isAnswer: true only if the message actually answers the cancellation-cutoff question. Set isAnswer: false if the message is a counter-question (e.g. "what do you mean by cutoff?", "מה זה בעצם?"), a refusal/deferral ("not now", "later", "אחר כך"), or confusion. When isAnswer is false, return hours: null.
@@ -1037,6 +1041,30 @@ The manager was sent a Google Calendar connection link and asked to connect thei
 Return JSON: { "choice": "skip" | "connect" | "unclear" }`
   const safeMessage = sanitizeUserInput(message)
   return callWithSchema(systemPrompt, safeMessage, calendarChoiceSchema)
+}
+
+// Onboarding "customer_import" step — the manager was asked whether they have an
+// existing customer list / booking history / service catalog to bulk-import. They
+// reply in free text. Decide whether they want to IMPORT (get an upload link),
+// SKIP (move on now), or it's UNCLEAR (a question/confusion → explain & re-ask).
+// Replaces the old isAffirmative/isNegative keyword gate that looped on any
+// natural phrasing ("נדלג", "בוא נמשיך", "אין רשימה", "יש לי קובץ").
+export async function parseImportChoice(
+  message: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<{ choice: 'import' | 'skip' | 'unclear' }>> {
+  const langNote = lang === 'he' ? 'The manager is writing in Hebrew.' : 'The manager is writing in English.'
+  const systemPrompt = `${langNote}
+
+The manager is setting up their PA and was asked whether they have an existing customer list, booking history, or service catalog they want to bulk-import now. Classify their reply:
+
+- "import": they want to import / upload now, or say they have a file or list to bring in. Examples: "כן", "יש לי קובץ", "יש לי רשימת לקוחות", "אקסל", "בוא נעלה", "yes", "I have a list", "sure", "let's upload".
+- "skip": they have no list, or want to move on / skip / do it later. Examples: "נדלג", "דלג", "אין לי רשימה", "אין רשימת לקוחות", "בוא נמשיך", "להמשיך הלאה", "אחר כך", "skip", "no list", "let's move on", "continue", "not now".
+- "unclear": anything else — a question about the format or process, a greeting, or confusion. Examples: "באיזה פורמט?", "מה זאת אומרת?", "what format?", "how does it work?".
+
+Return JSON: { "choice": "import" | "skip" | "unclear" }`
+  const safeMessage = sanitizeUserInput(message)
+  return callWithSchema(systemPrompt, safeMessage, importChoiceSchema)
 }
 
 // ── Proactive customer message generator ─────────────────────────────────────
