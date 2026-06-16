@@ -14,6 +14,7 @@ import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { createBlock } from '../availability/blocks.js'
 import { localTimeToUtc, localParts } from '../availability/compute.js'
 import { enqueueBlockMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
+import { findProviderByName } from '../provider/lookup.js'
 
 // Bilingual day names (Sun=0 … Sat=6)
 function dayName(dayOfWeek: number | null | undefined, lang: Lang): string {
@@ -1280,25 +1281,6 @@ async function findServiceByName(db: Db, businessId: string, name: string): Prom
     .where(and(eq(serviceTypes.businessId, businessId), ilike(serviceTypes.name, name), eq(serviceTypes.isActive, true)))
     .limit(1)
   return svc ?? null
-}
-
-/** Resolve an active provider identity by display name within the business.
- *  Returns 'ambiguous' when more than one matches. */
-async function findProviderByName(
-  db: Db, businessId: string, name: string,
-): Promise<{ status: 'found'; id: string } | { status: 'none' } | { status: 'ambiguous' }> {
-  const rows = await db
-    .select({ id: identities.id })
-    .from(identities)
-    .where(and(
-      eq(identities.businessId, businessId),
-      eq(identities.role, 'provider'),
-      ilike(identities.displayName, name),
-      isNull(identities.revokedAt),
-    ))
-  if (rows.length === 0) return { status: 'none' }
-  if (rows.length > 1) return { status: 'ambiguous' }
-  return { status: 'found', id: rows[0]!.id }
 }
 
 /** Human-readable hours fragment for confirmations, e.g. " (Mon 09:00–13:00, Wed 09:00–13:00)". */
