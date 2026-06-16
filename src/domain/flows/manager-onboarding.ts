@@ -107,7 +107,7 @@ async function maybeAmendPriorAnswer(
   if (targetStep && targetStep !== step) {
     await db.update(businesses).set({ onboardingStep: targetStep }).where(eq(businesses.id, business.id))
     log.info({ businessId: business.id, field, targetStep }, 'Onboarding: re-opening step to amend')
-    const ack = lang === 'he' ? 'בסדר, בוא/י נתקן את זה.' : "Sure — let's fix that."
+    const ack = lang === 'he' ? 'בסדר, בוא נתקן את זה.' : "Sure — let's fix that."
     const q = await onboardingQuestion(targetStep, business.name ?? '', lang, { isRetry: true, transcript })
     return { reply: `${ack}\n\n${q}` }
   }

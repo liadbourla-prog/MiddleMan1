@@ -61,7 +61,7 @@ export async function resolveInterjection(intent: TurnIntent | null, h: Interjec
   if (intent.kind === 'lead_in') {
     // Invite the detail; the next turn carries the content. Don't re-present the
     // step yet — we are pausing it on purpose.
-    return he ? 'בכיף, ספר/י לי — אני מקשיב/ה.' : "Sure — go ahead, I'm listening."
+    return he ? 'בכיף, ספר לי — אני מקשיב.' : "Sure — go ahead, I'm listening."
   }
 
   if (intent.kind === 'info') {
@@ -75,7 +75,7 @@ export async function resolveInterjection(intent: TurnIntent | null, h: Interjec
   if (intent.capture && h.saveNote) await h.saveNote(intent.capture)
   const ack = intent.kind === 'go_back'
     ? (he ? 'הבנתי, רשמתי לי את זה.' : "Got it — I've noted that.")
-    : (he ? 'שאלה טובה — בוא/י נשלים את ההגדרה ואחזור לזה.' : "Good question — let's finish setup and I'll come back to it.")
+    : (he ? 'שאלה טובה — בוא נשלים את ההגדרה ואחזור לזה.' : "Good question — let's finish setup and I'll come back to it.")
   return `${ack}\n\n${h.presentStep()}`
 }
 
