@@ -861,14 +861,25 @@ async function dispatchStep(
         return await runWebsiteOffer(ctx, state, skillName)
       }
 
+      // A bare lead-in ("I want to tell you about our instructors") carries no
+      // concrete fact yet — don't misfile it as a deferred feature request and
+      // brush the owner off. Invite the detail; the next turn carries the content.
+      const isLeadIn = /(?:אני\s+)?רוצה\s+(?:ל)?(?:ספר|הסביר|שתף|הוסיף)|תן\s+לי\s+(?:ל)?(?:ספר|הסביר)|(?:let me|i(?:'?d)?\s+(?:want|like)\s+to)\s+(?:tell|explain|share|add)/i
+      if (isLeadIn.test(text) && text.trim().length < 60) {
+        const reply = lang === 'he' ? 'בכיף, ספר/י לי — אני מקשיב/ה.' : "Sure — go ahead, I'm listening."
+        return { handled: true, reply, sessionComplete: false, skillName }
+      }
+
       const classification = await classifyOpenQuestion(text)
 
       if (!classification || classification.confidence < 0.65 || classification.type === 'unsupported') {
-        // Defer to operator
+        // Genuinely unclassifiable — capture it, but acknowledge honestly. Do NOT
+        // claim it was "passed to the team" / that they'll get a confirmation; the
+        // owner is usually just sharing business context, not filing a ticket.
         await ctx.deferFeatureRequest(text)
         const reply = lang === 'he'
-          ? `תודה — העברתי את הרעיון לצוות שלנו. תקבל/י אישור בקרוב.\n\n${Q['open-question'](ctx, state)}`
-          : `Thanks — I've flagged that idea for our team and you'll hear from us shortly.\n\n${Q['open-question'](ctx, state)}`
+          ? `תודה, רשמתי לי את זה.\n\n${Q['open-question'](ctx, state)}`
+          : `Thanks, I've noted that.\n\n${Q['open-question'](ctx, state)}`
         const ns: BksState = { ...state, openQuestionCount: count + 1 }
         await ctx.workflow.advance('open-question', ns as unknown as Record<string, unknown>)
         return { handled: true, reply, sessionComplete: false, skillName }
@@ -1062,9 +1073,17 @@ async function generateOfferMessage(ctx: SkillContext, type: 'website' | 'gmb'):
     const result = await ai.models.generateContent({
       model: MODEL,
       contents: 'Generate the offer message.',
-      config: { systemInstruction: systemPrompt, maxOutputTokens: 128, temperature: 0.5 },
+      // Gemini 2.5 Flash "thinks" by default, and those tokens are drawn from
+      // maxOutputTokens — a tight 128 budget gets consumed by thinking and the
+      // reply comes back truncated (e.g. "רוצה שא"). Disable thinking (valid on
+      // Flash) and give the one-liner ample room.
+      config: { systemInstruction: systemPrompt, maxOutputTokens: 256, temperature: 0.5, thinkingConfig: { thinkingBudget: 0 } },
     })
-    return result.text?.trim() || fallback
+    const text = result.text?.trim()
+    // Guard against truncated/garbage output: a real offer sentence is a full
+    // clause. Anything implausibly short falls back to the hand-written copy.
+    if (!text || text.length < 12) return fallback
+    return text
   } catch {
     return fallback
   }
