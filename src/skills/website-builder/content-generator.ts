@@ -14,13 +14,17 @@ export async function triageTurn(stepAsk: string, text: string): Promise<TurnInt
   return callJson(buildTurnIntentPrompt(stepAsk), text, turnIntentSchema)
 }
 
-async function callJson<T>(systemPrompt: string, userMessage: string, schema: z.ZodType<T>): Promise<T | null> {
+async function callJson<T>(systemPrompt: string, userMessage: string, schema: z.ZodType<T>, maxOutputTokens = 4096): Promise<T | null> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const result = await ai.models.generateContent({
         model: MODEL,
         contents: userMessage,
-        config: { systemInstruction: systemPrompt, maxOutputTokens: 4096, temperature: 0, responseMimeType: 'application/json' },
+        // thinkingBudget:0 — Gemini 2.5 Flash otherwise spends part of maxOutputTokens
+        // "thinking", which truncated large generations (a full site JSON) into
+        // invalid JSON → null. Disable it (valid on Flash) so the whole budget is
+        // available for output. Large callers pass a bigger maxOutputTokens.
+        config: { systemInstruction: systemPrompt, maxOutputTokens, temperature: 0, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } },
       })
       const text = result.text
       if (!text) continue
@@ -118,7 +122,10 @@ workflowId: ${workflowId}
 generatedAt: ${new Date().toISOString()}
 language: ${lang}`
 
-  return (await callJson(system, user, SiteSchemaZod)) as unknown as SiteSchema | null
+  // A full multi-page site (business + services + 8–12 FAQs, descriptions 40–60
+  // words each, often Hebrew) is large — give it ample output room so the JSON
+  // isn't truncated.
+  return (await callJson(system, user, SiteSchemaZod, 16384)) as unknown as SiteSchema | null
 }
 
 // ── Patch (update flow) ───────────────────────────────────────────────────────
@@ -149,7 +156,8 @@ Update the "generatedAt" field to: ${new Date().toISOString()}`
 Current site schema:
 ${JSON.stringify(existingSchema, null, 2)}`
 
-  return (await callJson(system, user, SiteSchemaZod)) as unknown as SiteSchema | null
+  // Patch returns the COMPLETE updated schema — same size as generation.
+  return (await callJson(system, user, SiteSchemaZod, 16384)) as unknown as SiteSchema | null
 }
 
 // ── Palette suggestion ────────────────────────────────────────────────────────
