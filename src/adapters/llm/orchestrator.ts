@@ -10,7 +10,7 @@ import { db } from '../../db/client.js'
 import { managerMemory } from '../../db/schema.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../../domain/authorization/check.js'
-import { buildInstructorRosterBlock, type InstructorRosterEntry } from '../../domain/provider/roster.js'
+import { buildInstructorRosterBlock, buildTeachingScheduleBlock, type InstructorRosterEntry, type TeachingSlot } from '../../domain/provider/roster.js'
 import type { CalendarClient } from '../calendar/client.js'
 import type { TranscriptTurn } from './types.js'
 import type { Lang } from '../../domain/i18n/t.js'
@@ -319,10 +319,11 @@ function buildSystemPrompt(params: {
   lang: Lang
   businessKnowledge: BusinessKnowledge | null
   instructorRoster: InstructorRosterEntry[]
+  teachingSchedule: TeachingSlot[]
   managerMemorySummaries: string[]
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, instructorRoster, managerMemorySummaries, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -338,6 +339,7 @@ function buildSystemPrompt(params: {
 
   const knowledgeBlock = buildBusinessKnowledgeBlock(businessKnowledge)
   const rosterBlock = buildInstructorRosterBlock(instructorRoster, lang)
+  const teachingScheduleBlock = buildTeachingScheduleBlock(teachingSchedule, lang)
 
   const memorySummary = managerMemorySummaries.length > 0
     ? managerMemorySummaries.map((s, i) => `[Session ${i + 1}] ${s}`).join('\n')
@@ -375,6 +377,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
+${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
 
 ## After completing actions
 If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them — phrased naturally, never the same way twice. Do not notify customers automatically — ask first.
@@ -446,6 +449,7 @@ export interface OrchestratorParams {
   transcript: TranscriptTurn[]
   businessKnowledge: BusinessKnowledge | null
   instructorRoster: InstructorRosterEntry[]
+  teachingSchedule: TeachingSlot[]
   // Caller role + granted actions — threaded into ToolContext so delegated staff
   // are gated to the actions the owner declared. Defaults to manager when omitted.
   role?: IdentityRole
@@ -462,7 +466,7 @@ export interface OrchestratorParams {
 export async function runManagerOrchestratorLoop(params: OrchestratorParams): Promise<string> {
   const {
     messageId, message, sessionId, businessId, identityId,
-    businessName, timezone, lang, calendar, transcript, businessKnowledge, instructorRoster,
+    businessName, timezone, lang, calendar, transcript, businessKnowledge, instructorRoster, teachingSchedule,
   } = params
 
   const loadMemory = params.loadMemoryFn ?? loadManagerMemorySummaries
@@ -476,6 +480,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     lang,
     businessKnowledge,
     instructorRoster,
+    teachingSchedule,
     managerMemorySummaries,
     conversationHistory: transcript.slice(-20),
   })

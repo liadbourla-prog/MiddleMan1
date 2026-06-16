@@ -46,7 +46,7 @@ import { i18n, managerSwitchOfferSuffix, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage, generateManagerCommandReply, generateProviderOnboardingReply, generateOnboardingReply } from '../adapters/llm/client.js'
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
-import { loadInstructorRoster } from '../domain/provider/roster.js'
+import { loadInstructorRoster, loadTeachingSchedule } from '../domain/provider/roster.js'
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
 import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
@@ -791,9 +791,10 @@ async function routeManagerMessage(
   })
 
   // Load business knowledge + instructor roster for orchestrator system prompt injection
-  const [mgBusinessKnowledgeForOrchestrator, mgInstructorRoster] = await Promise.all([
+  const [mgBusinessKnowledgeForOrchestrator, mgInstructorRoster, mgTeachingSchedule] = await Promise.all([
     loadBusinessKnowledge(db, business.id, business.currency),
     loadInstructorRoster(db, business.id),
+    loadTeachingSchedule(db, business.id, business.timezone),
   ])
 
   const calendar = createCalendarClient({
@@ -825,6 +826,7 @@ async function routeManagerMessage(
       transcript: mgTranscript,
       businessKnowledge: mgBusinessKnowledgeForOrchestrator,
       instructorRoster: mgInstructorRoster,
+      teachingSchedule: mgTeachingSchedule,
       role: identity.role,
       ...(delegatedPermissions ? { delegatedPermissions } : {}),
     }).catch((err) => {

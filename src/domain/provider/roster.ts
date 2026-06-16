@@ -1,6 +1,7 @@
-import { and, eq, isNull, ilike } from 'drizzle-orm'
+import { and, eq, isNull, ilike, gte, lte } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { identities, providerAssignments, serviceTypes, availability } from '../../db/schema.js'
+import { identities, providerAssignments, serviceTypes, availability, calendarBlocks } from '../../db/schema.js'
+import { localParts } from '../availability/compute.js'
 
 export interface InstructorWeeklyHours { dayOfWeek: number; startTime: string; endTime: string }
 export interface InstructorRosterEntry { id: string; name: string; services: string[]; weeklyHours: InstructorWeeklyHours[] }
@@ -68,6 +69,80 @@ export function buildInstructorRosterBlock(roster: InstructorRosterEntry[], lang
       ? e.weeklyHours.map((h) => `${days[h.dayOfWeek]} ${h.startTime}–${h.endTime}`).join(', ')
       : 'no hours set'
     lines.push(`- ${e.name}: ${svc} (${hrs})`)
+  }
+  return lines.join('\n')
+}
+
+export interface TeachingSlot { providerId: string; instructor: string; service: string; dayOfWeek: number; startTime: string }
+
+/**
+ * Derive "who teaches what" from the upcoming scheduled class blocks
+ * (calendar_blocks type='class' with a providerId) over the next `horizonDays`.
+ * This is the live source for the instructor FAQ — it reflects the actual
+ * week-to-week schedule, not a typed-once paragraph. Title-only classes and
+ * instructor-less classes are skipped (no providerId or no linked service).
+ */
+export async function loadTeachingSchedule(
+  db: Db,
+  businessId: string,
+  timezone: string,
+  horizonDays = 7,
+  now: Date = new Date(),
+): Promise<TeachingSlot[]> {
+  const to = new Date(now.getTime() + horizonDays * 86_400_000)
+  const rows = await db
+    .select({
+      providerId: calendarBlocks.providerId,
+      instructor: identities.displayName,
+      service: serviceTypes.name,
+      startTs: calendarBlocks.startTs,
+    })
+    .from(calendarBlocks)
+    .innerJoin(identities, eq(calendarBlocks.providerId, identities.id))
+    .innerJoin(serviceTypes, eq(calendarBlocks.serviceTypeId, serviceTypes.id))
+    .where(and(
+      eq(calendarBlocks.businessId, businessId),
+      eq(calendarBlocks.type, 'class'),
+      gte(calendarBlocks.startTs, now),
+      lte(calendarBlocks.startTs, to),
+    ))
+
+  // Dedup to one row per (provider, service, weekday, start-time) so a manager
+  // sees "Dana — Yoga Mon 10:00" once even across multiple weeks in the horizon.
+  const seen = new Set<string>()
+  const out: TeachingSlot[] = []
+  for (const r of rows) {
+    if (!r.providerId || !r.instructor || !r.service) continue
+    const lp = localParts(r.startTs, timezone)
+    const startTime = `${String(Math.floor(lp.minutes / 60)).padStart(2, '0')}:${String(lp.minutes % 60).padStart(2, '0')}`
+    const key = `${r.providerId}|${r.service}|${lp.dayOfWeek}|${startTime}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ providerId: r.providerId, instructor: r.instructor, service: r.service, dayOfWeek: lp.dayOfWeek, startTime })
+  }
+  return out
+}
+
+/**
+ * Render the derived teaching schedule for a system prompt, grouped by
+ * instructor. Pure (no DB/clock). Empty input → ''.
+ */
+export function buildTeachingScheduleBlock(slots: TeachingSlot[], lang: 'he' | 'en'): string {
+  if (slots.length === 0) return ''
+  const days = lang === 'he'
+    ? ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ש']
+    : ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+  const byInstructor = new Map<string, TeachingSlot[]>()
+  for (const s of slots) {
+    const arr = byInstructor.get(s.instructor) ?? []
+    arr.push(s)
+    byInstructor.set(s.instructor, arr)
+  }
+  const lines = ['Upcoming classes by instructor (live; answer on demand, do not volunteer to customers):']
+  for (const [instructor, list] of byInstructor) {
+    list.sort((a, b) => a.dayOfWeek - b.dayOfWeek || a.startTime.localeCompare(b.startTime))
+    const parts = list.map((s) => `${s.service} ${days[s.dayOfWeek]} ${s.startTime}`)
+    lines.push(`- ${instructor}: ${parts.join(', ')}`)
   }
   return lines.join('\n')
 }
