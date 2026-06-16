@@ -3,9 +3,16 @@ import { GoogleGenAI } from '@google/genai'
 import type { SkillContext } from '../../shared/skill-types.js'
 import { SiteSchemaZod, type SiteSchema } from './site-schema.js'
 import { matchPaletteFromText } from '../../shared/palettes.js'
+import { turnIntentSchema, buildTurnIntentPrompt, type TurnIntent } from '../../shared/turn-intent.js'
 
 const ai = new GoogleGenAI({ apiKey: process.env['LLM_API_KEY'] ?? '', apiVersion: 'v1beta' })
 const MODEL = 'gemini-2.5-flash'
+
+/** Shared turn-intent triage wired to this skill's LLM client. Used so confirm
+ *  steps don't misread a question/interjection as edit feedback (and regenerate). */
+export async function triageTurn(stepAsk: string, text: string): Promise<TurnIntent | null> {
+  return callJson(buildTurnIntentPrompt(stepAsk), text, turnIntentSchema)
+}
 
 async function callJson<T>(systemPrompt: string, userMessage: string, schema: z.ZodType<T>): Promise<T | null> {
   for (let attempt = 0; attempt < 3; attempt++) {

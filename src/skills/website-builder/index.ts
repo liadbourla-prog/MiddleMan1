@@ -1,5 +1,6 @@
 import type { Skill, SkillContext, SkillOutcome } from '../../shared/skill-types.js'
-import { generateSiteContent, patchSiteContent, suggestPalette } from './content-generator.js'
+import { generateSiteContent, patchSiteContent, suggestPalette, triageTurn } from './content-generator.js'
+import { resolveInterjection, isBareControl } from '../../shared/turn-intent.js'
 import { runFullAeoPass, formatAeoSummary, type AeoReport } from './aeo-validator.js'
 import type { SiteSchema } from './site-schema.js'
 import { SiteSchemaZod } from './site-schema.js'
@@ -422,6 +423,18 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
         return { handled: true, reply, sessionComplete: false, skillName }
       }
 
+      // Interjection (a lead-in like "wait, let me tell you something", or a side
+      // fact) — handle and resume, instead of misreading it as a color/edit hint.
+      if (!isBareControl(text, (t) => isApproveText(t) || isSkipText(t) || isCancelText(t))) {
+        const intent = await triageTurn('I showed you the planned website structure (pages, services, design). Approve it, or tell me what to change.', text)
+        const reply = await resolveInterjection(intent, {
+          lang: ctx.language,
+          presentStep: () => qStructureConfirm(ctx, state),
+          saveNote: async (t) => { await ctx.deferFeatureRequest(t) },
+        })
+        if (reply) return { handled: true, reply, sessionComplete: false, skillName }
+      }
+
       // Manager wants to change something — re-parse and re-show
       const updates = parseRequirements(text)
       const ns: WbsState = {
@@ -474,6 +487,19 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
         const ns: WbsState = { ...state }
         await advance('domain-setup', ns)
         return await runDomainSetup(ctx, ns, skillName)
+      }
+
+      // A question or side-remark here must NOT be treated as edit feedback (which
+      // would regenerate the whole site). Triage first; only real change requests
+      // ('answer') fall through to the edit loop below.
+      if (!isBareControl(text, (t) => isApproveText(t) || isSkipText(t) || isCancelText(t))) {
+        const intent = await triageTurn('I showed you the generated website preview. Approve it, or tell me what to change.', text)
+        const reply = await resolveInterjection(intent, {
+          lang: ctx.language,
+          presentStep: () => isHe ? 'חזרה לאתר — כתבו *אשר* לאישור, או תארו מה לשנות.' : 'Back to your site — reply *approve*, or describe what to change.',
+          saveNote: async (t) => { await ctx.deferFeatureRequest(t) },
+        })
+        if (reply) return { handled: true, reply, sessionComplete: false, skillName }
       }
 
       // Edit request — loop back

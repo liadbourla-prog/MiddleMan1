@@ -10,6 +10,10 @@ vi.mock('./content-generator.js', () => ({
   generateSiteContent: vi.fn().mockResolvedValue(null),
   patchSiteContent: vi.fn().mockResolvedValue(null),
   suggestPalette: vi.fn().mockResolvedValue('midnight-blue'),
+  // Turn-intent triage defaults to "not an interjection" so confirm/review steps
+  // fall through to their normal edit handling in tests (matches production
+  // behaviour when triage returns null on any LLM hiccup).
+  triageTurn: vi.fn().mockResolvedValue(null),
 }))
 
 vi.mock('./aeo-validator.js', async (importOriginal) => {
