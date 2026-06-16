@@ -718,10 +718,20 @@ async function applyRecurringClassChange(
     if (!svc) {
       return { ok: false, reason: lang === 'he' ? `לא מצאתי שירות בשם "${p.serviceName ?? ''}".` : `No service named "${p.serviceName ?? ''}" found.` }
     }
+    // Resolve a named instructor (explicit-add model). A hint that matches no
+    // existing instructor → clarify, don't silently create a provider-less series.
+    let seriesProviderId: string | null = null
+    if (p.providerHint && p.providerHint.trim().length > 0) {
+      const found = await findProviderByName(db, businessId, p.providerHint.trim())
+      if (found.status === 'none') return { ok: false, reason: i18n.apply_provider_not_found[lang](p.providerHint.trim()) }
+      if (found.status === 'ambiguous') return { ok: false, reason: i18n.apply_provider_ambiguous[lang](p.providerHint.trim()) }
+      seriesProviderId = found.id
+    }
     const startDate = p.startDate ?? localParts(new Date(), tz).dateStr
     const { created } = await createSeries(db, {
       businessId,
       serviceTypeId: svc.id,
+      providerId: seriesProviderId,
       dayOfWeek: p.dayOfWeek,
       startTime: p.startTime,
       durationMinutes: p.durationMinutes ?? svc.durationMinutes,
