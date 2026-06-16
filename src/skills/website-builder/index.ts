@@ -49,18 +49,41 @@ type Step =
 
 // ── Intent helpers ────────────────────────────────────────────────────────────
 
-// Use (?:\b|$) instead of \b alone — Hebrew chars are \W so \b doesn't match
-// at end of a Hebrew-only word. (?:\b|$) handles both ASCII and Hebrew endings.
+// Hebrew-safe keyword boundary. A bare `\b` never matches after a Hebrew letter
+// (Hebrew is non-word in JS regex without /u), and even `(?:\b|$)` fails when a
+// Hebrew keyword is followed by a space/punctuation. This lookahead accepts a
+// word boundary, end-of-string, whitespace, or punctuation — works for both.
+const KW_END = "(?=\\b|$|\\s|[.,!?'\"\\-])"
+
 function isCancelText(text: string): boolean {
-  return /^(stop|cancel|never mind|quit|עצור|בטל|די|הפסק|ביטול)(?:\b|$)/i.test(text.trim())
+  // Hebrew-safe boundary: a bare `\b` never matches after a Hebrew letter at
+  // end-of-input, and `(?:\b|$)` still fails when a Hebrew word is followed by a
+  // space/punctuation. This lookahead covers boundary, end, whitespace, or punct.
+  return new RegExp("^(stop|cancel|never mind|quit|עצור|בטל|די|הפסק|ביטול)" + KW_END, 'i').test(text.trim())
 }
 
 function isApproveText(text: string): boolean {
-  return /^(approve[d]?|yes|ok|good|great|looks? good|perfect|continue|proceed|אשר|אישור|טוב|מעולה|כן|אוקיי|מאושר|נראה טוב|המשך)(?:\b|$)/i.test(text.trim())
+  return new RegExp("^(approve[d]?|confirm(?:ed)?|yes|sure|ok(?:ay)?|good|great|looks? good|perfect|continue|proceed|אשר|מאשר(?:ת|ים)?|אישור|אישרתי|מאושר(?:ת)?|טוב|מעולה|כן|אוקיי|בטח|בסדר|יאלה|קדימה|סבבה|נראה טוב|המשך)" + KW_END, 'i').test(text.trim())
+}
+
+// A question seeking information (vs. an edit instruction). Used so confirm steps
+// answer "what other options are there?" instead of misreading it as a color hint.
+function looksLikeQuestion(text: string): boolean {
+  const t = text.trim()
+  if (/[?？]\s*$/.test(t)) return true
+  return /(^|\s)(מה|איזה|אילו|כמה|איך|אפשר|what|which|how|any other|are there|options)(\s|$)/i.test(t)
+}
+
+// True when the message clearly asks to CHANGE the design (so it's an edit, not a
+// pure question) — a style keyword, a palette word, or a change verb.
+function hasDesignEditSignal(text: string): boolean {
+  const lower = text.toLowerCase()
+  return /\b(minimal|bold|professional)\b/.test(lower) ||
+    /(switch|change|use |make it|set |עבור|שנה|תשנה|תעשה|החלף|פלטה|palette|צבע|color)/i.test(lower)
 }
 
 function isSkipText(text: string): boolean {
-  return /^(skip|next|דלג|הבא|pass)(?:\b|$)/i.test(text.trim())
+  return new RegExp("^(skip|next|דלג|הבא|pass)" + KW_END, 'i').test(text.trim())
 }
 
 // ── Question builders ─────────────────────────────────────────────────────────
@@ -388,6 +411,15 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
         await advance('content-generate', ns)
         // Generate content inline — the manager gets the result in this same turn
         return await runContentGenerate(ctx, ns, skillName)
+      }
+
+      // A genuine question (not an edit) — answer it instead of misreading it as a
+      // color hint and silently re-rendering the same preview.
+      if (looksLikeQuestion(text) && !hasDesignEditSignal(text)) {
+        const reply = ctx.language === 'he'
+          ? `יש שלושה סגנונות עיצוב:\n• *minimal* — נקי ואוורירי\n• *bold* — נועז וצבעוני\n• *professional* — קלאסי ומהוקצע\n\nלצבעים פשוט תאר/י את האווירה (למשל "בהיר ורגוע", "ירוק יער", "כחול עמוק") ואבחר פלטה מתאימה — או בחר/י אחת: warm-terracotta, ocean-teal, sage-forest, midnight-blue, dusty-rose, slate-green, charcoal-gold, lavender-purple.\n\nרוצה לשנות משהו? פשוט תאר/י. או כתב/י *אשר* כדי להמשיך.`
+          : `There are three design styles:\n• *minimal* — clean & airy\n• *bold* — vivid & colorful\n• *professional* — classic & polished\n\nFor colors, just describe the vibe (e.g. "bright and calm", "forest green", "deep navy") and I'll pick a matching palette — or choose one: warm-terracotta, ocean-teal, sage-forest, midnight-blue, dusty-rose, slate-green, charcoal-gold, lavender-purple.\n\nWant to change anything? Just describe it, or reply *approve* to continue.`
+        return { handled: true, reply, sessionComplete: false, skillName }
       }
 
       // Manager wants to change something — re-parse and re-show
