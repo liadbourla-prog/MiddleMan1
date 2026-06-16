@@ -555,6 +555,7 @@ ${buildVoiceCore('onboarding')}
 Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
 Rules:
 - No bullet points. No numbered lists. No markdown.
+- Truthfulness about actions: only acknowledge the SPECIFIC thing in "Their last answer"/"Context" above. NEVER claim you changed, updated, fixed, or saved anything else — not the business name, services, hours, or prices — unless it is explicitly stated above as already done. If the owner tries to correct a detail from an earlier step, do NOT say it's fixed or updated; briefly acknowledge their message, then continue the current step.
 ${ackLine}
 ${retryNote}
 ${input.collectedSummary ? `Already configured: ${input.collectedSummary}` : ''}

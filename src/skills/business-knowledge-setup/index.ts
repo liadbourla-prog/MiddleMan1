@@ -786,6 +786,12 @@ async function dispatchStep(
 
     // ── 10. message-review ────────────────────────────────────────────────────
     case 'message-review': {
+      // Defensive: if we landed here without generated messages (e.g. a prior
+      // generation failure advanced us in anyway), don't loop forever on the
+      // "preparing your messages..." placeholder — skip straight to FAQs.
+      if (!state.automatedMessages) {
+        return await runFaqGeneration(ctx, state, skillName)
+      }
       const group = state.messageReviewGroup ?? 0
       const totalGroups = 2 // compressed from 4 to 2 groups
       const regenCount = state.messageReviewRegenCount ?? 0
@@ -973,25 +979,26 @@ async function dispatchStep(
 
 async function runMessageGeneration(ctx: SkillContext, state: BksState, skillName: string): Promise<SkillOutcome> {
   const lang = ctx.language
+
+  const generated = await generateAutomatedMessages(ctx)
+
+  if (!generated) {
+    // Generation failed — do NOT enter message-review. Without generated messages
+    // that step has nothing to show and loops forever on the "preparing your
+    // messages..." placeholder (every reply read as an edit). Skip straight to FAQ
+    // generation, mirroring runFaqGeneration's own failure handling.
+    const skipped = await runFaqGeneration(ctx, { ...state, messageReviewGroup: 0 }, skillName)
+    const prefix = lang === 'he'
+      ? 'לא הצלחתי לייצר הודעות אוטומטיות כרגע, נמשיך הלאה.\n\n'
+      : "Couldn't generate automated messages right now — moving on.\n\n"
+    return skipped.handled ? { ...skipped, reply: prefix + skipped.reply } : skipped
+  }
+
   const thinking = lang === 'he'
     ? '⏳ מכין את ההודעות האוטומטיות שלך...'
     : '⏳ Generating your automated message templates...'
-
-  const generated = await generateAutomatedMessages(ctx)
-  const ns: BksState = { ...state, ...(generated ? { automatedMessages: generated } : {}), messageReviewGroup: 0 }
+  const ns: BksState = { ...state, automatedMessages: generated, messageReviewGroup: 0 }
   await ctx.workflow.advance('message-review', ns as unknown as Record<string, unknown>)
-
-  if (!generated) {
-    return {
-      handled: true,
-      reply: lang === 'he'
-        ? 'לא הצלחתי לייצר הודעות כרגע. דלגנו לשלב הבא.'
-        : "Couldn't generate messages right now. Skipping to next step.",
-      sessionComplete: false,
-      skillName,
-    }
-  }
-
   return {
     handled: true,
     reply: thinking + '\n\n' + buildMessageReviewPrompt(ctx, ns),
