@@ -146,11 +146,12 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'scheduleGroupSession',
-    description: 'Proactively place a SINGLE group session / class on the calendar for one specific date (e.g. "schedule a Vinyasa class this Tuesday 11:00–12:00, 10 spots"). Use this when the manager wants to put a one-off class on the calendar BEFORE any customer books it. Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours OR to set up a class that REPEATS every week ("yoga every Monday"), use manageBusinessSettings. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
+    description: 'Proactively place a SINGLE group session / class on the calendar for one specific date (e.g. "schedule a Vinyasa class this Tuesday 11:00–12:00 with Dana, 10 spots"). Use this when the manager wants to put a one-off class on the calendar BEFORE any customer books it. Capture the instructor when the manager names one ("with Dana" → instructor: "Dana"). Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours OR to set up a class that REPEATS every week ("yoga every Monday"), use manageBusinessSettings. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         serviceName: { type: Type.STRING, description: 'Name of the existing group service this class is an instance of (optional; matched fuzzily)' },
+        instructor: { type: Type.STRING, description: 'Name of the instructor teaching this class, if the manager named one (e.g. "with Dana" → "Dana"). Must be an instructor that already exists; optional.' },
         title: { type: Type.STRING, description: 'Display title if no service is linked (optional)' },
         date: DATE_PIECES_SCHEMA,
         startTime: timeSchema('Start clock time the manager said, 24-hour'),
@@ -368,7 +369,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Use it as well to set up, stop, or skip one date of a RECURRING weekly class / group session (e.g. "yoga every Monday 10am", "stop the weekly pilates class", "no spin class this coming Tuesday"). Also use it to add or manage instructors / teaching staff and their weekly hours (e.g. "add Dana as a yoga instructor Mon/Wed 9–13", "change Dana's hours", "Dana also teaches pilates", "remove Dana"). Never handle these as conversational replies.
 - listCalendarEvents: use for schedule questions. Use intent check_free_slots when the manager asks what times are open/free — it returns real bookable openings. Do not call it unless the manager is asking about their calendar.
 - createCalendarEvent: personal/business 1-on-1 events only (e.g. "dentist 3pm"). Do not use for blocking customer booking slots — that is manageBusinessSettings.
-- scheduleGroupSession: use when the manager wants to put a SINGLE class/group session on the calendar for one specific date ahead of bookings (e.g. "add a yoga class this Tuesday 11am, 10 spots"). For a class that repeats every week ("every Monday", "weekly"), use manageBusinessSettings instead.
+- scheduleGroupSession: use when the manager wants to put a SINGLE class/group session on the calendar for one specific date ahead of bookings (e.g. "add a yoga class this Tuesday 11am with Dana, 10 spots"). Capture the instructor when named ("with Dana"). For a class that repeats every week ("every Monday", "weekly"), use manageBusinessSettings instead.
 - deleteCalendarEvent: only for personal/business events, blocks, or classes the manager created. NEVER use for customer bookings — use manageBusinessSettings with a cancellation instruction for those.
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests.

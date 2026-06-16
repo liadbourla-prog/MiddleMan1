@@ -458,6 +458,14 @@ const strings = {
     he: (name: string) => `לא נמצא מדריך/ה בשם ${name}.`,
     en: (name: string) => `No instructor named ${name} found.`,
   },
+  schedule_instructor_not_found: {
+    he: (name: string) => `אין לי מדריך/ה בשם ${name}. רוצה להוסיף אותו/ה קודם? ("תוסיף את ${name} כמדריך/ה")`,
+    en: (name: string) => `I don't have an instructor named ${name}. Add them first? (e.g. "add ${name} as a yoga instructor")`,
+  },
+  schedule_instructor_ambiguous: {
+    he: (name: string) => `יש יותר ממדריך/ה אחד/ת בשם ${name}. למי מהם התכוונת?`,
+    en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,
+  },
   apply_provider_ambiguous: {
     he: (name: string) => `יש יותר ממדריך/ה אחד/ת בשם ${name}. למי מהם התכוונת?`,
     en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,

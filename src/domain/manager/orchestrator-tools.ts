@@ -13,11 +13,12 @@ import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
 import { applyInstruction, pauseConversation, resumeConversation } from './apply.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
-import type { Lang } from '../i18n/t.js'
+import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
 import { getOpenSlots } from '../availability/service.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
+import { findProviderByName } from '../provider/lookup.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -267,6 +268,7 @@ export async function executeCreateCalendarEvent(
 interface ScheduleGroupSessionArgs {
   serviceName?: string
   title?: string
+  instructor?: string
   date: DatePieces
   startTime: TimePieces
   endTime?: TimePieces
@@ -336,6 +338,20 @@ export async function executeScheduleGroupSession(
     }
   }
 
+  // Resolve the named instructor to an EXISTING provider (explicit-add model:
+  // never auto-create from a typo). Clarify when unknown/ambiguous.
+  let providerId: string | null = null
+  if (args.instructor && args.instructor.trim().length > 0) {
+    const found = await findProviderByName(ctx.db, ctx.businessId, args.instructor.trim())
+    if (found.status === 'none') {
+      return { success: false, needsClarification: true, message: i18n.schedule_instructor_not_found[ctx.lang](args.instructor.trim()) }
+    }
+    if (found.status === 'ambiguous') {
+      return { success: false, needsClarification: true, message: i18n.schedule_instructor_ambiguous[ctx.lang](args.instructor.trim()) }
+    }
+    providerId = found.id
+  }
+
   const maxParticipants = args.maxParticipants ?? serviceCapacity ?? null
   const title = args.title ?? serviceName ?? (ctx.lang === 'he' ? 'שיעור קבוצתי' : 'Group class')
 
@@ -347,6 +363,7 @@ export async function executeScheduleGroupSession(
     title,
     serviceTypeId,
     maxParticipants,
+    providerId,
   })
 
   // Durable outbound mirror (Phase 2) — no-op in internal mode.
@@ -357,7 +374,7 @@ export async function executeScheduleGroupSession(
   return {
     success: true,
     eventId: `${BLOCK_ID_PREFIX}${block.id}`,
-    scheduled: { title, when, maxParticipants: maxParticipants ?? null },
+    scheduled: { title, when, maxParticipants: maxParticipants ?? null, instructor: args.instructor?.trim() ?? null },
   }
 }
 
