@@ -98,7 +98,7 @@ function isSkipText(text: string): boolean {
 }
 
 function isApproveText(text: string): boolean {
-  return new RegExp("^(approve[d]?|confirm(?:ed)?|yes|ok(?:ay)?|good|great|looks? good|perfect|אשר|מאשר(?:ת|ים)?|אישור|אישרתי|מאושר(?:ת)?|טוב|מעולה|כן|אוקיי|סבבה|נראה טוב)" + KW_END, 'i').test(text.trim())
+  return new RegExp("^(approve[d]?|confirm(?:ed)?|yes|sure|ok(?:ay)?|good|great|looks? good|perfect|אשר|מאשר(?:ת|ים)?|אישור|אישרתי|מאושר(?:ת)?|טוב|מעולה|כן|אוקיי|בטח|בסדר|יאלה|קדימה|סבבה|נראה טוב)" + KW_END, 'i').test(text.trim())
 }
 
 // ── Section re-run detection ──────────────────────────────────────────────────
@@ -509,6 +509,35 @@ Return JSON matching the schema.`
   return callJson(system, text, openQuestionSchema)
 }
 
+// ── Universal turn-intent triage (interjection / deferral handling) ─────────────
+
+const turnIntentSchema = z.object({
+  kind: z.enum(['answer', 'lead_in', 'info', 'question', 'go_back']),
+  capture: z.string().nullable().optional(),
+  faqQuestion: z.string().nullable().optional(),
+  faqAnswer: z.string().nullable().optional(),
+})
+type TurnIntent = z.infer<typeof turnIntentSchema>
+
+// Step-aware triage: is the owner answering the CURRENT question, or interjecting
+// (a side question, extra info, a "do it but first…" lead-in, or a wish to go
+// back)? Defaults to 'answer' so the normal step handler always runs on any doubt
+// or failure — this never blocks the flow.
+async function classifyTurnIntent(stepAsk: string, text: string): Promise<TurnIntent | null> {
+  const system = `You are triaging a business owner's reply during PA setup.
+The PA just asked the owner: """${stepAsk}"""
+
+Classify the owner's reply into one "kind":
+- "answer": they are directly answering, approving, editing, or skipping THAT question. This is the DEFAULT — prefer it whenever the reply plausibly responds to the question.
+- "lead_in": they want to tell you something but haven't said it yet — e.g. "sure, but can I tell you about our team first?", "I want to add something", "אפשר לספר לך משהו קודם?". No concrete fact is included yet.
+- "info": they volunteered a concrete business fact that is NOT an answer to the current question (e.g. "our prices went up", "the main instructor is Yossi"). Put the fact in "capture"; if it reads like a customer FAQ, also fill faqQuestion + faqAnswer.
+- "question": they asked YOU a question instead of answering.
+- "go_back": they want to change or revisit something asked earlier.
+
+Return JSON. When unsure, choose "answer".`
+  return callJson(system, text, turnIntentSchema)
+}
+
 // ── Cancellation/payment parsing helpers ───────────────────────────────────────
 
 function parseCancellationUpdate(text: string): { cutoffHours?: number; feeAmount?: number; feeCurrency?: string } {
@@ -616,6 +645,53 @@ async function dispatchStep(
       reply: reply ?? (done ? completionReply(lang) : Q[nextStep as Step](ctx, ns)),
       sessionComplete: done,
       skillName,
+    }
+  }
+
+  // ── Universal interjection / deferral handling (applies to every step) ──────
+  // A human front-desk person, asked anything, can field "sure, but first let me
+  // tell you about the team", a side question, or a volunteered fact — then return
+  // to what they were doing. This gives the skill that, uniformly: triage the turn;
+  // if it isn't a direct answer, capture/answer it and RE-PRESENT the current step
+  // without advancing. Bare approve/skip/cancel words skip triage (fast path), and
+  // any triage failure falls through to the normal per-step handler below.
+  // Closed/decision steps only expect approve/skip/edit, so a free-form message
+  // there is genuinely an interjection. The open-ended info-gathering steps
+  // (brand-voice … faq-collect, open-question) already accept arbitrary input and
+  // have their own richer handling, so we leave them untouched to avoid regressing.
+  const TRIAGE_STEPS = new Set<Step>(['cancellation-payment-confirm', 'message-review', 'faq-review', 'website-offer', 'gmb-offer'])
+  if (TRIAGE_STEPS.has(step)) {
+    const wordCount = text.split(/\s+/).filter(Boolean).length
+    const isBareControl = wordCount <= 2 && (isApproveText(text) || isSkipText(text) || isCancelText(text))
+    if (text.length > 0 && !isBareControl) {
+      const stepAsk = (Q[step]?.(ctx, state) ?? '').replace(/\s+/g, ' ').slice(0, 240)
+      const intent = await classifyTurnIntent(stepAsk, text)
+      if (intent && intent.kind !== 'answer') {
+        const prompt = Q[step]?.(ctx, state) ?? ''
+        if (intent.kind === 'lead_in') {
+          // They want to tell us something — invite it; the next turn carries the
+          // content. Don't re-present the step yet (we're pausing it on purpose).
+          const lead = lang === 'he' ? 'בכיף, ספר/י לי — אני מקשיב/ה.' : "Sure — go ahead, I'm listening."
+          return { handled: true, reply: lead, sessionComplete: false, skillName }
+        }
+        if (intent.kind === 'info') {
+          if (intent.faqQuestion && intent.faqAnswer) {
+            const updated = [...(state.generatedFaqs ?? []), { question: intent.faqQuestion, answer: intent.faqAnswer }]
+            await ctx.saveFAQs(updated)
+            state.generatedFaqs = updated
+          } else if (intent.capture) {
+            await ctx.deferFeatureRequest(intent.capture)
+          }
+          const ack = lang === 'he' ? 'רשמתי 👍' : 'Noted 👍'
+          return { handled: true, reply: `${ack}\n\n${prompt}`, sessionComplete: false, skillName }
+        }
+        // 'question' or 'go_back': acknowledge (and capture), then resume the step.
+        if (intent.capture) await ctx.deferFeatureRequest(intent.capture)
+        const ack = intent.kind === 'go_back'
+          ? (lang === 'he' ? 'הבנתי, רשמתי לי את זה.' : "Got it — I've noted that.")
+          : (lang === 'he' ? 'שאלה טובה — בוא/י נשלים את ההגדרה ואחזור לזה.' : "Good question — let's finish setup and I'll come back to it.")
+        return { handled: true, reply: `${ack}\n\n${prompt}`, sessionComplete: false, skillName }
+      }
     }
   }
 
