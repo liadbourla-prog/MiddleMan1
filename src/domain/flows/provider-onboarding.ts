@@ -106,8 +106,10 @@ async function handleStep(
 
   switch (session.step) {
     case 'business_name': {
-      // Treat casual greetings as a re-ask rather than accepting as the business name
-      if (/^(שלום|היי|הי|אהלן|hello|hi|hey)\b/i.test(text)) {
+      // Treat casual greetings as a re-ask rather than accepting as the business name.
+      // Boundary uses a lookahead (not a bare `\b`, which fails after Hebrew letters
+      // at end-of-input and would never match Hebrew greetings).
+      if (/^(שלום|היי|הי|אהלן|hello|hi|hey)(?=\b|$|\s|[.,!?'"\-])/i.test(text)) {
         const greetFallback = `מה שם העסק שלכם? / What's the name of your business?`
         const greetReply = await generateProviderOnboardingReply({ step: 'ask_business_name', lang: 'bilingual', fallback: greetFallback })
         return { reply: greetReply }

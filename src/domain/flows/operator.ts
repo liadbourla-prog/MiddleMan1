@@ -133,8 +133,9 @@ async function routeOperatorMessage(
 
   // Operator requests a test Embedded Signup link — match both keyword shorthand and natural language
   const isLinkRequest =
-    // Exact keyword / shorthand
-    /^(link|test link|signup link|onboarding link|קישור|לינק)\b/i.test(text) ||
+    // Exact keyword / shorthand. Lookahead (not a bare `\b`, which never matches
+    // after Hebrew letters at end-of-input) so Hebrew keywords resolve.
+    /^(link|test link|signup link|onboarding link|קישור|לינק)(?=\b|$|\s|[.,!?'"\-])/i.test(text) ||
     // Natural language: "send me the link", "שלח לי את הלינק", etc.
     /(שלח|תביא|תן|give|send|provide).*(לינק|קישור|link)/i.test(text) ||
     // Link type mentioned alongside signup / onboarding / system / test

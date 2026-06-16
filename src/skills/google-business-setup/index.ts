@@ -99,16 +99,24 @@ interface GmbState {
 
 // ── Intent helpers ────────────────────────────────────────────────────────────
 
+// Hebrew-safe trailing boundary — a bare `\b` does not match after a Hebrew letter
+// at end-of-input (Hebrew is non-word in JS regex without /u), so Hebrew keywords
+// silently never match. See business-knowledge-setup for the same fix.
+const KW_END = "(?=\\b|$|\\s|[.,!?'\"\\-])"
+
 function isSkipText(text: string): boolean {
-  return /^(skip|next|later|no|not now|לא|דלג|הבא|אחר כך|pass)\b/i.test(text.trim())
+  return new RegExp("^(skip|next|later|no|not now|לא|דלג|הבא|אחר כך|pass)" + KW_END, 'i').test(text.trim())
 }
 
 function isApproveText(text: string): boolean {
-  return /^(yes|ok|sure|approve|let'?s go|do it|כן|אוקיי|בסדר|יאלה|קדימה|בטח)\b/i.test(text.trim())
+  return new RegExp("^(yes|ok|sure|approve|let'?s go|do it|כן|אוקיי|בסדר|יאלה|קדימה|בטח)" + KW_END, 'i').test(text.trim())
 }
 
 function isCancelText(text: string): boolean {
-  return /\b(stop|cancel|never mind|exit|quit|עצור|בטל|בוטל|עזוב|לא צריך)\b/i.test(text.trim())
+  // Word-bounded "contains" match that is safe for Hebrew (the original `\b…\b`
+  // failed on both sides for Hebrew). Requires the keyword to be delimited by
+  // start/whitespace/punctuation so e.g. "מבוטל" does not match "בטל".
+  return /(?:^|[\s.,!?])(stop|cancel|never mind|exit|quit|עצור|לבטל|ביטול|בטל|בוטל|עזוב|לא צריך)(?=$|[\s.,!?])/i.test(text.trim())
 }
 
 function makeReply(ctx: SkillContext, reply: string, sessionComplete = false): SkillOutcome {

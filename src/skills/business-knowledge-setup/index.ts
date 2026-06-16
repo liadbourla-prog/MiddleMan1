@@ -83,16 +83,22 @@ type Step =
 
 // ── Intent detection ──────────────────────────────────────────────────────────
 
+// Hebrew-safe trailing boundary. A bare `\b` does NOT match after a Hebrew letter
+// at end-of-input (Hebrew is non-word in JS regex without /u), so `^(...|כן)\b`
+// silently fails for ALL Hebrew keywords. This lookahead accepts a word boundary,
+// end-of-string, whitespace, or punctuation — working for both scripts.
+const KW_END = "(?=\\b|$|\\s|[.,!?'\"\\-])"
+
 function isCancelText(text: string): boolean {
-  return /^(stop|cancel|never mind|quit|done|finished|סיים|עצור|בטל|די|הפסק|no thanks|that'?s (all|enough|ok))\b/i.test(text.trim())
+  return new RegExp("^(stop|cancel|never mind|quit|done|finished|סיים|עצור|בטל|די|הפסק|no thanks|that'?s (all|enough|ok))" + KW_END, 'i').test(text.trim())
 }
 
 function isSkipText(text: string): boolean {
-  return /^(skip|next|later|דלג|הבא|אחר כך|pass)\b/i.test(text.trim())
+  return new RegExp("^(skip|next|later|דלג|הבא|אחר כך|pass)" + KW_END, 'i').test(text.trim())
 }
 
 function isApproveText(text: string): boolean {
-  return /^(approve[d]?|yes|ok|good|great|looks? good|perfect|approved|אשר|אישור|טוב|מעולה|כן|אוקיי|מאושר|נראה טוב)\b/i.test(text.trim())
+  return new RegExp("^(approve[d]?|confirm(?:ed)?|yes|ok(?:ay)?|good|great|looks? good|perfect|אשר|מאשר(?:ת|ים)?|אישור|אישרתי|מאושר(?:ת)?|טוב|מעולה|כן|אוקיי|סבבה|נראה טוב)" + KW_END, 'i').test(text.trim())
 }
 
 // ── Section re-run detection ──────────────────────────────────────────────────
