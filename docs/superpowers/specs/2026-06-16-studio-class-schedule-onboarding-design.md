@@ -1,139 +1,95 @@
-# Studio Class Schedule + Instructor Onboarding — Design (DRAFT for review)
+# Studio Instructors ↔ Booking: week-to-week class scheduling — Design
 
 **Date:** 2026-06-16
-**Status:** Draft — autonomous design pass; **needs user review on the marked decisions**
-**Relates to:** instructor-management (provider_change), recurring-class system (class_series)
+**Status:** Decisions confirmed (D1–D5 + model) — ready to turn into an implementation plan
+**Relates to:** instructor-management (`provider_change`), recurring-class system (`class_series`),
+group booking (`requestGroupClassBooking`)
 
 ---
 
-## 1. The problem, restated correctly
+## 1. The model (confirmed)
 
-The owner described instructors during onboarding ("Dana & Noa teach yoga, Dana also
-pilates, Mai & Gal pilates, Dan/Uri/Guy breathing"). Today that becomes an **FAQ**, not
-bookable structure: `provider identities = 0`, `provider_assignments = 0`, `class_series = 0`.
-So "book yoga with Dana" can't resolve Dana.
+A studio is **session-based and managed week-to-week in the ongoing Branch-3 conversation** —
+not a one-time onboarding capture. The owner schedules each week's classes conversationally
+("schedule yoga Monday 10:00 with Dana, 12 spots"), and each class carries its **instructor** and
+**capacity** and becomes bookable. Customers book **into a class**.
 
-The deeper insight (from the owner): a studio is **session-based**, not appointment-based.
-It doesn't run on "Dana is free 9–20"; it runs on **classes** — *Monday 10:00 Yoga, 60 min,
-cap 12, taught by Dana*. Customers book **into a class**. So the unit to capture is the
-**class schedule**, and the instructor is a property of the class — not a separate
-availability window.
+Confirmed decisions:
+- **D1 — yes:** a booking into a class **inherits that class's instructor** (`providerId`).
+- **Model — mostly week-to-week, ongoing** (one-off sessions); recurring series optional for any
+  genuinely fixed classes (open-ended, **D5**).
+- **Instructors — explicit add, then schedule:** the owner adds instructors first
+  ("add Dana as a yoga instructor"), then references them when scheduling. A name typo can't
+  silently create a phantom instructor.
+- **D3 — keep the instructor FAQ and upgrade it** (see §4).
+- **D4 — yes:** a class's length defaults to the linked service's `durationMinutes` when unstated.
 
-## 2. What already exists (reuse, do not rebuild)
+Because the schedule lives in the weekly conversation, **onboarding needs no schedule capture**,
+and **instructors need no separate availability windows** — an instructor's "schedule" *is* the
+set of classes assigned to them.
 
-The session model is already supported end-to-end:
+## 2. What already exists (reuse)
 
-- **`class_series`** (recurring weekly class): `serviceTypeId`, **`providerId`**, `dayOfWeek`,
-  `startTime`, `durationMinutes`, **`maxParticipants`**, `startDate`, `endDate?`, `timezone`.
-  `createSeries()` already accepts `providerId` ([series.ts]).
-- **Materializer** turns a series into `calendar_blocks` (`type='class'`) carrying
-  **`providerId`** + `maxParticipants` ([series.ts:167]).
-- **Group booking** (`requestGroupClassBooking`, [engine.ts:347]) enforces **per-class
-  capacity** via a `FOR UPDATE` count on the slot.
-- **Instructors** are `provider` identities + `provider_assignments` (instructor↔service),
-  created by `applyProviderChange` ([manager/apply.ts]).
-- **Customers already see/book scheduled classes** ("day.classes" with remaining spots,
-  [customer-booking.ts:252]).
+- **Instructor creation** — `applyProviderChange('add')` makes a `provider` identity +
+  `provider_assignments` ([manager/apply.ts]). Hours are optional and **omitted** for studio
+  instructors (their classes are their schedule). Built already.
+- **One-off class** — `scheduleGroupSession` → `createBlock(type='class', maxParticipants)`
+  ([orchestrator-tools.ts:342]). `createBlock` **already accepts `providerId`** ([blocks.ts:30]).
+- **Recurring class** — `recurring_class_change` → `createSeries(...)`; `createSeries` already
+  accepts `providerId`; the materializer carries it into the session `calendar_blocks`.
+- **Group booking** — `requestGroupClassBooking` enforces **per-class capacity** (FOR UPDATE).
+- **Customers already see/book scheduled classes** ("day.classes" with remaining spots).
 
-So a session-based studio maps cleanly onto: **services → instructors (providers) →
-class_series (the schedule, linking service + instructor + day/time + capacity)**.
+## 3. The gaps to close (small, additive)
 
-## 3. The one real engine gap (must fix for correct attribution)
+1. **`scheduleGroupSession` doesn't attach an instructor.** It calls `createBlock` **without
+   `providerId`** and has no instructor arg. → Add an `instructor` arg; resolve it to an existing
+   `provider` (clarify if not found — "I don't have an instructor named Dana; add her first?");
+   pass `providerId` to `createBlock`. Update the tool description + classifier so
+   "…with Dana" is captured.
+2. **`applyRecurringClassChange` ignores `providerHint`.** The schema parses `providerHint` but
+   `createSeries` is called **without `providerId`**. → Resolve `providerHint` → provider, pass
+   `providerId` to `createSeries`.
+3. **Booking doesn't inherit the class's instructor (D1).** `requestBooking` resolves a provider
+   via `provider_assignments`+`availability`, not the class block. → When booking into a class
+   session, set the booking's `providerId` from the matched `calendar_blocks.providerId`. Then
+   "book yoga with Dana" attributes Dana, and instructors need no availability rows.
 
-The booking engine resolves the provider **independently** of the class it's booking into:
+## 4. Instructor FAQ upgrade (D3)
 
-```
-const resolvedProvider = request.providerId
-  ? { identityId: request.providerId, ... }
-  : await resolveProvider(serviceTypeId, slot, hint)   // provider_assignments + availability
-```
+Today it's a **static paragraph** the owner typed once — it goes stale the moment the schedule
+changes. Upgrade to **derived + dynamic**:
+- Auto-generate "who teaches what" from the **live roster + upcoming scheduled classes**
+  ("Dana teaches Yoga Mon 10:00 & Wed 18:00 this week"), refreshed as the schedule changes —
+  not a frozen snapshot.
+- Optionally capture a short **bio/specialty per instructor** ("Dana — prenatal-yoga specialist,
+  10 yrs") for warmer answers when a customer asks about a specific instructor.
+- Keep it answer-on-demand (Branch 4 stays reactive — it doesn't volunteer the roster unprompted,
+  per the existing stance).
 
-It does **not** read the `calendar_block.providerId` of the class being booked. So a class
-that is "Dana's" (series.providerId = Dana) would attribute the booking to whatever
-`resolveProvider` returns (often null, since instructors in the session model may have no
-generic `availability` rows — their "availability" *is* their classes).
+## 5. Bridge from onboarding-volunteered instructors
 
-**Design decision (D1):** when a customer books into a specific **class** session, the booking
-must **inherit that class's `providerId`** (from the `calendar_blocks`/series row), rather than
-re-resolving. This makes "the Monday 10:00 yoga class is Dana's" true at booking time and means
-**instructors need no separate availability windows** in the session model — their schedule is
-their classes.
+Per "explicit add," we do **not** auto-create instructors from the onboarding FAQ. Instead, after
+the owner volunteers instructors during setup, the PA **nudges** once: "I noted your instructors —
+want them bookable? Just say 'add Dana as a yoga instructor'." (A prompt, not silent creation.)
+*(Optional; low-risk; can be dropped if you'd rather keep onboarding lean.)*
 
-## 4. Proposed model & flow
+## 6. Scope / plan outline
 
-### 4.1 Capture (onboarding) — dedicated step + auto-detect *(per earlier decision)*
-- **Dedicated step**: after services, ask for the **class schedule**: *"What classes do you run,
-  when, who teaches each, and how many spots?"* — e.g. "Yoga Mon & Wed 10:00 with Dana, 12 spots;
-  Pilates Tue 18:00 with Mai, 10 spots."
-- **Auto-detect**: if the owner volunteers instructor/class info at another moment (as happened),
-  recognize it and offer to set it up.
-- **Parse** the free text (LLM extraction) into structured rows:
-  `{ serviceName, dayOfWeek, startTime, durationMinutes?, instructorName, maxParticipants }[]`.
+1. **Engine (D1):** book-into-class inherits `calendar_blocks.providerId`. Unit + integration test
+   (book a class with instructor → booking carries that instructor; capacity still enforced).
+2. **`scheduleGroupSession` instructor:** tool arg + classifier + resolve-existing-provider +
+   `providerId` to `createBlock`; clarify when the instructor doesn't exist.
+3. **`recurring_class_change` instructor:** resolve `providerHint` → `providerId` into `createSeries`.
+4. **FAQ upgrade (D3):** derive "who teaches what" from roster + upcoming classes; optional bio field.
+5. **(Optional) onboarding nudge** to add volunteered instructors.
+6. **Tests:** unit (provider resolution/clarify in scheduleGroupSession; recurring providerId),
+   integration (schedule class with Dana → materialize/inherit → customer books → Dana attributed,
+   capacity enforced), quality (the "schedule yoga Monday 10 with Dana" + "who teaches yoga?" turns).
 
-### 4.2 Create (cross the skill boundary cleanly)
-Skills can't import domain. Add to `SkillContext` (co-owned `skill-types.ts`), implemented in
-`src/domain/skills/context-builder.ts` (which may import domain):
-
-```ts
-// skill-types.ts
-saveStudioSchedule: (classes: Array<{
-  serviceName: string
-  instructorName: string
-  dayOfWeek: number          // 0–6
-  startTime: string          // 'HH:MM' local
-  durationMinutes?: number   // default from the service
-  maxParticipants: number
-}>) => Promise<{ created: number; instructors: string[] }>
-```
-
-`context-builder` implementation, per class:
-1. find-or-create the **service** (exists) and set its `maxParticipants` if grouped;
-2. find-or-create the **instructor** (`provider` identity + `provider_assignments`) — reuse the
-   `applyProviderChange('add')` core so there is **one** instructor-creation path;
-3. create the **`class_series`** (`createSeries`) with `providerId` = that instructor, the day/time,
-   capacity, and `timezone` = business tz; the materializer schedules the sessions.
-
-### 4.3 Book (already works, plus the D1 fix)
-Customer books a class → capacity enforced per session → booking inherits the class's instructor
-(after D1). "Book yoga with Dana" resolves to Dana's classes.
-
-## 5. Reconciliation with existing capabilities (no duplication)
-- Instructor creation reuses the **`applyProviderChange` 'add'** core (one path).
-- Class creation reuses **`createSeries`** (same as the orchestrator's `recurring_class_change`).
-- The owner can still refine everything post-onboarding via the orchestrator
-  ("move the Monday class to 11:00", "add Dana to pilates", "stop the Friday class").
-- The onboarding FAQ capture ("who teaches what") can remain as a customer-facing answer *in
-  addition* to the structured classes (decision D3 below).
-
-## 6. Decisions needed from you
-
-- **D1 — booking inherits the class's instructor** (recommended **yes**): fix the engine so a
-  class booking attributes the class's `providerId`. Without it, session-model instructor
-  attribution is unreliable. *(I recommend yes; it's the crux of the session model.)*
-- **D2 — where the dedicated step lives**: (a) a new **manager-onboarding** step (Branch 3,
-  before "go live"), or (b) inside the **business-knowledge-setup** skill (post-go-live, where the
-  owner already volunteered instructors). The skill is more natural for the cross-boundary methods
-  and matches where it happened; onboarding makes it part of first-run setup. *Your call.*
-- **D3 — keep the instructor FAQ too?** Keep the auto-generated "who teaches what" FAQ for customer
-  Q&A in addition to the structured classes, or replace it once classes exist?
-- **D4 — duration default**: if the owner doesn't state a class length, default to the service's
-  `durationMinutes`? *(recommended yes.)*
-- **D5 — open-ended vs dated series**: create series as open-ended (no end date, rolls forward), or
-  ask for a term? *(recommended open-ended; owner can stop a series later.)*
-
-## 7. Scope & rough plan (after decisions)
-1. **Engine (D1):** book-into-class inherits `calendar_block.providerId`. Unit + integration tests.
-2. **Contract:** `SkillContext.saveStudioSchedule` in `skill-types.ts`; implement in
-   `context-builder.ts` (reusing `applyProviderChange` core + `createSeries`).
-3. **Capture:** LLM parser (free text → structured classes) + the dedicated step (D2) + auto-detect.
-4. **Reconcile/refine:** ensure orchestrator edits still work on onboarding-created series.
-5. **Tests:** parser unit; integration (capture schedule → classes materialize → book class →
-   instructor attributed, capacity enforced); quality (the capture conversation).
-
-## 8. Files (anticipated)
-`src/shared/skill-types.ts` (method), `src/domain/skills/context-builder.ts` (impl),
-`src/domain/booking/engine.ts` (D1 inherit), the capture parser (new, in adapters/llm or the
-chosen flow), the dedicated step (manager-onboarding **or** business-knowledge-setup per D2),
-plus tests. Reuse: `series.ts`, `manager/apply.ts` (provider add), resolver/engine read-side.
-
-**No new tables expected** — the model reuses `class_series` / providers / `provider_assignments`.
+## 7. Files (anticipated)
+`src/domain/manager/orchestrator-tools.ts` (scheduleGroupSession instructor), `src/adapters/llm/orchestrator.ts`
+(tool description/routing) + classifier if needed, `src/domain/manager/apply.ts`
+(`applyRecurringClassChange` providerId), `src/domain/booking/engine.ts` (D1 inherit),
+`src/domain/provider/roster.ts` or knowledge layer (derived FAQ), plus tests. **No new tables.**
+Reuse `createBlock`/`createSeries`/`applyProviderChange`/resolver.
