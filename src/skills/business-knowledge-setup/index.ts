@@ -125,9 +125,9 @@ const Q: Record<Step, (ctx: SkillContext, state: BksState) => string> = {
   'brand-voice': (ctx) => ctx.language === 'he'
     ? `לפני שהלקוחות מגיעים, בואנו נלמד על *${ctx.business.name}* כדי שאוכל לייצג אתכם הכי טוב.
 
-איך היית מתאר/ת את *${ctx.business.name}*? מה הרגש שאתה/את רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?
+איך היית מתאר את *${ctx.business.name}*? מה הרגש שאתה רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?
 
-(ככל שתשתף/י יותר, כך אדבר טוב יותר בשמך)`
+(ככל שתשתף יותר, כך אדבר טוב יותר בשמך)`
     : `Before customers arrive, let me get to know *${ctx.business.name}* so I can represent you well.
 
 How would you describe *${ctx.business.name}*? What feeling do you want customers to walk away with? What makes you stand out?
@@ -137,15 +137,15 @@ How would you describe *${ctx.business.name}*? What feeling do you want customer
   'communication-style': (ctx) => ctx.language === 'he'
     ? `מעולה! עכשיו בואנו נגדיר איך אני מתקשר עם לקוחות:
 
-• פורמלי ("אתה/את") או קז'ואל ("אתם", שפה חופשית)?
+• פורמלי ("אתה") או קז'ואל ("אתם", שפה חופשית)?
 • אימוג'ים: אף פעם / לפעמים / לעתים קרובות?
 • להשתמש בשם הפרטי של הלקוח?
 • הומור: כן / לא?
 • ביטויים שמבייש אותך לראות מהנציג?
-• ביטויים שאתה/את אוהב/ת שמשתמשים בהם?
-• אם לקוח גס — להיות נחרץ/ת, רך/ה, או להעביר אליך מיד?
+• ביטויים שאתה אוהב שמשתמשים בהם?
+• אם לקוח גס — להיות נחרץ, רך, או להעביר אליך מיד?
 
-ענה/י בכל צורה שנוחה לך — תיאור, רשימה, או פשוט "כמו שאני מדבר/ת"`
+ענה בכל צורה שנוחה לך — תיאור, רשימה, או פשוט "כמו שאני מדבר"`
     : `Great! Now let me understand how you like to communicate with customers:
 
 • Formal ("Sir/Ma'am") or casual (first names, relaxed tone)?
@@ -159,11 +159,11 @@ How would you describe *${ctx.business.name}*? What feeling do you want customer
 Answer however feels natural — a list, a description, or just say "talk like I do"`,
 
   'notification-prefs': (ctx) => ctx.language === 'he'
-    ? `מתי אתה/את רוצה שאשלח לך התראה אישית?\n\n• תור חדש אושר\n• לקוח ראשון מזמין (כדי שתהיה/י מוכן/ה)\n• ביטול התור\n• שינוי מועד\n• לא-הגיע (לקוח לא הופיע)\n• לקוח משתמש בשפה רגשית / כועסת\n\nאמור/י "הכל", "כלום", או מה שחשוב לך`
+    ? `מתי אתה רוצה שאשלח לך התראה אישית?\n\n• תור חדש אושר\n• לקוח ראשון מזמין (כדי שתהיה מוכן)\n• ביטול התור\n• שינוי מועד\n• לא-הגיע (לקוח לא הופיע)\n• לקוח משתמש בשפה רגשית / כועסת\n\nאמור "הכל", "כלום", או מה שחשוב לך`
     : `When do you want me to send you a personal notification?\n\n• New booking confirmed\n• First-time customer books (so you can prepare)\n• A cancellation comes in\n• A customer reschedules\n• A no-show (customer never arrived)\n• A customer uses upset or emotional language\n\nSay "all of them", "none", or list the ones you care about`,
 
   'handoff-rules': (ctx) => ctx.language === 'he'
-    ? `האם יש מצבים שבהם אתה/את רוצה לקחת שיחה בעצמך ולא להשאיר אותה לי?\n\nלמשל: לקוח ארגוני, תלונה, בקשה להנחה, ביקור יקר ערך.\n\nכשאני מעביר לך — מה לומר ללקוח? לדוגמה: "אעביר אתך ל[שמך]" או "הצוות יחזור אליך".\n\nויש מספר/דרך יצירת קשר אחרת שצריך להפנות אליה לסיטואציות מסוימות?`
+    ? `האם יש מצבים שבהם אתה רוצה לקחת שיחה בעצמך ולא להשאיר אותה לי?\n\nלמשל: לקוח ארגוני, תלונה, בקשה להנחה, ביקור יקר ערך.\n\nכשאני מעביר לך — מה לומר ללקוח? לדוגמה: "אעביר אתך ל[שמך]" או "הצוות יחזור אליך".\n\nויש מספר/דרך יצירת קשר אחרת שצריך להפנות אליה לסיטואציות מסוימות?`
     : `Are there situations where you want to take over personally and not leave them to me?\n\nFor example: corporate clients, complaints, discount requests, high-value bookings.\n\nWhen I hand off — what should I tell the customer? E.g. "I'll pass you to [your name]" or "The team will follow up".\n\nAnd is there a different number or contact to direct certain customers to?`,
 
   'cancellation-payment-confirm': (ctx) => {
@@ -178,7 +178,7 @@ Answer however feels natural — a list, a description, or just say "talk like I
       const cancPolicy = cutoffH === 0 ? 'ללא הגבלה (לקוחות יכולים לבטל בכל עת)' : `${cutoffH} שעות לפני התור`
       const feeStr = feeAmt ? `עמלת ביטול: ${feeAmt} ${feeCur}` : 'אין עמלת ביטול'
       const payStr = isPostPayment ? `תשלום מראש דרך: ${payMethod ?? 'לא הוגדר'}` : 'ללא תשלום מראש'
-      return `בואנו נאשר את הגדרות הביטול והתשלום שלך:\n\n*מדיניות ביטול:* ${cancPolicy}\n*${feeStr}*\n*תשלום:* ${payStr}\n\nהאם לשנות משהו? (למשל: "חלון ביטול 48 שעות", "עמלת ביטול 50 ש"ח", "שיטת תשלום ביט")\nאם הכל בסדר — ענה/י *אשר*`
+      return `בואנו נאשר את הגדרות הביטול והתשלום שלך:\n\n*מדיניות ביטול:* ${cancPolicy}\n*${feeStr}*\n*תשלום:* ${payStr}\n\nהאם לשנות משהו? (למשל: "חלון ביטול 48 שעות", "עמלת ביטול 50 ש"ח", "שיטת תשלום ביט")\nאם הכל בסדר — ענה *אשר*`
     } else {
       const cancPolicy = cutoffH === 0 ? 'No restriction (customers can cancel any time)' : `${cutoffH}h before appointment`
       const feeStr = feeAmt ? `Cancellation fee: ${feeAmt} ${feeCur}` : 'No cancellation fee'
@@ -198,20 +198,20 @@ Answer however feels natural — a list, a description, or just say "talk like I
     }
     const priceStr = next.price ? ` · ${next.price} ${next.currency}` : ''
     return lang === 'he'
-      ? `בואנו נדבר על *${next.name}* (${next.durationMinutes} דקות${priceStr}):\n\n• מה הלקוח צריך לדעת לפני שמזמין?\n• מה להביא, להכין, או להימנע ממנו?\n• יש התוויות נגד או הגבלות?\n\n(ענה/י *דלג* אם לא רוצה להוסיף פרטים)`
+      ? `בואנו נדבר על *${next.name}* (${next.durationMinutes} דקות${priceStr}):\n\n• מה הלקוח צריך לדעת לפני שמזמין?\n• מה להביא, להכין, או להימנע ממנו?\n• יש התוויות נגד או הגבלות?\n\n(ענה *דלג* אם לא רוצה להוסיף פרטים)`
       : `Let me learn about *${next.name}* (${next.durationMinutes} min${priceStr}):\n\n• What should a customer know before booking?\n• Anything to bring, prepare, or avoid beforehand?\n• Any contraindications or restrictions?\n\n(Reply *skip* if you'd rather not add details)`
   },
 
   'booking-edge-cases': (ctx) => ctx.language === 'he'
-    ? `כמה שאלות קצרות על כללי ההזמנה שלך:\n\n• הזמנה באותו יום: מקבל/ת? יש שעת סגירה (למשל "לא אחרי 14:00")?\n• walk-ins: מקבל/ת אותם? אם כן — האם לציין זאת ללקוחות?\n• הזמנות בו-זמניות מאותו לקוח ביום אחד: מותר?\n• תמחור: האם לציין מחיר מראש, להגיד "צרו קשר למחיר", או לפי בקשה?\n• מקדמה: אתה/את גובה מקדמה? אם כן — מה לומר ללקוחות לגבי התשלום?`
+    ? `כמה שאלות קצרות על כללי ההזמנה שלך:\n\n• הזמנה באותו יום: מקבל? יש שעת סגירה (למשל "לא אחרי 14:00")?\n• walk-ins: מקבל אותם? אם כן — האם לציין זאת ללקוחות?\n• הזמנות בו-זמניות מאותו לקוח ביום אחד: מותר?\n• תמחור: האם לציין מחיר מראש, להגיד "צרו קשר למחיר", או לפי בקשה?\n• מקדמה: אתה גובה מקדמה? אם כן — מה לומר ללקוחות לגבי התשלום?`
     : `A few quick questions about your booking rules:\n\n• Same-day bookings: accepted? Any cut-off time (e.g. "not after 2pm")?\n• Walk-ins: do you take them? If yes — should I mention this to customers?\n• Back-to-back bookings from the same customer in one day: allowed?\n• Pricing: state the price upfront, say "contact us for pricing", or share on request?\n• Deposits: do you take them? If so, what should I tell customers about paying?`,
 
   'off-limits': (ctx) => ctx.language === 'he'
-    ? `האם יש נושאים שאסור לי לטפל בהם — דברים שצריך להפנות ישירות אליך?\n\nלמשל: מיקוח על מחיר, הזמנות קבוצתיות גדולות, שאלות רפואיות ספציפיות, השוואות למתחרים.\n\nואיזה משפט לומר ללקוח כשאני לא יכול/ה לעזור? לדוגמה: "פנה/י ישירות ל[שמך] בנייד" או "זה משהו שנצטרך לדבר עליו ישירות"`
+    ? `האם יש נושאים שאסור לי לטפל בהם — דברים שצריך להפנות ישירות אליך?\n\nלמשל: מיקוח על מחיר, הזמנות קבוצתיות גדולות, שאלות רפואיות ספציפיות, השוואות למתחרים.\n\nואיזה משפט לומר ללקוח כשאני לא יכול לעזור? לדוגמה: "פנה ישירות ל[שמך] בנייד" או "זה משהו שנצטרך לדבר עליו ישירות"`
     : `Are there topics you never want me to handle — things I should redirect straight to you?\n\nFor example: price negotiations, large group bookings, specific medical questions, competitor mentions.\n\nAnd what should I say to the customer when I can't help? For example: "Please reach out to [your name] directly" or "This is something we'll need to discuss in person"`,
 
   'faq-collect': (ctx) => ctx.language === 'he'
-    ? `מה הלקוחות שואלים אותך הכי הרבה? אל תחשוב יותר מדי — רשום כל מה שעולה לך לראש. שאלות שחוזרות על עצמן, דברים שאתה/את מסביר/ת שוב ושוב, מה חשוב לדעת לפני הביקור.\n\nככל שיותר — יותר טוב.`
+    ? `מה הלקוחות שואלים אותך הכי הרבה? אל תחשוב יותר מדי — רשום כל מה שעולה לך לראש. שאלות שחוזרות על עצמן, דברים שאתה מסביר שוב ושוב, מה חשוב לדעת לפני הביקור.\n\nככל שיותר — יותר טוב.`
     : `What do customers ask you most often? Don't overthink it — just list anything that comes to mind. Recurring questions, things you explain repeatedly, must-know info before arriving.\n\nThe more the better.`,
 
   'message-review': (ctx, state) => buildMessageReviewPrompt(ctx, state),
@@ -219,7 +219,7 @@ Answer however feels natural — a list, a description, or just say "talk like I
   'faq-review': (ctx, state) => buildFaqReviewPrompt(ctx, state),
 
   'open-question': (ctx) => ctx.language === 'he'
-    ? `מצוין! כיסינו הרבה. יש משהו נוסף שרצית שאדע או שרצית לקבוע — משהו על העסק, על הלקוחות, על כל דבר שלא שאלתי?\n\n(ענה/י *סיים* אם הכל נאמר)`
+    ? `מצוין! כיסינו הרבה. יש משהו נוסף שרצית שאדע או שרצית לקבוע — משהו על העסק, על הלקוחות, על כל דבר שלא שאלתי?\n\n(ענה *סיים* אם הכל נאמר)`
     : `Great! We've covered a lot. Is there anything else you'd like me to know or set up — something about the business, customers, or anything I didn't ask?\n\n(Reply *done* if that's everything)`,
 
   'website-offer': (ctx) => ctx.language === 'he'
@@ -245,7 +245,7 @@ const MSG_LABELS: Record<keyof AutomatedMessagesConfig, { he: string; en: string
   rescheduled_confirmation:{ he: 'אישור שינוי מועד',      en: 'Rescheduling confirmed' },
   post_appointment:        { he: 'מעקב לאחר הביקור',     en: 'Post-appointment follow-up' },
   review_request:          { he: 'בקשת ביקורת גוגל',     en: 'Google review request' },
-  no_show:                 { he: 'לא הגיע/ה',             en: 'No-show follow-up' },
+  no_show:                 { he: 'לא הגיע',             en: 'No-show follow-up' },
   first_booking_welcome:   { he: 'ברוך הבא / לקוח חדש',  en: 'New customer welcome' },
   cancellation_ack:        { he: 'אישור ביטול',           en: 'Cancellation acknowledgment' },
   waitlist_offer:          { he: 'הצעת רשימת המתנה',      en: 'Waitlist slot offer' },
@@ -266,7 +266,7 @@ function buildMessageReviewPrompt(ctx: SkillContext, state: BksState): string {
 
   const lines: string[] = []
   const header = lang === 'he'
-    ? `📝 *קבוצה ${group + 1} מתוך ${isPostPayment ? 4 : 3} — בדוק/י את ההודעות:*`
+    ? `📝 *קבוצה ${group + 1} מתוך ${isPostPayment ? 4 : 3} — בדוק את ההודעות:*`
     : `📝 *Group ${group + 1} of ${isPostPayment ? 4 : 3} — review these messages:*`
   lines.push(header, '')
 
@@ -280,7 +280,7 @@ function buildMessageReviewPrompt(ctx: SkillContext, state: BksState): string {
   }
 
   lines.push(lang === 'he'
-    ? 'ענה/י *אשר* לאישור, או תאר/י מה לשנות.'
+    ? 'ענה *אשר* לאישור, או תאר מה לשנות.'
     : 'Reply *APPROVE* to confirm, or describe what to change.')
 
   return lines.join('\n')
@@ -296,7 +296,7 @@ function buildFaqReviewPrompt(ctx: SkillContext, state: BksState): string {
   const header = lang === 'he' ? `📋 *שאלות ותשובות שהכנתי לך:*\n` : `📋 *FAQs I've prepared for you:*\n`
   const body = faqs.map((f, i) => `*${i + 1}. ${f.question}*\n${f.answer}`).join('\n\n')
   const footer = lang === 'he'
-    ? '\n\nענה/י *אשר* לשמירה, או תאר/י מה לשנות.'
+    ? '\n\nענה *אשר* לשמירה, או תאר מה לשנות.'
     : '\n\nReply *APPROVE* to save, or describe what to change.'
 
   return header + body + footer
@@ -570,7 +570,7 @@ export const businessKnowledgeSetupSkill: Skill = {
       if (isCancelText(ctx.message.text) && step !== 'open-question') {
         await ctx.workflow.complete()
         const reply = ctx.language === 'he'
-          ? '✅ שמרתי את כל מה שאספנו עד כה. תוכל/י לחזור ולהשלים בכל עת.'
+          ? '✅ שמרתי את כל מה שאספנו עד כה. תוכל לחזור ולהשלים בכל עת.'
           : '✅ Saved everything collected so far. You can come back to complete it any time.'
         return { handled: true, reply, sessionComplete: true, skillName: this.name }
       }
@@ -580,7 +580,7 @@ export const businessKnowledgeSetupSkill: Skill = {
     } catch {
       return {
         handled: true,
-        reply: ctx.language === 'he' ? 'אירעה שגיאה. נסה/י שוב.' : 'Something went wrong. Please try again.',
+        reply: ctx.language === 'he' ? 'אירעה שגיאה. נסה שוב.' : 'Something went wrong. Please try again.',
         sessionComplete: false,
         skillName: this.name,
       }
@@ -771,7 +771,7 @@ async function dispatchStep(
       const nextService = remaining[0]!
       const priceStr = nextService.price ? ` · ${nextService.price} ${nextService.currency}` : ''
       const reply = lang === 'he'
-        ? `✅ שמרתי. עכשיו — *${nextService.name}* (${nextService.durationMinutes} דקות${priceStr}):\n\nמה הלקוח צריך לדעת? מה להביא/להכין/להימנע?\n\n(ענה/י *דלג* כדי לדלג)`
+        ? `✅ שמרתי. עכשיו — *${nextService.name}* (${nextService.durationMinutes} דקות${priceStr}):\n\nמה הלקוח צריך לדעת? מה להביא/להכין/להימנע?\n\n(ענה *דלג* כדי לדלג)`
         : `✅ Saved. Now — *${nextService.name}* (${nextService.durationMinutes} min${priceStr}):\n\nWhat should the customer know? Anything to bring/prepare/avoid?\n\n(Reply *skip* to skip)`
       return { handled: true, reply, sessionComplete: false, skillName }
     }
@@ -865,7 +865,7 @@ async function dispatchStep(
         messageReviewRegenCount: regenCount + 1,
       }
       await ctx.workflow.advance('message-review', ns as unknown as Record<string, unknown>)
-      const editConfirm = lang === 'he' ? '✅ עדכנתי. בדוק/י שוב:\n\n' : '✅ Updated. Review again:\n\n'
+      const editConfirm = lang === 'he' ? '✅ עדכנתי. בדוק שוב:\n\n' : '✅ Updated. Review again:\n\n'
       return { handled: true, reply: editConfirm + buildMessageReviewPrompt(ctx, ns), sessionComplete: false, skillName }
     }
 
@@ -885,7 +885,7 @@ async function dispatchStep(
       const finalFaqs = newFaqs ?? state.generatedFaqs
       const ns: BksState = { ...state, ...(finalFaqs !== undefined ? { generatedFaqs: finalFaqs } : {}) }
       await ctx.workflow.advance('faq-review', ns as unknown as Record<string, unknown>)
-      const editConfirm = lang === 'he' ? '✅ עדכנתי. בדוק/י שוב:\n\n' : '✅ Updated. Review again:\n\n'
+      const editConfirm = lang === 'he' ? '✅ עדכנתי. בדוק שוב:\n\n' : '✅ Updated. Review again:\n\n'
       return { handled: true, reply: editConfirm + buildFaqReviewPrompt(ctx, ns), sessionComplete: false, skillName }
     }
 
@@ -902,7 +902,7 @@ async function dispatchStep(
       // brush the owner off. Invite the detail; the next turn carries the content.
       const isLeadIn = /(?:אני\s+)?רוצה\s+(?:ל)?(?:ספר|הסביר|שתף|הוסיף)|תן\s+לי\s+(?:ל)?(?:ספר|הסביר)|(?:let me|i(?:'?d)?\s+(?:want|like)\s+to)\s+(?:tell|explain|share|add)/i
       if (isLeadIn.test(text) && text.trim().length < 60) {
-        const reply = lang === 'he' ? 'בכיף, ספר/י לי — אני מקשיב/ה.' : "Sure — go ahead, I'm listening."
+        const reply = lang === 'he' ? 'בכיף, ספר לי — אני מקשיב.' : "Sure — go ahead, I'm listening."
         return { handled: true, reply, sessionComplete: false, skillName }
       }
 
@@ -1096,7 +1096,7 @@ Return JSON: { "faqs": [{ "question": "...", "answer": "..." }] }`
 
 function completionReply(lang: 'he' | 'en'): string {
   return lang === 'he'
-    ? '✅ *הגדרת הידע העסקי הושלמה!*\n\nשמרתי את כל המידע. ה-PA מוכן לייצג אותך בצורה הטובה ביותר.\n\nאפשר לעדכן כל הגדרה בכל עת — פשוט כתב/י "עדכן מידע עסקי".'
+    ? '✅ *הגדרת הידע העסקי הושלמה!*\n\nשמרתי את כל המידע. ה-PA מוכן לייצג אותך בצורה הטובה ביותר.\n\nאפשר לעדכן כל הגדרה בכל עת — פשוט כתב "עדכן מידע עסקי".'
     : '✅ *Business knowledge setup complete!*\n\nAll information saved. Your PA is ready to represent you at its best.\n\nYou can update any setting at any time — just say "update business info".'
 }
 

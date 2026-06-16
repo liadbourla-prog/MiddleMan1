@@ -105,7 +105,7 @@ function qRequirementsGather(ctx: SkillContext): string {
 
 *2. צבע מועדף* — תאר בחופשיות (לדוגמה: "ירוק וטבעי", "כחול כהה", "זהב ושחור")
 
-*3. שם המטפל/ת (אם רלוונטי)* — לדף "אודות" ונוכחות מקצועית
+*3. שם המטפל (אם רלוונטי)* — לדף "אודות" ונוכחות מקצועית
 
 *4. כתובת*, שנת הקמה, הסמכות מקצועיות (אם לא הוזנו בעבר)
 
@@ -418,7 +418,7 @@ async function dispatchStep(step: Step, ctx: SkillContext, state: WbsState, skil
       // color hint and silently re-rendering the same preview.
       if (looksLikeQuestion(text) && !hasDesignEditSignal(text)) {
         const reply = ctx.language === 'he'
-          ? `יש שלושה סגנונות עיצוב:\n• *minimal* — נקי ואוורירי\n• *bold* — נועז וצבעוני\n• *professional* — קלאסי ומהוקצע\n\nלצבעים פשוט תאר/י את האווירה (למשל "בהיר ורגוע", "ירוק יער", "כחול עמוק") ואבחר פלטה מתאימה — או בחר/י אחת: warm-terracotta, ocean-teal, sage-forest, midnight-blue, dusty-rose, slate-green, charcoal-gold, lavender-purple.\n\nרוצה לשנות משהו? פשוט תאר/י. או כתב/י *אשר* כדי להמשיך.`
+          ? `יש שלושה סגנונות עיצוב:\n• *minimal* — נקי ואוורירי\n• *bold* — נועז וצבעוני\n• *professional* — קלאסי ומהוקצע\n\nלצבעים פשוט תאר את האווירה (למשל "בהיר ורגוע", "ירוק יער", "כחול עמוק") ואבחר פלטה מתאימה — או בחר אחת: warm-terracotta, ocean-teal, sage-forest, midnight-blue, dusty-rose, slate-green, charcoal-gold, lavender-purple.\n\nרוצה לשנות משהו? פשוט תאר. או כתב *אשר* כדי להמשיך.`
           : `There are three design styles:\n• *minimal* — clean & airy\n• *bold* — vivid & colorful\n• *professional* — classic & polished\n\nFor colors, just describe the vibe (e.g. "bright and calm", "forest green", "deep navy") and I'll pick a matching palette — or choose one: warm-terracotta, ocean-teal, sage-forest, midnight-blue, dusty-rose, slate-green, charcoal-gold, lavender-purple.\n\nWant to change anything? Just describe it, or reply *approve* to continue.`
         return { handled: true, reply, sessionComplete: false, skillName }
       }
