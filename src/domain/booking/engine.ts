@@ -16,6 +16,7 @@ import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { isSlotBookable } from '../availability/service.js'
+import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import type { CalendarBlockType } from '../../db/schema.js'
 
 const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15', 10)
@@ -102,30 +103,43 @@ export async function requestBooking(
   const timingError = validateSlotTiming(request.slotStart, request.slotEnd, bufferMinutes, maxDaysAhead)
   if (timingError) return { ok: false, reason: timingError }
 
-  // Resolve provider — may override request.providerId
-  const resolvedProvider = request.providerId
-    ? { identityId: request.providerId, displayName: null, phoneNumber: '' }
-    : await resolveProvider(db, actor.businessId, request.serviceTypeId, request.slotStart, request.slotEnd, request.providerHint, businessTz)
+  const isGroupClass = (service.maxParticipants ?? 1) > 1
 
-  // Reactive instructor gating: if the customer NAMED an instructor (providerHint)
-  // who actually teaches this service but isn't free for this slot, fail with a
-  // structured reason instead of silently booking provider-less. If no assigned
-  // instructor matches the hint, fall through to normal (provider-agnostic) booking.
-  if (!resolvedProvider && request.providerHint && request.providerHint.trim().length > 0) {
-    const named = await getInstructorHours(db, actor.businessId, request.serviceTypeId, request.providerHint)
-    if (named) {
-      const hours = named.weeklyHours.map((h) => `${h.dayOfWeek}:${h.startTime}-${h.endTime}`).join(';')
-      return { ok: false, reason: `provider_unavailable|${named.name}|${hours}` }
+  let effectiveProviderId: string | null
+  let providerDisplayName: string | null = null
+
+  if (isGroupClass) {
+    // D1: a booking into a class inherits THAT class's instructor. The scheduled
+    // class block (calendar_blocks type='class' at this slot) is the SoT — this
+    // bypasses resolveProvider (studio instructors carry no availability rows;
+    // their schedule IS their classes). An explicit request.providerId still wins.
+    const classBlock = await findClassBlockProviderForSlot(db, actor.businessId, request.serviceTypeId, request.slotStart)
+    effectiveProviderId = request.providerId ?? (classBlock.found ? classBlock.providerId : null)
+  } else {
+    // Private (1-on-1) booking: resolve provider by assignment + availability.
+    const resolvedProvider = request.providerId
+      ? { identityId: request.providerId, displayName: null, phoneNumber: '' }
+      : await resolveProvider(db, actor.businessId, request.serviceTypeId, request.slotStart, request.slotEnd, request.providerHint, businessTz)
+
+    // Reactive instructor gating: if the customer NAMED an instructor (providerHint)
+    // who actually teaches this service but isn't free for this slot, fail with a
+    // structured reason instead of silently booking provider-less. If no assigned
+    // instructor matches the hint, fall through to normal (provider-agnostic) booking.
+    if (!resolvedProvider && request.providerHint && request.providerHint.trim().length > 0) {
+      const named = await getInstructorHours(db, actor.businessId, request.serviceTypeId, request.providerHint)
+      if (named) {
+        const hours = named.weeklyHours.map((h) => `${h.dayOfWeek}:${h.startTime}-${h.endTime}`).join(';')
+        return { ok: false, reason: `provider_unavailable|${named.name}|${hours}` }
+      }
     }
+
+    effectiveProviderId = resolvedProvider?.identityId ?? null
+    providerDisplayName = resolvedProvider?.displayName ?? null
   }
 
-  const effectiveProviderId = resolvedProvider?.identityId ?? null
   const effectiveRequest: typeof request = effectiveProviderId
     ? { ...request, providerId: effectiveProviderId }
     : { ...request }
-  const providerDisplayName = resolvedProvider?.displayName ?? null
-
-  const isGroupClass = (service.maxParticipants ?? 1) > 1
 
   // Spatial pre-flight: enforce working hours + manager-occupied blocks for BOTH
   // calendar modes, independent of provider assignment. This is the canonical

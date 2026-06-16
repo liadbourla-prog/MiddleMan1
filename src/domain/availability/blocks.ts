@@ -99,6 +99,37 @@ export function parseBlockId(eventId: string): string | null {
   return eventId.startsWith(BLOCK_ID_PREFIX) ? eventId.slice(BLOCK_ID_PREFIX.length) : null
 }
 
+/**
+ * Find the instructor (providerId) of the scheduled class for a slot.
+ *
+ * Group bookings link to a class slot by (serviceTypeId, slotStart). The class
+ * block placed by scheduleGroupSession / the series materializer is the SoT for
+ * who teaches that slot, so a booking into the class inherits its providerId.
+ * Returns:
+ *  - { found: true, providerId } when a matching class block exists (providerId
+ *    may still be null if the manager scheduled it without an instructor)
+ *  - { found: false } when there is no class block for the slot.
+ */
+export async function findClassBlockProviderForSlot(
+  db: Db,
+  businessId: string,
+  serviceTypeId: string,
+  slotStart: Date,
+): Promise<{ found: true; providerId: string | null } | { found: false }> {
+  const [row] = await db
+    .select({ providerId: calendarBlocks.providerId })
+    .from(calendarBlocks)
+    .where(and(
+      eq(calendarBlocks.businessId, businessId),
+      eq(calendarBlocks.type, 'class'),
+      eq(calendarBlocks.serviceTypeId, serviceTypeId),
+      eq(calendarBlocks.startTs, slotStart),
+    ))
+    .limit(1)
+  if (!row) return { found: false }
+  return { found: true, providerId: row.providerId }
+}
+
 /** A human-facing label for a block row, used in calendar read-back. */
 export function blockLabel(block: CalendarBlock, lang: 'he' | 'en'): string {
   if (block.title) return block.title
