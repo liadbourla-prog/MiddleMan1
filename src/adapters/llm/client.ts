@@ -1009,6 +1009,42 @@ Return JSON: { "isBusinessName": boolean, "name": string | null }`
   return callWithSchema(systemPrompt, safeMessage, businessNameSchema)
 }
 
+// ── Onboarding: amend a previously-given answer ─────────────────────────────────
+
+const onboardingAmendmentSchema = z.object({
+  isAmendment: z.boolean().catch(false),
+  field: z.enum(['business_name', 'services', 'hours', 'cancellation', 'payment', 'escalation', 'none']).catch('none'),
+  newValue: z.string().nullable().catch(null),
+})
+export type OnboardingAmendmentOutput = z.infer<typeof onboardingAmendmentSchema>
+
+/**
+ * Detect whether, mid-onboarding, the manager is CORRECTING an answer they already
+ * gave (vs. answering the current question). Used so a "actually the name is X" /
+ * "מתקן - השם הוא X" is applied to the right field instead of being ignored or
+ * falsely confirmed. Conservative by design: only callers with a correction cue
+ * should invoke it, and it returns isAmendment=false for ordinary answers.
+ */
+export async function detectOnboardingAmendment(
+  message: string,
+  currentName: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<OnboardingAmendmentOutput>> {
+  const langNote = lang === 'he' ? 'The manager is writing in Hebrew.' : 'The manager is writing in English.'
+  const systemPrompt = `${langNote}
+
+During business setup the manager may CORRECT an earlier answer instead of answering the current question. The business name currently on file is: "${currentName}".
+
+Decide:
+- "isAmendment": true ONLY if they are clearly fixing or changing a PREVIOUSLY-given answer (e.g. "actually the name is X", "I meant to say…", "change the hours to…", "מתקן - השם הוא X", "השם צריך להיות X"). If they are simply answering the current question, set false.
+- "field": which earlier answer they're correcting — one of business_name | services | hours | cancellation | payment | escalation | none.
+- "newValue": the corrected value if they stated it (e.g. the corrected business name "X"), else null.
+
+Return JSON: { "isAmendment": boolean, "field": string, "newValue": string | null }`
+  const safeMessage = sanitizeUserInput(message)
+  return callWithSchema(systemPrompt, safeMessage, onboardingAmendmentSchema) as Promise<LlmResult<OnboardingAmendmentOutput>>
+}
+
 export type OnboardingHourEntry = z.infer<typeof onboardingHourEntrySchema>
 
 // Onboarding "hours" step — parses a full weekly schedule into per-day entries.

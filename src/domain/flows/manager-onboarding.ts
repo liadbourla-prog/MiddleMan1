@@ -5,7 +5,7 @@ import { businesses, importTokens, managerInstructions, serviceTypes, availabili
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
 import type { ResolvedIdentity } from '../identity/types.js'
-import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, parseCalendarChoice, parseImportChoice, type OnboardingHourEntry } from '../../adapters/llm/client.js'
+import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, parseCalendarChoice, parseImportChoice, detectOnboardingAmendment, type OnboardingHourEntry } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
@@ -27,6 +27,17 @@ export async function handleOnboardingMessage(
   transcript: TranscriptTurn[] = [],
 ): Promise<OnboardingResult> {
   const step = (business.onboardingStep ?? 'business_name') as OnboardingStep
+
+  // ── Amend a previously-given answer ─────────────────────────────────────────
+  // Onboarding steps collect free-form answers, so we DON'T triage every message
+  // (that would misread real answers). Instead, only when the message carries a
+  // correction cue do we check whether the owner is fixing an EARLIER answer —
+  // e.g. correcting a business-name typo at a later step. The business name is
+  // amended in place (no progress lost); other fields re-open their step.
+  const amendResult = business.name
+    ? await maybeAmendPriorAnswer(db, msg, business, step, lang, log, transcript)
+    : null
+  if (amendResult) return amendResult
 
   switch (step) {
     case 'business_name':
@@ -51,6 +62,58 @@ export async function handleOnboardingMessage(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Correction cues — only when one is present do we spend an LLM call deciding
+// whether the owner is amending an earlier answer (keeps the free-form steps safe
+// from false positives and avoids a triage call on every message).
+const CORRECTION_CUE = /\b(actually|i meant|correction|should be|my mistake|change the|wrong|let me (fix|correct))\b|מתקן|לתקן|תקן|בעצם|התכוונתי|צריך להיות|אמור להיות|לשנות|תשנה|טעות|לא נכון|שם.{0,14}(הוא|צריך|אמור)/i
+
+// Which onboarding step owns each amendable field (for re-opening).
+const FIELD_TO_STEP: Partial<Record<string, OnboardingStep>> = {
+  services: 'services',
+  hours: 'hours',
+  cancellation: 'cancellation_policy',
+  payment: 'payment',
+  escalation: 'escalation_policy',
+}
+
+async function maybeAmendPriorAnswer(
+  db: Db,
+  msg: InboundMessage,
+  business: Business,
+  step: OnboardingStep,
+  lang: Lang,
+  log: FastifyBaseLogger,
+  transcript: TranscriptTurn[],
+): Promise<OnboardingResult | null> {
+  if (!CORRECTION_CUE.test(msg.body)) return null
+
+  const detected = await detectOnboardingAmendment(msg.body, business.name ?? '', lang)
+  if (!detected.ok || !detected.data.isAmendment || detected.data.field === 'none') return null
+  const { field, newValue } = detected.data
+
+  // Business name: amend in place — no progress lost, resume the current step.
+  if (field === 'business_name' && newValue && newValue.trim()) {
+    const newName = newValue.trim().slice(0, 100)
+    await db.update(businesses).set({ name: newName }).where(eq(businesses.id, business.id))
+    log.info({ businessId: business.id, newName }, 'Onboarding: business name amended')
+    const ack = lang === 'he' ? `עדכנתי את שם העסק ל-${newName}.` : `Updated the business name to ${newName}.`
+    const q = await onboardingQuestion(step, newName, lang, { transcript })
+    return { reply: `${ack}\n\n${q}` }
+  }
+
+  // Other fields: re-open their step to re-collect (rare; correctness over re-walk).
+  const targetStep = FIELD_TO_STEP[field]
+  if (targetStep && targetStep !== step) {
+    await db.update(businesses).set({ onboardingStep: targetStep }).where(eq(businesses.id, business.id))
+    log.info({ businessId: business.id, field, targetStep }, 'Onboarding: re-opening step to amend')
+    const ack = lang === 'he' ? 'בסדר, בוא/י נתקן את זה.' : "Sure — let's fix that."
+    const q = await onboardingQuestion(targetStep, business.name ?? '', lang, { isRetry: true, transcript })
+    return { reply: `${ack}\n\n${q}` }
+  }
+
+  return null
+}
 
 function buildCalendarLink(business: Business, baseUrl: string): string {
   const base = baseUrl || process.env['PUBLIC_BASE_URL'] || 'https://your-domain.com'
