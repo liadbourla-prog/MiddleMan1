@@ -435,7 +435,7 @@ const strings = {
     en: (phone: string) => `No identity found for ${phone}.`,
   },
   apply_provider_added: {
-    he: (name: string, services: string, hours: string) => `הוספתי את ${name} כמדריך/ה ל${services}${hours}.`,
+    he: (name: string, services: string, hours: string) => `הוספתי את ${name} כמדריך ל${services}${hours}.`,
     en: (name: string, services: string, hours: string) => `Added ${name} as an instructor for ${services}${hours}.`,
   },
   apply_provider_hours_set: {
@@ -443,11 +443,11 @@ const strings = {
     en: (name: string, hours: string) => `Updated ${name}'s hours${hours}.`,
   },
   apply_provider_assigned: {
-    he: (name: string, service: string) => `${name} מלמד/ת עכשיו גם ${service}.`,
+    he: (name: string, service: string) => `${name} מלמד עכשיו גם ${service}.`,
     en: (name: string, service: string) => `${name} now also teaches ${service}.`,
   },
   apply_provider_unassigned: {
-    he: (name: string, service: string) => `${name} כבר לא מלמד/ת ${service}.`,
+    he: (name: string, service: string) => `${name} כבר לא מלמד ${service}.`,
     en: (name: string, service: string) => `${name} no longer teaches ${service}.`,
   },
   apply_provider_removed: {
@@ -455,19 +455,19 @@ const strings = {
     en: (name: string) => `Removed ${name} from the instructor list.`,
   },
   apply_provider_not_found: {
-    he: (name: string) => `לא נמצא מדריך/ה בשם ${name}.`,
+    he: (name: string) => `לא נמצא מדריך בשם ${name}.`,
     en: (name: string) => `No instructor named ${name} found.`,
   },
   schedule_instructor_not_found: {
-    he: (name: string) => `אין לי מדריך/ה בשם ${name}. רוצה להוסיף אותו/ה קודם? ("תוסיף את ${name} כמדריך/ה")`,
+    he: (name: string) => `אין לי מדריך בשם ${name}. רוצה להוסיף אותו קודם? ("תוסיף את ${name} כמדריך")`,
     en: (name: string) => `I don't have an instructor named ${name}. Add them first? (e.g. "add ${name} as a yoga instructor")`,
   },
   schedule_instructor_ambiguous: {
-    he: (name: string) => `יש יותר ממדריך/ה אחד/ת בשם ${name}. למי מהם התכוונת?`,
+    he: (name: string) => `יש יותר ממדריך אחד בשם ${name}. למי מהם התכוונת?`,
     en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,
   },
   apply_provider_ambiguous: {
-    he: (name: string) => `יש יותר ממדריך/ה אחד/ת בשם ${name}. למי מהם התכוונת?`,
+    he: (name: string) => `יש יותר ממדריך אחד בשם ${name}. למי מהם התכוונת?`,
     en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,
   },
   apply_provider_service_not_found: {

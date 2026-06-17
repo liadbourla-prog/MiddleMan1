@@ -624,7 +624,7 @@ export async function oauthRoutes(app: FastifyInstance) {
         // 10. Send BK opening prompt via the new PA credentials (best-effort)
         const businessName = collectedData['businessName'] as string | undefined
         const bkOpeningPrompt = lang === 'he'
-          ? `לפני שהלקוחות מגיעים, בואנו נלמד על *${businessName}* כדי שאוכל לייצג אתכם הכי טוב.\n\nאיך היית מתאר/ת את *${businessName}*? מה הרגש שאתה/את רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?\n\n(ככל שתשתף/י יותר, כך אדבר טוב יותר בשמך)`
+          ? `לפני שהלקוחות מגיעים, בואנו נלמד על *${businessName}* כדי שאוכל לייצג אתכם הכי טוב.\n\nאיך היית מתאר את *${businessName}*? מה הרגש שאתה רוצה שלקוחות יקבלו אחרי כל ביקור? מה מייחד אתכם?\n\n(ככל שתשתף יותר, כך אדבר טוב יותר בשמך)`
           : `Before customers arrive, let me get to know *${businessName}* so I can represent you well.\n\nHow would you describe *${businessName}*? What feeling do you want customers to walk away with? What makes you stand out?\n\n(The more detail you share, the better I'll speak in your voice)`
 
         await sendMessage(
