@@ -90,7 +90,22 @@ const customerIntentSchema = z.object({
   detectedLanguage: z.enum(['he', 'en']).catch('he'),
 })
 
-const managerInstructionSchema = z.object({
+// Defensive normalization: gemini-2.5-flash sometimes emits snake_case top-level
+// keys (instruction_type) instead of the camelCase the schema requires. The prompt
+// pins camelCase, but a single drift here silently breaks EVERY Branch-3 config
+// write (the model's output validates to ok:false → "Classification failed"), so we
+// also map the common snake_case aliases and default an omitted clarificationNeeded.
+const managerInstructionSchema = z.preprocess((value) => {
+  if (!value || typeof value !== 'object') return value
+  const o = { ...(value as Record<string, unknown>) }
+  if (o.instructionType === undefined && o.instruction_type !== undefined) o.instructionType = o.instruction_type
+  if (o.structuredParams === undefined && o.structured_params !== undefined) o.structuredParams = o.structured_params
+  if (o.clarificationNeeded === undefined && o.clarification_needed !== undefined) o.clarificationNeeded = o.clarification_needed
+  if (o.clarificationNeeded === undefined) o.clarificationNeeded = null
+  if (o.ambiguous === undefined) o.ambiguous = false
+  if (o.structuredParams === undefined) o.structuredParams = {}
+  return o
+}, z.object({
   instructionType: z.enum([
     'availability_change',
     'policy_change',
@@ -104,7 +119,7 @@ const managerInstructionSchema = z.object({
   structuredParams: z.record(z.unknown()),
   ambiguous: z.boolean(),
   clarificationNeeded: z.string().nullable(),
-})
+}))
 
 export async function extractCustomerIntent(
   message: string,
@@ -234,9 +249,17 @@ provider_change:
   - dayOfWeek: 0=Sunday … 6=Saturday. Times are 24-hour "HH:MM".
 
 If the instruction is ambiguous or missing required detail, set ambiguous=true and clarificationNeeded to the exact question to ask back.
-Respond only with valid JSON matching the schema. No explanation.`
 
-  return callWithSchema(systemPrompt, message, managerInstructionSchema)
+Return JSON with EXACTLY these top-level keys, in camelCase (not snake_case):
+{
+  "instructionType": one of [availability_change, policy_change, service_change, permission_change, booking_cancellation, recurring_class_change, provider_change, unknown],
+  "structuredParams": { ...the fields for that instructionType, as specified above... },
+  "ambiguous": boolean,
+  "clarificationNeeded": string or null
+}
+Use the key "instructionType" (never "instruction_type"). No explanation, no markdown fences.`
+
+  return callWithSchema(systemPrompt, message, managerInstructionSchema) as Promise<LlmResult<ManagerInstructionOutput>>
 }
 
 const operatorActionSchema = z.object({
@@ -320,6 +343,8 @@ WHATSAPP FORMATTING — strictly enforced:
 - URLs: place on their own line, never inside parentheses or as markdown [text](url).
 - No HTML tags, no markdown headers (#, ##), no tables.
 - Emoji: maximum one per message at a key moment (✅ confirmed, ⏰ reminder). None in questions or clarifications.
+
+NEVER CLAIM A BOOKING THAT WASN'T MADE — strictly enforced: only state or imply that an appointment is booked, reserved, registered, set, or done when the situation EXPLICITLY says it was created/confirmed. If the situation is asking, clarifying, offering times, or reporting a problem, do NOT say "קבעתי"/"booked"/"you're all set" or use a ✅ — ask or move it forward instead. When unsure, ask; never confirm.
 
 BOOKING CONFIRMATIONS: when confirming a booking, restate the service name, day, date, and time clearly, then ask for a yes/no IN PLAIN WORDS — never append a menu. NEVER write "(כן / לא)", "(YES / NO)", "השב כן/לא", or any option list; just ask naturally ("מתאים?" / "סוגר?" / "sound good?" / "shall I lock it in?"). Vary the wording — don't template the whole message.
 
@@ -1419,7 +1444,15 @@ async function callWithSchema<T>(
         contents: userMessage,
         config: {
           systemInstruction: systemPrompt,
-          maxOutputTokens: 1024,
+          // gemini-2.5-flash reasons by default and its thinking tokens draw down
+          // maxOutputTokens. Large classifier prompts (e.g. the ~250-line manager
+          // instruction spec) can burn the whole budget thinking and return EMPTY
+          // text → the caller sees ok:false ("Classification failed"). Classification
+          // is structured extraction that does not need reasoning, so disable thinking
+          // (thinkingBudget:0 is valid on Flash; see generateConversational fallback)
+          // and keep real headroom for the JSON answer.
+          thinkingConfig: { thinkingBudget: 0 },
+          maxOutputTokens: 2048,
           temperature: 0,
           responseMimeType: 'application/json',
         },

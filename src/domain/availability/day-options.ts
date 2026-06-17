@@ -46,6 +46,22 @@ export interface DayOptions {
   privateOpenings: PrivateOpening[]
 }
 
+/**
+ * A service must live in exactly ONE booking model on a given day — either a
+ * scheduled group class OR open private/1-on-1 slots, never both. (A cap=1 service
+ * mistakenly scheduled as a class previously showed up in both lists, so the reply
+ * mixed a real class time with a fabricated private slot — see WS-C.) Returns the
+ * services eligible for private openings: genuinely private (cap ≤ 1) AND not
+ * already running as a class that day.
+ */
+export function selectPrivateOpeningServices<T extends { id: string; maxParticipants?: number | null }>(
+  services: T[],
+  serviceIdsRunningAsClasses: Iterable<string>,
+): T[] {
+  const classIds = new Set(serviceIdsRunningAsClasses)
+  return services.filter((s) => (s.maxParticipants ?? 1) <= 1 && !classIds.has(s.id))
+}
+
 export interface ListDayOptionsOpts {
   /** Restrict to a single service (customer named one). */
   serviceTypeId?: string | undefined
@@ -156,7 +172,7 @@ export async function listDayOptions(
   // ── Open private/1-on-1 slots for the day ──────────────────────────────────
   const privateOpenings: PrivateOpening[] = []
   if (from.getTime() < dayEnd.getTime()) {
-    const privateServices = services.filter((s) => (s.maxParticipants ?? 1) <= 1)
+    const privateServices = selectPrivateOpeningServices(services, classServiceIds)
     for (const svc of privateServices) {
       let slots: Date[] = []
       try {

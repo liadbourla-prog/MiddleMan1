@@ -7,6 +7,8 @@ import type { ActiveSession } from '../session/types.js'
 import { updateSessionContext, completeSession, failSession } from '../session/manager.js'
 import { requestBooking, confirmBooking, cancelBooking } from '../booking/engine.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
+import { assertsBookingConfirmed } from './reply-guard.js'
+import { inferFocusService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { parseConfirmation } from './types.js'
@@ -268,6 +270,35 @@ async function buildDayOptionsText(
   return parts.length > 0 ? parts.join(' ') : null
 }
 
+// Safe clarification used when the LLM keeps asserting a booking that was never
+// made (cardinal "said done, didn't do" backstop — see reply-guard.ts).
+const BOOKING_NOT_CONFIRMED_FALLBACK: Record<'he' | 'en', string> = {
+  he: 'רגע, עוד לא סגרנו את זה — לאיזה יום ושעה בא לך?',
+  en: "Hang on — that's not booked yet. What day and time works for you?",
+}
+
+// Reply-vs-state binding guard. Every customer reply goes through here. When the
+// caller has NOT actually persisted a booking this turn (bookingConfirmed falsy)
+// and the drafted reply nonetheless CLAIMS one was made, regenerate once forbidding
+// the claim, then fall back to a safe clarification. Confirmation sites pass
+// bookingConfirmed:true to allow the legitimate "you're booked" wording.
+async function genReply(
+  input: Parameters<typeof generateCustomerReply>[0],
+  opts: { bookingConfirmed?: boolean } = {},
+): Promise<string> {
+  const reply = await generateCustomerReply(input)
+  if (opts.bookingConfirmed) return reply
+  if (!assertsBookingConfirmed(reply, input.language)) return reply
+
+  const correctedInput = {
+    ...input,
+    situation: `${input.situation}\n\nCRITICAL: No booking has been made or confirmed. Do NOT state or imply the appointment is booked, reserved, registered, or done. If a decision is needed, ask for it plainly.`,
+  }
+  const corrected = await generateCustomerReply(correctedInput)
+  if (!assertsBookingConfirmed(corrected, input.language)) return corrected
+  return BOOKING_NOT_CONFIRMED_FALLBACK[input.language]
+}
+
 export async function handleBookingFlow(
   db: Db,
   calendar: CalendarClient,
@@ -309,7 +340,7 @@ export async function handleBookingFlow(
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
   if (rebookVariants.test(messageText.trim())) {
     await updateSessionContext(db, session.id, { ...ctx, detectedLanguage: lang }, 'active')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -333,7 +364,7 @@ export async function handleBookingFlow(
       } catch { /* non-fatal */ }
       const newCtx: BookingFlowContext = { ...ctx, languageOverride: chosenLang, languageSwitchOfferPending: false }
       await updateSessionContext(db, session.id, newCtx, 'active')
-      const reply = await generateCustomerReply({
+      const reply = await genReply({
         businessTimezone,
         businessName,
         language: chosenLang,
@@ -432,7 +463,7 @@ export async function handleBookingFlow(
         : "We're a bit busy right now. Please try again in a few minutes."
       return { reply: quotaReply, sessionComplete: true, sessionFailed: true }
     }
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -548,7 +579,7 @@ export async function handleBookingFlow(
           ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
           faqs: businessKnowledge.faqs,
         } : {}
-        const inquiryReply = await generateCustomerReply({
+        const inquiryReply = await genReply({
           businessTimezone,
           businessName,
           language: detectedLanguage,
@@ -570,7 +601,7 @@ export async function handleBookingFlow(
           ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
           faqs: businessKnowledge.faqs,
         } : {}
-        const explainReply = await generateCustomerReply({
+        const explainReply = await genReply({
           businessTimezone,
           businessName,
           language: detectedLanguage,
@@ -623,7 +654,7 @@ export async function handleBookingFlow(
           ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
           faqs: businessKnowledge.faqs,
         } : {}
-        const unknownReply = await generateCustomerReply({
+        const unknownReply = await genReply({
           businessTimezone,
           businessName,
           language: detectedLanguage,
@@ -691,7 +722,11 @@ async function handleBookingIntent(
 
   const service =
     resolveService(intent.serviceTypeHint, activeServices) ??
-    (draft.serviceTypeId ? activeServices.find((s) => s.id === draft.serviceTypeId) ?? null : null)
+    (draft.serviceTypeId ? activeServices.find((s) => s.id === draft.serviceTypeId) ?? null : null) ??
+    // Referential fallback: the customer is continuing ("the one we discussed",
+    // "sign me up", "yes") without re-naming the service. Adopt the single service
+    // the conversation has clearly been about — never guess when it's ambiguous.
+    inferFocusService(transcript, activeServices)
   if (service) {
     draft.serviceTypeId = service.id
     draft.serviceName = service.name
@@ -700,7 +735,7 @@ async function handleBookingIntent(
 
   const failAfterThreeTries = async (): Promise<FlowResult> => {
     await failSession(db, session.id)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation: 'The customer has not landed on a workable date/time after several tries. Wrap up warmly and suggest they call the business directly.',
@@ -713,7 +748,7 @@ async function handleBookingIntent(
     const newAttempts = attempts + 1
     if (newAttempts >= 3) return failAfterThreeTries()
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draft, clarificationAttempts: newAttempts }, 'waiting_clarification')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation: `${firstMsgPrefix}The customer wants to book but ${sanitiseReason(dateProblem)}. Without repeating the unusable date back, ask which upcoming day they'd like.`,
@@ -736,7 +771,7 @@ async function handleBookingIntent(
     } else {
       ask = `Booking ${draft.serviceName} on ${formatLocalDate(draft.dateStr, businessTimezone)}. Still need the time — ask what time. Do NOT re-ask the day or service.`
     }
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation: `${firstMsgPrefix}${ask}`,
@@ -751,7 +786,7 @@ async function handleBookingIntent(
   if (draft.participants != null && draft.participants > 1 && svc.maxParticipants === 1) {
     const { participants: _dropParticipants, ...draftKeep } = draft
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation: `${svc.name} is a private, one-on-one session — it can't take ${draft.participants} people on a single booking. Ask whether they'd like to go ahead with just one spot, or if they meant something else.`,
@@ -761,7 +796,7 @@ async function handleBookingIntent(
   if (draft.participants != null && draft.participants > svc.maxParticipants && svc.maxParticipants > 1) {
     const { participants: _dropParticipants, ...draftKeep } = draft
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation: `${svc.name} holds at most ${svc.maxParticipants} people, and they asked for ${draft.participants}. Let them know the limit and ask how they'd like to proceed.`,
@@ -776,7 +811,7 @@ async function handleBookingIntent(
   if (isNaN(slotStart.getTime()) || isDstGap(slotStart, draft.time, businessTimezone)) {
     const { time: _dropTime, ...draftKeep } = draft
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation: 'That exact time does not exist on the clock that day (a daylight-saving shift). Ask the customer to pick a different time.',
@@ -811,7 +846,7 @@ async function handleBookingIntent(
         ? `Offer these actual open times and ask which they'd like: ${openSlotsText}.`
         : 'Ask them to pick a time within business hours.',
     ].filter(Boolean).join(' ')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation,
@@ -838,7 +873,7 @@ async function handleBookingIntent(
   }
 
   await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
-  const reply = await generateCustomerReply({
+  const reply = await genReply({
     businessTimezone,
     businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
     situation: `${firstMsgPrefix}Customer wants to book ${svc.name} on ${displayDate} at ${displayTime}. Restate the service, day, date and time clearly, then ask them to confirm.`,
@@ -883,7 +918,7 @@ async function handleReschedulingIntent(
   const existing = activeBookings[0]!
   const cancelResult = await cancelBooking(db, calendar, identity, existing.id, 'Rescheduled by customer via WhatsApp')
   if (!cancelResult.ok) {
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -915,7 +950,7 @@ async function handleHoldConfirmation(
   const confirmation = parseConfirmation(messageText)
 
   if (confirmation === 'unclear') {
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -929,7 +964,7 @@ async function handleHoldConfirmation(
 
   if (confirmation === 'no') {
     await completeSession(db, session.id)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -950,7 +985,7 @@ async function handleHoldConfirmation(
     await completeSession(db, session.id)
 
     if (!confirmResult.ok) {
-      const reply = await generateCustomerReply({
+      const reply = await genReply({
         businessTimezone,
         businessName,
         language: lang,
@@ -965,7 +1000,7 @@ async function handleHoldConfirmation(
     const pendingSlot = ctx.pendingSlot
     const confirmedDate = pendingSlot ? formatSlotDate(new Date(pendingSlot.start), businessTimezone) : 'the requested date'
     const confirmedTime = pendingSlot ? formatSlotTime(new Date(pendingSlot.start), businessTimezone) : 'the requested time'
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -973,7 +1008,7 @@ async function handleHoldConfirmation(
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
-    })
+    }, { bookingConfirmed: true })
     return { reply, sessionComplete: true }
   }
 
@@ -981,7 +1016,7 @@ async function handleHoldConfirmation(
   const pendingSlot = ctx.pendingSlot
   if (!pendingSlot) {
     await failSession(db, session.id)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1024,7 +1059,7 @@ async function handleHoldConfirmation(
             ? `Offer these actual open times and ask which they'd like: ${openSlotsText}.`
             : 'Suggest the customer pick a different time that falls within business hours.',
         ].filter(Boolean).join(' ')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1041,14 +1076,14 @@ async function handleHoldConfirmation(
     await completeSession(db, session.id)
     const confirmedDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
     const confirmedTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
       situation: `Spot confirmed in ${pendingSlot.serviceName} class on ${confirmedDate} at ${confirmedTime}. ${result.message}`,
       transcript,
       customerMemory: extractMemory(ctx),
-    })
+    }, { bookingConfirmed: true })
     return { reply, sessionComplete: true }
   }
 
@@ -1062,7 +1097,7 @@ async function handleHoldConfirmation(
 
   const heldDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
   const heldTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
-  const reply = await generateCustomerReply({
+  const reply = await genReply({
     businessTimezone,
     businessName,
     language: lang,
@@ -1112,7 +1147,7 @@ async function handleClarification(
   )
 
   if (!intentResult.ok) {
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1159,7 +1194,7 @@ async function handleCancellationIntent(
 
   if (activeBookings.length === 0) {
     await completeSession(db, session.id)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1178,7 +1213,7 @@ async function handleCancellationIntent(
     const newCtx: BookingFlowContext = { ...ctx, awaitingConfirmationFor: 'cancellation', targetBookingId: booking.id }
     await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
 
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1224,7 +1259,7 @@ async function enterCancellationSelection(
   await updateSessionContext(db, session.id, newCtx, 'waiting_clarification')
 
   const action = isRescheduling ? 'reschedule' : 'cancel'
-  const reply = await generateCustomerReply({
+  const reply = await genReply({
     businessTimezone,
     businessName,
     language: lang,
@@ -1251,7 +1286,7 @@ async function handleCancellationSelection(
   const n = parseInt(messageText.trim(), 10)
 
   if (isNaN(n) || n < 1 || n > candidates.length) {
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1272,7 +1307,7 @@ async function handleCancellationSelection(
   await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
 
   // Ask for explicit confirmation before cancelling — do NOT auto-confirm
-  const reply = await generateCustomerReply({
+  const reply = await genReply({
     businessTimezone,
     businessName,
     language: lang,
@@ -1298,7 +1333,7 @@ async function handleCancellationConfirmation(
   const confirmation = parseConfirmation(messageText)
 
   if (confirmation === 'unclear') {
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1312,7 +1347,7 @@ async function handleCancellationConfirmation(
 
   if (confirmation === 'no') {
     await completeSession(db, session.id)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1327,7 +1362,7 @@ async function handleCancellationConfirmation(
   const bookingId = ctx.targetBookingId
   if (!bookingId) {
     await failSession(db, session.id)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1343,7 +1378,7 @@ async function handleCancellationConfirmation(
 
   if (!result.ok) {
     await completeSession(db, session.id)
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1360,7 +1395,7 @@ async function handleCancellationConfirmation(
     const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, ...rest } = ctx
     const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: bookingId }
     await updateSessionContext(db, session.id, newCtx, 'active')
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1372,7 +1407,7 @@ async function handleCancellationConfirmation(
   }
 
   await completeSession(db, session.id)
-  const reply = await generateCustomerReply({
+  const reply = await genReply({
     businessTimezone,
     businessName,
     language: lang,
@@ -1413,7 +1448,7 @@ async function handleListBookings(
   await updateSessionContext(db, session.id, ctx, 'active')
 
   if (upcoming.length === 0) {
-    const reply = await generateCustomerReply({
+    const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
@@ -1429,7 +1464,7 @@ async function handleListBookings(
     .map((b, i) => `${i + 1}. ${formatSlotDate(b.slotStart, businessTimezone)} at ${formatSlotTime(b.slotStart, businessTimezone)} (${b.state})`)
     .join('; ')
 
-  const reply = await generateCustomerReply({
+  const reply = await genReply({
     businessTimezone,
     businessName,
     language: lang,

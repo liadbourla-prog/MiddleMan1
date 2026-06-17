@@ -466,6 +466,10 @@ const strings = {
     he: (name: string) => `יש יותר ממדריך אחד בשם ${name}. למי מהם התכוונת?`,
     en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,
   },
+  schedule_private_service_needs_capacity: {
+    he: (name: string) => `"${name}" מוגדר אצלי כשיעור פרטי (אחד על אחד). כדי לקבוע אותו כשיעור קבוצתי, כמה משתתפים הוא יכול לקבל?`,
+    en: (name: string) => `"${name}" is set up as a private 1-on-1 session. To run it as a group class, how many participants should it hold?`,
+  },
   apply_provider_ambiguous: {
     he: (name: string) => `יש יותר ממדריך אחד בשם ${name}. למי מהם התכוונת?`,
     en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,

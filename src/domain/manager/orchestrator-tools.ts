@@ -317,6 +317,20 @@ export async function executeScheduleGroupSession(
     }
   }
 
+  // Guard: a private (1-on-1) service must NOT be scheduled as a group class
+  // without an explicit capacity. Otherwise it lands as a cap=1 'class' that then
+  // surfaces in BOTH the day's class list AND its private-openings, so the customer
+  // reply mixes a real class time with a fabricated private slot (WS-C / the hours
+  // mismatch). Ask for the group size instead of silently creating that state.
+  const explicitCap = args.maxParticipants ?? null
+  if (serviceTypeId && (serviceCapacity ?? 1) <= 1 && (explicitCap === null || explicitCap <= 1)) {
+    return {
+      success: false,
+      needsClarification: true,
+      message: i18n.schedule_private_service_needs_capacity[ctx.lang](serviceName ?? args.serviceName ?? ''),
+    }
+  }
+
   // Conflict guard: a class cannot run over an active customer booking or over
   // manager-blocked/personal time (but may overlap other classes).
   const bookingConflicts = await ctx.db
@@ -451,7 +465,10 @@ export async function executeManageBusinessSettings(
   )
 
   if (!classified.ok) {
-    return { success: false, error: 'Classification failed. Try rephrasing the instruction.' }
+    // detail is the raw classifier failure reason (empty response / quota / schema) —
+    // kept internal for diagnosis (logged via orchestrator tool results), never shown
+    // to the manager verbatim.
+    return { success: false, error: 'Classification failed. Try rephrasing the instruction.', detail: classified.error }
   }
 
   if (classified.data.ambiguous && classified.data.clarificationNeeded) {

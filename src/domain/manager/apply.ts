@@ -718,6 +718,12 @@ async function applyRecurringClassChange(
     if (!svc) {
       return { ok: false, reason: lang === 'he' ? `לא מצאתי שירות בשם "${p.serviceName ?? ''}".` : `No service named "${p.serviceName ?? ''}" found.` }
     }
+    // Guard: a private (1-on-1) service must not become a cap=1 weekly class
+    // without an explicit group capacity — that materializes class instances that
+    // double-list with private openings (WS-C). Ask for the group size instead.
+    if ((svc.maxParticipants ?? 1) <= 1 && (p.maxParticipants == null || p.maxParticipants <= 1)) {
+      return { ok: false, reason: i18n.schedule_private_service_needs_capacity[lang](svc.name) }
+    }
     // Resolve a named instructor (explicit-add model). A hint that matches no
     // existing instructor → clarify, don't silently create a provider-less series.
     let seriesProviderId: string | null = null
