@@ -78,7 +78,13 @@ const serviceEntryZod = z.object({
   currency: z.string(),
   whoFor: z.string(),
   processSteps: z.array(z.string()),
-  contraindications: z.string().nullable(),
+  // The model often returns contraindications as a LIST. Accept both and normalize
+  // to the single string the schema promises (joined), so a harmless shape
+  // difference never fails the whole site generation.
+  contraindications: z.preprocess(
+    (v) => (Array.isArray(v) ? (v.length ? v.join('; ') : null) : v),
+    z.string().nullable(),
+  ),
   faqs: z.array(z.object({ question: z.string(), answer: z.string() })),
 })
 
@@ -89,7 +95,9 @@ const faqEntryZod = z.object({
   serviceSlug: z.string().nullable(),
 })
 
-export const SiteSchemaZod: z.ZodType<SiteSchema> = z.object({
+// Output is SiteSchema; input is `unknown` because some fields use z.preprocess to
+// tolerate the model's shape variations (string vs array) before validating.
+export const SiteSchemaZod: z.ZodType<SiteSchema, z.ZodTypeDef, unknown> = z.object({
   business: z.object({
     name: z.string().min(1),
     category: z.string().min(1),
@@ -97,7 +105,12 @@ export const SiteSchemaZod: z.ZodType<SiteSchema> = z.object({
     description: z.string().min(20),
     city: z.string().min(1),
     address: z.string().nullable(),
-    serviceArea: z.array(z.string()),
+    // The model often returns serviceArea as a single string ("Tel Aviv area")
+    // instead of an array. Accept both and normalize to the array the schema wants.
+    serviceArea: z.preprocess(
+      (v) => (typeof v === 'string' ? (v.trim() ? [v] : []) : v),
+      z.array(z.string()),
+    ),
     phone: z.string().min(5),
     googleBusinessProfileUrl: z.string().nullable(),
     openingHours: z.array(openingHoursZod),
