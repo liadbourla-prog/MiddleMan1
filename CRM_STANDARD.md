@@ -222,13 +222,26 @@ Unchanged from CALENDAR_UX_DESIGN.md — restated as the **pattern the website r
 
 ## 7. Scope locked this round (owner sign-off 2026-06-18)
 
-**Tier A — built now (Step-1 verify, then Step-3 align):**
-1. Per-instance / tiered pricing + the §4 price resolver (incl. a `member` price tier; eligibility inert
-   until memberships exist).
-2. `loadSessionRoster` — the canonical "who booked this session" read.
-3. Attendance: `attended` / `no_show` terminal states (post-`slotEnd`, from `confirmed`).
-4. Instructor weekly-schedule read formalized (`roster.ts`) as the canonical instructor view.
-5. Per-instance capacity + roster management (capacity already enforced; paired with read #2 + invariant 2).
+**Tier A — ✅ BUILT (2026-06-18, plan `docs/superpowers/plans/2026-06-18-crm-tier-a.md`):**
+1. ✅ Per-instance / tiered pricing + the §4 price resolver (`src/domain/pricing/resolver.ts`,
+   `service_price_tiers` table via migration `0019`). The skills knowledge layer now resolves price through
+   it — no channel reads `payment_amount` directly (§8.2). A `member` tier resolves; eligibility is inert
+   until memberships exist (Tier-B).
+2. ✅ `loadSessionRoster` (`src/domain/booking/roster.ts`) — the canonical "who booked this session" read
+   (class instance **and** 1-on-1).
+3. ✅ Attendance: `attended` / `no_show` terminal states + guarded `markAttendance`
+   (`src/domain/booking/attendance.ts`) — only from `confirmed`, only after `slotEnd`; audited; not mirrored
+   to Google. No migration (text column, no DB check constraint).
+4. ✅ Instructor weekly-schedule read — already live (`src/domain/provider/roster.ts`:
+   `loadTeachingSchedule` / `loadInstructorRoster`); locked here as the canonical instructor view.
+5. ✅ Per-instance capacity — enforced from the class block's `maxParticipants` via the advisory-locked gate
+   (Step-1 fix, commit `a7e549e`); roster management is read #2 + invariant 2.
+
+**Tier-A follow-ups (deliberately deferred):**
+- A Branch-3 orchestrator tool to *set* attendance conversationally ("mark the 10:00 — everyone showed
+  except Yossi") — needs a `test:quality` pass, deferred with the paid-LLM work.
+- The instance/series `price_override` **column** referenced by §4 step 2 — the resolver already honors an
+  `instanceOverride` param, but no column is wired yet; add when a UI needs per-instance overrides.
 
 **Tier B — seam defined here, engine built later:** memberships/credits/punch-cards, full
 payments/invoicing/deposits, per-service cancellation policies, customer tags.
