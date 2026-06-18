@@ -14,9 +14,10 @@ import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
 import { applyInstruction, pauseConversation, resumeConversation } from './apply.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import { i18n, type Lang } from '../i18n/t.js'
-import { createBlock, deleteBlockById, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX } from '../availability/blocks.js'
+import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
 import { getOpenSlots } from '../availability/service.js'
+import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
 import { findProviderByName } from '../provider/lookup.js'
 
@@ -446,6 +447,122 @@ export async function executeDeleteCalendarEvent(
     return { success: false, reason: 'not_found' }
   }
   return { success: false, error: result.status === 'error' ? result.reason : 'Unknown error' }
+}
+
+// ── editClassSession ──────────────────────────────────────────────────────────
+
+interface EditClassSessionArgs {
+  eventId: string
+  instructor?: string | null
+  date?: DatePieces
+  startTime?: TimePieces
+  endTime?: TimePieces
+  durationMinutes?: number
+  maxParticipants?: number
+}
+
+/**
+ * Edit an ALREADY-scheduled group session (calendar_blocks type='class') IN PLACE:
+ * swap its instructor, move its time, or change its capacity — without the
+ * delete+recreate dance that orphans the slot's bookings. Identify the session by
+ * the eventId from a prior listCalendarEvents read-back. Guards: a time move is
+ * refused while active bookings sit on the slot; capacity can't drop below the
+ * number already booked. (WS-D D1 — manager's "change the instructor/time of this
+ * session" request.)
+ */
+export async function executeEditClassSession(args: EditClassSessionArgs, ctx: ToolContext): Promise<object> {
+  // Arg-only guards fail closed BEFORE any DB read (no work on an unactionable edit).
+  const blockId = parseBlockId(args.eventId)
+  if (!blockId) {
+    return { success: false, reason: 'not_found', guidance: i18n.edit_session_not_found[ctx.lang]() }
+  }
+  const wantsInstructor = args.instructor != null && args.instructor.trim().length > 0
+  const wantsTime = !!(args.date || args.startTime || args.endTime || args.durationMinutes != null)
+  const wantsCapacity = args.maxParticipants != null
+  if (!wantsInstructor && !wantsTime && !wantsCapacity) {
+    return { success: false, needsClarification: true, message: i18n.edit_session_nothing_to_change[ctx.lang]() }
+  }
+
+  const block = await getBlockById(ctx.db, ctx.businessId, blockId)
+  if (!block || block.type !== 'class') {
+    return { success: false, reason: 'not_found', guidance: i18n.edit_session_not_found[ctx.lang]() }
+  }
+
+  // Active seats on this slot — identity of a class session is (serviceTypeId, slotStart).
+  let bookedCount = 0
+  if (block.serviceTypeId) {
+    const seats = await ctx.db
+      .select({ id: bookings.id })
+      .from(bookings)
+      .where(and(
+        eq(bookings.businessId, ctx.businessId),
+        eq(bookings.serviceTypeId, block.serviceTypeId),
+        eq(bookings.slotStart, block.startTs),
+        inArray(bookings.state, ['held', 'pending_payment', 'confirmed']),
+      ))
+    bookedCount = seats.length
+  }
+
+  const patch: UpdateBlockPatch = {}
+
+  if (wantsInstructor) {
+    const found = await findProviderByName(ctx.db, ctx.businessId, args.instructor!.trim())
+    if (found.status === 'none') return { success: false, needsClarification: true, message: i18n.schedule_instructor_not_found[ctx.lang](args.instructor!.trim()) }
+    if (found.status === 'ambiguous') return { success: false, needsClarification: true, message: i18n.schedule_instructor_ambiguous[ctx.lang](args.instructor!.trim()) }
+    patch.providerId = found.id
+  }
+
+  if (wantsTime) {
+    // Don't move a session's time out from under people who booked it.
+    if (bookedCount > 0) {
+      return { success: false, reason: 'has_active_bookings', guidance: i18n.edit_session_time_locked_bookings[ctx.lang](bookedCount) }
+    }
+    // Default any unspecified piece to the session's CURRENT date/time/duration.
+    const lp = localParts(block.startTs, ctx.timezone)
+    const [y, mo, d] = lp.dateStr.split('-').map(Number)
+    const currentDateParts: RequestedDateParts = { relativeDay: null, weekday: null, explicitDate: { year: y!, month: mo!, day: d! } }
+    const currentTime: TimePieces = { hour: Math.floor(lp.minutes / 60), minute: lp.minutes % 60 }
+    const currentDurationMin = Math.round((block.endTs.getTime() - block.startTs.getTime()) / 60_000)
+    const resolved = resolveSlotRange(
+      {
+        date: args.date ? toDateParts(args.date) : currentDateParts,
+        startTime: args.startTime ?? currentTime,
+        endTime: args.endTime ?? null,
+        durationMinutes: args.durationMinutes ?? (args.endTime ? null : currentDurationMin),
+      },
+      ctx.timezone,
+      new Date(),
+    )
+    if (!resolved.ok) return clarifyDate(resolved.reason)
+    patch.start = resolved.start
+    patch.end = resolved.end
+  }
+
+  if (wantsCapacity) {
+    if (args.maxParticipants! < bookedCount) {
+      return { success: false, reason: 'capacity_below_booked', guidance: i18n.edit_session_capacity_below_booked[ctx.lang](bookedCount) }
+    }
+    patch.maxParticipants = args.maxParticipants!
+  }
+
+  const updated = await updateBlock(ctx.db, ctx.businessId, block.id, patch)
+  if (!updated) return { success: false, reason: 'not_found', guidance: i18n.edit_session_not_found[ctx.lang]() }
+
+  await enqueueBlockMirror(ctx.businessId, updated.id)
+
+  const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
+  const when = updated.startTs.toLocaleString(locale, { timeZone: ctx.timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+  return {
+    success: true,
+    updated: {
+      what: updated.title ?? null,
+      when,
+      instructorChanged: wantsInstructor,
+      timeChanged: wantsTime,
+      maxParticipants: updated.maxParticipants ?? null,
+    },
+    guidance: 'The session was changed in place (its bookings are intact). Confirm what changed to the manager in your own words; after a customer-facing change, offer to notify the booked participants.',
+  }
 }
 
 // ── manageBusinessSettings ────────────────────────────────────────────────────

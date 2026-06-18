@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   executeCreateCalendarEvent,
   executeScheduleGroupSession,
+  executeEditClassSession,
   type ToolContext,
 } from './orchestrator-tools.js'
 

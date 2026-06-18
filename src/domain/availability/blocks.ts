@@ -94,6 +94,51 @@ export async function deleteBlockById(
   return deleted ?? null
 }
 
+/** Fetch a single block by its bare UUID (no prefix), scoped to the business. */
+export async function getBlockById(db: Db, businessId: string, blockId: string): Promise<CalendarBlock | null> {
+  const [row] = await db
+    .select()
+    .from(calendarBlocks)
+    .where(and(eq(calendarBlocks.businessId, businessId), eq(calendarBlocks.id, blockId)))
+    .limit(1)
+  return row ?? null
+}
+
+export interface UpdateBlockPatch {
+  start?: Date
+  end?: Date
+  title?: string | null
+  providerId?: string | null
+  maxParticipants?: number | null
+}
+
+/**
+ * Patch a calendar block in place by its bare UUID (no prefix), scoped to the
+ * business. Only the provided fields change — used by editClassSession to move a
+ * session's time, swap its instructor, or change its capacity WITHOUT deleting and
+ * recreating it (which would orphan any bookings on the slot). Returns the updated
+ * row, or null if no row matched.
+ */
+export async function updateBlock(
+  db: Db,
+  businessId: string,
+  blockId: string,
+  patch: UpdateBlockPatch,
+): Promise<CalendarBlock | null> {
+  const set: Record<string, unknown> = { updatedAt: new Date() }
+  if (patch.start !== undefined) set['startTs'] = patch.start
+  if (patch.end !== undefined) set['endTs'] = patch.end
+  if (patch.title !== undefined) set['title'] = patch.title
+  if (patch.providerId !== undefined) set['providerId'] = patch.providerId
+  if (patch.maxParticipants !== undefined) set['maxParticipants'] = patch.maxParticipants
+  const [row] = await db
+    .update(calendarBlocks)
+    .set(set)
+    .where(and(eq(calendarBlocks.businessId, businessId), eq(calendarBlocks.id, blockId)))
+    .returning()
+  return row ?? null
+}
+
 /** Strip the read-back prefix from a block event id, if present. */
 export function parseBlockId(eventId: string): string | null {
   return eventId.startsWith(BLOCK_ID_PREFIX) ? eventId.slice(BLOCK_ID_PREFIX.length) : null

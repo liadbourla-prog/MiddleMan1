@@ -470,6 +470,22 @@ const strings = {
     he: (name: string) => `"${name}" מוגדר אצלי כשיעור פרטי (אחד על אחד). כדי לקבוע אותו כשיעור קבוצתי, כמה משתתפים הוא יכול לקבל?`,
     en: (name: string) => `"${name}" is set up as a private 1-on-1 session. To run it as a group class, how many participants should it hold?`,
   },
+  edit_session_not_found: {
+    he: () => `לא מצאתי את השיעור הזה בלו"ז. אפשר להגיד לי איזה יום ושעה, ואבדוק.`,
+    en: () => `I couldn't find that session on the calendar. Tell me the day and time and I'll check.`,
+  },
+  edit_session_capacity_below_booked: {
+    he: (booked: number) => `כבר רשומים ${booked} משתתפים לשיעור הזה, אז אי אפשר להוריד את הקיבולת מתחת ל-${booked}.`,
+    en: (booked: number) => `${booked} people are already booked into that session, so the capacity can't go below ${booked}.`,
+  },
+  edit_session_time_locked_bookings: {
+    he: (booked: number) => `יש ${booked} הרשמות פעילות לשיעור הזה, אז אני לא משנה את השעה מתחתיהן. אפשר לבטל/להודיע למשתתפים קודם, ואז להזיז.`,
+    en: (booked: number) => `That session has ${booked} active booking(s), so I won't move its time out from under them. Cancel/notify those participants first, then I can move it.`,
+  },
+  edit_session_nothing_to_change: {
+    he: () => `לא קלטתי מה לשנות בשיעור — מדריך, שעה או קיבולת?`,
+    en: () => `I didn't catch what to change about the session — instructor, time, or capacity?`,
+  },
   apply_provider_ambiguous: {
     he: (name: string) => `יש יותר ממדריך אחד בשם ${name}. למי מהם התכוונת?`,
     en: (name: string) => `There's more than one instructor named ${name}. Which did you mean?`,

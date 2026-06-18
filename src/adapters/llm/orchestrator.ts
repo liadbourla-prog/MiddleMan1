@@ -22,6 +22,7 @@ import {
   executeCreateCalendarEvent,
   executeScheduleGroupSession,
   executeDeleteCalendarEvent,
+  executeEditClassSession,
   executeManageBusinessSettings,
   executeSearchWeb,
   executeLookupCustomer,
@@ -176,6 +177,23 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
           type: Type.STRING,
           description: 'Brief description of the event being deleted, for confirmation message generation',
         },
+      },
+      required: ['eventId'],
+    },
+  },
+  {
+    name: 'editClassSession',
+    description: 'Change an ALREADY-scheduled class/group session that is on the calendar — swap its instructor, move its time, or change its capacity — WITHOUT deleting and recreating it (which would drop the people booked into it). Use this for "change the instructor of tomorrow\'s 10:00 yoga to Dana", "move the Tuesday breathing session to 17:00", "make the Monday class hold 15". First call listCalendarEvents to get the session\'s eventId, then pass it here. Only set the fields that change. Report date/time as structured pieces — never compute an ISO date yourself. (For a brand-new one-off session use scheduleGroupSession; for a weekly recurring series use manageBusinessSettings.)',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        eventId: { type: Type.STRING, description: 'The session\'s event ID from listCalendarEvents (the calendar block to edit)' },
+        instructor: { type: Type.STRING, description: 'New instructor name, if changing who teaches it (must already exist as an instructor). Optional.' },
+        date: DATE_PIECES_SCHEMA,
+        startTime: timeSchema('New start clock time, 24-hour, if moving the session. Optional — omit to keep the current time.'),
+        endTime: timeSchema('New end clock time, 24-hour. Optional; provide this OR durationMinutes when changing length.'),
+        durationMinutes: { type: Type.NUMBER, description: 'New length in minutes, if changing duration. Optional. Provide this OR endTime.' },
+        maxParticipants: { type: Type.NUMBER, description: 'New capacity, if changing how many people the session holds. Optional.' },
       },
       required: ['eventId'],
     },
@@ -417,6 +435,8 @@ async function dispatchTool(
       return executeScheduleGroupSession(args as unknown as Parameters<typeof executeScheduleGroupSession>[0], ctx)
     case 'deleteCalendarEvent':
       return executeDeleteCalendarEvent(args as unknown as Parameters<typeof executeDeleteCalendarEvent>[0], ctx)
+    case 'editClassSession':
+      return executeEditClassSession(args as unknown as Parameters<typeof executeEditClassSession>[0], ctx)
     case 'manageBusinessSettings':
       return executeManageBusinessSettings(args as unknown as Parameters<typeof executeManageBusinessSettings>[0], ctx)
     case 'searchWeb':
