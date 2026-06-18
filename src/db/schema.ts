@@ -230,7 +230,7 @@ export const bookings = pgTable(
     slotStart: timestamp('slot_start', { withTimezone: true }).notNull(),
     slotEnd: timestamp('slot_end', { withTimezone: true }).notNull(),
     state: text('state', {
-      enum: ['inquiry', 'requested', 'held', 'pending_payment', 'confirmed', 'cancelled', 'expired', 'failed'],
+      enum: ['inquiry', 'requested', 'held', 'pending_payment', 'confirmed', 'cancelled', 'expired', 'failed', 'attended', 'no_show'],
     }).notNull(),
     holdExpiresAt: timestamp('hold_expires_at', { withTimezone: true }),
     calendarEventId: text('calendar_event_id'),
