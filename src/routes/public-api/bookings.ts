@@ -8,6 +8,7 @@ import { requireAuth, apiError } from './auth.js'
 import { isValidE164, registerCustomer, resolveIdentity } from '../../domain/identity/resolver.js'
 import { requestBooking } from '../../domain/booking/engine.js'
 import { createCalendarClient } from '../../adapters/calendar/client.js'
+import { writeRateLimit } from './rate-limit.js'
 
 const bookingBody = z.object({
   serviceTypeId: z.string().uuid(),
@@ -21,7 +22,7 @@ const bookingBody = z.object({
 const IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 
 export function registerBookingRoutes(app: FastifyInstance): void {
-  app.post('/api/v1/bookings', async (request, reply) => {
+  app.post('/api/v1/bookings', { config: writeRateLimit }, async (request, reply) => {
     const auth = await requireAuth(db, request, reply, 'secret')
     if (!auth) return
 

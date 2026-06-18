@@ -53,4 +53,15 @@ describe.skipIf(!integrationEnabled)('public-api auth', () => {
     expect(res.statusCode).toBe(403)
     expect(res.json().error.code).toBe('forbidden_scope')
   })
+
+  it('rate-limits repeated requests on the same key (429)', async () => {
+    const key = await mintKey(biz.businessId, 'publishable')
+    const headers = { authorization: `Bearer ${key}` }
+    let got429 = false
+    for (let i = 0; i < 130; i++) {
+      const res = await app.inject({ method: 'GET', url: '/api/v1/services', headers })
+      if (res.statusCode === 429) { got429 = true; break }
+    }
+    expect(got429).toBe(true)
+  })
 })

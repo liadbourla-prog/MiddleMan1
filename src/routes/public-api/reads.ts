@@ -9,6 +9,7 @@ import { loadInstructorRoster } from '../../domain/provider/roster.js'
 import { getOpenSlots } from '../../domain/availability/service.js'
 import { listBlocksInRange } from '../../domain/availability/blocks.js'
 import { loadSessionRoster } from '../../domain/booking/roster.js'
+import { readRateLimit } from './rate-limit.js'
 
 async function loadBusiness(businessId: string): Promise<Business | null> {
   const [b] = await db.select().from(businesses).where(eq(businesses.id, businessId)).limit(1)
@@ -17,7 +18,7 @@ async function loadBusiness(businessId: string): Promise<Business | null> {
 
 export function registerReadRoutes(app: FastifyInstance): void {
   // Services + resolved price (default tier — no membership eligibility)
-  app.get('/api/v1/services', async (request, reply) => {
+  app.get('/api/v1/services', { config: readRateLimit }, async (request, reply) => {
     const auth = await requireAuth(db, request, reply, 'public')
     if (!auth) return
     const biz = await loadBusiness(auth.businessId)
@@ -37,7 +38,7 @@ export function registerReadRoutes(app: FastifyInstance): void {
   })
 
   // Instructors (who teaches what + weekly hours)
-  app.get('/api/v1/instructors', async (request, reply) => {
+  app.get('/api/v1/instructors', { config: readRateLimit }, async (request, reply) => {
     const auth = await requireAuth(db, request, reply, 'public')
     if (!auth) return
     const roster = await loadInstructorRoster(db, auth.businessId)
@@ -45,7 +46,7 @@ export function registerReadRoutes(app: FastifyInstance): void {
   })
 
   // Upcoming class instances with spotsLeft COUNT (no participant names)
-  app.get<{ Querystring: { from?: string; to?: string } }>('/api/v1/schedule', async (request, reply) => {
+  app.get<{ Querystring: { from?: string; to?: string } }>('/api/v1/schedule', { config: readRateLimit }, async (request, reply) => {
     const auth = await requireAuth(db, request, reply, 'public')
     if (!auth) return
     const biz = await loadBusiness(auth.businessId)
@@ -75,7 +76,7 @@ export function registerReadRoutes(app: FastifyInstance): void {
   })
 
   // Open bookable slots for one service
-  app.get<{ Querystring: { serviceTypeId?: string; from?: string; to?: string } }>('/api/v1/availability', async (request, reply) => {
+  app.get<{ Querystring: { serviceTypeId?: string; from?: string; to?: string } }>('/api/v1/availability', { config: readRateLimit }, async (request, reply) => {
     const auth = await requireAuth(db, request, reply, 'public')
     if (!auth) return
     const biz = await loadBusiness(auth.businessId)
@@ -95,6 +96,7 @@ export function registerReadRoutes(app: FastifyInstance): void {
   // Participant roster for a session — PII, secret key only
   app.get<{ Params: { serviceTypeId: string; slotStartISO: string } }>(
     '/api/v1/sessions/:serviceTypeId/:slotStartISO/roster',
+    { config: readRateLimit },
     async (request, reply) => {
       const auth = await requireAuth(db, request, reply, 'secret')
       if (!auth) return
