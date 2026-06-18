@@ -107,9 +107,14 @@ Request: `{ serviceTypeId, slotStart, slotEnd, name, phone, providerHint? }` + h
    providerHint })`**. The engine runs identity → policy → availability (`isSlotBookable`) → capacity
    (advisory-locked) → safe write, exactly as for WhatsApp. The booking lands in whatever state the
    business's `confirmationGate` dictates (held/requested/confirmed).
-5. **Confirmation** → the **existing** PA flow sends the WhatsApp confirmation to that phone (this both
-   verifies the number and reuses the one confirmation path); the **existing** outbound Google mirror
-   fires. No website-specific messaging.
+5. **Confirmation** → **the booking handler sends the customer a WhatsApp confirmation** to that phone
+   (this both verifies the number and keeps the channel from being silent). *Correction to the original
+   design assumption:* `requestBooking` does NOT itself send the customer confirmation — in the WhatsApp
+   flow that send is done by the webhook flow, which the API bypasses. So the handler enqueues a templated,
+   lawbook-governed confirmation (`i18n.booking_confirmed` / `booking_pending_payment`) via `enqueueMessage`
+   after a successful booking (non-fatal — the booking is already committed). The **existing** outbound
+   Google mirror fires as part of `requestBooking`. Manager new-booking notification is not built
+   system-wide (notification preferences are stored but never consumed) and is out of scope here.
 6. **Response** → `{ booking: { id, state, slotStart, slotEnd, serviceName, providerName | null } }`, or a
    structured error (`slot_unavailable`, `class_full`, `validation_error`).
 

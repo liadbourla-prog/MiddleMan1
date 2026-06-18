@@ -207,7 +207,10 @@ Unchanged from CALENDAR_UX_DESIGN.md — restated as the **pattern the website r
 `docs/superpowers/plans/2026-06-18-website-data-plugin.md`): two-key auth (`business_api_keys`, migration
 `0020`) — publishable keys for public reads, secret keys for roster names + booking writes; per-key rate
 limiting; Redis idempotency on writes. Reads call the canonical functions; `POST /api/v1/bookings` calls
-`requestBooking` (find-or-create the phone-keyed identity first). No new data path.
+`requestBooking` (find-or-create the phone-keyed identity first). No new data path. A successful web booking
+sends the customer a **WhatsApp confirmation** (templated, lawbook-governed, via `enqueueMessage`) so the
+channel is never silent and the phone is reached — `requestBooking` itself does not send it; the WhatsApp
+flow and the API each trigger the customer confirmation on their own path.
 - **Read (live):** an authenticated read API exposes exactly the canonical reads — current schedule
   (classes + open 1-on-1 slots via `getOpenSlots`), instructors (`loadInstructorRoster`/
   `loadTeachingSchedule`), prices (via the §4 resolver), per-instance availability/spots-left, and a class
