@@ -113,6 +113,19 @@ kill %1 2>/dev/null
 
 If columns from new migration files are missing, apply the SQL directly — parse and run each statement from the migration `.sql` file manually via `sql.unsafe()`, skipping `42701`/`42P07`/`42710` errors (already exists).
 
+### CRM migrations 0019 + 0020 (service_price_tiers, business_api_keys)
+
+These two were added outside the Drizzle journal, so `db:migrate` WILL skip them. Apply + verify them in one idempotent step against prod (run while the Cloud SQL proxy is up):
+
+```bash
+./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &
+sleep 4
+DATABASE_URL="$LOCAL_DB_URL" npx tsx scripts/apply-crm-migrations.ts   # exits non-zero if tables missing
+kill %1 2>/dev/null
+```
+
+It is safe to re-run (every statement is `IF NOT EXISTS`) and it fails loudly if either table is absent — closing the silent-skip gap. The website public API (`/api/v1/*`) and the price resolver 500 without these tables, so this must succeed before/with the code deploy.
+
 ---
 
 ## After every full deploy
