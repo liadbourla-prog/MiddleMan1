@@ -35,9 +35,16 @@ import { createCalendarClient } from '../../src/adapters/calendar/client.js'
 import type { ResolvedIdentity } from '../../src/domain/identity/types.js'
 
 const TZ = 'Asia/Jerusalem'
-// 2026-06-15 is a Monday, 2026-06-17 is a Wednesday.
-const MONDAY = '2026-06-15'
-const WEDNESDAY = '2026-06-17'
+// Dynamic future weekdays so booking-path tests never trip the past-slot timing
+// gate. 'YYYY-MM-DD' for the next given weekday (0=Sun..6=Sat) at least 7 days out.
+function futureWeekday(weekday: number): string {
+  const d = new Date()
+  d.setUTCDate(d.getUTCDate() + 7)
+  while (d.getUTCDay() !== weekday) d.setUTCDate(d.getUTCDate() + 1)
+  return d.toISOString().slice(0, 10)
+}
+const MONDAY = futureWeekday(1)
+const WEDNESDAY = futureWeekday(3)
 
 function slot(dateStr: string, time: string): { start: Date; end: Date } {
   const start = localTimeToUtc(dateStr, time, TZ)

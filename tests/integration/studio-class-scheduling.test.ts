@@ -49,12 +49,12 @@ function futureWeekday(weekday: number): string {
   return d.toISOString().slice(0, 10)
 }
 
-const calendar = () =>
+const calendar = (businessId: string) =>
   createCalendarClient({
     accessToken: '',
     refreshToken: '',
     calendarId: 'test',
-    businessId: '',
+    businessId,
     calendarMode: 'internal',
     lang: 'en',
   })
@@ -132,7 +132,7 @@ describe.skipIf(!integrationEnabled)('studio class scheduling', () => {
     })
 
     const customerId = await seedCustomer(biz.businessId, '+972500000001')
-    const res = await requestBooking(db, calendar(), cust(customerId, biz.businessId, '+972500000001'), {
+    const res = await requestBooking(db, calendar(biz.businessId), cust(customerId, biz.businessId, '+972500000001'), {
       serviceTypeId: biz.groupServiceId,
       slotStart: start,
       slotEnd: end,
@@ -178,12 +178,12 @@ describe.skipIf(!integrationEnabled)('studio class scheduling', () => {
     const c1 = await seedCustomer(biz.businessId, '+972500000002')
     const c2 = await seedCustomer(biz.businessId, '+972500000003')
 
-    await requestBooking(db, calendar(), cust(c1, biz.businessId, '+972500000002'), {
+    await requestBooking(db, calendar(biz.businessId), cust(c1, biz.businessId, '+972500000002'), {
       serviceTypeId: biz.groupServiceId,
       slotStart: mon,
       slotEnd: new Date(mon.getTime() + 3_600_000),
     })
-    await requestBooking(db, calendar(), cust(c2, biz.businessId, '+972500000003'), {
+    await requestBooking(db, calendar(biz.businessId), cust(c2, biz.businessId, '+972500000003'), {
       serviceTypeId: biz.groupServiceId,
       slotStart: wed,
       slotEnd: new Date(wed.getTime() + 3_600_000),
@@ -223,12 +223,12 @@ describe.skipIf(!integrationEnabled)('studio class scheduling', () => {
     const c1 = await seedCustomer(biz.businessId, '+972500000004')
     const c2 = await seedCustomer(biz.businessId, '+972500000005')
 
-    const r1 = await requestBooking(db, calendar(), cust(c1, biz.businessId, '+972500000004'), {
+    const r1 = await requestBooking(db, calendar(biz.businessId), cust(c1, biz.businessId, '+972500000004'), {
       serviceTypeId: biz.groupServiceId,
       slotStart: start,
       slotEnd: end,
     })
-    const r2 = await requestBooking(db, calendar(), cust(c2, biz.businessId, '+972500000005'), {
+    const r2 = await requestBooking(db, calendar(biz.businessId), cust(c2, biz.businessId, '+972500000005'), {
       serviceTypeId: biz.groupServiceId,
       slotStart: start,
       slotEnd: end,

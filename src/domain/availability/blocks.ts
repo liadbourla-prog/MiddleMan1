@@ -151,18 +151,24 @@ export function parseBlockId(eventId: string): string | null {
  * block placed by scheduleGroupSession / the series materializer is the SoT for
  * who teaches that slot, so a booking into the class inherits its providerId.
  * Returns:
- *  - { found: true, providerId } when a matching class block exists (providerId
- *    may still be null if the manager scheduled it without an instructor)
+ *  - { found: true, providerId, maxParticipants } when a matching class block
+ *    exists (providerId may still be null if the manager scheduled it without an
+ *    instructor; maxParticipants is the per-INSTANCE capacity for that occurrence,
+ *    null if the block carries no explicit capacity)
  *  - { found: false } when there is no class block for the slot.
+ *
+ * The capacity is per-instance by design (CRM_STANDARD.md invariant #2): two
+ * occurrences of the same group service can hold different numbers of people, so
+ * the booking engine must enforce the BLOCK's capacity, never the service type's.
  */
 export async function findClassBlockProviderForSlot(
   db: Db,
   businessId: string,
   serviceTypeId: string,
   slotStart: Date,
-): Promise<{ found: true; providerId: string | null } | { found: false }> {
+): Promise<{ found: true; providerId: string | null; maxParticipants: number | null } | { found: false }> {
   const [row] = await db
-    .select({ providerId: calendarBlocks.providerId })
+    .select({ providerId: calendarBlocks.providerId, maxParticipants: calendarBlocks.maxParticipants })
     .from(calendarBlocks)
     .where(and(
       eq(calendarBlocks.businessId, businessId),
@@ -172,7 +178,7 @@ export async function findClassBlockProviderForSlot(
     ))
     .limit(1)
   if (!row) return { found: false }
-  return { found: true, providerId: row.providerId }
+  return { found: true, providerId: row.providerId, maxParticipants: row.maxParticipants }
 }
 
 /** A human-facing label for a block row, used in calendar read-back. */

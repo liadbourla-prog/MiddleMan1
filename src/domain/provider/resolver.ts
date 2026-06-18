@@ -10,7 +10,7 @@
  *  3. null if no providers are assigned (business-level booking, no provider required)
  */
 
-import { eq, and, isNull, or, lte, gt, lt, gte } from 'drizzle-orm'
+import { eq, and, isNull, isNotNull, or, lte, gt, lt, gte } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { providerAssignments, identities, availability, bookings } from '../../db/schema.js'
 import { localParts } from '../availability/compute.js'
@@ -155,8 +155,25 @@ async function isProviderAvailable(
     return slotTimeMs >= openMs && slotEndMs <= closeMs
   }
 
-  // No provider-specific rules — fall back to business-level (available by default)
-  return true
+  // No hours row covers THIS day. A provider who has declared ANY weekly hours is
+  // off on days they did not declare → unavailable. Only a provider with NO weekly
+  // hours at all (the studio model: their scheduled classes ARE their schedule)
+  // falls back to available-by-default. Without this guard a Wed-only instructor
+  // resolves on Monday (CRM_STANDARD.md data-point #2: instructor hours must hold).
+  const [anyWeekly] = await db
+    .select({ id: availability.id })
+    .from(availability)
+    .where(
+      and(
+        eq(availability.businessId, businessId),
+        eq(availability.providerId, providerId),
+        eq(availability.isBlocked, false),
+        isNotNull(availability.dayOfWeek),
+        isNotNull(availability.openTime),
+      ),
+    )
+    .limit(1)
+  return anyWeekly === undefined
 }
 
 function timeToMs(time: string): number {

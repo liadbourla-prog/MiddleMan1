@@ -1,4 +1,4 @@
-import { eq, and, or, lt, lte, gt, gte, count, isNotNull, ne } from 'drizzle-orm'
+import { eq, and, or, lt, lte, gt, gte, count, isNotNull, ne, sql } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { bookings, serviceTypes, businesses, identities } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
@@ -107,6 +107,11 @@ export async function requestBooking(
 
   let effectiveProviderId: string | null
   let providerDisplayName: string | null = null
+  // Per-instance capacity (CRM_STANDARD.md invariant #2): the scheduled class
+  // block's capacity for THIS occurrence overrides the service-type default. Null
+  // when no block exists for the slot (legacy materialize-on-first-booking) — the
+  // group path then falls back to the service capacity.
+  let instanceCapacity: number | null = null
 
   if (isGroupClass) {
     // D1: a booking into a class inherits THAT class's instructor. The scheduled
@@ -115,6 +120,7 @@ export async function requestBooking(
     // their schedule IS their classes). An explicit request.providerId still wins.
     const classBlock = await findClassBlockProviderForSlot(db, actor.businessId, request.serviceTypeId, request.slotStart)
     effectiveProviderId = request.providerId ?? (classBlock.found ? classBlock.providerId : null)
+    if (classBlock.found) instanceCapacity = classBlock.maxParticipants
   } else {
     // Private (1-on-1) booking: resolve provider by assignment + availability.
     const resolvedProvider = request.providerId
@@ -179,7 +185,7 @@ export async function requestBooking(
   }
 
   if (isGroupClass) {
-    return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName)
+    return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, instanceCapacity)
   }
 
   return requestPrivateBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName)
@@ -363,11 +369,24 @@ async function requestGroupClassBooking(
   confirmationGate: string,
   paymentMethod: string | null,
   providerDisplayName: string | null = null,
+  instanceCapacity: number | null = null,
 ): Promise<BookingEngineResult> {
-  const maxParticipants = service.maxParticipants
+  // Per-instance capacity wins over the service-type default (CRM_STANDARD.md
+  // invariant #2): the scheduled class block decides how many fit in THIS slot.
+  const maxParticipants = instanceCapacity ?? service.maxParticipants
 
   const txResult = await (db as unknown as { transaction: <T>(fn: (tx: typeof db) => Promise<T>) => Promise<T> })
     .transaction(async (tx) => {
+      // Serialize concurrent bookings into THIS class instance. Postgres rejects
+      // `SELECT count(*) … FOR UPDATE` (FOR UPDATE is not allowed with aggregates),
+      // and a row-level FOR UPDATE would not block a phantom INSERT from a racing
+      // first-booker anyway. An advisory transaction lock keyed on
+      // (business, service, slot) is the correct slot-level mutex: it forces
+      // concurrent bookers of the same class to take turns through the count→insert
+      // window, and Postgres releases it automatically at transaction end.
+      const lockKey = `${actor.businessId}:${request.serviceTypeId}:${request.slotStart.toISOString()}`
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`)
+
       // Count active bookings for this exact class slot
       const [row] = await tx
         .select({ total: count() })
@@ -384,7 +403,6 @@ async function requestGroupClassBooking(
             ),
           ),
         )
-        .for('update')
 
       const currentCount = Number(row?.total ?? 0)
       if (currentCount >= maxParticipants) {
