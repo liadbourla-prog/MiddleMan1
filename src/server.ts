@@ -6,6 +6,7 @@ import { oauthRoutes } from './routes/oauth.js'
 import { calendarWebhookRoutes } from './routes/calendar-webhook.js'
 import { importRoutes } from './routes/import.js'
 import { buildSiteRoutes } from './routes/build-site/index.js'
+import { publicApiRoutes } from './routes/public-api/index.js'
 import { startHoldExpiryWorker, scheduleHoldExpiryJob } from './workers/hold-expiry.js'
 import { startMessageRetryWorker } from './workers/message-retry.js'
 import { startSessionExpiryWorker } from './workers/session-expiry.js'
@@ -66,6 +67,7 @@ await app.register(oauthRoutes)
 await app.register(calendarWebhookRoutes)
 await app.register(importRoutes)
 await app.register(buildSiteRoutes)
+await app.register(publicApiRoutes)
 
 if (isDev) {
   const { simulateRoutes } = await import('./routes/simulate.js')
