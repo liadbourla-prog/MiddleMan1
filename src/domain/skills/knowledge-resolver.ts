@@ -1,6 +1,7 @@
 import { eq, and } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { businesses, serviceTypes, businessFaqs } from '../../db/schema.js'
+import { resolveServicePrice } from '../pricing/resolver.js'
 import type {
   BusinessKnowledge,
   CommunicationStyle,
@@ -35,7 +36,6 @@ export async function loadBusinessKnowledge(db: Db, businessId: string, currency
       id: serviceTypes.id,
       name: serviceTypes.name,
       durationMinutes: serviceTypes.durationMinutes,
-      paymentAmount: serviceTypes.paymentAmount,
       narrative: serviceTypes.narrative,
     }).from(serviceTypes).where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.isActive, true))),
 
@@ -49,14 +49,17 @@ export async function loadBusinessKnowledge(db: Db, businessId: string, currency
   const biz = business[0]
 
   return {
-    services: services.map((s) => ({
+    services: await Promise.all(services.map(async (s) => ({
       id: s.id,
       name: s.name,
       durationMinutes: s.durationMinutes,
-      price: s.paymentAmount !== null ? parseFloat(s.paymentAmount) : null,
+      // Default (no membership eligibility today) → resolves to the service base
+      // price, but through the single price path (CRM_STANDARD.md §4/§8.2) — no
+      // channel reads payment_amount directly.
+      price: (await resolveServicePrice(db, businessId, { serviceTypeId: s.id, currency })).amount,
       currency,
       narrative: s.narrative,
-    })),
+    }))),
     policies: {
       minBufferMinutes: biz?.minBookingBufferMinutes ?? 30,
       maxDaysAhead: biz?.maxBookingDaysAhead ?? 365,

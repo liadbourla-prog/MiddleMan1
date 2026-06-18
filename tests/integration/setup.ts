@@ -177,6 +177,8 @@ export async function teardown(businessId: string): Promise<void> {
   // Delegated staff permissions + assignments
   await db.execute(sql`DELETE FROM delegated_permissions WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM provider_assignments WHERE business_id = ${businessId}`)
+  // Per-service price tiers reference service_types — clear before it (CRM Tier-A)
+  await db.execute(sql`DELETE FROM service_price_tiers WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM service_types WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM availability WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM manager_instructions WHERE business_id = ${businessId}`)
