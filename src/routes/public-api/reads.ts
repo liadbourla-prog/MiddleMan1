@@ -91,4 +91,33 @@ export function registerReadRoutes(app: FastifyInstance): void {
     const slots = await getOpenSlots(db, biz, { start: from, end: to }, svc.durationMinutes)
     return reply.send({ timezone: biz.timezone, slots: slots.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString() })) })
   })
+
+  // Participant roster for a session — PII, secret key only
+  app.get<{ Params: { serviceTypeId: string; slotStartISO: string } }>(
+    '/api/v1/sessions/:serviceTypeId/:slotStartISO/roster',
+    async (request, reply) => {
+      const auth = await requireAuth(db, request, reply, 'secret')
+      if (!auth) return
+      const slotStart = new Date(decodeURIComponent(request.params.slotStartISO))
+      if (isNaN(slotStart.getTime())) return apiError(reply, 422, 'validation_error', 'Invalid slotStart')
+      const roster = await loadSessionRoster(db, auth.businessId, { serviceTypeId: request.params.serviceTypeId, slotStart })
+      if (!roster) return apiError(reply, 404, 'not_found', 'No session at that slot')
+      return reply.send({
+        instance: {
+          serviceTypeId: roster.instance.serviceTypeId,
+          serviceName: roster.instance.serviceName,
+          instructorName: roster.instance.instructorName,
+          start: roster.instance.start.toISOString(),
+          capacity: roster.instance.capacity,
+        },
+        spotsLeft: roster.spotsLeft,
+        participants: roster.participants.map((p) => ({
+          name: p.displayName,
+          state: p.state,
+          paymentStatus: p.paymentStatus,
+          attendance: p.attendance,
+        })),
+      })
+    },
+  )
 }
