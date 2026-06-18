@@ -140,6 +140,29 @@ export const servicePriceTiers = pgTable(
   (t) => [uniqueIndex('service_price_tiers_service_tier_idx').on(t.serviceTypeId, t.tier)],
 )
 
+// Per-business API keys for the public website data API (website-data-plugin spec).
+// We store only the sha256 hash of the raw key; the raw key is shown once at mint.
+export const businessApiKeys = pgTable(
+  'business_api_keys',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    type: text('type', { enum: ['publishable', 'secret'] }).notNull(),
+    keyHash: text('key_hash').notNull(),
+    prefix: text('prefix').notNull(),
+    label: text('label'),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('business_api_keys_hash_idx').on(t.keyHash),
+    index('business_api_keys_business_idx').on(t.businessId, t.isActive),
+  ],
+)
+
 export const availability = pgTable(
   'availability',
   {
@@ -719,6 +742,7 @@ export type Business = typeof businesses.$inferSelect
 export type Identity = typeof identities.$inferSelect
 export type ServiceType = typeof serviceTypes.$inferSelect
 export type ServicePriceTier = typeof servicePriceTiers.$inferSelect
+export type BusinessApiKey = typeof businessApiKeys.$inferSelect
 export type Availability = typeof availability.$inferSelect
 export type ProviderAssignment = typeof providerAssignments.$inferSelect
 export type DelegatedPermission = typeof delegatedPermissions.$inferSelect
