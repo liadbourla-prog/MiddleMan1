@@ -117,6 +117,29 @@ export const serviceTypes = pgTable('service_types', {
   intakeNotes: text('intake_notes'),
 })
 
+// Named price tiers per service type (CRM_STANDARD.md §1.2). The service base
+// price (service_types.payment_amount) is the default/drop-in rate; tiers express
+// alternatives — e.g. a 'member' rate. Eligibility (who is a member) is Tier-B and
+// inert today: a tier only applies when a caller passes its name to the resolver.
+export const servicePriceTiers = pgTable(
+  'service_price_tiers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    serviceTypeId: uuid('service_type_id')
+      .notNull()
+      .references(() => serviceTypes.id),
+    tier: text('tier').notNull(), // 'drop_in' | 'member' | free-form
+    amount: numeric('amount', { precision: 10, scale: 2 }).notNull(),
+    currency: text('currency').notNull(),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('service_price_tiers_service_tier_idx').on(t.serviceTypeId, t.tier)],
+)
+
 export const availability = pgTable(
   'availability',
   {
@@ -695,6 +718,7 @@ export const calendarSyncChannels = pgTable(
 export type Business = typeof businesses.$inferSelect
 export type Identity = typeof identities.$inferSelect
 export type ServiceType = typeof serviceTypes.$inferSelect
+export type ServicePriceTier = typeof servicePriceTiers.$inferSelect
 export type Availability = typeof availability.$inferSelect
 export type ProviderAssignment = typeof providerAssignments.$inferSelect
 export type DelegatedPermission = typeof delegatedPermissions.$inferSelect
