@@ -575,6 +575,20 @@ const strings = {
       `✅ Your ${service} at ${biz} is confirmed for ${date} at ${time}. See you then!`,
   },
 
+  // ── Booking confirmation to customer (website-originated booking) ────────────
+  booking_confirmed: {
+    he: (service: string, biz: string, date: string, time: string) =>
+      `✅ ה${service} שלכם ב-${biz} נקבע ל-${date} בשעה ${time}. נתראה!`,
+    en: (service: string, biz: string, date: string, time: string) =>
+      `✅ Your ${service} at ${biz} is booked for ${date} at ${time}. See you then!`,
+  },
+  booking_pending_payment: {
+    he: (service: string, biz: string, date: string, time: string) =>
+      `שמרנו לכם ${service} ב-${biz} ל-${date} בשעה ${time}. כדי לאשר סופית — נותר רק להשלים את התשלום.`,
+    en: (service: string, biz: string, date: string, time: string) =>
+      `We've reserved ${service} at ${biz} for ${date} at ${time}. To confirm it, just complete the payment.`,
+  },
+
   // ── Operator console ─────────────────────────────────────────────────────────
   op_help: {
     he: `הנה מה שאני יכול לעשות לך מכאן:\n\n• \`סטטוס הכל\` — מצב כל העסקים הפעילים\n• \`סטטוס [שם]\` — דוח מפורט לעסק אחד\n• \`מיומנויות [שם]\` — מצב זרימות המיומנויות לעסק\n• \`פניות\` — 10 פניות פתוחות אחרונות\n• \`פיצ'רים\` — בקשות פיצ'רים נדחות\n• \`הפעל מחדש [שם]\` — רשימת סקילים שניתן להפעיל מחדש\n• \`הפעל מחדש [שם] [סקיל]\` — הפעלת סקיל ספציפי מחדש\n• \`עדכן הכל: [הנחיה]\` — דחוף שינוי לכל הסוכנים\n\nפשוט תכתוב מה שאתה צריך.`,

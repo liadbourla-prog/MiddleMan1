@@ -8,6 +8,9 @@ import { requireAuth, apiError } from './auth.js'
 import { isValidE164, registerCustomer, resolveIdentity } from '../../domain/identity/resolver.js'
 import { requestBooking } from '../../domain/booking/engine.js'
 import { createCalendarClient } from '../../adapters/calendar/client.js'
+import { enqueueMessage } from '../../workers/message-retry.js'
+import { i18n } from '../../domain/i18n/t.js'
+import type { Business, BookingState } from '../../db/schema.js'
 import { writeRateLimit } from './rate-limit.js'
 
 const bookingBody = z.object({
@@ -41,8 +44,8 @@ export function registerBookingRoutes(app: FastifyInstance): void {
     if (idemRedisKey) {
       const prior = await redis.get(idemRedisKey)
       if (prior) {
-        const [row] = await db.select().from(bookings).where(eq(bookings.id, prior)).limit(1)
-        if (row) return reply.status(201).send({ booking: await shape(row.id) })
+        const priorDetail = await loadBookingDetail(prior)
+        if (priorDetail) return reply.status(201).send({ booking: shapeResponse(priorDetail) })
       }
     }
 
@@ -76,11 +79,30 @@ export function registerBookingRoutes(app: FastifyInstance): void {
     }
 
     if (idemRedisKey) await redis.set(idemRedisKey, result.bookingId, 'EX', IDEMPOTENCY_TTL_SECONDS)
-    return reply.status(201).send({ booking: await shape(result.bookingId) })
+
+    const detail = await loadBookingDetail(result.bookingId)
+    // WhatsApp confirmation to the customer — a website booking must NOT be silent.
+    // This is the same confirmation channel a WhatsApp booking uses (CRM_STANDARD.md
+    // §6.3). Templated + lawbook-governed (not LLM-phrased). Non-fatal: the booking
+    // is already committed, so a send failure must not fail the API response.
+    if (detail) {
+      const lang = resolved.identity.preferredLanguage ?? biz.defaultLanguage
+      await sendBookingConfirmation(biz, lang, phone, detail).catch(() => { /* non-fatal */ })
+    }
+
+    return reply.status(201).send({ booking: detail ? shapeResponse(detail) : { id: result.bookingId } })
   })
 }
 
-async function shape(bookingId: string): Promise<object> {
+interface BookingDetail {
+  id: string
+  state: BookingState
+  slotStart: Date
+  slotEnd: Date
+  serviceName: string
+}
+
+async function loadBookingDetail(bookingId: string): Promise<BookingDetail | null> {
   const [row] = await db
     .select({
       id: bookings.id, state: bookings.state, slotStart: bookings.slotStart, slotEnd: bookings.slotEnd,
@@ -90,9 +112,19 @@ async function shape(bookingId: string): Promise<object> {
     .innerJoin(serviceTypes, eq(bookings.serviceTypeId, serviceTypes.id))
     .where(eq(bookings.id, bookingId))
     .limit(1)
-  return {
-    id: row!.id, state: row!.state,
-    slotStart: row!.slotStart.toISOString(), slotEnd: row!.slotEnd.toISOString(),
-    serviceName: row!.serviceName,
-  }
+  return row ?? null
+}
+
+function shapeResponse(d: BookingDetail): object {
+  return { id: d.id, state: d.state, slotStart: d.slotStart.toISOString(), slotEnd: d.slotEnd.toISOString(), serviceName: d.serviceName }
+}
+
+async function sendBookingConfirmation(biz: Business, lang: 'he' | 'en', phone: string, d: BookingDetail): Promise<void> {
+  const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+  const dateStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, day: '2-digit', month: '2-digit', year: 'numeric' }).format(d.slotStart)
+  const timeStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, hour: '2-digit', minute: '2-digit', hour12: false }).format(d.slotStart)
+  const body = d.state === 'pending_payment'
+    ? i18n.booking_pending_payment[lang](d.serviceName, biz.name, dateStr, timeStr)
+    : i18n.booking_confirmed[lang](d.serviceName, biz.name, dateStr, timeStr)
+  await enqueueMessage(phone, body, d.id)
 }

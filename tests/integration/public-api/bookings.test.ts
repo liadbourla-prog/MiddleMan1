@@ -80,6 +80,15 @@ describe.skipIf(!integrationEnabled)('public-api bookings', () => {
     expect(rows.length).toBe(1)
   })
 
+  it('sends a WhatsApp confirmation to the customer on a successful booking', async () => {
+    const { enqueueMessage } = await import('../../../src/workers/message-retry.js')
+    const res = await app.inject({ method: 'POST', url: '/api/v1/bookings',
+      headers: { authorization: `Bearer ${key}`, 'idempotency-key': 'wa1' }, payload: body('+972500000510') })
+    expect(res.statusCode).toBe(201)
+    const sentToCustomer = vi.mocked(enqueueMessage).mock.calls.some((c) => c[0] === '+972500000510')
+    expect(sentToCustomer).toBe(true)
+  })
+
   it('rejects an invalid phone (422)', async () => {
     const res = await app.inject({ method: 'POST', url: '/api/v1/bookings',
       headers: { authorization: `Bearer ${key}`, 'idempotency-key': 'k3' }, payload: body('not-a-phone') })
