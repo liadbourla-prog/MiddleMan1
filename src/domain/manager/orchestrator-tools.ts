@@ -6,7 +6,8 @@
 
 import { and, desc, eq, gt, gte, ilike, inArray, lt, or } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes } from '../../db/schema.js'
+import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries } from '../../db/schema.js'
+import { createSeries } from '../scheduling/series.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../authorization/check.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
@@ -562,6 +563,153 @@ export async function executeEditClassSession(args: EditClassSessionArgs, ctx: T
       maxParticipants: updated.maxParticipants ?? null,
     },
     guidance: 'The session was changed in place (its bookings are intact). Confirm what changed to the manager in your own words; after a customer-facing change, offer to notify the booked participants.',
+  }
+}
+
+// ── scheduleRecurringClasses ──────────────────────────────────────────────────
+
+interface RecurringClassSpec {
+  serviceName: string
+  instructor?: string
+  daysOfWeek: number[]
+  times: TimePieces[]
+  durationMinutes?: number
+  maxParticipants?: number
+  startDate?: DatePieces
+  endDate?: DatePieces
+}
+interface ScheduleRecurringClassesArgs {
+  classes: RecurringClassSpec[]
+}
+
+// Cap one batch so a pathological "every minute" request can't blow up the DB.
+const MAX_SERIES_PER_BATCH = 200
+// Materialize only the near horizon synchronously; the series-materializer worker
+// rolls each series forward to the full horizon afterwards.
+const BATCH_HORIZON_DAYS = 28
+
+function fmtTime(t: TimePieces): string {
+  return `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`
+}
+
+/**
+ * Set up MANY recurring weekly classes from one instruction — e.g. "yoga and
+ * pilates every hour 09:00–20:00 Sunday–Thursday". The orchestrator expands the
+ * request into explicit specs (service × daysOfWeek × times); this executor loops
+ * createSeries for each (service, day, time), idempotently (an active series for
+ * the same slot is skipped, so re-running never duplicates). Reuses the WS-C
+ * cap-must-be>1 guard and instructor resolution; collects per-service counts and a
+ * skipped list with reasons. (WS-D D2.)
+ */
+export async function executeScheduleRecurringClasses(args: ScheduleRecurringClassesArgs, ctx: ToolContext): Promise<object> {
+  const specs = Array.isArray(args.classes) ? args.classes : []
+  if (specs.length === 0) {
+    return { success: false, needsClarification: true, guidance: 'No classes were given. Ask the manager which weekly classes to set up — service, which days, and what times.' }
+  }
+
+  const now = new Date()
+  const defaultStartDate = localParts(now, ctx.timezone).dateStr
+
+  // Sanity cap on total weekly series in one call.
+  let plannedTuples = 0
+  for (const s of specs) plannedTuples += (Array.isArray(s.daysOfWeek) ? s.daysOfWeek.length : 0) * (Array.isArray(s.times) ? s.times.length : 0)
+  if (plannedTuples > MAX_SERIES_PER_BATCH) {
+    return { success: false, needsClarification: true, guidance: `That works out to ${plannedTuples} separate weekly classes at once — a lot to create blindly. Ask the manager to confirm or narrow it (fewer days or times) before setting them all up.` }
+  }
+
+  let seriesCreated = 0
+  let instancesCreated = 0
+  const skipped: Array<{ what: string; reason: string }> = []
+  const createdByService: Record<string, number> = {}
+
+  for (const spec of specs) {
+    const name = (spec.serviceName ?? '').trim()
+    const days = Array.isArray(spec.daysOfWeek) ? spec.daysOfWeek.filter((d) => Number.isInteger(d) && d >= 0 && d <= 6) : []
+    const times = Array.isArray(spec.times) ? spec.times.filter((t) => t && Number.isInteger(t.hour)) : []
+    if (!name || days.length === 0 || times.length === 0) {
+      skipped.push({ what: name || 'class', reason: 'incomplete' })
+      continue
+    }
+
+    const [svc] = await ctx.db
+      .select({ id: serviceTypes.id, name: serviceTypes.name, durationMinutes: serviceTypes.durationMinutes, maxParticipants: serviceTypes.maxParticipants })
+      .from(serviceTypes)
+      .where(and(eq(serviceTypes.businessId, ctx.businessId), eq(serviceTypes.isActive, true), ilike(serviceTypes.name, `%${name}%`)))
+      .limit(1)
+    if (!svc) { skipped.push({ what: name, reason: 'service_not_found' }); continue }
+
+    // WS-C invariant: a class needs a real group capacity (>1).
+    const cap = spec.maxParticipants ?? svc.maxParticipants ?? 1
+    if (cap <= 1) { skipped.push({ what: svc.name, reason: 'needs_capacity' }); continue }
+
+    let providerId: string | null = null
+    if (spec.instructor && spec.instructor.trim().length > 0) {
+      const found = await findProviderByName(ctx.db, ctx.businessId, spec.instructor.trim())
+      if (found.status === 'none') { skipped.push({ what: `${svc.name} (${spec.instructor.trim()})`, reason: 'instructor_not_found' }); continue }
+      if (found.status === 'ambiguous') { skipped.push({ what: `${svc.name} (${spec.instructor.trim()})`, reason: 'instructor_ambiguous' }); continue }
+      providerId = found.id
+    }
+
+    let startDate = defaultStartDate
+    if (spec.startDate) {
+      const r = resolveRequestedDate(toDateParts(spec.startDate), ctx.timezone, now)
+      if (r.ok) startDate = r.dateStr
+    }
+    let endDate: string | null = null
+    if (spec.endDate) {
+      const r = resolveRequestedDate(toDateParts(spec.endDate), ctx.timezone, now)
+      if (r.ok) endDate = r.dateStr
+    }
+
+    for (const dow of days) {
+      for (const t of times) {
+        const startTime = fmtTime(t)
+        // Idempotency: an active series for this exact slot already exists → skip.
+        const [existing] = await ctx.db
+          .select({ id: classSeries.id })
+          .from(classSeries)
+          .where(and(
+            eq(classSeries.businessId, ctx.businessId),
+            eq(classSeries.serviceTypeId, svc.id),
+            eq(classSeries.dayOfWeek, dow),
+            eq(classSeries.startTime, startTime),
+            eq(classSeries.isActive, true),
+          ))
+          .limit(1)
+        if (existing) { skipped.push({ what: `${svc.name} ${startTime}`, reason: 'already_exists' }); continue }
+
+        const { created } = await createSeries(ctx.db, {
+          businessId: ctx.businessId,
+          serviceTypeId: svc.id,
+          providerId,
+          dayOfWeek: dow,
+          startTime,
+          durationMinutes: spec.durationMinutes ?? svc.durationMinutes,
+          maxParticipants: cap,
+          title: svc.name,
+          startDate,
+          endDate,
+          timezone: ctx.timezone,
+        }, { horizonDays: BATCH_HORIZON_DAYS })
+        seriesCreated++
+        instancesCreated += created
+        createdByService[svc.name] = (createdByService[svc.name] ?? 0) + 1
+      }
+    }
+  }
+
+  if (seriesCreated === 0) {
+    return {
+      success: false,
+      skipped,
+      guidance: 'Nothing was created. Tell the manager what was skipped and why (unknown service, a private service that needs a group capacity, or an unknown instructor) in your own words, and offer to fix it.',
+    }
+  }
+  return {
+    success: true,
+    created: { series: seriesCreated, instances: instancesCreated, byService: createdByService },
+    skipped,
+    guidance: 'Recurring weekly classes are set up and the first weeks are already on the calendar (the rest roll out automatically). Summarize for the manager in your own words — how many of which class, plus anything skipped and why. Offer to adjust or notify customers.',
   }
 }
 

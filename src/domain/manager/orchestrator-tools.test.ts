@@ -3,6 +3,7 @@ import {
   executeCreateCalendarEvent,
   executeScheduleGroupSession,
   executeEditClassSession,
+  executeScheduleRecurringClasses,
   type ToolContext,
 } from './orchestrator-tools.js'
 
@@ -112,5 +113,30 @@ describe('manager calendar writes — deterministic date guard (no write on bad 
     expect(res.success).toBe(false)
     expect(res.needsClarification).toBe(true)
     expect(res.reason).toBe('no_time')
+  })
+})
+
+describe('scheduleRecurringClasses — fail-fast guards before any DB read (WS-D D2)', () => {
+  it('empty classes list → needsClarification, no DB touch', async () => {
+    const res = await executeScheduleRecurringClasses(
+      { classes: [] },
+      noWriteCtx(),
+    ) as { success: boolean; needsClarification?: boolean }
+    expect(res.success).toBe(false)
+    expect(res.needsClarification).toBe(true)
+  })
+
+  it('two services every hour all week (> 200 tuples) → needsClarification, no DB touch', async () => {
+    const everyHour = Array.from({ length: 24 }, (_, h) => ({ hour: h, minute: 0 }))
+    const allWeek = [0, 1, 2, 3, 4, 5, 6]
+    const res = await executeScheduleRecurringClasses(
+      { classes: [
+        { serviceName: 'Yoga', daysOfWeek: allWeek, times: everyHour },     // 168
+        { serviceName: 'Pilates', daysOfWeek: allWeek, times: everyHour },  // +168 = 336 > 200
+      ] },
+      noWriteCtx(),
+    ) as { success: boolean; needsClarification?: boolean }
+    expect(res.success).toBe(false)
+    expect(res.needsClarification).toBe(true)
   })
 })

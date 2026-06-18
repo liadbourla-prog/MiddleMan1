@@ -23,6 +23,7 @@ import {
   executeScheduleGroupSession,
   executeDeleteCalendarEvent,
   executeEditClassSession,
+  executeScheduleRecurringClasses,
   executeManageBusinessSettings,
   executeSearchWeb,
   executeLookupCustomer,
@@ -147,7 +148,7 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'scheduleGroupSession',
-    description: 'Proactively place a SINGLE group session / class on the calendar for one specific date (e.g. "schedule a Vinyasa class this Tuesday 11:00–12:00 with Dana, 10 spots"). Use this when the manager wants to put a one-off class on the calendar BEFORE any customer books it. Capture the instructor when the manager names one ("with Dana" → instructor: "Dana"). Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours OR to set up a class that REPEATS every week ("yoga every Monday"), use manageBusinessSettings. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
+    description: 'Proactively place a SINGLE group session / class on the calendar for one specific date (e.g. "schedule a Vinyasa class this Tuesday 11:00–12:00 with Dana, 10 spots"). Use this when the manager wants to put a one-off class on the calendar BEFORE any customer books it. Capture the instructor when the manager names one ("with Dana" → instructor: "Dana"). Links to an existing service by name when given. For 1-on-1 personal events use createCalendarEvent; to change recurring weekly hours use manageBusinessSettings; to set up a class that REPEATS every week ("yoga every Monday") use scheduleRecurringClasses. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -196,6 +197,34 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         maxParticipants: { type: Type.NUMBER, description: 'New capacity, if changing how many people the session holds. Optional.' },
       },
       required: ['eventId'],
+    },
+  },
+  {
+    name: 'scheduleRecurringClasses',
+    description: 'Set up one OR MANY recurring weekly classes in a single step — use this for dense requests like "yoga and pilates every hour 09:00–20:00 Sunday to Thursday" or "breathing workshop every Monday and Wednesday at 10:00 and 16:00". Expand the request yourself into explicit specs: one entry per service, each with the days of week and the list of start times. The class repeats weekly on each (day, time). Only links to services that already exist; the service must have a group capacity (>1) or you must pass maxParticipants. Capture the instructor when named. For a SINGLE one-off class on one date use scheduleGroupSession instead; to change ONE existing session use editClassSession.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        classes: {
+          type: Type.ARRAY,
+          description: 'One entry per service. Each entry repeats weekly on every (dayOfWeek × time) combination it lists.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              serviceName: { type: Type.STRING, description: 'Name of the existing group service (matched fuzzily)' },
+              instructor: { type: Type.STRING, description: 'Instructor name if the manager named one for these classes (must already exist). Optional.' },
+              daysOfWeek: { type: Type.ARRAY, items: { type: Type.NUMBER }, description: 'Days this class runs: 0=Sunday … 6=Saturday. E.g. Sun–Thu = [0,1,2,3,4].' },
+              times: { type: Type.ARRAY, items: timeSchema('A start clock time, 24-hour'), description: 'All weekly start times. Expand a range like "every hour 9–20" into [{hour:9,minute:0}, … {hour:20,minute:0}].' },
+              durationMinutes: { type: Type.NUMBER, description: 'Session length in minutes (optional; defaults to the service duration)' },
+              maxParticipants: { type: Type.NUMBER, description: 'Capacity per session (optional; defaults to the service capacity). Required if the service is otherwise 1-on-1.' },
+              startDate: DATE_PIECES_SCHEMA,
+              endDate: DATE_PIECES_SCHEMA,
+            },
+            required: ['serviceName', 'daysOfWeek', 'times'],
+          },
+        },
+      },
+      required: ['classes'],
     },
   },
   {
@@ -386,10 +415,12 @@ Reply entirely in ${language}. All WhatsApp formatting rules apply:
 For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range), report the date/time the manager said as structured pieces (relativeDay / weekday / explicitDate, and {hour,minute} times). NEVER compute or output an absolute or ISO date — a deterministic system resolves the pieces and validates them. If a calendar tool returns needsClarification: true, the date/time couldn't be resolved (ambiguous, already past, impossible, or a clock time that doesn't exist that day) — do NOT retry the tool with a guessed date; ask the manager for a workable day/time in your own words, without echoing the unusable value.
 
 ## Tool usage rules
-- manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Use it as well to set up, stop, or skip one date of a RECURRING weekly class / group session (e.g. "yoga every Monday 10am", "stop the weekly pilates class", "no spin class this coming Tuesday"). Also use it to add or manage instructors / teaching staff and their weekly hours (e.g. "add Dana as a yoga instructor Mon/Wed 9–13", "change Dana's hours", "Dana also teaches pilates", "remove Dana"). Never handle these as conversational replies.
+- manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Use it to STOP or SKIP one date of a recurring weekly class (e.g. "stop the weekly pilates class", "no spin class this coming Tuesday") — but to CREATE/SET UP recurring classes use scheduleRecurringClasses, not this. Also use it to add or manage instructors / teaching staff and their weekly hours (e.g. "add Dana as a yoga instructor Mon/Wed 9–13", "change Dana's hours", "Dana also teaches pilates", "remove Dana"). Never handle these as conversational replies.
+- scheduleRecurringClasses: use to CREATE recurring weekly classes — one or many at once (e.g. "yoga every Monday 10am", "yoga and pilates every hour 9–20 Sun–Thu", "breathing Mon & Wed at 10:00 and 16:00"). Expand ranges into explicit days and times yourself. The service must already exist and have a group capacity (>1) or you pass maxParticipants.
 - listCalendarEvents: use for schedule questions. Use intent check_free_slots when the manager asks what times are open/free — it returns real bookable openings. Do not call it unless the manager is asking about their calendar.
 - createCalendarEvent: personal/business 1-on-1 events only (e.g. "dentist 3pm"). Do not use for blocking customer booking slots — that is manageBusinessSettings.
-- scheduleGroupSession: use when the manager wants to put a SINGLE class/group session on the calendar for one specific date ahead of bookings (e.g. "add a yoga class this Tuesday 11am with Dana, 10 spots"). Capture the instructor when named ("with Dana"). For a class that repeats every week ("every Monday", "weekly"), use manageBusinessSettings instead.
+- scheduleGroupSession: use when the manager wants to put a SINGLE class/group session on the calendar for one specific date ahead of bookings (e.g. "add a yoga class this Tuesday 11am with Dana, 10 spots"). Capture the instructor when named ("with Dana"). For a class that repeats every week ("every Monday", "weekly"), use scheduleRecurringClasses instead.
+- editClassSession: use to change an ALREADY-scheduled class on the calendar — its instructor, time, or capacity (e.g. "change tomorrow's 10:00 yoga to Dana", "move the Tuesday breathing to 17:00"). Get its eventId from listCalendarEvents first. Never delete+recreate a class to "edit" it — that drops its bookings.
 - deleteCalendarEvent: only for personal/business events, blocks, or classes the manager created. NEVER use for customer bookings — use manageBusinessSettings with a cancellation instruction for those.
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
@@ -437,6 +468,8 @@ async function dispatchTool(
       return executeDeleteCalendarEvent(args as unknown as Parameters<typeof executeDeleteCalendarEvent>[0], ctx)
     case 'editClassSession':
       return executeEditClassSession(args as unknown as Parameters<typeof executeEditClassSession>[0], ctx)
+    case 'scheduleRecurringClasses':
+      return executeScheduleRecurringClasses(args as unknown as Parameters<typeof executeScheduleRecurringClasses>[0], ctx)
     case 'manageBusinessSettings':
       return executeManageBusinessSettings(args as unknown as Parameters<typeof executeManageBusinessSettings>[0], ctx)
     case 'searchWeb':
