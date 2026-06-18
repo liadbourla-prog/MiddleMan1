@@ -202,7 +202,12 @@ Unchanged from CALENDAR_UX_DESIGN.md — restated as the **pattern the website r
   internal record as inputs (owner-wins with a blast-radius gate + Branch-3 confirmation), with periodic
   **full reconcile** as the real guarantee. Owner-created events ⇒ opaque `source='google_import'` blocks.
 
-### 6.3 Website (new projection — Step 2, same pattern)
+### 6.3 Website (new projection — ✅ IMPLEMENTED 2026-06-18, same pattern)
+**Built as the `/api/v1/*` JSON API** (`src/routes/public-api/`, plan
+`docs/superpowers/plans/2026-06-18-website-data-plugin.md`): two-key auth (`business_api_keys`, migration
+`0020`) — publishable keys for public reads, secret keys for roster names + booking writes; per-key rate
+limiting; Redis idempotency on writes. Reads call the canonical functions; `POST /api/v1/bookings` calls
+`requestBooking` (find-or-create the phone-keyed identity first). No new data path.
 - **Read (live):** an authenticated read API exposes exactly the canonical reads — current schedule
   (classes + open 1-on-1 slots via `getOpenSlots`), instructors (`loadInstructorRoster`/
   `loadTeachingSchedule`), prices (via the §4 resolver), per-instance availability/spots-left, and a class
