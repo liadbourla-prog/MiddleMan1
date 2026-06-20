@@ -839,6 +839,40 @@ export const calendarSyncChannels = pgTable(
   ],
 )
 
+// Integrity Sentinel findings (WS-B). The independent every-2h auditor records each
+// detected calendar mistake here: dedup tracking (one OPEN row per business+dedupKey),
+// the on-demand "is everything correct?" report, and the audit trail of what it fixed.
+// `quarantineBlockId` links the calendar_blocks row created to block new bookings into a
+// contested slot, so resolution can remove it.
+export const integrityFindings = pgTable(
+  'integrity_findings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    kind: text('kind').notNull(),
+    severity: text('severity', { enum: ['critical', 'warning'] }).notNull(),
+    status: text('status', { enum: ['open', 'resolved'] }).notNull().default('open'),
+    // Stable per underlying problem so re-runs update rather than duplicate.
+    dedupKey: text('dedup_key').notNull(),
+    bookingId: uuid('booking_id'),
+    slotStart: timestamp('slot_start', { withTimezone: true }),
+    detail: jsonb('detail'),
+    autoRemediated: boolean('auto_remediated').notNull().default(false),
+    quarantineBlockId: uuid('quarantine_block_id'),
+    firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    notifiedAt: timestamp('notified_at', { withTimezone: true }),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+  },
+  (t) => [
+    // At most one OPEN finding per (business, dedupKey) — the dedup guarantee.
+    uniqueIndex('integrity_findings_open_dedup_idx')
+      .on(t.businessId, t.dedupKey)
+      .where(sql`${t.status} = 'open'`),
+    index('integrity_findings_business_status_idx').on(t.businessId, t.status),
+  ],
+)
+
 // ── Type exports ──────────────────────────────────────────────────────────────
 
 export type Business = typeof businesses.$inferSelect
@@ -878,6 +912,7 @@ export type ReshuffleCampaign = typeof reshuffleCampaigns.$inferSelect
 export type ReshuffleOffer = typeof reshuffleOffers.$inferSelect
 export type ReshuffleProposal = typeof reshuffleProposals.$inferSelect
 export type FreedSlotApproval = typeof freedSlotApprovals.$inferSelect
+export type IntegrityFinding = typeof integrityFindings.$inferSelect
 
 export type BookingState = Booking['state']
 export type IdentityRole = Identity['role']

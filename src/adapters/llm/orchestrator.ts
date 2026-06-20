@@ -35,6 +35,7 @@ import {
   executeAmendReshuffle,
   executeConfigureReshuffle,
   executeDecideFreedSlotOffer,
+  executeCheckCalendarIntegrity,
   executeConnectGoogleCalendar,
   executeMessageCustomer,
   type ToolContext,
@@ -402,6 +403,11 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
       },
     },
   },
+  {
+    name: 'checkCalendarIntegrity',
+    description: "Run a live calendar integrity check and report whether everything is correct. Use WHENEVER the owner asks if the calendar is OK, if there are any mistakes/double-bookings/problems, or to verify everything is in order (e.g. \"is everything correct?\", \"any double bookings?\", \"is the calendar OK?\"). It checks for double-bookings, bookings missing from Google, calendar collisions, wrong times, and bookings inside breaks. ALWAYS base your answer on this tool's result — never claim the calendar is fine from memory.",
+    parameters: { type: Type.OBJECT, properties: {} },
+  },
 ]
 
 // ── System prompt builder ─────────────────────────────────────────────────────
@@ -578,6 +584,8 @@ async function dispatchTool(
       return executeConfigureReshuffle(args as unknown as Parameters<typeof executeConfigureReshuffle>[0], ctx)
     case 'decideFreedSlotOffer':
       return executeDecideFreedSlotOffer(args as unknown as Parameters<typeof executeDecideFreedSlotOffer>[0], ctx)
+    case 'checkCalendarIntegrity':
+      return executeCheckCalendarIntegrity(args as unknown as Parameters<typeof executeCheckCalendarIntegrity>[0], ctx)
     default:
       return { error: `Unknown tool: ${name}` }
   }

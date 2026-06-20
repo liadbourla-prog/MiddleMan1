@@ -16,6 +16,7 @@ import { applyInstruction, pauseConversation, resumeConversation, applyReshuffle
 import { reshuffleCampaigns, reshuffleProposals, freedSlotApprovals } from '../../db/schema.js'
 import { approveProposal, rejectProposal } from '../reshuffle/gate.js'
 import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
+import { runSentinelForBusiness } from '../../workers/integrity-sentinel.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
@@ -1181,6 +1182,40 @@ export async function executeDecideFreedSlotOffer(
     success: true,
     fact: `Left the slot open.${prefNote}`,
     guidance: 'Confirm to the owner the slot stays open and no one was offered it.',
+  }
+}
+
+// ── Integrity Sentinel: on-demand "is everything correct?" (WS-B / WS-F) ─────────
+
+export async function executeCheckCalendarIntegrity(
+  _args: Record<string, never>,
+  ctx: ToolContext,
+): Promise<object> {
+  // Refresh on demand so the answer reflects reality right now, then report the open
+  // findings. The result IS the grounding for any "all clear" claim — never assert this
+  // from memory (L1/L2 grounding contract).
+  const open = await runSentinelForBusiness(ctx.businessId)
+  if (open.length === 0) {
+    return {
+      success: true,
+      clear: true,
+      fact: 'Calendar integrity check passed — no issues found.',
+      guidance: 'Tell the owner everything checks out and there are no calendar problems right now. This was just verified against the calendar, not assumed.',
+    }
+  }
+  const critical = open.filter((f) => f.severity === 'critical')
+  return {
+    success: true,
+    clear: false,
+    criticalCount: critical.length,
+    warningCount: open.length - critical.length,
+    findings: open.slice(0, 10).map((f) => ({
+      kind: f.kind,
+      severity: f.severity,
+      slotStart: f.slotStart?.toISOString() ?? null,
+      detail: f.detail,
+    })),
+    guidance: 'Report the issues to the owner plainly with their severity. Do not minimize critical issues; offer to help resolve them.',
   }
 }
 
