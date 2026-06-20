@@ -8,6 +8,19 @@ business-killing event for this customer.
 This plan is grounded in a code audit performed on 2026-06-20. File references are to
 the state of the repo at that time.
 
+## P0 build status (branch `dev/system/calendar-bulletproofing-p0`)
+
+| Workstream | Status |
+|---|---|
+| WS-A · Google bidirectional sync ON | ✅ code verified wired (route + renewal cron in `server.ts`); **needs you**: domain verification + prod env vars |
+| WS-B · Integrity Sentinel | ✅ **built + tested** (pure engine + 17 tests, worker, table, migration 0023, on-demand tool, 2h cron) |
+| WS-C · Owner-approval gate on freed-slot offers | ✅ **built + tested** (pure decision + 6 tests, table, migration 0022, gate in cancelBooking, orchestrator tool) |
+| WS-E · Provisioning reality (hours/breaks) | ⏳ **needs you**: business config at provisioning |
+| WS-G · Launch-day initial state | ⏳ **needs you**: existing ~60 appointments |
+
+All P0 *code* lands typechecked with 416/416 unit tests green. Remaining P0 items are
+operational (domain verification, prod flags, business data) and the pre-launch gauntlet (§4).
+
 ---
 
 ## 0. Reference reality (the operating envelope)
