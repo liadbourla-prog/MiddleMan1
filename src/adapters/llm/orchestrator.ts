@@ -34,6 +34,8 @@ import {
   executeRejectReshuffle,
   executeAmendReshuffle,
   executeConfigureReshuffle,
+  executeConnectGoogleCalendar,
+  executeMessageCustomer,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
 import {
@@ -300,6 +302,24 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'connectGoogleCalendar',
+    description: "Generate the link the owner taps to connect their Google Calendar. Use this WHENEVER the owner wants to connect/sync/link Google Calendar. It returns the real sign-in URL — you then send that link to the owner here in WhatsApp. You have NO email and cannot send anything by email; never say you emailed a link or ask which email to use.",
+    parameters: { type: Type.OBJECT, properties: {} },
+  },
+  {
+    name: 'messageCustomer',
+    description: "Send a WhatsApp message to ONE specific customer on the owner's behalf (e.g. \"text Harel and ask when he's free this week\", \"let Dana know class is cancelled\"). Compose the message yourself and confirm with the owner before calling. Pass the customer's phone number when the owner gives one (lets you reach someone new); otherwise pass the name to match a customer on file. Only report the message as sent if this tool returns ok:true — it may report the customer can't be reached, in which case tell the owner the truth.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        phoneNumber: { type: Type.STRING, description: "Customer phone in E.164 (e.g. +972541234567) when the owner provides it. Preferred — lets you message a new contact." },
+        name: { type: Type.STRING, description: 'Customer name to match an existing customer, when no phone number is given.' },
+        message: { type: Type.STRING, description: "The full message text to send, composed in the customer's language. Warm and natural — this is what the customer receives verbatim." },
+      },
+      required: ['message'],
+    },
+  },
+  {
     name: 'pauseConversation',
     description: 'Pause PA responses for one customer so the manager can handle the conversation manually via Meta Business Suite. The PA will go completely silent for that customer until the pause expires or is manually lifted.',
     parameters: {
@@ -464,6 +484,11 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - deleteCalendarEvent: only for personal/business events, blocks, or classes the manager created. NEVER use for customer bookings — use manageBusinessSettings with a cancellation instruction for those.
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests.
+- connectGoogleCalendar: ALWAYS use this when the owner wants to connect, sync, or link Google Calendar. It returns the real sign-in link — send that link to the owner here in WhatsApp, on its own line. You have NO email and no way to send email: never offer to email the link, never ask for an email address, and never claim you emailed anything.
+- messageCustomer: use to actually send a WhatsApp message to a specific customer the owner names (e.g. "ask Harel when he's free"). Compose the message and confirm with the owner first, then call the tool. Only tell the owner the message was sent if the tool returns ok:true; if it reports the customer can't be reached (e.g. they haven't messaged recently), relay that honestly and never pretend it went out.
+
+## Never claim an action you did not take
+Only state something happened — a message sent, a calendar connected, a booking changed — when a tool actually returned success for it. If you have no tool for what the owner asked, or a tool reports it failed or couldn't proceed, say so plainly and offer a real next step. Never fabricate a confirmation, a link, or an email.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 ${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
@@ -518,6 +543,10 @@ async function dispatchTool(
       return executeLookupCustomer(args as unknown as Parameters<typeof executeLookupCustomer>[0], ctx)
     case 'saveContactNote':
       return executeSaveContactNote(args as unknown as Parameters<typeof executeSaveContactNote>[0], ctx)
+    case 'connectGoogleCalendar':
+      return executeConnectGoogleCalendar(args as unknown as Parameters<typeof executeConnectGoogleCalendar>[0], ctx)
+    case 'messageCustomer':
+      return executeMessageCustomer(args as unknown as Parameters<typeof executeMessageCustomer>[0], ctx)
     case 'pauseConversation':
       return executePauseConversation(args as unknown as Parameters<typeof executePauseConversation>[0], ctx)
     case 'resumeConversation':

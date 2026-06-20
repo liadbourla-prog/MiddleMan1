@@ -12,6 +12,14 @@ describe('hasLanguageSignal — low-signal tokens must not flip language', () =>
     expect(hasLanguageSignal('I want to set my hours')).toBe(true)
     expect(hasLanguageSignal('credit card')).toBe(true)
   })
+  it('treats a bare email / URL / domain as no signal (must not flip to English)', () => {
+    for (const t of ['liadbourla@gmail.com', 'name.surname@studio.co.il', 'https://example.com/connect', 'www.example.com', 'mybiz.co.il']) {
+      expect(hasLanguageSignal(t)).toBe(false)
+    }
+  })
+  it('still detects English prose that merely contains an email', () => {
+    expect(hasLanguageSignal('please email me at liadbourla@gmail.com tomorrow')).toBe(true)
+  })
 })
 
 describe('resolveTurnLanguage', () => {

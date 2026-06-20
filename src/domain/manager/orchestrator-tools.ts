@@ -23,6 +23,8 @@ import { getOpenSlots } from '../availability/service.js'
 import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
 import { findProviderByName } from '../provider/lookup.js'
+import { sendMessage, canSendFreeForm } from '../../adapters/whatsapp/sender.js'
+import { registerCustomer, isValidE164 } from '../identity/resolver.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -1095,4 +1097,148 @@ export async function executeAmendReshuffle(args: AmendReshuffleArgs, ctx: ToolC
     requestedChange: args.change,
     guidance: 'Tell the owner you can approve or reject this plan as-is, and that tweaking it (then re-checking with the affected customers) is coming soon — do not imply the tweak was applied.',
   }
+}
+
+// ── connectGoogleCalendar ───────────────────────────────────────────────────────
+
+// The PA's only way to connect Google Calendar post-onboarding. Without this tool
+// the orchestrator has no link to offer and the model fabricates one ("I emailed
+// it") — there is no email channel anywhere in the system. Returns the real OAuth
+// URL for the PA to send IN WHATSAPP.
+function publicBaseUrl(): string {
+  const explicit = process.env['PUBLIC_BASE_URL']
+  if (explicit) return explicit.replace(/\/$/, '')
+  // Fall back to the OAuth redirect's origin so the link is always correct even if
+  // PUBLIC_BASE_URL is unset (the redirect URI is required for OAuth to work at all).
+  const redirect = process.env['GOOGLE_REDIRECT_URI']
+  if (redirect) {
+    try { return new URL(redirect).origin } catch { /* ignore */ }
+  }
+  return ''
+}
+
+export async function executeConnectGoogleCalendar(
+  _args: Record<string, never>,
+  ctx: ToolContext,
+): Promise<object> {
+  const [biz] = await ctx.db
+    .select({ refreshToken: businesses.googleRefreshToken, calendarMode: businesses.calendarMode })
+    .from(businesses)
+    .where(eq(businesses.id, ctx.businessId))
+    .limit(1)
+
+  if (biz?.refreshToken && biz.calendarMode === 'google') {
+    return {
+      ok: true,
+      alreadyConnected: true,
+      guidance: 'Google Calendar is already connected and syncing for this business. Reassure the owner it is connected — do not send another link unless they want to reconnect a different account.',
+    }
+  }
+
+  const base = publicBaseUrl()
+  if (!base) {
+    return { ok: false, reason: 'no_base_url', guidance: 'Tell the owner you hit a configuration problem generating the connect link and will follow up — do not invent a link or claim it was sent.' }
+  }
+
+  const connectUrl = `${base}/oauth/google?businessId=${ctx.businessId}`
+  return {
+    ok: true,
+    connectUrl,
+    guidance: 'Send this exact link to the owner here in WhatsApp, on its own line. Tell them it opens a standard Google sign-in that lets the PA read and sync their calendar so bookings never clash, it is safe, and they can disconnect any time. The PA has NO email — never offer to email the link or claim you did.',
+  }
+}
+
+// ── messageCustomer ─────────────────────────────────────────────────────────────
+
+interface MessageCustomerArgs {
+  phoneNumber?: string
+  name?: string
+  message: string
+}
+
+// Proactively send a WhatsApp message to one specific customer on the owner's behalf
+// (e.g. "ask Harel when he's free this week"). Replaces the prior gap where the model
+// claimed "I sent it" with no tool behind it. Reports the REAL outcome only — WhatsApp
+// forbids free-form messages to a customer who hasn't messaged in the last 24h, so an
+// out-of-window send is reported as not-sent rather than faked.
+export async function executeMessageCustomer(
+  args: MessageCustomerArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const body = (args.message ?? '').trim()
+  if (!body) return { ok: false, reason: 'empty_message', guidance: 'No message text was provided. Ask the owner what they want said.' }
+
+  const [biz] = await ctx.db
+    .select({
+      defaultLanguage: businesses.defaultLanguage,
+      whatsappPhoneNumberId: businesses.whatsappPhoneNumberId,
+      whatsappAccessToken: businesses.whatsappAccessToken,
+    })
+    .from(businesses)
+    .where(eq(businesses.id, ctx.businessId))
+    .limit(1)
+
+  // Resolve the target customer. Prefer an explicit phone number (can register a
+  // brand-new contact so their reply routes back as a customer); otherwise match a
+  // known customer by name.
+  let target: { id: string; phoneNumber: string; optOut: boolean } | null = null
+  const phone = args.phoneNumber?.replace(/[\s-]/g, '')
+
+  if (phone && isValidE164(phone)) {
+    const [existing] = await ctx.db
+      .select({ id: identities.id, phoneNumber: identities.phoneNumber, optOut: identities.messagingOptOut })
+      .from(identities)
+      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.phoneNumber, phone)))
+      .limit(1)
+    if (existing) {
+      target = existing
+    } else {
+      const newId = await registerCustomer(ctx.db, ctx.businessId, phone, args.name)
+      target = { id: newId, phoneNumber: phone, optOut: false }
+    }
+  } else if (args.name) {
+    const rows = await ctx.db
+      .select({ id: identities.id, phoneNumber: identities.phoneNumber, optOut: identities.messagingOptOut })
+      .from(identities)
+      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'customer'), ilike(identities.displayName, `%${args.name}%`)))
+      .limit(5)
+    if (rows.length === 0) {
+      return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.name}" is on file. Ask the owner for the phone number so you can reach them.` }
+    }
+    if (rows.length > 1) {
+      return { ok: false, reason: 'ambiguous_customer', guidance: `Several customers match "${args.name}". Ask the owner which one (or for the phone number).` }
+    }
+    target = rows[0]!
+  } else {
+    return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to message — a name on file or a phone number.' }
+  }
+
+  if (target.optOut) {
+    return { ok: false, reason: 'opted_out', guidance: 'This customer has opted out of messages. Tell the owner you cannot contact them — do not claim the message was sent.' }
+  }
+
+  // WhatsApp policy: free-form only inside the 24h customer-initiated window. Outside
+  // it, a send would be rejected by Meta, so report honestly instead of faking it.
+  const freeFormAllowed = await canSendFreeForm(target.id)
+  if (!freeFormAllowed) {
+    return {
+      ok: false,
+      reason: 'outside_messaging_window',
+      guidance: 'WhatsApp only allows messaging a customer who contacted the business in the last 24 hours (unless via a pre-approved template, which is not set up). This customer has no recent conversation, so the message was NOT sent. Tell the owner plainly and suggest the customer message first, or that you can reach out once they do.',
+    }
+  }
+
+  const waCredentials = biz?.whatsappPhoneNumberId && biz.whatsappAccessToken
+    ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+    : undefined
+
+  const res = await sendMessage({ toNumber: target.phoneNumber, body }, waCredentials)
+  if (!res.ok) {
+    if (res.userOptedOut) {
+      return { ok: false, reason: 'opted_out', guidance: 'The customer has blocked/opted out. Tell the owner the message could not be delivered.' }
+    }
+    return { ok: false, reason: 'send_failed', guidance: 'The message failed to send. Tell the owner it did not go through and you will retry — do not claim it was delivered.' }
+  }
+
+  return { ok: true, sentTo: target.phoneNumber, guidance: 'The message was actually delivered. Confirm to the owner in your own words that you sent it and will update them when the customer replies.' }
 }

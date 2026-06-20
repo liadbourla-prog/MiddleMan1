@@ -236,9 +236,14 @@ export async function oauthRoutes(app: FastifyInstance) {
           .send('Google did not return a refresh token. Re-authorize with prompt=consent.')
       }
 
+      // Store the token AND switch the business into google calendar mode. Without
+      // the mode flip, createCalendarClient keeps returning the internal client and
+      // the freshly-connected calendar is never read or written — so a business that
+      // onboarded in internal mode and connects Google later would stay effectively
+      // unsynced. Connecting Google is an explicit choice to use it.
       await db
         .update(businesses)
-        .set({ googleRefreshToken: tokens.refresh_token })
+        .set({ googleRefreshToken: tokens.refresh_token, calendarMode: 'google' })
         .where(eq(businesses.id, businessId))
 
       const [updatedBusiness] = await db

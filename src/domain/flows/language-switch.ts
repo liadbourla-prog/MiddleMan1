@@ -14,7 +14,15 @@ import { detectLang, type Lang } from '../i18n/t.js'
 //   re-introduces the other. The §3.4 offer is reversible, so a wrong flip is cheap.
 export function hasLanguageSignal(text: string): boolean {
   if (/[֐-׿]/.test(text)) return true
-  const latinWords = text.match(/[A-Za-z]{2,}/g)
+  // Strip tokens that look like language but aren't: email addresses and URLs/domains
+  // each contribute several Latin word-tokens ("liadbourla@gmail.com" → liadbourla,
+  // gmail, com) and would wrongly clear the two-word threshold below, flipping the
+  // conversation to English just because someone typed their email. Remove them first.
+  const stripped = text
+    .replace(/[^\s]+@[^\s]+/g, ' ')
+    .replace(/\bhttps?:\/\/\S+/gi, ' ')
+    .replace(/\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.[a-z]{2,}(?:\/\S*)?/gi, ' ')
+  const latinWords = stripped.match(/[A-Za-z]{2,}/g)
   return (latinWords?.length ?? 0) >= 2
 }
 
