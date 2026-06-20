@@ -7,13 +7,18 @@ import { and, eq, gte } from 'drizzle-orm'
 export const replyCapture = new AsyncLocalStorage<string[]>()
 
 const WA_USER_OPT_OUT_CODE = 131026
+// Meta rejects a free-form send when >24h have passed since the customer last messaged
+// this number ("re-engagement" error). This — not our local session table — is the
+// authority on the 24h window. We surface it so callers can fall back to a template or
+// report honestly, instead of pre-blocking sends our DB merely *thinks* are out of window.
+const WA_REENGAGEMENT_CODE = 131047
 
 export interface WaCredentials {
   accessToken: string
   phoneNumberId: string
 }
 
-export type SendResultWithOptOut = SendResult & { userOptedOut?: boolean }
+export type SendResultWithOptOut = SendResult & { userOptedOut?: boolean; outsideWindow?: boolean }
 
 function resolveCredentials(override?: WaCredentials): WaCredentials {
   return {
@@ -131,12 +136,14 @@ export async function sendMessage(
     if (!response.ok) {
       const text = await response.text()
       let userOptedOut = false
+      let outsideWindow = false
       try {
         const parsed = JSON.parse(text) as { error?: { code?: number } }
         if (parsed.error?.code === WA_USER_OPT_OUT_CODE) userOptedOut = true
+        if (parsed.error?.code === WA_REENGAGEMENT_CODE) outsideWindow = true
       } catch { /* ignore */ }
 
-      return { ok: false, error: `WA API ${response.status}: ${text}`, userOptedOut }
+      return { ok: false, error: `WA API ${response.status}: ${text}`, userOptedOut, outsideWindow }
     }
 
     const data = (await response.json()) as { messages: Array<{ id: string }> }

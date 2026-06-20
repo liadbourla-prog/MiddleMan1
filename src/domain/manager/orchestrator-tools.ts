@@ -23,7 +23,7 @@ import { getOpenSlots } from '../availability/service.js'
 import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
 import { findProviderByName } from '../provider/lookup.js'
-import { sendMessage, canSendFreeForm } from '../../adapters/whatsapp/sender.js'
+import { sendMessage } from '../../adapters/whatsapp/sender.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
@@ -1217,25 +1217,26 @@ export async function executeMessageCustomer(
     return { ok: false, reason: 'opted_out', guidance: 'This customer has opted out of messages. Tell the owner you cannot contact them — do not claim the message was sent.' }
   }
 
-  // WhatsApp policy: free-form only inside the 24h customer-initiated window. Outside
-  // it, a send would be rejected by Meta, so report honestly instead of faking it.
-  const freeFormAllowed = await canSendFreeForm(target.id)
-  if (!freeFormAllowed) {
-    return {
-      ok: false,
-      reason: 'outside_messaging_window',
-      guidance: 'WhatsApp only allows messaging a customer who contacted the business in the last 24 hours (unless via a pre-approved template, which is not set up). This customer has no recent conversation, so the message was NOT sent. Tell the owner plainly and suggest the customer message first, or that you can reach out once they do.',
-    }
-  }
-
   const waCredentials = biz?.whatsappPhoneNumberId && biz.whatsappAccessToken
     ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
     : undefined
 
+  // Attempt the send and let Meta be the authority on the 24h window. We do NOT pre-gate
+  // on our local conversation_sessions table (canSendFreeForm): that proxy produces false
+  // negatives — most sharply right after a chat reset, which wipes the very sessions it
+  // reads — and would block sends WhatsApp would actually accept. Meta returns the
+  // re-engagement error (outsideWindow) when the window is genuinely closed.
   const res = await sendMessage({ toNumber: target.phoneNumber, body }, waCredentials)
   if (!res.ok) {
     if (res.userOptedOut) {
       return { ok: false, reason: 'opted_out', guidance: 'The customer has blocked/opted out. Tell the owner the message could not be delivered.' }
+    }
+    if (res.outsideWindow) {
+      return {
+        ok: false,
+        reason: 'outside_messaging_window',
+        guidance: 'WhatsApp blocked the first message because more than 24 hours have passed since this customer last messaged the business (only a pre-approved template can reopen contact, and none is set up). The message was NOT sent. Tell the owner plainly and suggest the customer message first, or that you can reach out once they do.',
+      }
     }
     return { ok: false, reason: 'send_failed', guidance: 'The message failed to send. Tell the owner it did not go through and you will retry — do not claim it was delivered.' }
   }
