@@ -43,6 +43,8 @@ reconciled (internal-as-hub). WhatsApp is an interface, never a source of truth.
 | Inbound Google sync machinery (route, watch, renewal, etag loop-prevention, blast-radius gate) — **built, flag-gated OFF** | `src/domain/calendar/inbound-sync.ts`, `src/routes/calendar-webhook.ts` |
 | Per-conversation pause/resume (owner takeover primitive) | `src/adapters/llm/orchestrator.ts:303`, `src/domain/flows/customer-booking.ts:371` |
 | Full audit trail of every state change | `src/domain/audit/logger.ts` |
+| **L1 grounding**: real `audit_log` actions injected into LLM context ("trust this over the chat") | `src/domain/audit/ledger-block.ts` (v1.0.69) |
+| **L2 claim auditor**: reply that *claims* an action is done is regenerated unless a tool actually succeeded this turn | `src/domain/flows/reply-guard.ts`, `src/adapters/llm/orchestrator.ts` (v1.0.69) |
 
 ---
 
@@ -66,6 +68,7 @@ This catalog is the contract — finalize it with the owner (open item #9).
 | F10 | Lost booking (silent failure) | `markFailed` rollback ✓ | audit scan for `failed` | force a calendar-API failure |
 | F11 | Wrong-person attribution (session for a child) | beneficiary field (WS-D) | n/a (CRM) | book "for my daughter Noa" |
 | F12 | Unapproved offer sent to a customer | owner-approval gate (WS-C) | audit scan | cancel a slot with someone waitlisted |
+| F13 | Phantom action claim ("you're booked ✅" — engine wrote nothing) | reply-guard + claim-auditor ✓ (v1.0.69) | n/a (turn-level) | transcript saturated with "shall I book? …yes", engine writes nothing → reply must NOT claim booked |
 
 Legend: ✓ = exists today. WS-x = workstream below.
 
@@ -129,6 +132,15 @@ the Sentinel verifies the correction happened. Defense in depth.
 - **Powers the on-demand "is everything correct right now?" command** (WS-F) — that command
   reads the latest Sentinel state rather than recomputing.
 
+**v1.0.69 alignment (grounding):**
+- Use the existing `audit_log` action vocabulary (`outreach.message_sent` / `outreach.message_blocked`,
+  `REPORTABLE_ACTIONS` in `ledger-block.ts`) for any audit-scan invariant and any action the
+  Sentinel takes, so the L1 ledger renders it and the L2 claim-auditor stays consistent.
+- The on-demand integrity report must reach the orchestrator as a **grounded tool result**
+  (Sentinel findings = the backing data), not prose — otherwise the claim-auditor could
+  suppress a legitimate "all clear" or the LLM could fabricate one. This is a hard design
+  constraint on the WS-F command.
+
 Closes/detects: F1–F10 (detection layer for the whole catalog).
 
 ### WS-C · Owner-approval gate on freed-slot offers (P0)
@@ -144,6 +156,10 @@ with no owner approval. Required behavior:
    opts into automatic). Reuse the reshuffle approval-gate pattern (`reshuffle/gate.ts`)
    and a preference store (e.g. `managerMemory` / business config).
 4. Reshuffle/switch path already has this gate — align the two so the behavior is uniform.
+5. **v1.0.69 alignment:** the gate's sends and decisions must be audit-logged with the
+   ledger's outreach vocabulary so the PA cannot falsely claim "I offered it to the waitlist"
+   before approval (L1/L2 grounding), and the owner-approval reply flows through the
+   claim-auditor for free.
 
 Closes: F12. Implements: #6/#8.
 
@@ -224,7 +240,9 @@ Run against staging before go-live. Each scenario maps to a failure mode; all mu
 12. **Cancel a slot with someone waitlisted** (F12) → owner asked first, no auto-offer.
 13. **Cancel within the 24h cutoff** → refused with the configured message.
 14. **DST boundary booking** (Israel) → correct wall-clock time preserved.
-15. **Sentinel end-to-end**: inject each defect directly in the DB/Google and confirm the
+15. **Phantom confirmation** (F13) — transcript saturated with "shall I book? …yes" but the
+    engine persists nothing → the reply must NOT claim the booking is made (reply-guard regenerates).
+16. **Sentinel end-to-end**: inject each defect directly in the DB/Google and confirm the
     Sentinel detects, alerts both parties, auto-quarantines the slot, and dedups.
 
 ---
