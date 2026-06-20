@@ -59,6 +59,10 @@ export const businesses = pgTable('businesses', {
   bookingEdgeCases: jsonb('booking_edge_cases'),
   // Proactive reshuffle engine knobs (null = safe defaults; see domain/reshuffle/config.ts)
   reshuffleConfig: jsonb('reshuffle_config'),
+  // Owner-approval gate for freed-slot waitlist offers (WS-C / #6 / #8).
+  // null = owner never asked → first freed slot asks AND offers to set a standing pref.
+  // 'ask' = ask each time · 'auto' = offer automatically · 'never' = never offer.
+  freedSlotOfferPolicy: text('freed_slot_offer_policy', { enum: ['ask', 'auto', 'never'] }),
   cancellationFeeAmount: numeric('cancellation_fee_amount', { precision: 10, scale: 2 }),
   cancellationFeeCurrency: text('cancellation_fee_currency'),
   // Website builder
@@ -527,6 +531,33 @@ export const waitlist = pgTable(
   ],
 )
 
+// One per freed slot that is waiting on owner approval before the waitlist offer goes
+// out (WS-C / #6 / #8). Created only when a cancel frees a slot, someone is waiting, and
+// the business policy is 'ask' (or unset). The owner approves/declines via Branch 3; an
+// approved row triggers the normal waitlist cascade. `candidateCount` is a snapshot for
+// the owner prompt. Expires if undecided so a stale request can't fire days later.
+export const freedSlotApprovals = pgTable(
+  'freed_slot_approvals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    serviceTypeId: uuid('service_type_id').notNull().references(() => serviceTypes.id),
+    slotStart: timestamp('slot_start', { withTimezone: true }).notNull(),
+    slotEnd: timestamp('slot_end', { withTimezone: true }).notNull(),
+    // The cancelled booking that freed this slot (provenance / dedup).
+    sourceBookingId: uuid('source_booking_id').references(() => bookings.id),
+    candidateCount: integer('candidate_count').notNull().default(0),
+    status: text('status', { enum: ['pending', 'approved', 'declined', 'expired'] }).notNull().default('pending'),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('freed_slot_approvals_pending_idx').on(t.businessId, t.status),
+    index('freed_slot_approvals_slot_idx').on(t.businessId, t.slotStart),
+  ],
+)
+
 // ── Proactive Reshuffle Engine ────────────────────────────────────────────────
 // See docs/superpowers/plans/2026-06-18-proactive-reshuffle-engine.md
 
@@ -846,6 +877,7 @@ export type CalendarSyncChannel = typeof calendarSyncChannels.$inferSelect
 export type ReshuffleCampaign = typeof reshuffleCampaigns.$inferSelect
 export type ReshuffleOffer = typeof reshuffleOffers.$inferSelect
 export type ReshuffleProposal = typeof reshuffleProposals.$inferSelect
+export type FreedSlotApproval = typeof freedSlotApprovals.$inferSelect
 
 export type BookingState = Booking['state']
 export type IdentityRole = Identity['role']

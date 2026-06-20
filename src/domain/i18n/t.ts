@@ -567,6 +567,23 @@ const strings = {
       `A spot just opened — ${service} at ${biz} on ${date}. Want it? Just say the word and it's yours — I'm holding it for the next ${ttl} minutes.`,
   },
 
+  // ── Freed-slot owner-approval gate (WS-C / #6 / #8) → manager language ─────────
+  // Asked when a cancellation frees a slot that someone is waiting for. The owner
+  // decides; the PA never offers it without approval.
+  freed_slot_ask: {
+    he: (service: string, date: string, waiting: number) =>
+      `התפנה תור ל${service} ב-${date}, ויש ${waiting} בהמתנה. להציע להם את המקום? כתבו "כן" להצעה או "לא" להשארה פנוי.`,
+    en: (service: string, date: string, waiting: number) =>
+      `A ${service} slot on ${date} just opened up, and ${waiting} ${waiting === 1 ? 'person is' : 'people are'} waiting. Offer it to them? Reply "yes" to offer or "no" to leave it open.`,
+  },
+  // First time only: also offer to make this automatic going forward.
+  freed_slot_ask_first_time: {
+    he: (service: string, date: string, waiting: number) =>
+      `התפנה תור ל${service} ב-${date}, ויש ${waiting} בהמתנה. להציע להם את המקום? כתבו "כן" להצעה או "לא" להשארה פנוי.\n\nרוצים שאטפל בזה אוטומטית מעכשיו בכל פעם שמתפנה תור? כתבו "תמיד" כדי שאציע אוטומטית, או "לעולם לא" כדי שלא אציע בכלל.`,
+    en: (service: string, date: string, waiting: number) =>
+      `A ${service} slot on ${date} just opened up, and ${waiting} ${waiting === 1 ? 'person is' : 'people are'} waiting. Offer it to them? Reply "yes" to offer or "no" to leave it open.\n\nWant me to handle this automatically from now on whenever a slot frees up? Reply "always" to auto-offer, or "never" so I never offer.`,
+  },
+
   // ── Payment confirmation to customer ────────────────────────────────────────
   payment_confirmed: {
     he: (service: string, biz: string, date: string, time: string) =>

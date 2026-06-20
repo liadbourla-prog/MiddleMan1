@@ -4,7 +4,7 @@ import { bookings, serviceTypes, businesses, identities } from '../../db/schema.
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { resolveProvider } from '../provider/resolver.js'
 import { getInstructorHours } from '../provider/roster.js'
-import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
+import { handleFreedSlot } from '../waitlist/freed-slot.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import { authorize } from '../authorization/check.js'
 import { transition } from './state-machine.js'
@@ -697,13 +697,15 @@ export async function cancelBooking(
   // Cancel any pending reminders for this booking
   cancelReminders(bookingId).catch(() => { /* non-fatal */ })
 
-  // Trigger waitlist cascade so the freed slot can be offered to waiting customers
-  triggerWaitlistForSlot(
-    actor.businessId,
-    booking.serviceTypeId,
-    booking.slotStart,
-    booking.slotEnd,
-  ).catch(() => { /* non-fatal — waitlist is best-effort */ })
+  // Freed-slot handling now passes through the owner-approval gate (WS-C / #6 / #8):
+  // it offers automatically only if the owner opted in, otherwise asks first. Best-effort.
+  handleFreedSlot(db, {
+    businessId: actor.businessId,
+    serviceTypeId: booking.serviceTypeId,
+    slotStart: booking.slotStart,
+    slotEnd: booking.slotEnd,
+    sourceBookingId: bookingId,
+  }).catch(() => { /* non-fatal — freed-slot handling is best-effort */ })
 
   return { ok: true, bookingId, message: 'Booking cancelled.' }
 }

@@ -13,8 +13,9 @@ import type { Action } from '../authorization/check.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
 import { applyInstruction, pauseConversation, resumeConversation, applyReshuffleConfigUpdate } from './apply.js'
-import { reshuffleCampaigns, reshuffleProposals } from '../../db/schema.js'
+import { reshuffleCampaigns, reshuffleProposals, freedSlotApprovals } from '../../db/schema.js'
 import { approveProposal, rejectProposal } from '../reshuffle/gate.js'
+import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
@@ -1077,6 +1078,110 @@ export async function executeResumeConversation(
 ): Promise<object> {
   const message = await resumeConversation(ctx.db, ctx.businessId, args.customer_identifier, ctx.lang)
   return { success: true, message }
+}
+
+// ── Freed-slot owner-approval gate (WS-C / #6 / #8) ──────────────────────────────
+
+interface DecideFreedSlotOfferArgs {
+  // Approve or decline offering the freed slot to the people waiting.
+  decision: 'offer' | 'leave_open'
+  // Optional standing preference for future freed slots.
+  setStandingPreference?: 'always_auto' | 'always_ask' | 'never'
+}
+
+/** The most recent freed slot still awaiting the owner's decision (not yet past). */
+async function latestPendingFreedSlot(ctx: ToolContext) {
+  const [row] = await ctx.db
+    .select({
+      id: freedSlotApprovals.id,
+      serviceTypeId: freedSlotApprovals.serviceTypeId,
+      slotStart: freedSlotApprovals.slotStart,
+      slotEnd: freedSlotApprovals.slotEnd,
+      candidateCount: freedSlotApprovals.candidateCount,
+    })
+    .from(freedSlotApprovals)
+    .where(
+      and(
+        eq(freedSlotApprovals.businessId, ctx.businessId),
+        eq(freedSlotApprovals.status, 'pending'),
+        gt(freedSlotApprovals.expiresAt, new Date()),
+      ),
+    )
+    .orderBy(desc(freedSlotApprovals.createdAt))
+    .limit(1)
+  return row ?? null
+}
+
+export async function executeDecideFreedSlotOffer(
+  args: DecideFreedSlotOfferArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  // Setting a standing preference is allowed on its own, with or without a pending slot.
+  let prefNote = ''
+  if (args.setStandingPreference) {
+    const policy =
+      args.setStandingPreference === 'always_auto' ? 'auto'
+      : args.setStandingPreference === 'never' ? 'never'
+      : 'ask'
+    await ctx.db.update(businesses).set({ freedSlotOfferPolicy: policy }).where(eq(businesses.id, ctx.businessId))
+    await logAudit(ctx.db, {
+      businessId: ctx.businessId,
+      actorId: ctx.identityId,
+      action: 'waitlist.policy_set',
+      entityType: 'business',
+      entityId: ctx.businessId,
+      metadata: { policy },
+    }).catch(() => { /* best-effort */ })
+    prefNote =
+      policy === 'auto' ? ' From now on, freed slots will be offered automatically.'
+      : policy === 'never' ? ' From now on, freed slots will not be offered.'
+      : ' From now on, I will ask you each time.'
+  }
+
+  const pending = await latestPendingFreedSlot(ctx)
+  if (!pending) {
+    if (args.setStandingPreference) {
+      return { success: true, fact: `Preference saved.${prefNote}`, guidance: 'Confirm the new preference to the owner in your own words. There is no freed slot waiting right now.' }
+    }
+    return { success: false, reason: 'no_pending_freed_slot', guidance: 'There is no freed slot waiting for a decision. Tell the owner that plainly.' }
+  }
+
+  if (args.decision === 'offer') {
+    await ctx.db
+      .update(freedSlotApprovals)
+      .set({ status: 'approved', decidedAt: new Date() })
+      .where(eq(freedSlotApprovals.id, pending.id))
+    await triggerWaitlistForSlot(ctx.businessId, pending.serviceTypeId, pending.slotStart, pending.slotEnd)
+    await logAudit(ctx.db, {
+      businessId: ctx.businessId,
+      actorId: ctx.identityId,
+      action: 'waitlist.offer_approved',
+      entityType: 'booking',
+      metadata: { slotStart: pending.slotStart.toISOString(), waiting: pending.candidateCount },
+    }).catch(() => { /* best-effort */ })
+    return {
+      success: true,
+      fact: `Offering the freed slot to ${pending.candidateCount} waiting customer(s).${prefNote}`,
+      guidance: "Tell the owner you're now offering the slot to the people waiting — the first in line is next to be contacted. Do NOT claim the message has already been delivered.",
+    }
+  }
+
+  await ctx.db
+    .update(freedSlotApprovals)
+    .set({ status: 'declined', decidedAt: new Date() })
+    .where(eq(freedSlotApprovals.id, pending.id))
+  await logAudit(ctx.db, {
+    businessId: ctx.businessId,
+    actorId: ctx.identityId,
+    action: 'waitlist.offer_declined',
+    entityType: 'booking',
+    metadata: { slotStart: pending.slotStart.toISOString(), waiting: pending.candidateCount },
+  }).catch(() => { /* best-effort */ })
+  return {
+    success: true,
+    fact: `Left the slot open.${prefNote}`,
+    guidance: 'Confirm to the owner the slot stays open and no one was offered it.',
+  }
 }
 
 // ── Reshuffle engine: owner gate + config ───────────────────────────────────────

@@ -34,6 +34,7 @@ import {
   executeRejectReshuffle,
   executeAmendReshuffle,
   executeConfigureReshuffle,
+  executeDecideFreedSlotOffer,
   executeConnectGoogleCalendar,
   executeMessageCustomer,
   type ToolContext,
@@ -390,6 +391,17 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
       },
     },
   },
+  {
+    name: 'decideFreedSlotOffer',
+    description: "Decide what to do with a slot that just freed up (after a cancellation) when customers are waiting for it. Use this when you previously asked the owner whether to offer a freed slot and they answered — 'yes/offer it' → decision 'offer'; 'no/leave it' → decision 'leave_open'. Also use it to set a standing preference when the owner says how to handle these going forward: 'always do it automatically' → setStandingPreference 'always_auto'; 'always ask me' → 'always_ask'; 'never offer' → 'never'. The owner can set a preference with or without a slot currently waiting.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        decision: { type: Type.STRING, enum: ['offer', 'leave_open'], description: "'offer' to offer the freed slot to the waiting customers; 'leave_open' to keep it open and offer it to no one." },
+        setStandingPreference: { type: Type.STRING, enum: ['always_auto', 'always_ask', 'never'], description: 'Optional. Persist how future freed slots are handled: always_auto = offer automatically; always_ask = ask each time; never = never offer.' },
+      },
+    },
+  },
 ]
 
 // ── System prompt builder ─────────────────────────────────────────────────────
@@ -564,6 +576,8 @@ async function dispatchTool(
       return executeAmendReshuffle(args as unknown as Parameters<typeof executeAmendReshuffle>[0], ctx)
     case 'configureReshuffle':
       return executeConfigureReshuffle(args as unknown as Parameters<typeof executeConfigureReshuffle>[0], ctx)
+    case 'decideFreedSlotOffer':
+      return executeDecideFreedSlotOffer(args as unknown as Parameters<typeof executeDecideFreedSlotOffer>[0], ctx)
     default:
       return { error: `Unknown tool: ${name}` }
   }
