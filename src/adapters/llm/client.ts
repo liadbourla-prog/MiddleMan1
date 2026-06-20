@@ -494,9 +494,15 @@ ${input.businessFacts.trim()}
 `
     : ''
 
+  const ledgerBlock = input.actionLedger && input.actionLedger.trim().length > 0
+    ? `${input.actionLedger.trim()}
+
+`
+    : ''
+
   const userTurn = `Situation: ${input.situation}
 
-${factsBlock}Recent conversation (tone & thread only — not a source of facts or outcomes):
+${factsBlock}${ledgerBlock}Recent conversation (tone & thread only — not a source of facts or outcomes):
 ${transcriptText}
 
 Customer profile: ${memoryText}`

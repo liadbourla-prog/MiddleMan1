@@ -1,6 +1,10 @@
 # Action Grounding & Hallucination-Snowball Prevention — Design Spec
 
-**Status:** Proposed (spec only — not yet built). Authored 2026-06-20 after a live
+**Status:** Implemented 2026-06-20 — L1 (ledger + ground-truth blocks, both branches),
+reply-visibility tool, L2 (generalized claim auditor, decision D3 resolved to "generalize
+the existing guard"), L3 (durable `audit.unbacked_claim` observability), and the §7.4
+lawbook rule (D5). The proactive cross-branch notification (manager pinged when a customer
+replies) is intentionally a SEPARATE follow-up, not part of this plan. Originally authored after a live
 Branch-3 incident on business `סטודיוגה` where the PA claimed it had messaged a customer
 ("שלחתי לו") and emailed a calendar link, having done neither. The false claims persisted
 into the transcript and self-reinforced across turns even after the underlying capability

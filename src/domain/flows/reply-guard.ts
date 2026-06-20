@@ -48,3 +48,64 @@ export function assertsBookingConfirmed(text: string, lang: 'he' | 'en'): boolea
   const patterns = lang === 'he' ? HE_CONFIRMED : EN_CONFIRMED
   return patterns.some((re) => re.test(text))
 }
+
+// ── Generalized claim detection (L2 claim auditor, ACTION_GROUNDING_SPEC.md) ──────
+//
+// Branch 3 generalizes the booking guard above to every high-risk "said done" claim:
+// a customer message sent on the owner's behalf, a Google Calendar connection, a
+// cancellation. The orchestrator cross-checks the detected claims against what tools
+// actually succeeded this turn (plus the ledger) and regenerates if any is unbacked.
+// Detection is COMPLETED-claims only — offers/questions ("אשלח לו?", "want me to text
+// him?") move the action forward and must never be flagged.
+
+export type ActionClaim = 'booking_made' | 'message_sent' | 'calendar_connected' | 'cancelled'
+
+// Sending a message TO A CUSTOMER (third person). Deliberately excludes "שלחתי לך" /
+// "sent you" — that is the PA handing the owner something in-chat (e.g. a link), not a
+// customer outreach.
+const HE_MESSAGE_SENT = [
+  /שלחתי\s+ל(?!ך)/, // I sent to him/her/them/<name> — not "to you"
+  /ההודעה.{0,15}נשלחה/, // the message (to X) was (already) sent
+  /יצרתי\s+(?:איתו|איתה|איתם)\s+קשר/, // I contacted him/her/them
+  /פניתי\s+(?:אליו|אליה|אליהם)/, // I reached out to them
+]
+const EN_MESSAGE_SENT = [
+  /\bi(?:'| ha)ve\s+(?:messaged|texted|contacted)\b/i,
+  /\bi\s+(?:messaged|texted|contacted)\s+(?:him|her|them|\w+)\b/i,
+  /\bi\s+sent\s+(?:him|her|them|\w+)\s+(?:a\s+)?(?:message|text|note)\b/i,
+  /\b(?:the\s+)?(?:message|text)\s+(?:has\s+been\s+|was\s+|is\s+)?sent\b/i,
+  /\breached\s+out\s+to\b/i,
+]
+
+const HE_CALENDAR_CONNECTED = [
+  /היומן.{0,15}(?:מחובר|חובר|מסונכרן|סונכרן)/, // the calendar is (now/your) connected/synced
+  /חיברתי\s+(?:את\s+)?(?:ה)?יומן/, // I connected the calendar
+  /הסנכרון\s+(?:הושלם|פעיל)/, // sync is complete/active
+]
+const EN_CALENDAR_CONNECTED = [
+  /\bcalendar\s+(?:is\s+)?(?:now\s+)?(?:connected|linked|synced)\b/i,
+  /\b(?:i(?:'| ha)ve\s+)?connected\s+your\s+calendar\b/i,
+  /\bsync(?:ing|ed)?\s+is\s+(?:now\s+)?(?:on|active|complete)\b/i,
+]
+
+const HE_CANCELLED = [
+  /ביטלתי/, // I cancelled
+  /(?:ה)?תור\s+בוטל/, // the appointment was cancelled
+  /בוטל\s+(?:בהצלחה|לך)/, // cancelled (successfully / for you)
+]
+const EN_CANCELLED = [
+  /\bi(?:'| ha)ve\s+cancell?ed\b/i,
+  /\bi\s+cancell?ed\b/i,
+  /\b(?:booking|appointment|class|session)\s+(?:has\s+been\s+|was\s+|is\s+)?cancell?ed\b/i,
+]
+
+export function detectActionClaims(text: string, lang: 'he' | 'en'): ActionClaim[] {
+  if (!text) return []
+  const he = lang === 'he'
+  const claims: ActionClaim[] = []
+  if ((he ? HE_CONFIRMED : EN_CONFIRMED).some((re) => re.test(text))) claims.push('booking_made')
+  if ((he ? HE_MESSAGE_SENT : EN_MESSAGE_SENT).some((re) => re.test(text))) claims.push('message_sent')
+  if ((he ? HE_CALENDAR_CONNECTED : EN_CALENDAR_CONNECTED).some((re) => re.test(text))) claims.push('calendar_connected')
+  if ((he ? HE_CANCELLED : EN_CANCELLED).some((re) => re.test(text))) claims.push('cancelled')
+  return claims
+}

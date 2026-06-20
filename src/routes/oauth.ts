@@ -10,6 +10,7 @@ import { createCalendarClient } from '../adapters/calendar/client.js'
 import { generateOnboardingReply } from '../adapters/llm/client.js'
 import { provisionBusiness } from '../domain/flows/provider-onboarding.js'
 import { registerWatchChannel } from '../domain/calendar/inbound-sync.js'
+import { logAudit } from '../domain/audit/logger.js'
 
 function buildOAuth2Client() {
   return new google.auth.OAuth2(
@@ -245,6 +246,17 @@ export async function oauthRoutes(app: FastifyInstance) {
         .update(businesses)
         .set({ googleRefreshToken: tokens.refresh_token, calendarMode: 'google' })
         .where(eq(businesses.id, businessId))
+
+      // Action ledger (L1 grounding): record the real connect so the PA can never
+      // falsely claim the calendar is/ isn't connected.
+      await logAudit(db, {
+        businessId,
+        actorId: null,
+        action: 'calendar.connected',
+        entityType: 'business',
+        entityId: businessId,
+        metadata: { provider: 'google' },
+      }).catch(() => { /* best-effort */ })
 
       const [updatedBusiness] = await db
         .select()

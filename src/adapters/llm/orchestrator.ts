@@ -43,6 +43,9 @@ import {
   logOrchestratorCompletion,
   logOrchestratorError,
 } from '../../domain/orchestrator-log.js'
+import { buildActionLedgerBlock, hasCalendarConnected } from '../../domain/audit/ledger-block.js'
+import { detectActionClaims, type ActionClaim } from '../../domain/flows/reply-guard.js'
+import { logAudit } from '../../domain/audit/logger.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 const MAX_ITERATIONS = 5
@@ -265,13 +268,13 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'lookupCustomer',
-    description: 'Find a customer by name or phone number, view their booking history, or query a segment of customers (e.g. inactive customers, frequent visitors).',
+    description: "Find a customer by name or phone, view their booking history, read their recent messages, or query a segment of customers. ALWAYS use recent_messages to check whether a customer has replied (e.g. after you messaged them on the owner's behalf) — never guess or claim from memory whether someone wrote back.",
     parameters: {
       type: Type.OBJECT,
       properties: {
         queryType: {
           type: Type.STRING,
-          enum: ['find_by_name', 'find_by_phone', 'booking_history', 'segment'],
+          enum: ['find_by_name', 'find_by_phone', 'booking_history', 'recent_messages', 'segment'],
         },
         identifier: {
           type: Type.STRING,
@@ -428,9 +431,10 @@ function buildSystemPrompt(params: {
   instructorRoster: InstructorRosterEntry[]
   teachingSchedule: TeachingSlot[]
   managerMemorySummaries: string[]
+  actionLedger: string
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -483,7 +487,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - editClassSession: use to change an ALREADY-scheduled class on the calendar — its instructor, time, or capacity (e.g. "change tomorrow's 10:00 yoga to Dana", "move the Tuesday breathing to 17:00"). Get its eventId from listCalendarEvents first. Never delete+recreate a class to "edit" it — that drops its bookings.
 - deleteCalendarEvent: only for personal/business events, blocks, or classes the manager created. NEVER use for customer bookings — use manageBusinessSettings with a cancellation instruction for those.
 - searchWeb: only when the manager explicitly needs external information.
-- lookupCustomer / saveContactNote: only for customer or contact management requests.
+- lookupCustomer / saveContactNote: only for customer or contact management requests. When the owner asks whether a customer has replied or what they said, you MUST call lookupCustomer with recent_messages and answer from the result — never say "not yet" or "they replied" from memory or assumption.
 - connectGoogleCalendar: ALWAYS use this when the owner wants to connect, sync, or link Google Calendar. It returns the real sign-in link — send that link to the owner here in WhatsApp, on its own line. You have NO email and no way to send email: never offer to email the link, never ask for an email address, and never claim you emailed anything.
 - messageCustomer: use to actually send a WhatsApp message to a specific customer the owner names (e.g. "ask Harel when he's free"). Compose the message and confirm with the owner first, then call the tool. Only tell the owner the message was sent if the tool returns ok:true; if it reports the customer can't be reached (e.g. they haven't messaged recently), relay that honestly and never pretend it went out.
 
@@ -499,7 +503,8 @@ If the action you just completed has downstream effects on customers (cancellati
 ## Memory
 Cross-session context:
 ${memorySummary}
-${historyBlock ? `\n## Recent conversation\n${historyBlock}` : ''}`
+${historyBlock ? `\n## Recent conversation\n${historyBlock}` : ''}
+${actionLedger ? `\n${actionLedger}` : ''}`
 }
 
 // ── Manager memory loader ─────────────────────────────────────────────────────
@@ -564,6 +569,99 @@ async function dispatchTool(
   }
 }
 
+// ── L2 claim auditor ────────────────────────────────────────────────────────────
+//
+// Generalizes Branch 4's assertsBookingConfirmed guard (decision D3): never let the
+// orchestrator's reply assert a high-risk action that did not actually happen. A claim is
+// "backed" only by a real successful tool call this turn (or, for calendar_connected, a
+// prior real connection). Unbacked claims trigger one corrective regeneration, then a safe
+// honest fallback — the same regenerate-or-fall-back shape the booking guard already uses.
+
+// Maps a tool's result to the claims it legitimately backs. Inspects the result object,
+// not just ok/error status: messageCustomer returns {ok:false,reason} on a blocked send,
+// which is not an "error" and must NOT back a "message sent" claim. connectGoogleCalendar
+// is deliberately absent — it only produces a link, it does not connect the calendar.
+function actionsFromToolResult(name: string, result: unknown): ActionClaim[] {
+  const r = (result ?? {}) as Record<string, unknown>
+  const failed = 'error' in r || r['ok'] === false || r['success'] === false || r['needsClarification'] === true
+  if (failed) return []
+  switch (name) {
+    case 'messageCustomer':
+      return ['message_sent']
+    case 'createCalendarEvent':
+    case 'scheduleGroupSession':
+    case 'scheduleRecurringClasses':
+      return ['booking_made']
+    case 'deleteCalendarEvent':
+    case 'manageBusinessSettings':
+      return ['cancelled']
+    default:
+      return []
+  }
+}
+
+const CLAIM_LABEL: Record<ActionClaim, string> = {
+  booking_made: 'that a booking was made or confirmed',
+  message_sent: 'that a message was sent to a customer',
+  calendar_connected: 'that the Google Calendar is connected',
+  cancelled: 'that a booking was cancelled',
+}
+
+const SAFE_AUDIT_FALLBACK: Record<Lang, string> = {
+  he: 'רגע אחד — אני רוצה לוודא לפני שאני אומר שמשהו בוצע. אבדוק ואחזור אליך.',
+  en: "One sec — I want to verify before I say anything's done. I'll check and get back to you.",
+}
+
+function unbackedClaims(text: string, lang: Lang, backed: Set<ActionClaim>, calendarConnected: boolean): ActionClaim[] {
+  return detectActionClaims(text, lang).filter((c) =>
+    c === 'calendar_connected' ? !(calendarConnected || backed.has(c)) : !backed.has(c),
+  )
+}
+
+async function auditReplyClaims(params: {
+  draft: string
+  lang: Lang
+  backed: Set<ActionClaim>
+  calendarConnected: boolean
+  contents: Content[]
+  systemPrompt: string
+  businessId: string
+  actorId: string
+}): Promise<string> {
+  const { draft, lang, backed, calendarConnected, contents, systemPrompt, businessId, actorId } = params
+  const unbacked = unbackedClaims(draft, lang, backed, calendarConnected)
+  if (unbacked.length === 0) return draft
+
+  // L3 (observability): a durable, queryable record of every caught hallucination —
+  // outcome filled in below (corrected vs blocked). Best-effort, never blocks the reply.
+  const recordIntervention = (outcome: 'corrected' | 'blocked') =>
+    logAudit(db, {
+      businessId,
+      actorId,
+      action: 'audit.unbacked_claim',
+      entityType: 'conversation',
+      metadata: { claims: unbacked, outcome },
+    }).catch(() => { /* best-effort */ })
+
+  const list = unbacked.map((c) => CLAIM_LABEL[c]).join('; ')
+  const correction = `SYSTEM CHECK — your draft reply implies ${list}, but no such action actually happened this turn and the records do not show it. Rewrite your reply WITHOUT stating it as done. If it still needs doing, say what you will do or ask — never claim a completed action that did not happen. Keep everything else.`
+
+  const correctionContents: Content[] = [
+    ...contents,
+    { role: 'model', parts: [{ text: draft }] },
+    { role: 'user', parts: [{ text: correction }] },
+  ]
+  // Text-only regeneration (no tools) — we are fixing wording, not taking new actions.
+  const result = await generateOrchestratorTurn(correctionContents, { systemInstruction: systemPrompt, maxOutputTokens: 1024 })
+  const corrected = result.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text
+  if (!corrected || unbackedClaims(corrected, lang, backed, calendarConnected).length > 0) {
+    await recordIntervention('blocked')
+    return SAFE_AUDIT_FALLBACK[lang]
+  }
+  await recordIntervention('corrected')
+  return corrected
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 export interface OrchestratorParams {
@@ -591,6 +689,7 @@ export interface OrchestratorParams {
   // so runtime behaviour is unchanged. See tests/quality/scenarios.test.ts.
   dispatchToolFn?: (name: string, args: Record<string, unknown>, ctx: ToolContext) => Promise<object>
   loadMemoryFn?: (identityId: string) => Promise<string[]>
+  loadLedgerFn?: () => Promise<string>
 }
 
 export async function runManagerOrchestratorLoop(params: OrchestratorParams): Promise<string> {
@@ -604,6 +703,13 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
 
   const managerMemorySummaries = await loadMemory(identityId)
 
+  // L1 grounding: the authoritative record of real actions, injected so the model trusts
+  // what the system actually did over what the chat prose claims. Best-effort — a ledger
+  // read failure must never drop a turn.
+  const loadLedger = params.loadLedgerFn
+    ?? (() => buildActionLedgerBlock(db, { businessId, timezone, lang, scope: 'business' }))
+  const actionLedger = await loadLedger().catch(() => '')
+
   const systemPrompt = buildSystemPrompt({
     businessName,
     timezone,
@@ -612,6 +718,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     instructorRoster,
     teachingSchedule,
     managerMemorySummaries,
+    actionLedger,
     conversationHistory: transcript.slice(-20),
   })
 
@@ -630,6 +737,12 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
   let iterations = 0
   const loopStart = Date.now()
   const fallback = lang === 'he' ? 'רגע, משהו נתקע לי — אפשר לנסות שוב?' : 'Hmm, something got stuck on my end — mind trying that again?'
+
+  // L2 claim auditor state: which high-risk actions actually succeeded this turn, and
+  // whether the calendar was already connected (the only thing that backs a "connected"
+  // claim). Both best-effort — never let the auditor's bookkeeping drop a turn.
+  const succeededActions = new Set<ActionClaim>()
+  const calendarAlreadyConnected = await hasCalendarConnected(db, businessId).catch(() => false)
 
   while (iterations < MAX_ITERATIONS) {
     const iterStart = Date.now()
@@ -678,6 +791,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
         }
 
         toolResults.push({ name: toolName, status, result: toolResult })
+        actionsFromToolResult(toolName, toolResult).forEach((a) => succeededActions.add(a))
         functionResponseParts.push({
           functionResponse: { name: toolName, response: { result: toolResult } },
         })
@@ -696,13 +810,25 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     }
 
     if (textPart) {
+      // L2: reconcile the reply's claims against what actually happened; correct or
+      // fall back if it asserts an unbacked action. Fail-open — never drop the turn.
+      const finalReply = await auditReplyClaims({
+        draft: textPart,
+        lang,
+        backed: succeededActions,
+        calendarConnected: calendarAlreadyConnected,
+        contents,
+        systemPrompt,
+        businessId,
+        actorId: identityId,
+      }).catch(() => textPart)
       logOrchestratorCompletion({
         businessId, sessionId, messageId,
         totalIterations: iterations,
-        finalReply: textPart,
+        finalReply,
         totalDurationMs: Date.now() - loopStart,
       })
-      return textPart
+      return finalReply
     }
 
     // No function calls, no text — shouldn't happen; break out

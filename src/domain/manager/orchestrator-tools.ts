@@ -6,7 +6,7 @@
 
 import { and, desc, eq, gt, gte, ilike, inArray, lt, or } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries } from '../../db/schema.js'
+import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries, conversationSessions, conversationMessages } from '../../db/schema.js'
 import { createSeries } from '../scheduling/series.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../authorization/check.js'
@@ -25,6 +25,7 @@ import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotSt
 import { findProviderByName } from '../provider/lookup.js'
 import { sendMessage } from '../../adapters/whatsapp/sender.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
+import { logAudit } from '../audit/logger.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -822,7 +823,7 @@ export async function executeSearchWeb(
 // ── lookupCustomer ────────────────────────────────────────────────────────────
 
 interface LookupCustomerArgs {
-  queryType: 'find_by_name' | 'find_by_phone' | 'booking_history' | 'segment'
+  queryType: 'find_by_name' | 'find_by_phone' | 'booking_history' | 'recent_messages' | 'segment'
   identifier?: string
   segmentFilter?: { serviceTypeId?: string; inactiveSinceDays?: number; hasBooking?: boolean }
 }
@@ -899,6 +900,55 @@ export async function executeLookupCustomer(
       date: b.slotStart.toLocaleDateString(ctx.lang === 'he' ? 'he-IL' : 'en-GB', { timeZone: ctx.timezone }),
       state: b.state,
     })) }
+  }
+
+  if (queryType === 'recent_messages') {
+    if (!identifier) return { error: 'identifier (phone, name, or identityId) is required' }
+
+    // Resolve to an identityId from phone / name / id.
+    let identityId = identifier
+    if (identifier.startsWith('+') || /^\d{7,}$/.test(identifier)) {
+      const [id] = await ctx.db
+        .select({ id: identities.id })
+        .from(identities)
+        .where(and(eq(identities.businessId, ctx.businessId), eq(identities.phoneNumber, identifier)))
+        .limit(1)
+      if (!id) return { found: false }
+      identityId = id.id
+    } else if (!/^[0-9a-f-]{36}$/i.test(identifier)) {
+      const [id] = await ctx.db
+        .select({ id: identities.id })
+        .from(identities)
+        .where(and(eq(identities.businessId, ctx.businessId), ilike(identities.displayName, `%${identifier}%`)))
+        .limit(1)
+      if (!id) return { found: false }
+      identityId = id.id
+    }
+
+    const msgs = await ctx.db
+      .select({ role: conversationMessages.role, text: conversationMessages.text, at: conversationMessages.createdAt })
+      .from(conversationMessages)
+      .innerJoin(conversationSessions, eq(conversationMessages.sessionId, conversationSessions.id))
+      .where(and(eq(conversationSessions.businessId, ctx.businessId), eq(conversationSessions.identityId, identityId)))
+      .orderBy(desc(conversationMessages.createdAt))
+      .limit(8)
+
+    // Ground truth for "did the customer reply?" — read it here, never guess. A proactive
+    // outreach sent via messageCustomer is not in this thread; the customer REPLYING shows
+    // up as customer-role turns. No customer turns = they have not written back yet.
+    const customerHasReplied = msgs.some((m) => m.role === 'customer')
+    return {
+      found: true,
+      customerHasReplied,
+      messages: msgs
+        .slice()
+        .reverse()
+        .map((m) => ({
+          from: m.role === 'customer' ? 'customer' : 'assistant',
+          text: m.text,
+          at: m.at.toLocaleString(ctx.lang === 'he' ? 'he-IL' : 'en-GB', { timeZone: ctx.timezone, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false }),
+        })),
+    }
   }
 
   if (queryType === 'segment') {
@@ -1213,7 +1263,21 @@ export async function executeMessageCustomer(
     return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to message — a name on file or a phone number.' }
   }
 
+  // Every outcome — sent or blocked — is written to the action ledger (audit_log) so the
+  // ground-truth context can later contradict any false "I sent it" claim. This is the
+  // L1 grounding contract: a state-changing tool MUST record what actually happened.
+  const recordOutreach = (action: 'outreach.message_sent' | 'outreach.message_blocked', meta: Record<string, unknown>) =>
+    logAudit(ctx.db, {
+      businessId: ctx.businessId,
+      actorId: ctx.identityId,
+      action,
+      entityType: 'identity',
+      entityId: target!.id,
+      metadata: { to: target!.phoneNumber, ...meta },
+    }).catch(() => { /* ledger write is best-effort; never fail the send on it */ })
+
   if (target.optOut) {
+    await recordOutreach('outreach.message_blocked', { reason: 'opted_out' })
     return { ok: false, reason: 'opted_out', guidance: 'This customer has opted out of messages. Tell the owner you cannot contact them — do not claim the message was sent.' }
   }
 
@@ -1229,17 +1293,21 @@ export async function executeMessageCustomer(
   const res = await sendMessage({ toNumber: target.phoneNumber, body }, waCredentials)
   if (!res.ok) {
     if (res.userOptedOut) {
+      await recordOutreach('outreach.message_blocked', { reason: 'opted_out' })
       return { ok: false, reason: 'opted_out', guidance: 'The customer has blocked/opted out. Tell the owner the message could not be delivered.' }
     }
     if (res.outsideWindow) {
+      await recordOutreach('outreach.message_blocked', { reason: 'outside_window', body })
       return {
         ok: false,
         reason: 'outside_messaging_window',
         guidance: 'WhatsApp blocked the first message because more than 24 hours have passed since this customer last messaged the business (only a pre-approved template can reopen contact, and none is set up). The message was NOT sent. Tell the owner plainly and suggest the customer message first, or that you can reach out once they do.',
       }
     }
+    await recordOutreach('outreach.message_blocked', { reason: 'send_failed' })
     return { ok: false, reason: 'send_failed', guidance: 'The message failed to send. Tell the owner it did not go through and you will retry — do not claim it was delivered.' }
   }
 
+  await recordOutreach('outreach.message_sent', { body })
   return { ok: true, sentTo: target.phoneNumber, guidance: 'The message was actually delivered. Confirm to the owner in your own words that you sent it and will update them when the customer replies.' }
 }

@@ -106,6 +106,11 @@ export interface GenerateReplyInput {
   // LLM can never invent instructors, prices, capacities, or services. When the
   // transcript and these facts disagree, these facts win.
   businessFacts?: string | undefined
+  // L1 grounding (ACTION_GROUNDING_SPEC.md): a record of real, system-performed actions
+  // involving this customer (e.g. a proactive outreach the business just sent them). Lets
+  // a reply continue an outreach thread instead of cold-greeting, and overrides any action
+  // the transcript merely implies. Built from audit_log by the flow layer.
+  actionLedger?: string | undefined
   botPersona?: 'female' | 'male' | 'neutral' | undefined
   customerMemory?: {
     returningCustomer: boolean

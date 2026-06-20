@@ -4,6 +4,7 @@ import { serviceTypes, bookings, identities, availability } from '../../db/schem
 import type { Business, CalendarBlockType } from '../../db/schema.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import type { ActiveSession } from '../session/types.js'
+import { buildActionLedgerBlock } from '../audit/ledger-block.js'
 import { updateSessionContext, completeSession, failSession } from '../session/manager.js'
 import { requestBooking, confirmBooking, cancelBooking } from '../booking/engine.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
@@ -298,9 +299,13 @@ type GenReply = (
 //
 // `businessFacts` is closed over here and merged into every reply so the LLM is
 // grounded in the real, exhaustive config on EVERY path — not just inquiries.
-function makeGenReply(businessFacts: string): GenReply {
+function makeGenReply(businessFacts: string, actionLedger: string): GenReply {
   return async (input, opts = {}) => {
-    const grounded = businessFacts ? { ...input, businessFacts } : input
+    const grounded = {
+      ...input,
+      ...(businessFacts ? { businessFacts } : {}),
+      ...(actionLedger ? { actionLedger } : {}),
+    }
     const reply = await generateCustomerReply(grounded)
     if (opts.bookingConfirmed) return reply
     if (!assertsBookingConfirmed(reply, input.language)) return reply
@@ -399,7 +404,17 @@ export async function handleBookingFlow(
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
 
   const businessFacts = buildBusinessFacts(activeServices, businessKnowledge, business)
-  const genReply = makeGenReply(businessFacts)
+  // L1 grounding: surface any real action involving this customer — chiefly a proactive
+  // outreach the business just sent them — so a reply continues that thread instead of
+  // cold-greeting, and never invents an action. Best-effort; never block a reply on it.
+  const actionLedger = await buildActionLedgerBlock(db, {
+    businessId: identity.businessId,
+    timezone: businessTimezone,
+    lang,
+    scope: 'customer',
+    identityId: identity.id,
+  }).catch(() => '')
+  const genReply = makeGenReply(businessFacts, actionLedger)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i

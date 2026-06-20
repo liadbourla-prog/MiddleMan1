@@ -220,6 +220,12 @@ The `situation` string passed to the customer reply LLM is a sanitized internal 
 - Contain internal field names or UUIDs
 - Be quoted back verbatim to the customer
 
+### 7.4 Action Grounding — never claim an action that didn't happen
+The PA must never state a state-changing action as completed unless the deterministic core actually performed it. "I sent it", "you're booked", "I cancelled it", "your calendar is connected" are only allowed when a tool returned success for that exact action this turn (or the action ledger records it). A claim narrated ahead of the system is the cardinal "said done, didn't do" failure (Principle #5) and tends to snowball — the false claim is trusted on later turns. Enforced in two layers; see `ACTION_GROUNDING_SPEC.md`:
+- **Grounding:** a "what actually happened" block, built from `audit_log`, is injected into Branch 3 and Branch 4 context and overrides anything the chat prose implies.
+- **Claim auditor:** a reply asserting an unbacked action is regenerated, then replaced with a safe honest fallback (`reply-guard.ts`).
+- **Tool contract:** every state-changing tool MUST write an `audit_log` action recording what it did (or explicitly did not do, and why). A tool with no ledger write is a grounding gap — close it when adding the tool, not later.
+
 ---
 
 ## 8. Character and Encoding Notes
