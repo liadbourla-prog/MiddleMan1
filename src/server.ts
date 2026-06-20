@@ -18,6 +18,7 @@ import { startOperatorSummaryWorker } from './workers/generate-operator-summary.
 import { startCustomerSummaryWorker } from './workers/generate-customer-summary.js'
 import { startDailyBriefingWorker } from './workers/daily-briefing.js'
 import { startCalendarMirrorWorker } from './workers/calendar-mirror.js'
+import { startReshuffleCampaignWorker } from './workers/reshuffle-campaign.js'
 import { startCalendarSyncRenewalWorker, scheduleCalendarSyncRenewalJob } from './workers/calendar-sync-renewal.js'
 import { startSeriesMaterializerWorker } from './workers/series-materializer.js'
 
@@ -92,6 +93,7 @@ startDailyBriefingWorker()
 startCalendarMirrorWorker()
 startCalendarSyncRenewalWorker()
 startSeriesMaterializerWorker()
+startReshuffleCampaignWorker()
 await scheduleHoldExpiryJob()
 await scheduleCalendarSyncRenewalJob()
 app.log.info('Background workers started')

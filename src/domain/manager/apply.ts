@@ -15,6 +15,34 @@ import { createBlock } from '../availability/blocks.js'
 import { localTimeToUtc, localParts } from '../availability/compute.js'
 import { enqueueBlockMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
 import { findProviderByName } from '../provider/lookup.js'
+import { resolveReshuffleConfig, type ReshuffleConfig } from '../reshuffle/config.js'
+
+/**
+ * Deterministic writer for the reshuffle engine knobs. Merges an owner patch over the
+ * current config, clamps via resolveReshuffleConfig, persists, and audits. The owner sets
+ * these conversationally through the `configureReshuffle` orchestrator tool.
+ */
+export async function applyReshuffleConfigUpdate(
+  database: Db,
+  businessId: string,
+  patch: Record<string, unknown>,
+  actorId?: string,
+): Promise<{ ok: true; config: ReshuffleConfig } | { ok: false; reason: string }> {
+  const [biz] = await database.select({ cfg: businesses.reshuffleConfig }).from(businesses).where(eq(businesses.id, businessId)).limit(1)
+  if (!biz) return { ok: false, reason: 'business_not_found' }
+
+  const merged = resolveReshuffleConfig({ ...resolveReshuffleConfig(biz.cfg), ...patch })
+  await database.update(businesses).set({ reshuffleConfig: merged as unknown as Record<string, unknown> }).where(eq(businesses.id, businessId))
+  await logAudit(database, {
+    businessId,
+    actorId: actorId ?? null,
+    action: 'reshuffle.config_updated',
+    entityType: 'business',
+    entityId: businessId,
+    metadata: merged as unknown as Record<string, unknown>,
+  })
+  return { ok: true, config: merged }
+}
 
 // Bilingual day names (Sun=0 … Sat=6)
 function dayName(dayOfWeek: number | null | undefined, lang: Lang): string {

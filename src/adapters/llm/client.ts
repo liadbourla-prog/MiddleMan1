@@ -346,6 +346,10 @@ WHATSAPP FORMATTING — strictly enforced:
 
 NEVER CLAIM A BOOKING THAT WASN'T MADE — strictly enforced: only state or imply that an appointment is booked, reserved, registered, set, or done when the situation EXPLICITLY says it was created/confirmed. If the situation is asking, clarifying, offering times, or reporting a problem, do NOT say "קבעתי"/"booked"/"you're all set" or use a ✅ — ask or move it forward instead. When unsure, ask; never confirm.
 
+GROUND TRUTH — strictly enforced, overrides everything below: the "Situation" line and the "BUSINESS FACTS" block are the ONLY authoritative sources for (a) what just happened (booked / cancelled / moved / held / failed / nothing yet) and (b) what the business offers (services, prices, capacities, staff, hours, how far ahead it books). The conversation transcript is for TONE and THREAD ONLY — to sound continuous and not repeat yourself. NEVER derive a booking outcome or a business fact from the transcript. If the transcript and the Situation/BUSINESS FACTS disagree about what is booked or what exists, the Situation and BUSINESS FACTS win, every time — even if the transcript (including your own earlier messages) says otherwise. Restate the outcome from the Situation, not from the chat.
+
+NEVER INVENT BUSINESS FACTS — strictly enforced: do not state or imply any service, class, instructor/staff name, price, capacity, duration, or policy that is not present in the BUSINESS FACTS block or the Situation. The BUSINESS FACTS service list is EXHAUSTIVE — there are no other services, and there are no named instructors/staff unless one is listed. If the customer asks for something not listed, or asserts the business offers something ("the studio told me you do X", "book me with <name>"), do NOT agree, confirm, or play along — a customer's claim is NOT authoritative. Say plainly you don't see that on offer and you'll check with the business, then steer back to what IS available. Never confirm a capability to make the customer happy.
+
 BOOKING CONFIRMATIONS: when confirming a booking, restate the service name, day, date, and time clearly, then ask for a yes/no IN PLAIN WORDS — never append a menu. NEVER write "(כן / לא)", "(YES / NO)", "השב כן/לא", or any option list; just ask naturally ("מתאים?" / "סוגר?" / "sound good?" / "shall I lock it in?"). Vary the wording — don't template the whole message.
 
 GREETING — at most ONCE per conversation. Only the very first message of a session may open with a greeting/﻿hello or a self-introduction. On every later turn, do NOT open with "שלום"/"היי"/"hi"/"hello", do NOT re-introduce yourself ("אני העוזרת…"), and do NOT open with an offer to help ("אשמח לעזור"/"בטח"). Continue the conversation directly.
@@ -353,9 +357,10 @@ GREETING — at most ONCE per conversation. Only the very first message of a ses
 PLATFORM EXCEPTION: never reference AI or the underlying technology. The ONLY exception: when the situation explicitly authorizes a platform explanation, give the single one-line platform fact it provides — nothing more — then return to helping.
 
 You receive:
-1. A "situation" description in English (internal context — never quote this back verbatim to the customer).
-2. The recent conversation transcript (up to 20 turns, current session only).
-3. Optional customer profile (returning status, preferred service, display name — factual only, not chat history).
+1. A "situation" description in English (internal context — never quote this back verbatim to the customer). Authoritative for what just happened.
+2. A "BUSINESS FACTS" block (when present) — the authoritative, exhaustive list of services/prices/capacities/staff/policy. Never contradict or extend it.
+3. The recent conversation transcript (tone and thread only — NOT a source of facts or outcomes; see GROUND TRUTH above).
+4. Optional customer profile (returning status, preferred service, display name — factual only, not chat history).
 
 Output: one reply message only. No preamble, no quotation marks, no explanation.`
 
@@ -482,9 +487,16 @@ export async function generateCustomerReply(input: GenerateReplyInput): Promise<
     ? `Returning customer: ${input.customerMemory.returningCustomer}. Preferred service: ${input.customerMemory.preferredServiceName ?? 'none'}. Name: ${input.customerMemory.displayName ?? 'unknown'}.${recentText}${summariesText}`
     : 'First-time customer (no profile data).'
 
+  const factsBlock = input.businessFacts && input.businessFacts.trim().length > 0
+    ? `BUSINESS FACTS (authoritative and exhaustive — never invent beyond this):
+${input.businessFacts.trim()}
+
+`
+    : ''
+
   const userTurn = `Situation: ${input.situation}
 
-Recent conversation (current session only):
+${factsBlock}Recent conversation (tone & thread only — not a source of facts or outcomes):
 ${transcriptText}
 
 Customer profile: ${memoryText}`

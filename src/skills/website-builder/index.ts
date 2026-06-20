@@ -258,10 +258,19 @@ async function callSiteBuilder(siteSchema: SiteSchema, workflowId: string): Prom
       },
       body: JSON.stringify({ schema: siteSchema, workflowId }),
     })
-    if (!res.ok) return null
+    if (!res.ok) {
+      // Surface the real reason instead of a silent null — the site-builder route
+      // returns 400 (invalid schema), 401 (secret mismatch), or 500 (GCS upload).
+      const body = await res.text().catch(() => '')
+      console.error(`[website-builder] callSiteBuilder non-OK: ${res.status} ${res.statusText} url=${builderUrl}/build-site body=${body.slice(0, 500)}`)
+      return null
+    }
     const data = await res.json() as { previewUrl?: string }
     return data.previewUrl ?? null
-  } catch {
+  } catch (err) {
+    // A swallowed fetch error here (ECONNREFUSED when SITE_BUILDER_URL is unset/
+    // wrong, DNS, timeout) is why preview-deploy failures were invisible. Log it.
+    console.error(`[website-builder] callSiteBuilder fetch failed url=${builderUrl}/build-site:`, err instanceof Error ? err.message : err)
     return null
   }
 }

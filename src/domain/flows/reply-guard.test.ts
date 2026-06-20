@@ -30,4 +30,14 @@ describe('assertsBookingConfirmed', () => {
     expect(assertsBookingConfirmed('Which day would you like to book?', 'en')).toBe(false)
     expect(assertsBookingConfirmed('Shall I book that for you?', 'en')).toBe(false)
   })
+
+  it('flags phantom-reschedule claims (C2) but not move OFFERS', () => {
+    // The exact prod hallucination: a "✅ moved your yoga" with no engine write.
+    expect(assertsBookingConfirmed('סגור. העברתי את שיעור היוגה שלך ליום ראשון ✅', 'he')).toBe(true)
+    expect(assertsBookingConfirmed("Done — I've moved your yoga to Sunday", 'en')).toBe(true)
+    expect(assertsBookingConfirmed('moved your appointment to 13:00', 'en')).toBe(true)
+    // Offers to move must still pass through (booking not yet changed).
+    expect(assertsBookingConfirmed('רוצה שאעביר את היוגה ליום ראשון?', 'he')).toBe(false)
+    expect(assertsBookingConfirmed('Want me to move it to Sunday?', 'en')).toBe(false)
+  })
 })

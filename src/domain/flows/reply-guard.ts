@@ -26,6 +26,7 @@ const HE_CONFIRMED = [
   /נקבע\s+לך/, // it's been set for you
   /התור\s+נקבע/, // the appointment was set
   /הזמנתי\s+לך/, // I booked for you
+  /העברתי/, // I moved/rescheduled (phantom-reschedule claim — C2)
 ]
 
 // English: completed claims only. \bbooked\b / reserved / registered / "all set" /
@@ -39,6 +40,7 @@ const EN_CONFIRMED = [
   /\blocked\s+it\s+in\b/i,
   /\bsigned\s+you\s+up\b/i,
   /\byour\s+(?:booking|appointment|spot)\s+is\s+(?:confirmed|booked|set)\b/i,
+  /\b(?:i(?:'| ha)ve\s+moved|i\s+moved|moved\s+your)\b/i, // phantom-reschedule claim (C2)
 ]
 
 export function assertsBookingConfirmed(text: string, lang: 'he' | 'en'): boolean {

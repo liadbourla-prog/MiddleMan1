@@ -12,7 +12,9 @@ import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../authorization/check.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
-import { applyInstruction, pauseConversation, resumeConversation } from './apply.js'
+import { applyInstruction, pauseConversation, resumeConversation, applyReshuffleConfigUpdate } from './apply.js'
+import { reshuffleCampaigns, reshuffleProposals } from '../../db/schema.js'
+import { approveProposal, rejectProposal } from '../reshuffle/gate.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
@@ -1023,4 +1025,74 @@ export async function executeResumeConversation(
 ): Promise<object> {
   const message = await resumeConversation(ctx.db, ctx.businessId, args.customer_identifier, ctx.lang)
   return { success: true, message }
+}
+
+// ── Reshuffle engine: owner gate + config ───────────────────────────────────────
+
+/** Find the most recent proposal awaiting the owner's decision for this business. */
+async function latestPendingProposal(ctx: ToolContext): Promise<{ id: string; touchedCount: number; kind: string } | null> {
+  const [row] = await ctx.db
+    .select({ id: reshuffleProposals.id, touchedCount: reshuffleProposals.touchedCount, kind: reshuffleProposals.kind })
+    .from(reshuffleProposals)
+    .innerJoin(reshuffleCampaigns, eq(reshuffleProposals.campaignId, reshuffleCampaigns.id))
+    .where(and(eq(reshuffleCampaigns.businessId, ctx.businessId), inArray(reshuffleProposals.status, ['pending', 'amended'])))
+    .orderBy(desc(reshuffleProposals.presentedToOwnerAt))
+    .limit(1)
+  return row ?? null
+}
+
+export async function executeApproveReshuffle(_args: Record<string, never>, ctx: ToolContext): Promise<object> {
+  const proposal = await latestPendingProposal(ctx)
+  if (!proposal) return { success: false, reason: 'no_pending_proposal', guidance: 'There is no reshuffle plan waiting for approval. Tell the owner that plainly.' }
+  const res = await approveProposal(ctx.db, proposal.id, new Date())
+  if (!res.ok) return { success: false, reason: res.reason, guidance: 'The plan could not be applied (it may be stale). Tell the owner and offer to re-run the search. reason is raw — phrase it naturally.' }
+  return { success: true, fact: `Applied ${res.movedCount} move(s).`, guidance: 'The swap is live and everyone moved was already in agreement. Confirm to the owner in your own words.' }
+}
+
+export async function executeRejectReshuffle(_args: Record<string, never>, ctx: ToolContext): Promise<object> {
+  const proposal = await latestPendingProposal(ctx)
+  if (!proposal) return { success: false, reason: 'no_pending_proposal', guidance: 'There is no reshuffle plan waiting. Tell the owner plainly.' }
+  const res = await rejectProposal(ctx.db, proposal.id, new Date())
+  if (!res.ok) return { success: false, reason: res.reason }
+  return { success: true, fact: 'Plan rejected; nothing changed.', guidance: 'Confirm to the owner that nothing changed and anyone contacted will be told never mind.' }
+}
+
+interface ConfigureReshuffleArgs {
+  enabled?: boolean
+  approvalMode?: 'require_approval' | 'auto_apply'
+  batchSize?: number
+  maxChainLength?: number
+  maxOutreachPerCampaign?: number
+  protectWindowHours?: number
+  protectVip?: boolean
+  contactScope?: 'conflicting_only' | 'service_match' | 'all_booked'
+}
+
+export async function executeConfigureReshuffle(args: ConfigureReshuffleArgs, ctx: ToolContext): Promise<object> {
+  // Strip undefined keys so only what the owner specified is patched.
+  const patch: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(args)) if (v !== undefined) patch[k] = v
+  if (Object.keys(patch).length === 0) return { success: false, reason: 'nothing_to_change', guidance: 'Ask the owner which reshuffle setting they want to change.' }
+
+  const res = await applyReshuffleConfigUpdate(ctx.db, ctx.businessId, patch, ctx.identityId)
+  if (!res.ok) return { success: false, reason: res.reason }
+  return { success: true, fact: JSON.stringify(res.config), guidance: 'Settings saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
+}
+
+interface AmendReshuffleArgs {
+  change: string
+}
+
+export async function executeAmendReshuffle(args: AmendReshuffleArgs, ctx: ToolContext): Promise<object> {
+  // Amend (decision D3) re-validates a modified plan and re-consents affected customers.
+  // The re-solve-on-amendment backing is not built yet, so we never silently apply a tweak:
+  // record the request and tell the owner it needs a fresh search rather than fake success.
+  const proposal = await latestPendingProposal(ctx)
+  if (!proposal) return { success: false, reason: 'no_pending_proposal' }
+  return {
+    success: false,
+    reason: 'amend_not_yet_supported',
+    requestedChange: args.change,
+    guidance: 'Tell the owner you can approve or reject this plan as-is, and that tweaking it (then re-checking with the affected customers) is coming soon — do not imply the tweak was applied.',
+  }
 }

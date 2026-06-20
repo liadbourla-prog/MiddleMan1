@@ -5,6 +5,11 @@ import type { ActiveSession, SessionState, SessionIntent } from './types.js'
 
 const DEFAULT_SESSION_EXPIRY_MINUTES = parseInt(process.env['SESSION_EXPIRY_MINUTES'] ?? '30', 10)
 
+// Phase 4 (churn): a customer mid-booking (awaiting confirmation or clarification)
+// gets a longer idle grace so a brief step-away doesn't expire the session and lose
+// the in-flight slot. Only the customer flow uses these waiting_* states.
+const MID_FLOW_EXPIRY_MINUTES = 60
+
 export const SESSION_EXPIRY = {
   customer: DEFAULT_SESSION_EXPIRY_MINUTES,
   manager: 240,
@@ -96,13 +101,20 @@ export async function updateSessionContext(
   state?: SessionState,
   expiryMinutes?: number,
 ): Promise<void> {
+  // Mid-flow states get a longer idle grace (unless the caller set an explicit
+  // window) so a customer pausing mid-booking doesn't lose their slot.
+  const minutes = expiryMinutes
+    ?? (state === 'waiting_confirmation' || state === 'waiting_clarification'
+      ? MID_FLOW_EXPIRY_MINUTES
+      : undefined)
+
   await db
     .update(conversationSessions)
     .set({
       context,
       ...(state !== undefined ? { state } : {}),
       lastMessageAt: new Date(),
-      expiresAt: expiryFromNow(expiryMinutes),
+      expiresAt: expiryFromNow(minutes),
     })
     .where(eq(conversationSessions.id, sessionId))
 }

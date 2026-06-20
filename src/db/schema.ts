@@ -57,6 +57,8 @@ export const businesses = pgTable('businesses', {
   handoffBehavior: jsonb('handoff_behavior'),
   automatedMessagesConfig: jsonb('automated_messages_config'),
   bookingEdgeCases: jsonb('booking_edge_cases'),
+  // Proactive reshuffle engine knobs (null = safe defaults; see domain/reshuffle/config.ts)
+  reshuffleConfig: jsonb('reshuffle_config'),
   cancellationFeeAmount: numeric('cancellation_fee_amount', { precision: 10, scale: 2 }),
   cancellationFeeCurrency: text('cancellation_fee_currency'),
   // Website builder
@@ -86,6 +88,8 @@ export const identities = pgTable(
     grantedAt: timestamp('granted_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
     messagingOptOut: boolean('messaging_opt_out').notNull().default(false),
+    // Reshuffle engine: VIPs are never moved involuntarily (decision A4)
+    vip: boolean('vip').notNull().default(false),
     // Customer's preferred language for PA replies; null = use business default
     preferredLanguage: text('preferred_language', { enum: ['he', 'en'] }),
     conversationPausedUntil: timestamp('conversation_paused_until', { withTimezone: true }),
@@ -523,6 +527,74 @@ export const waitlist = pgTable(
   ],
 )
 
+// ── Proactive Reshuffle Engine ────────────────────────────────────────────────
+// See docs/superpowers/plans/2026-06-18-proactive-reshuffle-engine.md
+
+/** One per reschedule request the engine takes on. */
+export const reshuffleCampaigns = pgTable(
+  'reshuffle_campaigns',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    requesterId: uuid('requester_id').notNull().references(() => identities.id),
+    requesterBookingId: uuid('requester_booking_id').notNull().references(() => bookings.id),
+    serviceTypeId: uuid('service_type_id').notNull().references(() => serviceTypes.id),
+    targetSlotStart: timestamp('target_slot_start', { withTimezone: true }).notNull(),
+    targetSlotEnd: timestamp('target_slot_end', { withTimezone: true }).notNull(),
+    status: text('status', {
+      enum: ['searching', 'solution_pending_approval', 'applying', 'applied', 'failed', 'abandoned'],
+    }).notNull().default('searching'),
+    strategy: text('strategy', { enum: ['direct', 'chain', 'broadcast'] }),
+    outreachCount: integer('outreach_count').notNull().default(0),
+    // The reshuffleConfig in force at start, so mid-flight config edits don't corrupt a solve.
+    configSnapshot: jsonb('config_snapshot').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+  },
+  (t) => [index('reshuffle_campaigns_status_idx').on(t.businessId, t.status)],
+)
+
+/** One per "we asked customer X whether they'll take slot Y". Mirrors the waitlist offer lifecycle. */
+export const reshuffleOffers = pgTable(
+  'reshuffle_offers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    campaignId: uuid('campaign_id').notNull().references(() => reshuffleCampaigns.id),
+    customerId: uuid('customer_id').notNull().references(() => identities.id),
+    bookingId: uuid('booking_id').references(() => bookings.id),
+    proposedSlotStart: timestamp('proposed_slot_start', { withTimezone: true }).notNull(),
+    proposedSlotEnd: timestamp('proposed_slot_end', { withTimezone: true }).notNull(),
+    status: text('status', {
+      enum: ['probing', 'accepted', 'declined', 'countered', 'expired'],
+    }).notNull().default('probing'),
+    counterSlotStart: timestamp('counter_slot_start', { withTimezone: true }),
+    counterSlotEnd: timestamp('counter_slot_end', { withTimezone: true }),
+    offeredAt: timestamp('offered_at', { withTimezone: true }).notNull().defaultNow(),
+    offerExpiresAt: timestamp('offer_expires_at', { withTimezone: true }),
+  },
+  (t) => [index('reshuffle_offers_campaign_idx').on(t.campaignId, t.status)],
+)
+
+/** The assembled solution presented to the owner (the approval gate's persisted state). */
+export const reshuffleProposals = pgTable(
+  'reshuffle_proposals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    campaignId: uuid('campaign_id').notNull().references(() => reshuffleCampaigns.id),
+    // Ordered moves: [{ bookingId, customerId, fromSlot, toSlot }]
+    moves: jsonb('moves').notNull(),
+    touchedCount: integer('touched_count').notNull(),
+    kind: text('kind', { enum: ['exact', 'better_offer'] }).notNull().default('exact'),
+    status: text('status', {
+      enum: ['pending', 'amended', 'rejected', 'approved', 'expired', 'applied'],
+    }).notNull().default('pending'),
+    amendedFromId: uuid('amended_from_id'),
+    presentedToOwnerAt: timestamp('presented_to_owner_at', { withTimezone: true }),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+  },
+  (t) => [index('reshuffle_proposals_campaign_idx').on(t.campaignId, t.status)],
+)
+
 export const providerOnboardingSessions = pgTable('provider_onboarding_sessions', {
   id: uuid('id').primaryKey().defaultRandom(),
   managerPhone: text('manager_phone').notNull().unique(),
@@ -771,6 +843,9 @@ export type CustomerSessionNote = typeof customerSessionNotes.$inferSelect
 export type BusinessContact = typeof businessContacts.$inferSelect
 export type OperatorSessionNote = typeof operatorSessionNotes.$inferSelect
 export type CalendarSyncChannel = typeof calendarSyncChannels.$inferSelect
+export type ReshuffleCampaign = typeof reshuffleCampaigns.$inferSelect
+export type ReshuffleOffer = typeof reshuffleOffers.$inferSelect
+export type ReshuffleProposal = typeof reshuffleProposals.$inferSelect
 
 export type BookingState = Booking['state']
 export type IdentityRole = Identity['role']

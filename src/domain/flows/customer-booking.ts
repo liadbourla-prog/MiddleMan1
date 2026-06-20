@@ -272,31 +272,77 @@ async function buildDayOptionsText(
 
 // Safe clarification used when the LLM keeps asserting a booking that was never
 // made (cardinal "said done, didn't do" backstop — see reply-guard.ts).
+// How many slot/date clarification fumbles before the PA nudges toward a phone
+// call (while keeping the session alive — see nudgeAfterRepeatedTries). A confused
+// customer hits 3 quickly, so allow a little more patience before nudging.
+const MAX_CLARIFICATION_ATTEMPTS = 4
+
 const BOOKING_NOT_CONFIRMED_FALLBACK: Record<'he' | 'en', string> = {
   he: 'רגע, עוד לא סגרנו את זה — לאיזה יום ושעה בא לך?',
   en: "Hang on — that's not booked yet. What day and time works for you?",
 }
+
+// Bound reply function: built once per request with the business's authoritative
+// facts so every customer reply is grounded in real config (no invented services,
+// instructors, prices, or policies — C3/C4). Callers never pass businessFacts.
+type GenReply = (
+  input: Parameters<typeof generateCustomerReply>[0],
+  opts?: { bookingConfirmed?: boolean },
+) => Promise<string>
 
 // Reply-vs-state binding guard. Every customer reply goes through here. When the
 // caller has NOT actually persisted a booking this turn (bookingConfirmed falsy)
 // and the drafted reply nonetheless CLAIMS one was made, regenerate once forbidding
 // the claim, then fall back to a safe clarification. Confirmation sites pass
 // bookingConfirmed:true to allow the legitimate "you're booked" wording.
-async function genReply(
-  input: Parameters<typeof generateCustomerReply>[0],
-  opts: { bookingConfirmed?: boolean } = {},
-): Promise<string> {
-  const reply = await generateCustomerReply(input)
-  if (opts.bookingConfirmed) return reply
-  if (!assertsBookingConfirmed(reply, input.language)) return reply
+//
+// `businessFacts` is closed over here and merged into every reply so the LLM is
+// grounded in the real, exhaustive config on EVERY path — not just inquiries.
+function makeGenReply(businessFacts: string): GenReply {
+  return async (input, opts = {}) => {
+    const grounded = businessFacts ? { ...input, businessFacts } : input
+    const reply = await generateCustomerReply(grounded)
+    if (opts.bookingConfirmed) return reply
+    if (!assertsBookingConfirmed(reply, input.language)) return reply
 
-  const correctedInput = {
-    ...input,
-    situation: `${input.situation}\n\nCRITICAL: No booking has been made or confirmed. Do NOT state or imply the appointment is booked, reserved, registered, or done. If a decision is needed, ask for it plainly.`,
+    const correctedInput = {
+      ...grounded,
+      situation: `${input.situation}\n\nCRITICAL: No booking has been made or confirmed. Do NOT state or imply the appointment is booked, reserved, registered, or done. If a decision is needed, ask for it plainly.`,
+    }
+    const corrected = await generateCustomerReply(correctedInput)
+    if (!assertsBookingConfirmed(corrected, input.language)) return corrected
+    return BOOKING_NOT_CONFIRMED_FALLBACK[input.language]
   }
-  const corrected = await generateCustomerReply(correctedInput)
-  if (!assertsBookingConfirmed(corrected, input.language)) return corrected
-  return BOOKING_NOT_CONFIRMED_FALLBACK[input.language]
+}
+
+// Build the authoritative, closed-world business-facts block injected into every
+// customer reply. Exhaustive service list (model/capacity/price) + an explicit
+// no-invented-staff rule + the real booking-horizon policy. This is the ground
+// truth that overrides anything the transcript implies (kills C3/C4).
+export function buildBusinessFacts(
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number }>,
+  businessKnowledge: BusinessKnowledge | undefined,
+  business: Business | undefined,
+): string {
+  if (activeServices.length === 0) {
+    return 'This business has NO bookable services configured. Do not offer to book anything or invent any service; tell the customer to contact the business directly.'
+  }
+  const lines: string[] = ['Services offered (this is the COMPLETE list — there are no other services):']
+  for (const s of activeServices) {
+    const model = s.maxParticipants > 1
+      ? `group class, up to ${s.maxParticipants} people`
+      : 'private 1-on-1 (one person per booking)'
+    const k = businessKnowledge?.services.find((ks) => ks.id === s.id)
+    const price = k?.price != null
+      ? `${k.price}${k.currency ? ' ' + k.currency : ''}`
+      : 'no price on record — do NOT quote a price'
+    lines.push(`• ${s.name} — ${s.durationMinutes} min, ${model}, ${price}`)
+  }
+  lines.push('Instructors/staff: do NOT name, list, suggest, or invent any instructor or staff member. If the customer names one, do not confirm or deny by name — say you will check with the business.')
+  if (business?.maxBookingDaysAhead != null) {
+    lines.push(`Bookings can be made up to ${business.maxBookingDaysAhead} days ahead — never claim a date within that window is "not open yet".`)
+  }
+  return lines.join('\n')
 }
 
 export async function handleBookingFlow(
@@ -335,6 +381,25 @@ export async function handleBookingFlow(
     const pauseLang: 'he' | 'en' = (ctx.languageOverride ?? ctx.detectedLanguage) ?? (businessDefaultLanguage ?? 'he')
     return { reply: t('pa_paused_customer', pauseLang), sessionComplete: false }
   }
+
+  // ── Ground every reply in real config ───────────────────────────────────
+  // Load the active services once, up front, and build the authoritative
+  // business-facts block. genReply closes over it so EVERY reply on EVERY path
+  // (confirmations, clarifications, inquiries, errors) is grounded — the LLM can
+  // never invent services/instructors/prices/policy (C3/C4).
+  const activeServices = await db
+    .select({
+      id: serviceTypes.id,
+      name: serviceTypes.name,
+      durationMinutes: serviceTypes.durationMinutes,
+      maxParticipants: serviceTypes.maxParticipants,
+      category: serviceTypes.category,
+    })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
+
+  const businessFacts = buildBusinessFacts(activeServices, businessKnowledge, business)
+  const genReply = makeGenReply(businessFacts)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
@@ -407,36 +472,26 @@ export async function handleBookingFlow(
 
   // ── Branch: cancellation_selection (multi-booking numbered pick) ──────────
   if (session.state === 'waiting_clarification' && ctx.awaitingConfirmationFor === 'cancellation_selection') {
-    return handleCancellationSelection(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript)
+    return handleCancellationSelection(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply)
   }
 
   // ── Branch: waiting for hold confirmation ────────────────────────────────
   if (session.state === 'waiting_confirmation' && ctx.awaitingConfirmationFor === 'hold') {
-    return handleHoldConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, business)
+    return handleHoldConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
   }
 
   // ── Branch: waiting for cancellation confirmation ────────────────────────
   if (session.state === 'waiting_confirmation' && ctx.awaitingConfirmationFor === 'cancellation') {
-    return handleCancellationConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript)
+    return handleCancellationConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
   }
 
   // ── Branch: waiting for clarification on vague slot ──────────────────────
   if (session.state === 'waiting_clarification') {
-    return handleClarification(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, business)
+    return handleClarification(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
   }
 
   // ── Default: new message, extract intent ─────────────────────────────────
-  const activeServices = await db
-    .select({
-      id: serviceTypes.id,
-      name: serviceTypes.name,
-      durationMinutes: serviceTypes.durationMinutes,
-      maxParticipants: serviceTypes.maxParticipants,
-      category: serviceTypes.category,
-    })
-    .from(serviceTypes)
-    .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
-
+  // activeServices already loaded above (hoisted for businessFacts).
   const serviceNames = activeServices.map((s) => s.name)
 
   const hoursForIntent = business ? await loadHoursSummary(db, business.id) : null
@@ -456,12 +511,14 @@ export async function handleBookingFlow(
   )
 
   if (!intentResult.ok) {
-    await failSession(db, session.id)
+    // Phase 4 (churn): a transient extraction/quota hiccup must NOT destroy the
+    // session — that fragments the conversation and loses any draft. Keep it alive
+    // so the customer's retry continues in the same session.
     if (intentResult.error === 'quota_exceeded') {
       const quotaReply = lang === 'he'
         ? 'אנחנו עסוקים כרגע. אנא נסה שוב בעוד מספר דקות.'
         : "We're a bit busy right now. Please try again in a few minutes."
-      return { reply: quotaReply, sessionComplete: true, sessionFailed: true }
+      return { reply: quotaReply, sessionComplete: false }
     }
     const reply = await genReply({
       businessTimezone,
@@ -472,7 +529,7 @@ export async function handleBookingFlow(
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     })
-    return { reply, sessionComplete: true, sessionFailed: true }
+    return { reply, sessionComplete: false }
   }
 
   const intent = intentResult.data
@@ -506,16 +563,24 @@ export async function handleBookingFlow(
   const intentResult2 = await (async (): Promise<FlowResult> => {
     switch (intent.intent) {
       case 'booking':
-        return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, firstMsgPrefix, business)
+        return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply, firstMsgPrefix, business)
 
       case 'rescheduling':
-        return handleReschedulingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, business)
+        // If a reschedule is already in progress (the booking to move is designated
+        // via `rescheduledFrom`, but not yet released — deferred cancel), this turn is
+        // the customer supplying the NEW time. Route it to the booking path; re-entering
+        // the reschedule handler would see the still-active original and bounce back
+        // into booking selection. The old slot is released on confirmation.
+        if (updatedCtx.rescheduledFrom) {
+          return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply, firstMsgPrefix, business)
+        }
+        return handleReschedulingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply, business)
 
       case 'cancellation':
-        return handleCancellationIntent(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript)
+        return handleCancellationIntent(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply)
 
       case 'list_bookings':
-        return handleListBookings(db, identity, session, updatedCtx, businessTimezone, businessName, transcript)
+        return handleListBookings(db, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply)
 
       case 'inquiry': {
         // Read-only intent: keep the session ACTIVE so a continuing conversation
@@ -680,6 +745,121 @@ export async function handleBookingFlow(
   return intentResult2
 }
 
+// Reconstruct an incremental slot draft from a slot that was about to be confirmed,
+// so a one-field correction ("make it 7pm") keeps the rest while the new piece
+// overrides on merge. Business-local date/time via localParts (DST-correct).
+function slotDraftFromPending(
+  ps: NonNullable<BookingFlowContext['pendingSlot']>,
+  tz: string,
+): NonNullable<BookingFlowContext['slotDraft']> {
+  const lp = localParts(new Date(ps.start), tz)
+  return {
+    serviceTypeId: ps.serviceTypeId,
+    serviceName: ps.serviceName,
+    dateStr: lp.dateStr,
+    time: { hour: Math.floor(lp.minutes / 60), minute: lp.minutes % 60 },
+  }
+}
+
+// Capture the slot pieces a customer stated up front (service/day/time) into a
+// draft, resolving the date deterministically. Used so a multi-booking reschedule
+// ("move my yoga to Sunday 3pm") doesn't drop the new slot during the
+// which-booking selection detour and then re-ask for it.
+function buildDraftFromIntent(
+  intent: CustomerIntentOutput,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null }>,
+  tz: string,
+  now: Date = new Date(),
+): NonNullable<BookingFlowContext['slotDraft']> | null {
+  const draft: NonNullable<BookingFlowContext['slotDraft']> = {}
+  const slot = intent.slotRequest
+  if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
+    const resolved = resolveRequestedDate(
+      { relativeDay: slot.relativeDay ?? null, weekday: slot.weekday ?? null, explicitDate: slot.explicitDate ?? null },
+      tz, now,
+    )
+    if (resolved.ok) draft.dateStr = resolved.dateStr
+  }
+  if (slot?.time) draft.time = { hour: slot.time.hour, minute: slot.time.minute }
+  const svc = resolveService(intent.serviceTypeHint, activeServices)
+  if (svc) {
+    draft.serviceTypeId = svc.id
+    draft.serviceName = svc.name
+  }
+  return Object.keys(draft).length > 0 ? draft : null
+}
+
+// Root B — while a slot is awaiting confirmation, a non-"yes" reply may be the
+// customer REVISING the request ("no, breathing instead", "make it Tuesday 7pm"),
+// not answering yes/no. Re-extract intent; if they named a different
+// service/day/time, release any held slot, seed a fresh draft from the slot they
+// were about to confirm, and rebuild through the booking path so the NEW slot is
+// what gets confirmed/committed. Returns the rebuilt FlowResult, or null when the
+// reply carried no new slot information (genuine yes/no/ambiguity — caller handles).
+async function rebuildOnSlotPivot(
+  db: Db,
+  calendar: CalendarClient,
+  identity: ResolvedIdentity,
+  session: ActiveSession,
+  ctx: BookingFlowContext,
+  messageText: string,
+  businessTimezone: string,
+  businessName: string,
+  transcript: TranscriptTurn[],
+  genReply: GenReply,
+  business?: Business,
+): Promise<FlowResult | null> {
+  const svcRows = await db
+    .select({
+      id: serviceTypes.id,
+      name: serviceTypes.name,
+      durationMinutes: serviceTypes.durationMinutes,
+      maxParticipants: serviceTypes.maxParticipants,
+      category: serviceTypes.category,
+    })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
+
+  const re = await extractCustomerIntent(
+    messageText,
+    {
+      recentMessages: transcript.slice(-6).map((t) => `${t.role === 'customer' ? 'Customer' : 'Assistant'}: ${t.text}`),
+      sessionState: session.state,
+    },
+    businessTimezone,
+    svcRows.map((s) => s.name),
+  )
+  if (!re.ok) return null
+
+  const intent = re.data
+  const ns = intent.slotRequest
+  const hasNewSlot =
+    intent.serviceTypeHint != null ||
+    (ns != null && (ns.time != null || ns.relativeDay != null || ns.weekday != null || ns.explicitDate != null))
+  if ((intent.intent !== 'booking' && intent.intent !== 'rescheduling') || !hasNewSlot) return null
+
+  // Release any hold already placed for the stale slot so it isn't orphaned.
+  if (ctx.pendingBookingId) {
+    await cancelBooking(db, calendar, identity, ctx.pendingBookingId, 'Customer revised the request before confirming').catch(() => { /* non-fatal */ })
+  }
+
+  const ps = ctx.pendingSlot
+  const seededDraft = ps ? slotDraftFromPending(ps, businessTimezone) : ctx.slotDraft
+  const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, ...rest } = ctx
+  const rebuildCtx: BookingFlowContext = {
+    ...rest,
+    ...(seededDraft ? { slotDraft: seededDraft } : {}),
+    clarificationAttempts: 0,
+  }
+  await updateSessionContext(db, session.id, rebuildCtx, 'active')
+
+  return handleBookingIntent(
+    db, calendar, identity,
+    { ...session, state: 'active', context: rebuildCtx },
+    rebuildCtx, intent, svcRows, businessTimezone, businessName, transcript, genReply, '', business,
+  )
+}
+
 // ── Intent handlers ───────────────────────────────────────────────────────────
 
 async function handleBookingIntent(
@@ -693,6 +873,7 @@ async function handleBookingIntent(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
   firstMsgPrefix: string = '',
   business?: Business,
 ): Promise<FlowResult> {
@@ -733,20 +914,30 @@ async function handleBookingIntent(
   }
   if (intent.participantsHint != null) draft.participants = intent.participantsHint
 
-  const failAfterThreeTries = async (): Promise<FlowResult> => {
-    await failSession(db, session.id)
+  // Phase 4 (churn): after several failed tries, DON'T fail the session — that ends
+  // it, so the next message spawns a fresh session that re-greets and loses the
+  // draft (the 18-sessions-in-90-min churn). Instead keep it alive: drop the
+  // unworkable date/time (keep the service), reset the counter, and nudge toward a
+  // call while staying open to keep trying. One continuous session, state intact.
+  const nudgeAfterRepeatedTries = async (): Promise<FlowResult> => {
+    const { dateStr: _droppedDate, time: _droppedTime, ...keptDraft } = draft
+    await updateSessionContext(
+      db, session.id,
+      { ...ctx, slotDraft: keptDraft, clarificationAttempts: 0 },
+      'waiting_clarification',
+    )
     const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
-      situation: 'The customer has not landed on a workable date/time after several tries. Wrap up warmly and suggest they call the business directly.',
+      situation: 'The customer has struggled to land on a workable date/time after several tries. Warmly suggest it might be quickest to sort out by phone with the business — but stay open: invite them to just name another day and you will keep trying. Do NOT end the conversation or say goodbye.',
     })
-    return { reply, sessionComplete: true, sessionFailed: true }
+    return { reply, sessionComplete: false }
   }
 
   // ── A bad date (past / impossible / ambiguous): clarify, don't echo it back ─
   if (dateProblem) {
     const newAttempts = attempts + 1
-    if (newAttempts >= 3) return failAfterThreeTries()
+    if (newAttempts >= MAX_CLARIFICATION_ATTEMPTS) return nudgeAfterRepeatedTries()
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draft, clarificationAttempts: newAttempts }, 'waiting_clarification')
     const reply = await genReply({
       businessTimezone,
@@ -759,7 +950,7 @@ async function handleBookingIntent(
   // ── Still missing one of {service, date, time}? Ask for exactly one ────────
   if (!draft.serviceTypeId || !draft.dateStr || !draft.time) {
     const newAttempts = attempts + 1
-    if (newAttempts >= 3) return failAfterThreeTries()
+    if (newAttempts >= MAX_CLARIFICATION_ATTEMPTS) return nudgeAfterRepeatedTries()
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draft, clarificationAttempts: newAttempts }, 'waiting_clarification')
 
     let ask: string
@@ -881,6 +1072,30 @@ async function handleBookingIntent(
   return { reply, sessionComplete: false }
 }
 
+/**
+ * Release the booking that a reschedule is replacing. Called only once the new
+ * booking is actually secured (confirmed), so a customer is never left without an
+ * appointment if the requested new slot turns out to be unavailable.
+ *
+ * Best-effort by design: the replacement booking has already committed, so a
+ * failure here means the customer briefly holds two slots — a visible, recoverable
+ * state — rather than losing the new booking we just made. We never throw out of
+ * the confirmation path on account of the old slot.
+ */
+async function releaseSupersededBooking(
+  db: Db,
+  calendar: CalendarClient,
+  identity: ResolvedIdentity,
+  ctx: BookingFlowContext,
+): Promise<void> {
+  if (!ctx.rescheduledFrom) return
+  try {
+    await cancelBooking(db, calendar, identity, ctx.rescheduledFrom, 'Superseded by reschedule')
+  } catch {
+    /* old slot lingers; surfaced via the customer's upcoming-appointments view + reminders */
+  }
+}
+
 async function handleReschedulingIntent(
   db: Db,
   calendar: CalendarClient,
@@ -892,6 +1107,7 @@ async function handleReschedulingIntent(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
   business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
@@ -908,30 +1124,31 @@ async function handleReschedulingIntent(
     )
 
   if (activeBookings.length === 0) {
-    return handleBookingIntent(db, calendar, identity, session, ctx, intent, activeServices, businessTimezone, businessName, transcript, '', business)
+    return handleBookingIntent(db, calendar, identity, session, ctx, intent, activeServices, businessTimezone, businessName, transcript, genReply, '', business)
   }
 
   if (activeBookings.length > 1) {
-    return enterCancellationSelection(db, session, ctx, activeBookings, businessTimezone, businessName, transcript, lang, true)
+    // Preserve any new slot the customer already gave ("move my yoga to Sunday 3pm")
+    // so the which-booking selection detour doesn't drop it and re-ask. It's applied
+    // once they pick which booking to move (see handleCancellationConfirmation).
+    const captured = buildDraftFromIntent(intent, activeServices, businessTimezone)
+    const ctxForSelection: BookingFlowContext = captured
+      ? { ...ctx, slotDraft: { ...(ctx.slotDraft ?? {}), ...captured } }
+      : ctx
+    return enterCancellationSelection(db, session, ctxForSelection, activeBookings, businessTimezone, businessName, transcript, genReply, lang, true)
   }
 
   const existing = activeBookings[0]!
-  const cancelResult = await cancelBooking(db, calendar, identity, existing.id, 'Rescheduled by customer via WhatsApp')
-  if (!cancelResult.ok) {
-    const reply = await genReply({
-      businessTimezone,
-      businessName,
-      language: lang,
-      situation: `Could not cancel the existing booking in order to reschedule because ${sanitiseReason(cancelResult.reason)}. Apologise and suggest they contact the business directly.`,
-      transcript,
-      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
-    })
-    return { reply, sessionComplete: true }
-  }
-
+  // Deferred-cancel reschedule. Do NOT release the current booking yet. If we cancel
+  // first and the requested new slot turns out to be unavailable (e.g. a fully-booked
+  // week where the customer asks to move onto an already-taken slot), the customer is
+  // left with nothing — original gone, replacement refused. Instead we carry
+  // `rescheduledFrom` through the booking flow and release the old slot only once the
+  // new one is actually secured (see releaseSupersededBooking, called at the
+  // confirmation success points in handleHoldConfirmation). Until then — including if
+  // the customer declines the proposed slot — they keep their original appointment.
   const newCtx: BookingFlowContext = { ...ctx, rescheduledFrom: existing.id }
-  return handleBookingIntent(db, calendar, identity, session, newCtx, intent, activeServices, businessTimezone, businessName, transcript, '', business)
+  return handleBookingIntent(db, calendar, identity, session, newCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply, '', business)
 }
 
 async function handleHoldConfirmation(
@@ -944,17 +1161,33 @@ async function handleHoldConfirmation(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
   business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
   const confirmation = parseConfirmation(messageText)
 
+  // Root B: a non-"yes" reply may be REVISING the slot, not answering. If so, rebuild
+  // from the new request so the revised slot is what gets booked (not the stale one).
+  if (confirmation !== 'yes') {
+    const rebuilt = await rebuildOnSlotPivot(
+      db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business,
+    )
+    if (rebuilt) return rebuilt
+  }
+
   if (confirmation === 'unclear') {
+    // Phase 2: re-ask is self-describing — anchored on the EXACT pending slot, not
+    // whatever the transcript implies, so a stale conversation can't mislead it.
+    const ps = ctx.pendingSlot
+    const slotPhrase = ps
+      ? `${ps.serviceName} on ${formatSlotDate(new Date(ps.start), businessTimezone)} at ${formatSlotTime(new Date(ps.start), businessTimezone)}`
+      : 'the appointment'
     const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
-      situation: "Customer's reply was unclear. Gently ask again whether they want to go ahead with the booking or not — in plain words, no menu.",
+      situation: `The customer's reply wasn't a clear yes or no. The slot waiting to be confirmed is: ${slotPhrase}. Restate exactly that slot (service, day, time) and ask in plain words whether to lock it in — no menu. Use ONLY these details; ignore any different service/day/time mentioned earlier in the chat.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
@@ -997,6 +1230,9 @@ async function handleHoldConfirmation(
       return { reply, sessionComplete: true }
     }
 
+    // New booking is committed — now (and only now) release the slot it replaces.
+    await releaseSupersededBooking(db, calendar, identity, ctx)
+
     const pendingSlot = ctx.pendingSlot
     const confirmedDate = pendingSlot ? formatSlotDate(new Date(pendingSlot.start), businessTimezone) : 'the requested date'
     const confirmedTime = pendingSlot ? formatSlotTime(new Date(pendingSlot.start), businessTimezone) : 'the requested time'
@@ -1036,6 +1272,36 @@ async function handleHoldConfirmation(
   })
 
   if (!result.ok) {
+    // Reshuffle engine entry (decision X2 / A5): a reschedule onto a taken slot, with the
+    // feature enabled, becomes a proactive swap campaign instead of a dead-end. The
+    // customer keeps their current booking (deferred-cancel) until an approved plan applies.
+    // Dynamic import keeps Redis/BullMQ out of this module's static graph.
+    const providerUnavailEarly = parseProviderUnavailable(result.reason, lang)
+    if (ctx.rescheduledFrom && business && !providerUnavailEarly) {
+      const { openReshuffleCampaign } = await import('../reshuffle/entry.js')
+      const campaignId = await openReshuffleCampaign(db, {
+        businessId: identity.businessId,
+        requesterId: identity.id,
+        requesterBookingId: ctx.rescheduledFrom,
+        serviceTypeId: pendingSlot.serviceTypeId,
+        targetSlotStart: new Date(pendingSlot.start),
+        targetSlotEnd: new Date(pendingSlot.end),
+      }).catch(() => null)
+      if (campaignId) {
+        await completeSession(db, session.id)
+        const reply = await genReply({
+          businessTimezone,
+          businessName,
+          language: lang,
+          situation: 'The requested time is taken, but you are going to try to arrange a swap with other customers to free it up. Tell them warmly that their current appointment stays booked in the meantime, and you will message them as soon as you know more. Do NOT promise it will work.',
+          transcript,
+          ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+          customerMemory: extractMemory(ctx),
+        })
+        return { reply, sessionComplete: true }
+      }
+    }
+
     await completeSession(db, session.id)
     const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
     // Proactive suggestion: enumerate real bookable openings near the request so
@@ -1074,6 +1340,8 @@ async function handleHoldConfirmation(
   // Group class — booking already confirmed, no second YES needed
   if (result.directlyConfirmed) {
     await completeSession(db, session.id)
+    // New booking is committed — release the slot it replaces (reschedule into a class).
+    await releaseSupersededBooking(db, calendar, identity, ctx)
     const confirmedDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
     const confirmedTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
     const reply = await genReply({
@@ -1118,6 +1386,7 @@ async function handleClarification(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
   business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
@@ -1165,7 +1434,7 @@ async function handleClarification(
   return handleBookingIntent(
     db, calendar, identity,
     { ...session, state: 'active', context: mergedCtx },
-    mergedCtx, intentResult.data, activeServices, businessTimezone, businessName, transcript, '', business,
+    mergedCtx, intentResult.data, activeServices, businessTimezone, businessName, transcript, genReply, '', business,
   )
 }
 
@@ -1178,6 +1447,7 @@ async function handleCancellationIntent(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
 
@@ -1225,7 +1495,7 @@ async function handleCancellationIntent(
     return { reply, sessionComplete: false }
   }
 
-  return enterCancellationSelection(db, session, ctx, activeBookings, businessTimezone, businessName, transcript, lang, false)
+  return enterCancellationSelection(db, session, ctx, activeBookings, businessTimezone, businessName, transcript, genReply, lang, false)
 }
 
 async function enterCancellationSelection(
@@ -1236,6 +1506,7 @@ async function enterCancellationSelection(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
   lang: 'he' | 'en',
   isRescheduling: boolean,
 ): Promise<FlowResult> {
@@ -1280,6 +1551,7 @@ async function handleCancellationSelection(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
   const candidates = ctx.cancellationCandidates ?? []
@@ -1306,12 +1578,15 @@ async function handleCancellationSelection(
   }
   await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
 
-  // Ask for explicit confirmation before cancelling — do NOT auto-confirm
+  // Ask for explicit confirmation before acting — do NOT auto-confirm
+  const situation = ctx.isReschedulingFlow
+    ? `Customer selected booking #${n} as the one to move. Confirm that's the booking they want to reschedule — naturally, no menu. (It stays booked until the new time is set.)`
+    : `Customer selected booking #${n} to cancel. Ask them to confirm the cancellation — naturally, no menu.`
   const reply = await genReply({
     businessTimezone,
     businessName,
     language: lang,
-    situation: `Customer selected booking #${n} to cancel. Ask them to confirm the cancellation — naturally, no menu.`,
+    situation,
     transcript,
     customerMemory: extractMemory(ctx),
   })
@@ -1328,6 +1603,8 @@ async function handleCancellationConfirmation(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
+  business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
   const confirmation = parseConfirmation(messageText)
@@ -1374,6 +1651,58 @@ async function handleCancellationConfirmation(
     return { reply, sessionComplete: true, sessionFailed: true }
   }
 
+  // Reschedule flow (multi-booking path): the customer has picked WHICH booking to
+  // move. Do NOT cancel it yet — deferred-cancel, same invariant as the single-booking
+  // path. We carry it as `rescheduledFrom` and ask for the new time; it is released
+  // only once the replacement is secured (releaseSupersededBooking). If the new slot
+  // turns out to be unavailable (e.g. a fully-booked week), the customer keeps this
+  // booking instead of being stranded. The next turn is routed straight to the booking
+  // path via the `rescheduledFrom` guard in the intent dispatch, so the still-active
+  // original does not bounce us back into booking selection.
+  if (ctx.isReschedulingFlow) {
+    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, ...rest } = ctx
+    const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: bookingId }
+
+    // If the customer already gave the new slot up front ("move my yoga to Sunday
+    // 3pm"), continue straight to it instead of re-asking for the time they already
+    // provided. The captured draft was carried through the selection detour.
+    const d = newCtx.slotDraft
+    if (d?.serviceTypeId && d?.dateStr && d?.time) {
+      const svcRows = await db
+        .select({
+          id: serviceTypes.id,
+          name: serviceTypes.name,
+          durationMinutes: serviceTypes.durationMinutes,
+          maxParticipants: serviceTypes.maxParticipants,
+          category: serviceTypes.category,
+        })
+        .from(serviceTypes)
+        .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
+      await updateSessionContext(db, session.id, newCtx, 'active')
+      // Synthetic intent: the slot is already in the draft, so no new pieces to merge.
+      const synthetic: CustomerIntentOutput = {
+        intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
+        participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+      }
+      return handleBookingIntent(
+        db, calendar, identity,
+        { ...session, state: 'active', context: newCtx },
+        newCtx, synthetic, svcRows, businessTimezone, businessName, transcript, genReply, '', business,
+      )
+    }
+
+    await updateSessionContext(db, session.id, newCtx, 'active')
+    const reply = await genReply({
+      businessTimezone,
+      businessName,
+      language: lang,
+      situation: 'Customer picked which booking to move. Keep it for now — ask what date and time they would like for the new appointment.',
+      transcript,
+      customerMemory: extractMemory(ctx),
+    })
+    return { reply, sessionComplete: false }
+  }
+
   const result = await cancelBooking(db, calendar, identity, bookingId, 'Customer requested via WhatsApp')
 
   if (!result.ok) {
@@ -1388,22 +1717,6 @@ async function handleCancellationConfirmation(
       customerMemory: extractMemory(ctx),
     })
     return { reply, sessionComplete: true }
-  }
-
-  // B1 fix: if this cancellation was part of a reschedule flow, continue to booking
-  if (ctx.isReschedulingFlow) {
-    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, ...rest } = ctx
-    const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: bookingId }
-    await updateSessionContext(db, session.id, newCtx, 'active')
-    const reply = await genReply({
-      businessTimezone,
-      businessName,
-      language: lang,
-      situation: 'Old booking successfully cancelled as part of reschedule. Ask the customer what date and time they would like for their new appointment.',
-      transcript,
-      customerMemory: extractMemory(ctx),
-    })
-    return { reply, sessionComplete: false }
   }
 
   await completeSession(db, session.id)
@@ -1426,6 +1739,7 @@ async function handleListBookings(
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
+  genReply: GenReply,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
 

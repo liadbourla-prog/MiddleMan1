@@ -30,6 +30,10 @@ import {
   executeSaveContactNote,
   executePauseConversation,
   executeResumeConversation,
+  executeApproveReshuffle,
+  executeRejectReshuffle,
+  executeAmendReshuffle,
+  executeConfigureReshuffle,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
 import {
@@ -327,6 +331,42 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
       required: ['customer_identifier'],
     },
   },
+  {
+    name: 'approveReshuffle',
+    description: 'Approve the reschedule swap plan that is waiting for the owner. Only call this when the owner clearly says to go ahead. It applies the agreed moves atomically; everyone involved already consented.',
+    parameters: { type: Type.OBJECT, properties: {} },
+  },
+  {
+    name: 'rejectReshuffle',
+    description: 'Reject the pending reschedule swap plan. Nothing changes and anyone contacted is told never mind. Use when the owner declines the plan.',
+    parameters: { type: Type.OBJECT, properties: {} },
+  },
+  {
+    name: 'amendReshuffle',
+    description: 'The owner wants to tweak the pending reschedule plan (e.g. a different time, or move someone else). Pass their requested change in plain words.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: { change: { type: Type.STRING, description: "The owner's requested modification, verbatim or paraphrased" } },
+      required: ['change'],
+    },
+  },
+  {
+    name: 'configureReshuffle',
+    description: 'Change the proactive reschedule (swap) engine settings for this business. Use when the owner adjusts how it behaves — turn it on/off, batch size for outreach, whether to require approval, how many people to contact, the protect window, who to contact.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        enabled: { type: Type.BOOLEAN, description: 'Turn the swap engine on or off' },
+        approvalMode: { type: Type.STRING, enum: ['require_approval', 'auto_apply'], description: 'Whether the owner must approve each plan (default) or it applies automatically' },
+        batchSize: { type: Type.NUMBER, description: 'How many customers to message per outreach wave (0 = no cap)' },
+        maxChainLength: { type: Type.NUMBER, description: 'Max number of people a single swap may move' },
+        maxOutreachPerCampaign: { type: Type.NUMBER, description: 'Hard cap on total customers messaged for one request' },
+        protectWindowHours: { type: Type.NUMBER, description: "Don't disturb anyone whose appointment is within this many hours" },
+        protectVip: { type: Type.BOOLEAN, description: 'Never move VIP customers to accommodate others' },
+        contactScope: { type: Type.STRING, enum: ['conflicting_only', 'service_match', 'all_booked'], description: 'Who may be contacted for a swap' },
+      },
+    },
+  },
 ]
 
 // ── System prompt builder ─────────────────────────────────────────────────────
@@ -482,6 +522,14 @@ async function dispatchTool(
       return executePauseConversation(args as unknown as Parameters<typeof executePauseConversation>[0], ctx)
     case 'resumeConversation':
       return executeResumeConversation(args as unknown as Parameters<typeof executeResumeConversation>[0], ctx)
+    case 'approveReshuffle':
+      return executeApproveReshuffle(args as unknown as Parameters<typeof executeApproveReshuffle>[0], ctx)
+    case 'rejectReshuffle':
+      return executeRejectReshuffle(args as unknown as Parameters<typeof executeRejectReshuffle>[0], ctx)
+    case 'amendReshuffle':
+      return executeAmendReshuffle(args as unknown as Parameters<typeof executeAmendReshuffle>[0], ctx)
+    case 'configureReshuffle':
+      return executeConfigureReshuffle(args as unknown as Parameters<typeof executeConfigureReshuffle>[0], ctx)
     default:
       return { error: `Unknown tool: ${name}` }
   }

@@ -100,6 +100,12 @@ export interface GenerateReplyInput {
   // DATE FACTS block so the conversational replier states real dates instead of
   // inventing them. Real human dates the LLM phrases — not internal codes (G2).
   businessTimezone?: string | undefined
+  // Authoritative, closed-world business facts (exhaustive service list, capacities,
+  // prices, and an explicit "no other staff/services exist" statement). Built from
+  // real config by the flow layer and injected as a ground-truth block so the reply
+  // LLM can never invent instructors, prices, capacities, or services. When the
+  // transcript and these facts disagree, these facts win.
+  businessFacts?: string | undefined
   botPersona?: 'female' | 'male' | 'neutral' | undefined
   customerMemory?: {
     returningCustomer: boolean

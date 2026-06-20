@@ -165,6 +165,16 @@ export async function teardown(businessId: string): Promise<void> {
     sql`DELETE FROM reminders
         WHERE booking_id IN (SELECT id FROM bookings WHERE business_id = ${businessId})`,
   )
+  // Reshuffle engine rows reference bookings/identities — clear before them.
+  await db.execute(
+    sql`DELETE FROM reshuffle_proposals
+        WHERE campaign_id IN (SELECT id FROM reshuffle_campaigns WHERE business_id = ${businessId})`,
+  )
+  await db.execute(
+    sql`DELETE FROM reshuffle_offers
+        WHERE campaign_id IN (SELECT id FROM reshuffle_campaigns WHERE business_id = ${businessId})`,
+  )
+  await db.execute(sql`DELETE FROM reshuffle_campaigns WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM bookings WHERE business_id = ${businessId}`)
   await db.execute(sql`DELETE FROM customer_profiles WHERE business_id = ${businessId}`)
   // Recurring class series + their materialized instances and exceptions

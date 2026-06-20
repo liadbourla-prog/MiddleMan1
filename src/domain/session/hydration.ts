@@ -133,12 +133,28 @@ export async function buildHydratedContext(
 // context): just the last few turns plus greeted/language flags.
 
 const CARRYOVER_WINDOW_MS = 6 * 60 * 60 * 1000 // 6 hours
+// Root C: a booking-in-progress draft is only carried across a session boundary
+// for a short window — older than this it's an abandoned attempt, not a continuation.
+const DRAFT_CARRYOVER_WINDOW_MS = 90 * 60 * 1000 // 90 minutes
+const MID_FLOW_STATES = new Set(['waiting_confirmation', 'waiting_clarification'])
 
 export interface SessionCarryover {
   priorTurns: TranscriptTurn[]
   greeted: boolean
   detectedLanguage?: 'he' | 'en'
   languageOverride?: 'he' | 'en'
+  // Root C: the in-progress slot pieces from a recent mid-flow session, so a booking
+  // that fragments across a session boundary doesn't re-ask for what was already
+  // given. DATA ONLY — never a live hold (pendingSlot/pendingBookingId) or a
+  // reschedule target (rescheduledFrom): those would risk resurrecting an expired
+  // hold or auto-cancelling an unrelated booking. The booking gates re-validate it.
+  carriedDraft?: {
+    dateStr?: string
+    time?: { hour: number; minute: number }
+    serviceTypeId?: string
+    serviceName?: string
+    participants?: number
+  }
 }
 
 export async function loadSessionCarryover(
@@ -151,6 +167,7 @@ export async function loadSessionCarryover(
     .select({
       id: conversationSessions.id,
       context: conversationSessions.context,
+      state: conversationSessions.state,
       lastMessageAt: conversationSessions.lastMessageAt,
     })
     .from(conversationSessions)
@@ -177,10 +194,20 @@ export async function loadSessionCarryover(
   const detectedLanguage = lang(ctx['detectedLanguage'])
   const languageOverride = lang(ctx['languageOverride'])
 
+  // Root C: carry the in-progress draft only from a RECENT, genuinely mid-flow
+  // session (data only — see SessionCarryover.carriedDraft).
+  const draftAgeMs = now.getTime() - prev.lastMessageAt.getTime()
+  const rawDraft = ctx['slotDraft']
+  const carriedDraft =
+    MID_FLOW_STATES.has(prev.state) && draftAgeMs <= DRAFT_CARRYOVER_WINDOW_MS && rawDraft && typeof rawDraft === 'object'
+      ? (rawDraft as SessionCarryover['carriedDraft'])
+      : undefined
+
   return {
     priorTurns,
     greeted: ctx['greeted'] === true,
     ...(detectedLanguage ? { detectedLanguage } : {}),
     ...(languageOverride ? { languageOverride } : {}),
+    ...(carriedDraft ? { carriedDraft } : {}),
   }
 }

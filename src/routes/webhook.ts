@@ -21,6 +21,7 @@ import {
   SESSION_EXPIRY,
 } from '../domain/session/manager.js'
 import { handleBookingFlow } from '../domain/flows/customer-booking.js'
+import { handleReshuffleReply } from '../domain/reshuffle/inbound.js'
 import { parseConfirmation, type ManagerFlowContext } from '../domain/flows/types.js'
 import { resolveTurnLanguage } from '../domain/flows/language-switch.js'
 import { handleOnboardingMessage } from '../domain/flows/manager-onboarding.js'
@@ -304,13 +305,16 @@ async function routeCustomerMessage(
       loadSessionCarryover(db, identity.id),
     ])
     const hydratedContext = await buildHydratedContext(db, identity.id, business.id, memory)
-    // Carry forward conversational flags only (never booking state) so the PA
-    // doesn't re-greet and keeps the chosen language.
+    // Carry forward conversational flags + (Root C) a recent in-progress booking
+    // draft so a flow that fragmented across a session boundary isn't restarted from
+    // scratch. Still never carries live holds or reschedule targets — only data the
+    // booking gates re-validate.
     const seededContext: Record<string, unknown> = {
       ...(hydratedContext as unknown as Record<string, unknown>),
       ...(carryover?.greeted ? { greeted: true } : {}),
       ...(carryover?.detectedLanguage ? { detectedLanguage: carryover.detectedLanguage } : {}),
       ...(carryover?.languageOverride ? { languageOverride: carryover.languageOverride } : {}),
+      ...(carryover?.carriedDraft ? { slotDraft: carryover.carriedDraft } : {}),
     }
     carriedTurns = carryover?.priorTurns ?? []
     session = await createSession(db, business.id, identity.id, 'booking')
@@ -409,6 +413,17 @@ async function routeCustomerMessage(
     })
     await sendMessage({ toNumber: msg.fromNumber, body: skillOutcome.reply }, waCredentials)
     if (skillOutcome.sessionComplete) await completeSession(db, session.id)
+    return
+  }
+
+  // Reshuffle engine: if this customer has a live swap offer, their reply is an answer to
+  // it — interpret and route it before the normal booking flow runs.
+  const reshuffleReply = await handleReshuffleReply(db, identity.id, msg.body, lang)
+  if (reshuffleReply.handled) {
+    if (reshuffleReply.ack) {
+      await saveMessage(db, session.id, 'assistant', reshuffleReply.ack).catch(() => { /* non-fatal */ })
+      await sendMessage({ toNumber: msg.fromNumber, body: reshuffleReply.ack }, waCredentials)
+    }
     return
   }
 
