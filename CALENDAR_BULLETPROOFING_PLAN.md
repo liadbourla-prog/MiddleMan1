@@ -8,18 +8,44 @@ business-killing event for this customer.
 This plan is grounded in a code audit performed on 2026-06-20. File references are to
 the state of the repo at that time.
 
-## P0 build status (branch `dev/system/calendar-bulletproofing-p0`)
+## P0 build status — DEPLOYED v1.0.70 (2026-06-21)
 
 | Workstream | Status |
 |---|---|
-| WS-A · Google bidirectional sync ON | ✅ code verified wired (route + renewal cron in `server.ts`); **needs you**: domain verification + prod env vars |
-| WS-B · Integrity Sentinel | ✅ **built + tested** (pure engine + 17 tests, worker, table, migration 0023, on-demand tool, 2h cron) |
-| WS-C · Owner-approval gate on freed-slot offers | ✅ **built + tested** (pure decision + 6 tests, table, migration 0022, gate in cancelBooking, orchestrator tool) |
+| WS-A · Google transport fix (native fetch) | ✅ **built + deployed** — fixed Node22/gaxios6 node-fetch gunzip "Premature close" that broke ALL Google calls (`src/adapters/google/native-fetch.ts`) + token-exchange retry |
+| WS-A · Google bidirectional sync ON | ✅ code wired; **needs you**: domain verification + prod env vars (`CALENDAR_INBOUND_SYNC_ENABLED`, `CALENDAR_WEBHOOK_ADDRESS`) |
+| WS-B · Integrity Sentinel | ✅ **built + deployed + tested** (pure engine + 17 tests, worker, table, migration 0023, on-demand tool, 2h cron) |
+| WS-C · Owner-approval gate on freed-slot offers | ✅ **built + deployed + tested** (pure decision + 6 tests, table, migration 0022, gate in cancelBooking, orchestrator tool) |
 | WS-E · Provisioning reality (hours/breaks) | ⏳ **needs you**: business config at provisioning |
 | WS-G · Launch-day initial state | ⏳ **needs you**: existing ~60 appointments |
 
-All P0 *code* lands typechecked with 416/416 unit tests green. Remaining P0 items are
-operational (domain verification, prod flags, business data) and the pre-launch gauntlet (§4).
+Migrations 0022/0023 are outside the drizzle journal → `db:migrate` skips them; both were
+hand-applied to prod + verified. 416/416 unit tests green at deploy.
+
+### Calendar-connection bugs found in live testing (2026-06-21) — root cause + fixes
+
+Symptoms: PA "connected" but a session never landed in the calendar; PA said it was done
+when it wasn't; couldn't manage a non-primary calendar. **Root cause:** `businesses.googleCalendarId`
+held a **phone number** (onboarding stored it there; the OAuth callback never sets a valid
+calendar ID) → every Google write 404s; the manager create-event tool returns success on the
+INTERNAL save (the async mirror fails afterward), so the PA truthfully reports the internal
+write while nothing lands in Google.
+
+- **F-a (DONE):** set the live business's `googleCalendarId` to its real secondary ("Testing")
+  calendar + re-mirrored the orphaned internal block out to Google. Verified live. Internal
+  brain untouched (the block already existed; only synced outward).
+- **F-b (HANDOFF):** OAuth callback must fetch `calendarList.list()` and set a VALID
+  `googleCalendarId` (default `primary`, ideally let the owner pick a calendar — supports
+  secondary calendars); validate/reject non-calendar values; fix the onboarding step that
+  stored a phone number. `src/routes/oauth.ts` + onboarding + validator tests.
+- **F-c (HANDOFF — MUST preserve internal-as-source-of-truth):** in Google mode, the create
+  path / booking confirmation must not claim "done in your calendar" before the async mirror
+  confirms — internal write stays authoritative and still succeeds; only change WORDING
+  ("saved — syncing…") and surface mirror status. Tighten mirror-divergence alerting; consider
+  a Sentinel invariant for `google_event_id` NULL > N min in google mode.
+
+**Next session:** build F-b + F-c, then the pre-launch gauntlet (§4) + WS-E/WS-G. Deploy
+via `/update-agent` when that code is ready (code-only; no new migrations expected).
 
 ---
 
