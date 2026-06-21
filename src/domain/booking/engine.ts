@@ -16,6 +16,7 @@ import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { isSlotBookable } from '../availability/service.js'
+import { buildOneOnOneEventContent, refreshGroupEventRoster } from '../calendar/booking-event.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import type { CalendarBlockType } from '../../db/schema.js'
 
@@ -485,7 +486,9 @@ async function requestGroupClassBooking(
       return { ok: false, reason: 'Could not create calendar event — please try again' }
     }
 
-    const confirmResult = await calendar.confirmHold(holdResult.eventId, service.name, 'Group class')
+    // Seed with the service name; refreshGroupEventRoster (below) immediately
+    // overwrites title + description with the live roster once the booking is stored.
+    const confirmResult = await calendar.confirmHold(holdResult.eventId, service.name, '')
     if (confirmResult.status === 'error') {
       await markFailed(db, txResult.bookingId, actor.id, 'Calendar confirm failed')
       return { ok: false, reason: 'Could not confirm calendar event — please try again' }
@@ -500,6 +503,11 @@ async function requestGroupClassBooking(
     .update(bookings)
     .set({ state: 'confirmed', calendarEventId, googleEtag: groupGoogleEtag, updatedAt: new Date() })
     .where(eq(bookings.id, txResult.bookingId))
+
+  // Refresh the shared class event so the owner sees the live headcount + roster.
+  // Best-effort (never throws); runs for every participant — first creates it, the
+  // rest update the count and attendee list.
+  await refreshGroupEventRoster(db, calendar, actor.businessId, request.serviceTypeId, request.slotStart)
 
   await logAudit(db, {
     businessId: actor.businessId,
@@ -561,11 +569,15 @@ export async function confirmBooking(
   const eventId = booking.calendarEventId
   if (!eventId) return { ok: false, reason: 'Booking has no calendar event' }
 
-  const confirmResult = await calendar.confirmHold(
-    eventId,
-    service?.name ?? 'Appointment',
-    customerName,
-  )
+  const rendered = await buildOneOnOneEventContent(db, actor.businessId, {
+    serviceTypeId: booking.serviceTypeId,
+    customerId: booking.customerId,
+    providerId: booking.providerId,
+  })
+  const confirmTitle = rendered?.title ?? `${service?.name ?? 'Appointment'} — ${customerName}`
+  const confirmDescription = rendered?.description ?? `${customerName}`
+
+  const confirmResult = await calendar.confirmHold(eventId, confirmTitle, confirmDescription)
 
   if (confirmResult.status === 'error') {
     return { ok: false, reason: 'Could not confirm calendar event — please try again' }
@@ -636,6 +648,10 @@ export async function cancelBooking(
   const t = transition(booking.state, 'cancelled')
   if (!t.ok) return { ok: false, reason: t.reason }
 
+  // When a group participant cancels but others remain, refresh the shared event's
+  // roster after the state flip (below) instead of deleting it.
+  let refreshGroupRosterAfter = false
+
   if (booking.calendarEventId) {
     // For group classes, only delete the calendar event when the last participant cancels
     const [service] = await db
@@ -667,6 +683,8 @@ export async function cancelBooking(
       if (deleteResult.status === 'error') {
         return { ok: false, reason: 'Could not remove calendar event — please try again' }
       }
+    } else if (isGroupClass) {
+      refreshGroupRosterAfter = true
     }
   }
 
@@ -683,6 +701,11 @@ export async function cancelBooking(
       updatedAt: new Date(),
     })
     .where(eq(bookings.id, bookingId))
+
+  // Now that this booking is no longer active, redraw the remaining class roster.
+  if (refreshGroupRosterAfter) {
+    await refreshGroupEventRoster(db, calendar, actor.businessId, booking.serviceTypeId, booking.slotStart)
+  }
 
   await logAudit(db, {
     businessId: actor.businessId,
@@ -761,7 +784,15 @@ export async function confirmPaymentReceived(
   const eventId = booking.calendarEventId
   if (!eventId) return { ok: false, reason: 'Booking has no calendar event' }
 
-  const confirmResult = await calendar.confirmHold(eventId, service?.name ?? 'Appointment', customerPhone)
+  const rendered = await buildOneOnOneEventContent(db, businessId, {
+    serviceTypeId: booking.serviceTypeId,
+    customerId: booking.customerId,
+    providerId: booking.providerId,
+  })
+  const confirmTitle = rendered?.title ?? `${service?.name ?? 'Appointment'} — ${customerPhone}`
+  const confirmDescription = rendered?.description ?? customerPhone
+
+  const confirmResult = await calendar.confirmHold(eventId, confirmTitle, confirmDescription)
   if (confirmResult.status === 'error') {
     return { ok: false, reason: 'Could not confirm calendar event' }
   }

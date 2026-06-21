@@ -94,10 +94,18 @@ function createInternalCalendarClient(options: CalendarClientOptions) {
   async function confirmHold(
     eventId: string,
     _summary: string,
-    _customerName: string,
+    _description: string,
   ): Promise<ConfirmResult> {
     // Nothing to do — DB booking row state is managed by booking engine
     return { status: 'confirmed', eventId }
+  }
+
+  async function updateEventDetails(
+    _eventId: string,
+    _summary: string,
+    _description: string,
+  ): Promise<void> {
+    // No Google calendar to patch in internal mode.
   }
 
   async function deleteEvent(_eventId: string): Promise<DeleteResult> {
@@ -168,7 +176,7 @@ function createInternalCalendarClient(options: CalendarClientOptions) {
     return []
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
+  return { checkAvailability, placeHold, confirmHold, updateEventDetails, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
 }
 
 // ── Google Calendar ───────────────────────────────────────────────────────────
@@ -269,7 +277,7 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
   async function confirmHold(
     eventId: string,
     summary: string,
-    customerName: string,
+    description: string,
   ): Promise<ConfirmResult> {
     try {
       const response = await withTokenRefresh(() =>
@@ -278,7 +286,7 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
           eventId,
           requestBody: {
             summary,
-            description: `Confirmed booking for ${customerName}`,
+            description,
             colorId: confirmedColorId,
             status: 'confirmed',
           },
@@ -290,6 +298,24 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
       return { status: 'confirmed', eventId: id, etag: response.data.etag ?? null }
     } catch (err) {
       return { status: 'error', reason: extractErrorMessage(err) }
+    }
+  }
+
+  // Patches only the owner-facing title + description of an existing event (used to
+  // keep a group class's live roster current). Leaves status/color/timing untouched.
+  // Best-effort: logs and swallows errors so calendar UI never breaks a booking.
+  async function updateEventDetails(
+    eventId: string,
+    summary: string,
+    description: string,
+  ): Promise<void> {
+    if (eventId.startsWith('internal:')) return
+    try {
+      await withTokenRefresh(() =>
+        calendar.events.patch({ calendarId, eventId, requestBody: { summary, description } }),
+      )
+    } catch (err) {
+      console.error('[calendar] updateEventDetails failed:', extractErrorMessage(err))
     }
   }
 
@@ -506,7 +532,7 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
     })).filter((c) => c.id !== '')
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
+  return { checkAvailability, placeHold, confirmHold, updateEventDetails, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
