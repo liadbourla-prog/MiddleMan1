@@ -37,7 +37,13 @@ export interface GroupEventContent {
   attendees: EventPerson[]
 }
 
-export type BookingEventContent = OneOnOneEventContent | GroupEventContent
+export interface MeetingEventContent {
+  kind: 'meeting'
+  title: string
+  contact: EventPerson
+}
+
+export type BookingEventContent = OneOnOneEventContent | GroupEventContent | MeetingEventContent
 
 export interface RenderedEvent {
   title: string
@@ -57,6 +63,7 @@ const LABELS = {
     of: 'מתוך',
     attendees: 'משתתפים',
     noName: 'ללא שם',
+    with: 'עם',
   },
   en: {
     client: 'Client',
@@ -70,6 +77,7 @@ const LABELS = {
     of: 'of',
     attendees: 'Attendees',
     noName: 'No name',
+    with: 'With',
   },
 } as const
 
@@ -98,6 +106,14 @@ export function renderBookingEvent(content: BookingEventContent, lang: Lang): Re
     if (instructor) lines.push(`${L.staff}: ${instructor}`)
 
     return { title: `${content.serviceName} — ${who}`, description: lines.join('\n') }
+  }
+
+  if (content.kind === 'meeting') {
+    const who = personLabel(content.contact, L.noName)
+    const lines: string[] = [`${L.with}: ${who}`]
+    const phone = clean(content.contact.phone)
+    if (phone) lines.push(`${L.phone}: ${phone}`)
+    return { title: `${content.title} — ${who}`, description: lines.join('\n') }
   }
 
   const n = content.attendees.length
