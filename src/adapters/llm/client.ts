@@ -1163,6 +1163,55 @@ Return JSON: { "choice": "import" | "skip" | "unclear" }`
   return callWithSchema(systemPrompt, safeMessage, importChoiceSchema)
 }
 
+// ── Meeting coordination: external contact reply classifier ──────────────────
+
+const meetingReplySchema = z.object({
+  intent: z.enum(['propose_time', 'decline', 'unclear']).catch('unclear'),
+  relativeDay: z.enum(['today', 'tomorrow', 'day_after_tomorrow', 'this_week', 'next_week']).nullable().catch(null),
+  weekday: z.number().int().min(0).max(6).nullable().catch(null),
+  explicitDate: z
+    .object({
+      year: z.number().int().nullable().catch(null),
+      month: z.number().int().min(1).max(12).nullable().catch(null),
+      day: z.number().int().min(1).max(31).nullable().catch(null),
+    })
+    .nullable()
+    .catch(null),
+  startTime: z
+    .object({ hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59) })
+    .nullable()
+    .catch(null),
+})
+
+export type MeetingReplyOutput = z.infer<typeof meetingReplySchema>
+
+// Classify an external meeting invitee's free-text reply into a structured intent.
+// The LLM only extracts day/time PIECES — never an absolute date (resolved downstream).
+export async function interpretMeetingReply(
+  replyText: string,
+  candidateSummaries: string,
+  lang: 'he' | 'en',
+): Promise<LlmResult<MeetingReplyOutput>> {
+  const langNote = lang === 'he' ? 'The person is writing in Hebrew.' : 'The person is writing in English.'
+  const systemPrompt = `${langNote}
+
+Someone was invited to a meeting and offered these candidate time(s): ${candidateSummaries}.
+Classify their reply:
+- intent "propose_time": they agree to one of the offered times OR propose a specific different time. In BOTH cases extract the day/time PIECES of the time they indicated — NEVER an absolute/ISO date.
+- intent "decline": they cannot or do not want to meet at any of these and propose no alternative.
+- intent "unclear": you cannot tell, they ask a question, or they give no usable time.
+
+Date pieces (only when intent is propose_time; otherwise null):
+- relativeDay: "today"/"היום"→today, "tomorrow"/"מחר"→tomorrow, "day after tomorrow"/"מחרתיים"→day_after_tomorrow, "this week"/"השבוע"→this_week, "next week"/"שבוע הבא"→next_week; else null.
+- weekday: 0=Sun..6=Sat when they name a weekday; else null.
+- explicitDate: fill day+month for a stated calendar date ("May 2"/"2 במאי"); year only if explicitly stated; else null.
+- startTime: { hour 0-23, minute 0-59 } of the time they indicated; null if no clock time.
+
+Return JSON: { "intent": "propose_time"|"decline"|"unclear", "relativeDay": ...|null, "weekday": number|null, "explicitDate": {"year":..,"month":..,"day":..}|null, "startTime": {"hour":..,"minute":..}|null }`
+  const safeMessage = sanitizeUserInput(replyText)
+  return callWithSchema(systemPrompt, safeMessage, meetingReplySchema) as Promise<LlmResult<MeetingReplyOutput>>
+}
+
 // ── Proactive customer message generator ─────────────────────────────────────
 // Used for all system-initiated messages to customers: reminders, hold expiry,
 // waitlist offers, schedule-change cancellations, payment confirmations, and
