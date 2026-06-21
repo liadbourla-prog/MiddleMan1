@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { google } from 'googleapis'
+import type { Credentials } from 'google-auth-library'
 import { eq, and, isNull, sql } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { businesses, identities, providerOnboardingSessions } from '../db/schema.js'
@@ -19,6 +20,50 @@ function buildOAuth2Client() {
     process.env['GOOGLE_REDIRECT_URI'],
   )
 }
+
+// The server→Google token exchange occasionally drops mid-response on Cloud Run
+// (ERR_STREAM_PREMATURE_CLOSE / "Premature close" from the undici transport). A failed
+// calendar connection is unacceptable at launch, so retry transient failures with a short
+// backoff. `invalid_grant` means the auth code was already consumed/expired — retrying
+// cannot help, so bail immediately and let the caller ask the owner to reconnect.
+type GoogleTokens = Credentials
+
+async function exchangeCodeForTokens(
+  auth: ReturnType<typeof buildOAuth2Client>,
+  code: string,
+  log: FastifyInstance['log'],
+): Promise<GoogleTokens> {
+  const MAX_ATTEMPTS = 3
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const { tokens } = await auth.getToken(code)
+      return tokens
+    } catch (err) {
+      lastErr = err
+      const msg = err instanceof Error ? err.message : String(err)
+      if (/invalid_grant/i.test(msg)) throw err // consumed/expired code — retry is futile
+      log.warn({ attempt, err: msg }, '[oauth] token exchange failed; retrying')
+      if (attempt < MAX_ATTEMPTS) await new Promise((r) => setTimeout(r, 300 * attempt))
+    }
+  }
+  throw lastErr
+}
+
+const OAUTH_RETRY_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connection hiccup</title>
+  <style>body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 480px; margin: 80px auto; padding: 0 24px; text-align: center; color: #111; }</style>
+</head>
+<body>
+  <div style="font-size:3rem">🔄</div>
+  <h1>Almost there — let's try once more</h1>
+  <p style="color:#555">The connection to Google hit a brief hiccup. Please return to WhatsApp and tap the calendar-connect link again — it usually goes through on the next try.</p>
+</body>
+</html>`
 
 const SCOPES = ['https://www.googleapis.com/auth/calendar']
 
@@ -229,7 +274,16 @@ export async function oauthRoutes(app: FastifyInstance) {
       }
 
       const auth = buildOAuth2Client()
-      const { tokens } = await auth.getToken(code)
+      let tokens: GoogleTokens
+      try {
+        tokens = await exchangeCodeForTokens(auth, code, app.log)
+      } catch (err) {
+        // Transient drops are retried inside the helper; reaching here means it still
+        // failed (or the code was already consumed). Show a friendly retry page rather
+        // than a raw 500 — the owner just taps the connect link again.
+        app.log.error({ err: err instanceof Error ? err.message : String(err) }, '[oauth] token exchange failed after retries')
+        return reply.status(503).type('text/html').send(OAUTH_RETRY_HTML)
+      }
 
       if (!tokens.refresh_token) {
         return reply
