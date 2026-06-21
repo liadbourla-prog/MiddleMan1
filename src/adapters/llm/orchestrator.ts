@@ -41,6 +41,8 @@ import {
   executeMessageCustomer,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
+import { executeCoordinateMeeting, executeResolveMeetingCoordination } from '../../domain/manager/coordination-tools.js'
+import { findActiveByBusiness } from '../../domain/coordination/repository.js'
 import {
   logOrchestratorIteration,
   logOrchestratorCompletion,
@@ -338,6 +340,29 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'coordinateMeeting',
+    description: 'Coordinate a NEW meeting with someone on the owner\'s behalf — only when the owner has NOT already agreed a time and wants the PA to reach out. First confirm with the owner that they want you to coordinate (vs. they already set it), and capture a primary time AND one or two fallback times. Report all dates/times as structured pieces — NEVER an absolute/ISO date. For a meeting whose time is already agreed, use createCalendarEvent instead.',
+    parameters: { type: Type.OBJECT, properties: {
+      contactName: { type: Type.STRING, description: 'Name of the person to meet, if given.' },
+      phoneNumber: { type: Type.STRING, description: 'Their phone in E.164 — required to reach someone new.' },
+      title: { type: Type.STRING, description: 'What the meeting is about (e.g. "Meeting with the accountant").' },
+      date: DATE_PIECES_SCHEMA,
+      startTime: timeSchema('Primary start clock time the owner said, 24-hour'),
+      endTime: timeSchema('Primary end clock time, 24-hour. Provide this OR durationMinutes.'),
+      durationMinutes: { type: Type.NUMBER, description: 'Meeting length in minutes; provide this OR endTime.' },
+      fallbacks: { type: Type.ARRAY, description: 'One or two backup times to offer if the primary does not work.', items: { type: Type.OBJECT, properties: { date: DATE_PIECES_SCHEMA, startTime: timeSchema('Fallback start time, 24-hour') }, required: ['date', 'startTime'] } },
+    }, required: ['title', 'date', 'startTime'] },
+  },
+  {
+    name: 'resolveMeetingCoordination',
+    description: 'Act on an in-progress meeting coordination after the counterparty replied — confirm the agreed time (books it), offer a different time, or abandon it. The active coordination id is given to you in context. Report any counter time as structured pieces, never an absolute date.',
+    parameters: { type: Type.OBJECT, properties: {
+      coordinationId: { type: Type.STRING, description: 'Id of the coordination from context.' },
+      action: { type: Type.STRING, enum: ['confirm', 'counter_offer', 'abandon'] },
+      counterTime: { type: Type.OBJECT, description: 'For counter_offer: the new time to offer.', properties: { date: DATE_PIECES_SCHEMA, startTime: timeSchema('New offer start, 24-hour') }, required: ['date', 'startTime'] },
+    }, required: ['coordinationId', 'action'] },
+  },
+  {
     name: 'pauseConversation',
     description: 'Pause PA responses for one customer so the manager can handle the conversation manually via Meta Business Suite. The PA will go completely silent for that customer until the pause expires or is manually lifted.',
     parameters: {
@@ -463,9 +488,10 @@ function buildSystemPrompt(params: {
   teachingSchedule: TeachingSlot[]
   managerMemorySummaries: string[]
   actionLedger: string
+  activeCoordinations: string
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -521,12 +547,15 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - lookupCustomer / saveContactNote: only for customer or contact management requests. When the owner asks whether a customer has replied or what they said, you MUST call lookupCustomer with recent_messages and answer from the result — never say "not yet" or "they replied" from memory or assumption.
 - connectGoogleCalendar: ALWAYS use this when the owner wants to connect, sync, or link Google Calendar. It returns the real sign-in link — send that link to the owner here in WhatsApp, on its own line. You have NO email and no way to send email: never offer to email the link, never ask for an email address, and never claim you emailed anything.
 - messageCustomer: use to actually send a WhatsApp message to a specific customer the owner names (e.g. "ask Harel when he's free"). Compose the message and confirm with the owner first, then call the tool. Only tell the owner the message was sent if the tool returns ok:true; if it reports the customer can't be reached (e.g. they haven't messaged recently), relay that honestly and never pretend it went out.
+- coordinateMeeting: use ONLY when the owner wants you to reach out and arrange a meeting with someone whose time is NOT yet agreed. First ask, in ONE question, whether they have already set a time (then use createCalendarEvent) or want you to coordinate; when coordinating, capture a primary time AND one or two fallback times. Never message the other person before the owner has asked you to coordinate. That person is a contact, not a customer.
+- resolveMeetingCoordination: after the contact replies (you will see active meeting coordinations in your context), use this to confirm the agreed time (which books it and tells them), offer a different time, or abandon it. Only confirm a booking when the owner says to.
 
 ## Never claim an action you did not take
 Only state something happened — a message sent, a calendar connected, a booking changed — when a tool actually returned success for it. If you have no tool for what the owner asked, or a tool reports it failed or couldn't proceed, say so plainly and offer a real next step. Never fabricate a confirmation, a link, or an email.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 ${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
+${activeCoordinations ? `\n## Active meeting coordinations\n${activeCoordinations}` : ''}
 
 ## After completing actions
 If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them — phrased naturally, never the same way twice. Do not notify customers automatically — ask first.
@@ -585,6 +614,10 @@ async function dispatchTool(
       return executeConnectGoogleCalendar(args as unknown as Parameters<typeof executeConnectGoogleCalendar>[0], ctx)
     case 'messageCustomer':
       return executeMessageCustomer(args as unknown as Parameters<typeof executeMessageCustomer>[0], ctx)
+    case 'coordinateMeeting':
+      return executeCoordinateMeeting(args as unknown as Parameters<typeof executeCoordinateMeeting>[0], ctx)
+    case 'resolveMeetingCoordination':
+      return executeResolveMeetingCoordination(args as unknown as Parameters<typeof executeResolveMeetingCoordination>[0], ctx)
     case 'pauseConversation':
       return executePauseConversation(args as unknown as Parameters<typeof executePauseConversation>[0], ctx)
     case 'resumeConversation':
@@ -748,6 +781,16 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     ?? (() => buildActionLedgerBlock(db, { businessId, timezone, lang, scope: 'business' }))
   const actionLedger = await loadLedger().catch(() => '')
 
+  const coordRows = await findActiveByBusiness(db, businessId)
+  const activeCoordinations = coordRows.length
+    ? coordRows.map((c) => {
+        const when = c.agreedSlotStart
+          ? ` (proposed ${new Intl.DateTimeFormat(lang === 'he' ? 'he-IL' : 'en-GB', { timeZone: timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(c.agreedSlotStart)})`
+          : ''
+        return `[${c.id}] "${c.title}" — ${c.status}${when}. To act on it, call resolveMeetingCoordination with this id.`
+      }).join('\n')
+    : ''
+
   const systemPrompt = buildSystemPrompt({
     businessName,
     timezone,
@@ -757,6 +800,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     teachingSchedule,
     managerMemorySummaries,
     actionLedger,
+    activeCoordinations,
     conversationHistory: transcript.slice(-20),
   })
 

@@ -52,6 +52,8 @@ import { loadInstructorRoster, loadTeachingSchedule } from '../domain/provider/r
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
 import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
+import { findActiveByContact } from '../domain/coordination/repository.js'
+import { advanceFromContact, type BusinessCtx } from '../domain/coordination/handler.js'
 
 export async function webhookRoutes(app: FastifyInstance) {
   // Webhook verification handshake (GET)
@@ -206,6 +208,8 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
 
   if (identity.role === 'manager' || identity.role === 'delegated_user') {
     await routeManagerMessage(msg, identity, business, app)
+  } else if (identity.role === 'contact') {
+    await routeContactMessage(msg, identity, business, app)
   } else {
     await routeCustomerMessage(msg, identity, business, app)
   }
@@ -266,6 +270,58 @@ async function notifyManagerOfError(msg: InboundMessage, errorMsg: string, app: 
     toNumber: managerIdentity.phoneNumber,
     body: i18n.manager_process_error[lang](msg.fromNumber, errorMsg.slice(0, 200)),
   }, waCredentials)
+}
+
+export async function routeContactMessage(
+  msg: InboundMessage,
+  identity: ResolvedIdentity,
+  business: Business,
+  _app: FastifyInstance,
+) {
+  const lang: Lang = (identity.preferredLanguage ?? (business.defaultLanguage as Lang | null | undefined)) ?? 'he'
+  const waCredentials = business.whatsappPhoneNumberId && business.whatsappAccessToken
+    ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
+    : undefined
+
+  const row = await findActiveByContact(db, business.id, identity.id)
+
+  // No active coordination — relay the stray message to the owner so it's never dropped.
+  if (!row) {
+    const [manager] = await db
+      .select({ phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.businessId, business.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+      .limit(1)
+    if (manager?.phoneNumber) {
+      const who = identity.displayName ?? msg.fromNumber
+      const body = await generateProactiveCustomerMessage({
+        businessName: business.name,
+        language: lang,
+        situation: `${who} (a contact you have no open meeting coordination with) messaged: "${msg.body}". Relay this to the owner briefly and ask if they want to do anything about it.`,
+        fallback: i18n.outreach_reply_notify[lang](who, msg.body),
+        timeoutMs: 2500,
+      })
+      await sendMessage({ toNumber: manager.phoneNumber, body }, waCredentials)
+    }
+    return
+  }
+
+  const calendar = createCalendarClient({
+    accessToken: '',
+    refreshToken: business.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
+    calendarId: business.googleCalendarId,
+    businessId: business.id,
+    calendarMode: business.calendarMode,
+    lang,
+  })
+  const ctx: BusinessCtx = {
+    businessId: business.id,
+    businessName: business.name,
+    lang,
+    timezone: business.timezone,
+    waCredentials,
+  }
+  await advanceFromContact(db, calendar, row, msg.body, ctx)
 }
 
 async function routeCustomerMessage(

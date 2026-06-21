@@ -23,6 +23,7 @@ import { startCalendarSyncRenewalWorker, scheduleCalendarSyncRenewalJob } from '
 import { startSeriesMaterializerWorker } from './workers/series-materializer.js'
 import { startIntegritySentinelWorker, scheduleIntegritySentinelJob } from './workers/integrity-sentinel.js'
 import { startOutreachReplyNotifyWorker } from './workers/outreach-reply-notify.js'
+import { startCoordinationExpiryWorker } from './workers/coordination-expiry.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
@@ -98,6 +99,7 @@ startSeriesMaterializerWorker()
 startReshuffleCampaignWorker()
 startIntegritySentinelWorker()
 startOutreachReplyNotifyWorker()
+startCoordinationExpiryWorker()
 await scheduleHoldExpiryJob()
 await scheduleCalendarSyncRenewalJob()
 await scheduleIntegritySentinelJob()

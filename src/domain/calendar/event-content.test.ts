@@ -110,3 +110,21 @@ describe('renderBookingEvent — group', () => {
     )
   })
 })
+
+describe('renderBookingEvent — meeting', () => {
+  const base = {
+    kind: 'meeting' as const,
+    title: 'Meeting with the accountant',
+    contact: { name: 'Harel Cohen', phone: '+972521112233' },
+  }
+  it('title is "meeting title — contact"', () => {
+    expect(renderBookingEvent(base, 'en').title).toBe('Meeting with the accountant — Harel Cohen')
+  })
+  it('description lists contact + phone', () => {
+    expect(renderBookingEvent(base, 'en').description).toBe('With: Harel Cohen\nPhone: +972521112233')
+  })
+  it('renders Hebrew labels', () => {
+    expect(renderBookingEvent({ ...base, contact: { name: 'הראל', phone: '+972521112233' } }, 'he').description)
+      .toBe('עם: הראל\nטלפון: +972521112233')
+  })
+})

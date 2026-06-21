@@ -12,6 +12,7 @@ export type Action =
   | 'permission.manage'
   | 'policy.change'
   | 'staff.manage'
+  | 'meeting.coordinate'
 
 export type AuthResult =
   | { allowed: true }
@@ -36,6 +37,7 @@ const MANAGER_ACTIONS = new Set<Action>([
   'permission.manage',
   'policy.change',
   'staff.manage',
+  'meeting.coordinate',
 ])
 
 const CUSTOMER_ACTIONS = new Set<Action>([
@@ -103,5 +105,9 @@ export function authorize(ctx: AuthContext, action: Action): AuthResult {
       // Instructors do not operate the PA in V1; grant only the customer baseline.
       if (CUSTOMER_ACTIONS.has(action)) return { allowed: true }
       return { allowed: false, reason: `Action '${action}' is not available to providers` }
+
+    case 'contact':
+      // External meeting counterparties have no PA-facing actions.
+      return { allowed: false, reason: `Action '${action}' is not available to contacts` }
   }
 }

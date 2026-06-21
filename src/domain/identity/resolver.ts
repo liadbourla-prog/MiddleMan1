@@ -48,10 +48,11 @@ export async function resolveIdentity(
   }
 }
 
-export async function registerCustomer(
+async function registerIdentity(
   db: Db,
   businessId: string,
   phoneNumber: string,
+  role: 'customer' | 'contact',
   displayName?: string,
 ): Promise<string> {
   if (!isValidE164(phoneNumber)) {
@@ -62,7 +63,7 @@ export async function registerCustomer(
     .values({
       businessId,
       phoneNumber,
-      role: 'customer',
+      role,
       displayName: displayName ?? null,
       grantedAt: new Date(),
     })
@@ -78,6 +79,24 @@ export async function registerCustomer(
     .where(and(eq(identities.businessId, businessId), eq(identities.phoneNumber, phoneNumber)))
     .limit(1)
 
-  if (!existing) throw new Error('registerCustomer: conflict but record not found')
+  if (!existing) throw new Error('registerIdentity: conflict but record not found')
   return existing.id
+}
+
+export async function registerCustomer(
+  db: Db,
+  businessId: string,
+  phoneNumber: string,
+  displayName?: string,
+): Promise<string> {
+  return registerIdentity(db, businessId, phoneNumber, 'customer', displayName)
+}
+
+export async function registerContact(
+  db: Db,
+  businessId: string,
+  phoneNumber: string,
+  displayName?: string,
+): Promise<string> {
+  return registerIdentity(db, businessId, phoneNumber, 'contact', displayName)
 }
