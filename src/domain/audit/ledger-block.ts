@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, like } from 'drizzle-orm'
+import { and, desc, eq, inArray } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { auditLog } from '../../db/schema.js'
 import type { Lang } from '../i18n/t.js'
@@ -14,6 +14,7 @@ import type { Lang } from '../i18n/t.js'
 const REPORTABLE_ACTIONS = [
   'outreach.message_sent',
   'outreach.message_blocked',
+  'outreach.reply_notified',
   'calendar.connected',
   'booking.confirmed',
   'booking.cancelled',
@@ -54,6 +55,8 @@ function renderAction(action: string, metadata: Record<string, unknown> | null, 
           : 'NOT sent — delivery failed'
       return `${when} — Outreach to ${to}: ${reason}.`
     }
+    case 'outreach.reply_notified':
+      return `${when} — You were already told ${to} replied${m['replyText'] ? `: "${truncate(String(m['replyText']))}"` : ''} — do not re-announce it as new.`
     case 'calendar.connected':
       return `${when} — Google Calendar was connected.`
     case 'booking.confirmed':
@@ -88,7 +91,10 @@ export async function buildActionLedgerBlock(db: Db, opts: LedgerOptions): Promi
     ? and(
         eq(auditLog.businessId, opts.businessId),
         opts.identityId ? eq(auditLog.entityId, opts.identityId) : undefined,
-        like(auditLog.action, 'outreach.%'),
+        // Only the outbound-outreach facts belong in the customer's own context (so a reply
+        // continues the thread). The manager-facing reply_notified/reply_deferred rows also
+        // carry entityId = this customer, but must NOT surface in Branch 4.
+        inArray(auditLog.action, ['outreach.message_sent', 'outreach.message_blocked']),
       )
     : and(
         eq(auditLog.businessId, opts.businessId),

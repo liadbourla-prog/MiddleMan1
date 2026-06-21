@@ -766,6 +766,14 @@ const strings = {
     he: `אנחנו לא זמינים כרגע לתיאום תורים — נחזור אליכם בהקדם.`,
     en: `We're not available for bookings right now — we'll be in touch shortly.`,
   },
+
+  // ── Proactive outreach-reply notification (Branch 3) → requester language ─────
+  // Unprompted update to whoever asked the PA to reach out, when that customer replies.
+  // Deterministic fallback; the live wording is LLM-phrased around the verbatim reply.
+  outreach_reply_notify: {
+    he: (name: string, reply: string) => `📩 ${name} הגיב/ה: "${reply}"\n\nרוצה שאטפל בזה?`,
+    en: (name: string, reply: string) => `📩 ${name} replied: "${reply}"\n\nWant me to act on it?`,
+  },
 } as const
 
 // Type-safe accessor — falls back to 'en' if a key is missing for 'he'

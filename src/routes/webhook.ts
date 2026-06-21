@@ -40,6 +40,7 @@ import {
 import { confirmPaymentReceived } from '../domain/booking/engine.js'
 import { enqueueMessage } from '../workers/message-retry.js'
 import { enqueueCustomerSummary } from '../workers/generate-customer-summary.js'
+import { findPendingOutreachForCustomer, enqueueOutreachReplyNotify, enqueueOutreachReplyFlush } from '../workers/outreach-reply-notify.js'
 import { loadCustomerMemory } from '../domain/customer/profile.js'
 import { buildHydratedContext, loadSessionCarryover } from '../domain/session/hydration.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
@@ -345,6 +346,17 @@ async function routeCustomerMessage(
   await saveMessage(db, session.id, 'customer', msg.body).catch((err) => {
     app.log.warn({ err }, 'Failed to save inbound message to transcript')
   })
+
+  // Proactive outreach-reply notification: if this customer is one the PA recently reached
+  // out to on a requester's behalf and that reply hasn't been relayed yet, treat this
+  // inbound as the reply and ping the requester (off the hot path via a worker). Cheap
+  // indexed check here; all send/dedupe work happens in the worker.
+  findPendingOutreachForCustomer(business.id, identity.id)
+    .then((pending) => {
+      if (!pending) return
+      return enqueueOutreachReplyNotify({ businessId: business.id, customerId: identity.id, outreachRowId: pending.id, replyText: msg.body })
+    })
+    .catch((err) => app.log.warn({ err }, 'Failed to enqueue outreach-reply notification'))
   const sessionTranscript = await loadTranscript(db, session.id, 8).catch(() => [])
   // Prepend carried-over turns from the prior session (if any) so the PA's reply
   // has the recent thread. These are context only — not re-persisted as messages.
@@ -587,6 +599,12 @@ async function routeManagerMessage(
   // here — that lives on the conversational orchestrator path below (§3.4).
   const defaultLang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
   const lang: Lang = identity.preferredLanguage ?? defaultLang
+
+  // The requester just messaged us — their WhatsApp window is open. Flush any outreach-reply
+  // notifications that were deferred because the window was previously closed (worker no-ops
+  // when there are none). Fire-and-forget; never blocks the manager's own message.
+  enqueueOutreachReplyFlush(business.id, identity.id)
+    .catch((err) => app.log.warn({ err }, 'Failed to enqueue outreach-reply flush'))
 
   if (upper === 'STATUS') {
     const rawReport = await buildStatusReport(db, business.id, lang)
