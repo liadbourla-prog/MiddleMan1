@@ -774,6 +774,36 @@ const strings = {
     he: (name: string, reply: string) => `📩 ${name} הגיב/ה: "${reply}"\n\nרוצה שאטפל בזה?`,
     en: (name: string, reply: string) => `📩 ${name} replied: "${reply}"\n\nWant me to act on it?`,
   },
+
+  // ── Meeting coordination fallback strings ─────────────────────────────────
+  coordination_offer_to_contact: {
+    he: (businessName: string, times: string) => `שלום, מ${businessName} — רוצים לקבוע פגישה. מתאים לך אחד מהמועדים: ${times}? אפשר גם להציע זמן אחר.`,
+    en: (businessName: string, times: string) => `Hi, this is ${businessName} — we'd like to set up a meeting. Do any of these work: ${times}? Or suggest another time.`,
+  },
+  coordination_confirm_to_owner: {
+    he: (contact: string, time: string) => `${contact} פנוי ל${time}. לקבוע?`,
+    en: (contact: string, time: string) => `${contact} is good for ${time}. Want me to book it?`,
+  },
+  coordination_counter_to_owner: {
+    he: (contact: string, time: string) => `${contact} הציע ${time} במקום. לאשר, או להציע זמן אחר?`,
+    en: (contact: string, time: string) => `${contact} suggested ${time} instead. Take it, or offer another time?`,
+  },
+  coordination_decline_to_owner: {
+    he: (contact: string) => `${contact} לא יכול במועדים שהצענו.`,
+    en: (contact: string) => `${contact} can't make the times we offered.`,
+  },
+  coordination_soft_ack_to_contact: {
+    he: () => `מעולה — אאשר ואחזור אליך לסגור.`,
+    en: () => `Great — let me confirm and I'll get back to you to lock it in.`,
+  },
+  coordination_booked_to_contact: {
+    he: (time: string) => `סגור — נקבענו ל${time}. נתראה!`,
+    en: (time: string) => `You're set — ${time}. See you then!`,
+  },
+  coordination_expired_to_owner: {
+    he: (contact: string) => `לא קיבלתי תשובה מ${contact} על הפגישה. רוצה שאנסה שוב?`,
+    en: (contact: string) => `I didn't hear back from ${contact} about the meeting. Want me to try again?`,
+  },
 } as const
 
 // Type-safe accessor — falls back to 'en' if a key is missing for 'he'
