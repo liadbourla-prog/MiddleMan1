@@ -19,6 +19,7 @@ function booking(over: Partial<BookingSnapshot> = {}): BookingSnapshot {
     rescheduledFrom: over.rescheduledFrom ?? null,
     holdExpiresAt: over.holdExpiresAt ?? null,
     isGroup: over.isGroup ?? false,
+    ...(over.createdAt !== undefined ? { createdAt: over.createdAt } : {}),
   }
 }
 
@@ -31,6 +32,8 @@ function snapshot(over: Partial<IntegritySnapshot> = {}): IntegritySnapshot {
     knownBlockEventIds: over.knownBlockEventIds ?? [],
     reminders: over.reminders ?? [],
     holdGraceMs: over.holdGraceMs ?? 60_000,
+    ...(over.blocks !== undefined ? { blocks: over.blocks } : {}),
+    ...(over.unmirrorGraceMs !== undefined ? { unmirrorGraceMs: over.unmirrorGraceMs } : {}),
   }
 }
 
@@ -226,5 +229,97 @@ describe('runIntegrityChecks', () => {
       ],
     })
     expect(kinds(s)).not.toContain('reschedule_residue')
+  })
+
+  // ── INV-9 unmirrored (F-c) ───────────────────────────────────────────────────
+  const GRACE = 10 * 60_000 // 10 min
+  const old = new Date(T0.getTime() + 100 * HOUR - GRACE - 60_000) // before now-grace
+  const fresh = new Date(T0.getTime() + 100 * HOUR - 60_000) // within grace
+
+  it('INV-9 flags a confirmed booking with no Google event id past the grace window', () => {
+    const s = snapshot({
+      googleMode: true,
+      unmirrorGraceMs: GRACE,
+      bookings: [booking({ id: 'b1', state: 'confirmed', calendarEventId: null, createdAt: old })],
+    })
+    const f = runIntegrityChecks(s).find((x) => x.kind === 'unmirrored')
+    expect(f).toBeDefined()
+    expect(f!.severity).toBe('warning')
+    expect(f!.dedupKey).toBe('unmirrored:booking:b1')
+    expect(f!.detail['entity']).toBe('booking')
+  })
+
+  it('INV-9 treats an internal: placeholder event id as unmirrored', () => {
+    const s = snapshot({
+      googleMode: true,
+      unmirrorGraceMs: GRACE,
+      bookings: [booking({ id: 'b1', state: 'confirmed', calendarEventId: 'internal:123', createdAt: old })],
+    })
+    expect(kinds(s)).toContain('unmirrored')
+  })
+
+  it('INV-9 does NOT flag a booking with a real Google event id', () => {
+    const s = snapshot({
+      googleMode: true,
+      unmirrorGraceMs: GRACE,
+      bookings: [booking({ id: 'b1', state: 'confirmed', calendarEventId: 'ev1', createdAt: old })],
+      googleEvents: [{ id: 'ev1', start: T0, end: new Date(T0.getTime() + HOUR) }],
+    })
+    expect(kinds(s)).not.toContain('unmirrored')
+  })
+
+  it('INV-9 does NOT flag a record still inside the grace window', () => {
+    const s = snapshot({
+      googleMode: true,
+      unmirrorGraceMs: GRACE,
+      bookings: [booking({ id: 'b1', state: 'confirmed', calendarEventId: null, createdAt: fresh })],
+    })
+    expect(kinds(s)).not.toContain('unmirrored')
+  })
+
+  it('INV-9 does NOT flag held bookings (only confirmed are mirrored)', () => {
+    const s = snapshot({
+      googleMode: true,
+      unmirrorGraceMs: GRACE,
+      bookings: [booking({ id: 'b1', state: 'held', calendarEventId: null, createdAt: old })],
+    })
+    expect(kinds(s)).not.toContain('unmirrored')
+  })
+
+  it('INV-9 flags an internal-origin block with no Google event id past grace', () => {
+    const s = snapshot({
+      googleMode: true,
+      unmirrorGraceMs: GRACE,
+      blocks: [{ id: 'blk1', start: T0, end: new Date(T0.getTime() + HOUR), createdAt: old, googleEventId: null, source: 'internal' }],
+    })
+    const f = runIntegrityChecks(s).find((x) => x.kind === 'unmirrored')
+    expect(f).toBeDefined()
+    expect(f!.dedupKey).toBe('unmirrored:block:blk1')
+  })
+
+  it('INV-9 does NOT flag a google_import block (originates in Google)', () => {
+    const s = snapshot({
+      googleMode: true,
+      unmirrorGraceMs: GRACE,
+      blocks: [{ id: 'blk1', start: T0, end: new Date(T0.getTime() + HOUR), createdAt: old, googleEventId: null, source: 'google_import' }],
+    })
+    expect(kinds(s)).not.toContain('unmirrored')
+  })
+
+  it('INV-9 is disabled when unmirrorGraceMs is omitted', () => {
+    const s = snapshot({
+      googleMode: true,
+      bookings: [booking({ id: 'b1', state: 'confirmed', calendarEventId: null, createdAt: old })],
+    })
+    expect(kinds(s)).not.toContain('unmirrored')
+  })
+
+  it('INV-9 does NOT fire outside google mode', () => {
+    const s = snapshot({
+      googleMode: false,
+      unmirrorGraceMs: GRACE,
+      bookings: [booking({ id: 'b1', state: 'confirmed', calendarEventId: null, createdAt: old })],
+    })
+    expect(kinds(s)).not.toContain('unmirrored')
   })
 })

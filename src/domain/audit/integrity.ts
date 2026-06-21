@@ -19,6 +19,7 @@ export type IntegrityKind =
   | 'stuck_hold' // INV-7 / F8
   | 'reschedule_residue' // INV-8 / F9
   | 'out_of_hours' // INV-4 / F6 — emitted by the worker (needs DB-backed hours), not this pure engine
+  | 'unmirrored' // INV-9 / F-c — internal record not yet write-through to Google after the grace window
 
 export type Severity = 'critical' | 'warning'
 
@@ -35,6 +36,20 @@ export interface BookingSnapshot {
   holdExpiresAt: Date | null
   /** True when the service is a group class (legitimate to share a slot). */
   isGroup: boolean
+  /** When the row was created — used by INV-9 to age unmirrored records. Optional so
+   *  callers that don't run INV-9 (and existing fixtures) need not supply it. */
+  createdAt?: Date
+}
+
+/** A calendar_blocks row — needed by INV-9 to detect blocks not yet mirrored to Google. */
+export interface BlockSnapshot {
+  id: string
+  start: Date
+  end: Date
+  createdAt: Date
+  googleEventId: string | null
+  /** 'google_import' blocks originate in Google and are never mirrored back out. */
+  source: string
 }
 
 export interface GoogleEventSnapshot {
@@ -61,6 +76,11 @@ export interface IntegritySnapshot {
   reminders: ReminderSnapshot[]
   /** Holds are only "stuck" once expired by at least this many ms (matches hold-expiry grace). */
   holdGraceMs: number
+  /** calendar_blocks rows in window — only needed when INV-9 runs (else omit). */
+  blocks?: BlockSnapshot[]
+  /** INV-9 grace: a record older than this with no Google event id is "unmirrored".
+   *  Omit to disable INV-9 entirely (e.g. fixtures that don't exercise it). */
+  unmirrorGraceMs?: number
 }
 
 export interface IntegrityFinding {
@@ -188,6 +208,48 @@ export function runIntegrityChecks(snap: IntegritySnapshot): IntegrityFinding[] 
           autoRemediable: false,
         })
       }
+    }
+  }
+
+  // ── INV-9 unmirrored (F-c) ──────────────────────────────────────────────────
+  // In google mode, an internal record that is still missing its Google event id after
+  // the grace window means the outbound mirror never landed — the exact silent
+  // divergence behind the live incident (the PA "saved" it internally and reported
+  // success while the Google write 404'd). The internal record stays authoritative; the
+  // worker re-enqueues the mirror. Warning severity: the schedule is correct, only the
+  // Google view is behind. autoRemediable is false here because the fix (re-enqueue) is
+  // entity-specific and handled explicitly by the worker, not the generic remediator.
+  if (snap.googleMode && snap.unmirrorGraceMs != null) {
+    const mirrorCutoff = new Date(snap.now.getTime() - snap.unmirrorGraceMs)
+    const hasRealMirror = (id: string | null): boolean => !!id && !id.startsWith('internal:')
+
+    for (const b of active) {
+      if (b.state !== 'confirmed') continue // only confirmed bookings are mirrored (decision 8)
+      if (!b.createdAt || b.createdAt >= mirrorCutoff) continue
+      if (hasRealMirror(b.calendarEventId)) continue
+      findings.push({
+        kind: 'unmirrored',
+        severity: 'warning',
+        dedupKey: `unmirrored:booking:${b.id}`,
+        bookingId: b.id,
+        slotStart: b.slotStart,
+        detail: { entity: 'booking', entityId: b.id, createdAt: b.createdAt.toISOString() },
+        autoRemediable: false,
+      })
+    }
+
+    for (const blk of snap.blocks ?? []) {
+      if (blk.source === 'google_import') continue // originates in Google — never mirrored out
+      if (blk.createdAt >= mirrorCutoff) continue
+      if (hasRealMirror(blk.googleEventId)) continue
+      findings.push({
+        kind: 'unmirrored',
+        severity: 'warning',
+        dedupKey: `unmirrored:block:${blk.id}`,
+        slotStart: blk.start,
+        detail: { entity: 'block', entityId: blk.id, createdAt: blk.createdAt.toISOString() },
+        autoRemediable: false,
+      })
     }
   }
 

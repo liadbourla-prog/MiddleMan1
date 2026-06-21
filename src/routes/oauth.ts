@@ -13,6 +13,7 @@ import { generateOnboardingReply } from '../adapters/llm/client.js'
 import { provisionBusiness } from '../domain/flows/provider-onboarding.js'
 import { registerWatchChannel } from '../domain/calendar/inbound-sync.js'
 import { logAudit } from '../domain/audit/logger.js'
+import { chooseCalendarId, isPlausibleCalendarId, type CalendarListEntry } from '../domain/calendar/calendar-id.js'
 
 function buildOAuth2Client() {
   return useNativeFetch(new google.auth.OAuth2(
@@ -265,7 +266,7 @@ export async function oauthRoutes(app: FastifyInstance) {
       }
 
       const [business] = await db
-        .select({ id: businesses.id })
+        .select({ id: businesses.id, googleCalendarId: businesses.googleCalendarId })
         .from(businesses)
         .where(eq(businesses.id, businessId))
         .limit(1)
@@ -301,6 +302,35 @@ export async function oauthRoutes(app: FastifyInstance) {
         .update(businesses)
         .set({ googleRefreshToken: tokens.refresh_token, calendarMode: 'google' })
         .where(eq(businesses.id, businessId))
+
+      // Resolve a VALID googleCalendarId from the connected account (F-b). The column
+      // was historically seeded with a phone-number placeholder by onboarding, which
+      // made every Google write 404. Fetch the account's calendars and pick a real
+      // write target: preserve a still-valid prior selection (e.g. a secondary
+      // calendar), else the primary, else the literal 'primary'. The owner can switch
+      // later from WhatsApp ("use my Testing calendar").
+      let switchCandidates: CalendarListEntry[] = []
+      try {
+        const listClient = createCalendarClient({
+          accessToken: tokens.access_token ?? '',
+          refreshToken: tokens.refresh_token,
+          calendarId: 'primary',
+          calendarMode: 'google',
+        })
+        const calendars = await listClient.listCalendars()
+        const chosen = chooseCalendarId(calendars, business.googleCalendarId)
+        switchCandidates = chosen.candidates
+        await db.update(businesses).set({ googleCalendarId: chosen.calendarId }).where(eq(businesses.id, businessId))
+        app.log.info({ businessId, calendarId: chosen.calendarId, source: chosen.source }, '[oauth] resolved googleCalendarId')
+      } catch (err) {
+        // calendarList read failed — never leave a non-calendar value in the column.
+        // Keep a plausible prior selection, otherwise fall back to 'primary'.
+        const safeId = isPlausibleCalendarId(business.googleCalendarId) ? business.googleCalendarId : 'primary'
+        if (safeId !== business.googleCalendarId) {
+          await db.update(businesses).set({ googleCalendarId: safeId }).where(eq(businesses.id, businessId))
+        }
+        app.log.warn({ businessId, err: err instanceof Error ? err.message : String(err), safeId }, '[oauth] calendarList read failed; used safe calendar id')
+      }
 
       // Action ledger (L1 grounding): record the real connect so the PA can never
       // falsely claim the calendar is/ isn't connected.
@@ -379,6 +409,19 @@ export async function oauthRoutes(app: FastifyInstance) {
             // non-fatal — skip preview if calendar read fails
           }
 
+          // When the account has more than one writable calendar, tell the owner which
+          // one the PA will use and that they can switch from chat (F-b). With a single
+          // calendar there is nothing to choose, so stay quiet.
+          let calendarChoiceNote = ''
+          if (switchCandidates.length > 1) {
+            const active = switchCandidates.find((c) => c.id === biz.googleCalendarId)
+            const others = switchCandidates.filter((c) => c.id !== biz.googleCalendarId).map((c) => c.summary)
+            const activeName = active?.summary ?? (biz.googleCalendarId === 'primary' ? (lang === 'he' ? 'הראשי' : 'your main calendar') : biz.googleCalendarId)
+            calendarChoiceNote = lang === 'he'
+              ? `\n\nאני אנהל את היומן: *${activeName}*. אם תעדיף יומן אחר (${others.join(', ')}) — פשוט תכתוב לי "תשתמש ביומן <שם>".`
+              : `\n\nI'll manage the *${activeName}* calendar. Prefer a different one (${others.join(', ')})? Just tell me "use the <name> calendar".`
+          }
+
           // The connection happened via a Google button, not a manager message, so
           // there is no reply to acknowledge — the ob_calendar_connected line below
           // already confirms it. Tell the LLM to just ask the import question.
@@ -394,7 +437,7 @@ export async function oauthRoutes(app: FastifyInstance) {
           await sendMessage(
             {
               toNumber: mgr.phoneNumber,
-              body: `${t('ob_calendar_connected', lang)}${calendarPreview}\n\n${importQ || getPrompt('customer_import', lang)}`,
+              body: `${t('ob_calendar_connected', lang)}${calendarPreview}${calendarChoiceNote}\n\n${importQ || getPrompt('customer_import', lang)}`,
             },
             waCredentials,
           ).catch((err) => app.log.warn({ err }, 'Failed to send calendar confirmation to manager'))

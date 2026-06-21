@@ -18,6 +18,7 @@ import { handleOperatorMessage } from './operator.js'
 import { i18n, detectLang, type Lang } from '../i18n/t.js'
 import { sendMessage } from '../../adapters/whatsapp/sender.js'
 import { explainOnboardingConcept, generateProviderOnboardingReply } from '../../adapters/llm/client.js'
+import { isPlausibleCalendarId } from '../calendar/calendar-id.js'
 
 export interface ProviderOnboardingResult {
   reply: string
@@ -485,8 +486,17 @@ export async function provisionBusiness(
       whatsappNumber: paPhoneNumber,
       whatsappPhoneNumberId: phoneNumberId,
       whatsappAccessToken: accessToken,
-      // For internal mode, use the PA number as a placeholder; real Calendar ID only for google mode
-      googleCalendarId: resolvedCalendarMode === 'google' && calendarId ? calendarId : paPhoneNumber,
+      // Never store a phone number here. The column is NOT NULL, but a non-calendar
+      // value (the old `paPhoneNumber` placeholder) made every Google write 404 while
+      // the internal write succeeded — the PA reported "done" while nothing landed in
+      // Google. Default to the literal 'primary' (a valid Google calendar id); the
+      // OAuth callback resolves the real calendar from calendarList after connect.
+      // Internal mode never touches Google, so 'primary' is a harmless placeholder
+      // there too (the internal client keys off businessId, not this field).
+      googleCalendarId:
+        resolvedCalendarMode === 'google' && calendarId && isPlausibleCalendarId(calendarId)
+          ? calendarId
+          : 'primary',
       calendarMode: resolvedCalendarMode,
       timezone,
       onboardingStep: null,

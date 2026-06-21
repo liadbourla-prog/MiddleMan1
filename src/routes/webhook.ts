@@ -838,6 +838,7 @@ async function routeManagerMessage(
       timezone: business.timezone,
       lang: turnLang,
       calendar,
+      calendarMode: business.calendarMode,
       transcript: mgTranscript,
       businessKnowledge: mgBusinessKnowledgeForOrchestrator,
       instructorRoster: mgInstructorRoster,

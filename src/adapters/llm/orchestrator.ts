@@ -20,6 +20,7 @@ import { MODELS } from './models.js'
 import {
   executeListCalendarEvents,
   executeCreateCalendarEvent,
+  executeSelectCalendar,
   executeScheduleGroupSession,
   executeDeleteCalendarEvent,
   executeEditClassSession,
@@ -155,6 +156,18 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         notes: { type: Type.STRING },
       },
       required: ['title', 'date', 'startTime', 'endTime'],
+    },
+  },
+  {
+    name: 'selectCalendar',
+    description: 'List the connected Google account\'s calendars, or change WHICH calendar the PA manages (supports a secondary calendar, e.g. "use my Testing calendar", "which calendar are you using?", "switch to the Work calendar"). Use action "list" to show the available calendars and which is active; use action "switch" with the calendar name the manager said. Only for choosing the target calendar — NOT for creating events (createCalendarEvent) or changing working hours (manageBusinessSettings).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: { type: Type.STRING, enum: ['list', 'switch'], description: '"list" to show calendars, "switch" to change the active one' },
+        calendarName: { type: Type.STRING, description: 'For "switch": the calendar name the manager named (matched against the calendar titles; required to switch)' },
+      },
+      required: ['action'],
     },
   },
   {
@@ -550,6 +563,8 @@ async function dispatchTool(
       return executeListCalendarEvents(args as unknown as Parameters<typeof executeListCalendarEvents>[0], ctx)
     case 'createCalendarEvent':
       return executeCreateCalendarEvent(args as unknown as Parameters<typeof executeCreateCalendarEvent>[0], ctx)
+    case 'selectCalendar':
+      return executeSelectCalendar(args as unknown as Parameters<typeof executeSelectCalendar>[0], ctx)
     case 'scheduleGroupSession':
       return executeScheduleGroupSession(args as unknown as Parameters<typeof executeScheduleGroupSession>[0], ctx)
     case 'deleteCalendarEvent':
@@ -696,6 +711,7 @@ export interface OrchestratorParams {
   timezone: string
   lang: Lang
   calendar: CalendarClient
+  calendarMode?: 'google' | 'internal'
   transcript: TranscriptTurn[]
   businessKnowledge: BusinessKnowledge | null
   instructorRoster: InstructorRosterEntry[]
@@ -746,6 +762,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
 
   const ctx: ToolContext = {
     db, businessId, identityId, timezone, lang, calendar,
+    ...(params.calendarMode ? { calendarMode: params.calendarMode } : {}),
     ...(params.role ? { role: params.role } : {}),
     ...(params.delegatedPermissions ? { delegatedPermissions: params.delegatedPermissions } : {}),
   }

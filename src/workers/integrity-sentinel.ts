@@ -14,6 +14,7 @@ import {
 import { createCalendarClient } from '../adapters/calendar/client.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { enqueueMessage } from './message-retry.js'
+import { enqueueBlockMirror, enqueueBookingMirror } from './calendar-mirror.js'
 import { redisConnection } from '../redis.js'
 import { type Lang } from '../domain/i18n/t.js'
 import {
@@ -27,6 +28,11 @@ const REPEAT_EVERY_MS = 2 * 60 * 60 * 1000 // every 2 hours (WS-B)
 const WINDOW_BACK_MS = 24 * 60 * 60 * 1000
 const WINDOW_FWD_MS = 90 * 24 * 60 * 60 * 1000
 const HOLD_GRACE_MS = parseInt(process.env['HOLD_GRACE_PERIOD_SECONDS'] ?? '60', 10) * 1000
+// INV-9 grace: how long an internal record may lack a Google event id before the
+// Sentinel treats the outbound mirror as not-yet-landed. Generous enough that a healthy
+// async mirror (seconds, with retries) is never flagged; tight enough to catch a silently
+// dropped/failed write well inside a 2h tick.
+const UNMIRROR_GRACE_MS = parseInt(process.env['UNMIRROR_GRACE_MINUTES'] ?? '15', 10) * 60_000
 const QUARANTINE_REASON = 'integrity_quarantine'
 
 export const integritySentinelQueue = new Queue(QUEUE_NAME, { connection: redisConnection })
@@ -49,6 +55,7 @@ async function loadSnapshot(business: Business, now: Date): Promise<IntegritySna
       calendarEventId: bookings.calendarEventId,
       rescheduledFrom: bookings.rescheduledFrom,
       holdExpiresAt: bookings.holdExpiresAt,
+      createdAt: bookings.createdAt,
       maxParticipants: serviceTypes.maxParticipants,
     })
     .from(bookings)
@@ -65,6 +72,20 @@ async function loadSnapshot(business: Business, now: Date): Promise<IntegritySna
     .select({ googleEventId: calendarBlocks.googleEventId })
     .from(calendarBlocks)
     .where(and(eq(calendarBlocks.businessId, business.id), isNotNull(calendarBlocks.googleEventId)))
+
+  // INV-9 (unmirrored): all blocks in window, INCLUDING those with a null googleEventId —
+  // those are the ones whose outbound mirror may not have landed yet.
+  const unmirroredBlockRows = await db
+    .select({
+      id: calendarBlocks.id,
+      startTs: calendarBlocks.startTs,
+      endTs: calendarBlocks.endTs,
+      createdAt: calendarBlocks.createdAt,
+      googleEventId: calendarBlocks.googleEventId,
+      source: calendarBlocks.source,
+    })
+    .from(calendarBlocks)
+    .where(and(eq(calendarBlocks.businessId, business.id), gte(calendarBlocks.startTs, from), lte(calendarBlocks.startTs, to)))
 
   // Pending reminders for this business's bookings (sentAt null) — join to scope by business.
   const reminderRows = await db
@@ -90,19 +111,20 @@ async function loadSnapshot(business: Business, now: Date): Promise<IntegritySna
       // Fail open: a Google read error must not produce false ghost/orphan findings.
       // Skip the Google-dependent invariants this run by reporting no events AND no mode.
       console.warn('[integrity-sentinel] listEvents failed; skipping Google invariants', err)
-      return buildSnapshot(now, false, bookingRows, [], blockRows, reminderRows)
+      return buildSnapshot(now, false, bookingRows, [], blockRows, unmirroredBlockRows, reminderRows)
     }
   }
 
-  return buildSnapshot(now, googleMode, bookingRows, googleEvents, blockRows, reminderRows)
+  return buildSnapshot(now, googleMode, bookingRows, googleEvents, blockRows, unmirroredBlockRows, reminderRows)
 }
 
 function buildSnapshot(
   now: Date,
   googleMode: boolean,
-  bookingRows: Array<{ id: string; serviceTypeId: string; slotStart: Date; slotEnd: Date; state: string; calendarEventId: string | null; rescheduledFrom: string | null; holdExpiresAt: Date | null; maxParticipants: number }>,
+  bookingRows: Array<{ id: string; serviceTypeId: string; slotStart: Date; slotEnd: Date; state: string; calendarEventId: string | null; rescheduledFrom: string | null; holdExpiresAt: Date | null; createdAt: Date; maxParticipants: number }>,
   googleEvents: IntegritySnapshot['googleEvents'],
   blockRows: Array<{ googleEventId: string | null }>,
+  unmirroredBlockRows: Array<{ id: string; startTs: Date; endTs: Date; createdAt: Date; googleEventId: string | null; source: string }>,
   reminderRows: Array<{ id: string; bookingId: string; sentAt: Date | null }>,
 ): IntegritySnapshot {
   return {
@@ -117,10 +139,20 @@ function buildSnapshot(
       calendarEventId: b.calendarEventId,
       rescheduledFrom: b.rescheduledFrom,
       holdExpiresAt: b.holdExpiresAt,
+      createdAt: b.createdAt,
       isGroup: (b.maxParticipants ?? 1) > 1,
     })),
     googleEvents,
     knownBlockEventIds: blockRows.map((r) => r.googleEventId).filter((x): x is string => !!x),
+    blocks: unmirroredBlockRows.map((b) => ({
+      id: b.id,
+      start: b.startTs,
+      end: b.endTs,
+      createdAt: b.createdAt,
+      googleEventId: b.googleEventId,
+      source: b.source,
+    })),
+    unmirrorGraceMs: UNMIRROR_GRACE_MS,
     reminders: reminderRows,
     holdGraceMs: HOLD_GRACE_MS,
   }
@@ -195,6 +227,20 @@ export async function runSentinelForBusiness(businessId: string): Promise<typeof
 
   const snapshot = await loadSnapshot(business, now)
   const detected = [...runIntegrityChecks(snapshot), ...(await checkOutOfHours(business, now))]
+
+  // INV-9 self-heal: re-enqueue the outbound mirror for anything still unmirrored. The
+  // mirror queue dedups by jobId, so re-enqueueing every tick is safe and idempotent —
+  // it recovers a write that was dropped or never enqueued (the live-incident shape). The
+  // internal record is already authoritative; this only catches Google up. A mirror that
+  // keeps failing exhausts its retries and triggers the owner divergence alert separately.
+  for (const f of detected) {
+    if (f.kind !== 'unmirrored') continue
+    const entity = f.detail['entity']
+    const entityId = f.detail['entityId']
+    if (typeof entityId !== 'string') continue
+    if (entity === 'block') await enqueueBlockMirror(businessId, entityId).catch(() => { /* best-effort */ })
+    else if (entity === 'booking') await enqueueBookingMirror(businessId, entityId).catch(() => { /* best-effort */ })
+  }
 
   const existingOpen = await db
     .select()
@@ -330,6 +376,7 @@ function describeFinding(f: IntegrityFinding, lang: Lang, businessName: string):
     time_mismatch: "a booking's time no longer matches Google Calendar",
     reschedule_residue: 'a reschedule left two active bookings',
     out_of_hours: 'a booking sits inside a break / blocked time',
+    unmirrored: 'an event saved here has not synced to Google Calendar yet',
   }
   const he: Record<string, string> = {
     double_book: 'שתי הזמנות חופפות באותו זמן',
@@ -338,6 +385,7 @@ function describeFinding(f: IntegrityFinding, lang: Lang, businessName: string):
     time_mismatch: 'זמן ההזמנה כבר לא תואם ל-Google Calendar',
     reschedule_residue: 'שינוי תור השאיר שתי הזמנות פעילות',
     out_of_hours: 'הזמנה נמצאת בתוך הפסקה / זמן חסום',
+    unmirrored: 'אירוע שנשמר כאן עדיין לא סונכרן ל-Google Calendar',
   }
   const desc = (lang === 'he' ? he : en)[f.kind] ?? f.kind
   return lang === 'he'

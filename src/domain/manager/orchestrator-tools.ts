@@ -28,6 +28,7 @@ import { findProviderByName } from '../provider/lookup.js'
 import { sendMessage } from '../../adapters/whatsapp/sender.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
 import { logAudit } from '../audit/logger.js'
+import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -72,6 +73,10 @@ export interface ToolContext {
   timezone: string
   lang: Lang
   calendar: CalendarClient
+  // Whether this business mirrors to Google. Drives mirror-honest wording (F-c): in
+  // google mode a freshly-created event is saved internally and syncing OUT to Google
+  // asynchronously, so the reply must not claim it is already in Google Calendar.
+  calendarMode?: 'google' | 'internal'
   // Caller role + granted actions — used to gate config changes for delegated
   // staff at the apply seam. Optional so existing test contexts default to manager.
   role?: IdentityRole
@@ -269,7 +274,131 @@ export async function executeCreateCalendarEvent(
   // No-op for internal-mode businesses.
   await enqueueBlockMirror(ctx.businessId, block.id)
 
+  // Mirror-honest wording (F-c): in google mode the event is now saved INTERNALLY
+  // (authoritative) and syncing OUT to Google asynchronously — it is NOT yet in Google
+  // Calendar. The PA must say "saved — syncing to your Google calendar", never claim it
+  // is already on the calendar. The root cause of the live incident was the opposite:
+  // a 404'd Google write while the PA reported "done". Internal mode has no Google view,
+  // so a plain "saved/done" is accurate there.
+  if (ctx.calendarMode === 'google') {
+    return {
+      success: true,
+      eventId: `${BLOCK_ID_PREFIX}${block.id}`,
+      mirrorStatus: 'syncing',
+      guidance: "Confirm the event is saved in your records (it's set). Say it is now syncing to their Google Calendar — do NOT claim it already appears in Google Calendar, the sync happens in the background.",
+    }
+  }
+
   return { success: true, eventId: `${BLOCK_ID_PREFIX}${block.id}` }
+}
+
+// ── selectCalendar ────────────────────────────────────────────────────────────
+
+interface SelectCalendarArgs {
+  action: 'list' | 'switch'
+  calendarName?: string
+}
+
+/**
+ * List the connected Google account's calendars, or switch which one the PA manages
+ * (F-b — "supports secondary calendars"). The active calendar lives in
+ * businesses.googleCalendarId; we only ever persist a validated, writable calendar id,
+ * so the phone-number-in-calendar-id bug can never recur from this path.
+ *
+ * Internal note: switching the active calendar does NOT migrate already-mirrored events.
+ * The internal record stays authoritative; the outbound mirror + Sentinel reconcile the
+ * new calendar over time. We surface that plainly to the owner.
+ */
+export async function executeSelectCalendar(
+  args: SelectCalendarArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const [biz] = await ctx.db
+    .select({ calendarMode: businesses.calendarMode, googleCalendarId: businesses.googleCalendarId })
+    .from(businesses)
+    .where(eq(businesses.id, ctx.businessId))
+    .limit(1)
+
+  if (!biz || biz.calendarMode !== 'google') {
+    return {
+      success: false,
+      reason: 'not_google_mode',
+      guidance: 'The calendar is not connected to Google, so there is nothing to choose. Tell the manager they can connect Google Calendar first.',
+    }
+  }
+
+  let candidates: CalendarListEntry[]
+  try {
+    const all = await ctx.calendar.listCalendars()
+    candidates = all.filter((c) => isWritableRole(c.accessRole))
+  } catch {
+    return {
+      success: false,
+      reason: 'calendar_read_failed',
+      guidance: "Couldn't read the calendar list from Google just now. Ask the manager to try again in a moment.",
+    }
+  }
+
+  const activeId = biz.googleCalendarId
+  const describe = (c: CalendarListEntry) => ({ name: c.summary, active: c.id === activeId })
+
+  if (args.action === 'list' || !args.calendarName) {
+    return {
+      success: true,
+      activeCalendar: candidates.find((c) => c.id === activeId)?.summary ?? activeId,
+      calendars: candidates.map(describe),
+      guidance: 'List the calendars for the manager and note which one is active. They can switch by naming another.',
+    }
+  }
+
+  const resolved = resolveCalendarSwitch(candidates, args.calendarName)
+  if (resolved.status === 'not_found') {
+    return {
+      success: false,
+      needsClarification: true,
+      reason: 'calendar_not_found',
+      requested: args.calendarName,
+      calendars: candidates.map((c) => c.summary),
+      guidance: "That calendar name didn't match any writable calendar on the account. Show the manager the available names and ask which one.",
+    }
+  }
+  if (resolved.status === 'ambiguous') {
+    return {
+      success: false,
+      needsClarification: true,
+      reason: 'calendar_ambiguous',
+      matches: resolved.matches.map((c) => c.summary),
+      guidance: 'Several calendars match that name. Ask the manager which one they mean.',
+    }
+  }
+
+  const target = resolved.calendar
+  if (target.id === activeId) {
+    return { success: true, alreadyActive: true, activeCalendar: target.summary, guidance: 'That calendar is already the active one — let the manager know.' }
+  }
+
+  // Persist only a validated, writable calendar id (defence in depth alongside the
+  // resolver, which already excluded read-only calendars).
+  if (!isPlausibleCalendarId(target.id)) {
+    return { success: false, reason: 'invalid_calendar_id', guidance: 'That calendar could not be selected. Ask the manager to try another.' }
+  }
+
+  await ctx.db.update(businesses).set({ googleCalendarId: target.id }).where(eq(businesses.id, ctx.businessId))
+
+  await logAudit(ctx.db, {
+    businessId: ctx.businessId,
+    actorId: ctx.identityId,
+    action: 'calendar.calendar_selected',
+    entityType: 'business',
+    entityId: ctx.businessId,
+    metadata: { calendarId: target.id, calendarName: target.summary },
+  }).catch(() => { /* best-effort */ })
+
+  return {
+    success: true,
+    switchedTo: target.summary,
+    guidance: 'Confirm to the manager that you will now manage that calendar. New events go there from now on; existing events stay where they are and stay correct in your records.',
+  }
 }
 
 // ── scheduleGroupSession ──────────────────────────────────────────────────────

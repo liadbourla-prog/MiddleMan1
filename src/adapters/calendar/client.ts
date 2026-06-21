@@ -18,6 +18,7 @@ import type {
 } from './types.js'
 import { sendMessage } from '../whatsapp/sender.js'
 import { i18n, type Lang } from '../../domain/i18n/t.js'
+import type { CalendarListEntry } from '../../domain/calendar/calendar-id.js'
 
 const HOLD_PREFIX = '[HOLD]'
 const HOLD_COLOR_ID = '5' // banana — visually distinct in Google Calendar
@@ -162,7 +163,12 @@ function createInternalCalendarClient(options: CalendarClientOptions) {
     return { status: 'ok', events: [], nextSyncToken: null }
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync }
+  // Internal mode has no Google account — there are no selectable calendars.
+  async function listCalendars(): Promise<CalendarListEntry[]> {
+    return []
+  }
+
+  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
 }
 
 // ── Google Calendar ───────────────────────────────────────────────────────────
@@ -484,7 +490,23 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
     }
   }
 
-  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync }
+  // List the calendars the connected account can see, so the OAuth callback can
+  // pick a VALID googleCalendarId and the owner can later switch to a secondary
+  // calendar. Only owner/writer calendars are usable as write targets; the caller
+  // (chooseCalendarId) filters by accessRole.
+  async function listCalendars(): Promise<CalendarListEntry[]> {
+    const response = await withTokenRefresh(() =>
+      calendar.calendarList.list({ fields: 'items(id,summary,accessRole,primary)', maxResults: 250 }),
+    )
+    return (response.data.items ?? []).map((c) => ({
+      id: c.id ?? '',
+      summary: c.summary ?? '(untitled)',
+      accessRole: c.accessRole ?? 'reader',
+      primary: c.primary ?? false,
+    })).filter((c) => c.id !== '')
+  }
+
+  return { checkAvailability, placeHold, confirmHold, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────

@@ -34,18 +34,33 @@ write while nothing lands in Google.
 - **F-a (DONE):** set the live business's `googleCalendarId` to its real secondary ("Testing")
   calendar + re-mirrored the orphaned internal block out to Google. Verified live. Internal
   brain untouched (the block already existed; only synced outward).
-- **F-b (HANDOFF):** OAuth callback must fetch `calendarList.list()` and set a VALID
-  `googleCalendarId` (default `primary`, ideally let the owner pick a calendar — supports
-  secondary calendars); validate/reject non-calendar values; fix the onboarding step that
-  stored a phone number. `src/routes/oauth.ts` + onboarding + validator tests.
-- **F-c (HANDOFF — MUST preserve internal-as-source-of-truth):** in Google mode, the create
-  path / booking confirmation must not claim "done in your calendar" before the async mirror
-  confirms — internal write stays authoritative and still succeeds; only change WORDING
-  ("saved — syncing…") and surface mirror status. Tighten mirror-divergence alerting; consider
-  a Sentinel invariant for `google_event_id` NULL > N min in google mode.
+- **F-b (DONE — branch `dev/system/calendar-valid-id`, not yet deployed):** new pure
+  validator `src/domain/calendar/calendar-id.ts` (`isPhoneNumberLike` / `isPlausibleCalendarId`
+  / `chooseCalendarId` / `resolveCalendarSwitch`, 23 tests). OAuth callback
+  (`src/routes/oauth.ts`) now fetches `calendarList.list()` (new `listCalendars()` on the
+  calendar client) and persists a VALID `googleCalendarId` — preserve a still-valid prior
+  selection, else primary, else the literal `'primary'`; on a calendarList read failure it
+  keeps a plausible existing id or falls back to `'primary'` (never a phone number). Onboarding
+  (`provider-onboarding.ts`) no longer writes `paPhoneNumber` into the calendar field (defaults
+  to `'primary'`, validated). Owner can switch calendars from chat: new Branch-3 tool
+  `selectCalendar` (list/switch) → `executeSelectCalendar` (6 executor tests), surfaced in the
+  post-connect confirmation when >1 writable calendar exists. Audit action
+  `calendar.calendar_selected`.
+- **F-c (DONE — same branch; internal-as-source-of-truth preserved):** in google mode
+  `executeCreateCalendarEvent` now returns `mirrorStatus:'syncing'` + guidance so the PA says
+  "saved — syncing to your Google calendar", never "it's in your calendar" (the internal block
+  write stays authoritative; `calendarMode` threaded through `OrchestratorParams`→`ToolContext`).
+  Customer booking confirmations were already safe — google-mode holds insert the Google event
+  synchronously (`engine.ts:290`), so a failed write goes to `failed`, never a false confirm.
+  New Sentinel invariant **INV-9 `unmirrored`** (pure engine + 9 tests): a confirmed booking or
+  internal-origin block in google mode whose `google_event_id` is still null/`internal:` past a
+  grace window (`UNMIRROR_GRACE_MINUTES`, default 15) — warning severity; the worker re-enqueues
+  the outbound mirror every tick (idempotent self-heal). A mirror that keeps failing still
+  exhausts its 5 retries and fires the existing owner divergence alert.
 
-**Next session:** build F-b + F-c, then the pre-launch gauntlet (§4) + WS-E/WS-G. Deploy
-via `/update-agent` when that code is ready (code-only; no new migrations expected).
+**Next session:** the pre-launch gauntlet (§4) + WS-E/WS-G. Deploy F-b/F-c via `/update-agent`
+when ready (code-only; no new migrations — `integrity_findings.kind` is free text). 454/454
+unit tests green; `tsc --noEmit` clean.
 
 ---
 
@@ -159,6 +174,7 @@ the Sentinel verifies the correction happened. Defense in depth.
 | INV-6 | every pending reminder points at a still-active booking at its current time | F7 |
 | INV-7 | no `held`/`pending_payment` past expiry still occupying a slot | F8 |
 | INV-8 | no booking with `rescheduledFrom` whose source row is still active | F9 |
+| INV-9 | no confirmed booking / internal block in google mode with `google_event_id` null past the grace window (worker re-enqueues the mirror) | silent mirror failure (the "PA said done, nothing in Google" incident) |
 
 **Action by severity:**
 - **Auto-remediate the safe ones** silently + log (expire stuck holds, cancel orphaned reminders).
