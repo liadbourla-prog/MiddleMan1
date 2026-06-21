@@ -1,5 +1,6 @@
 import { google } from 'googleapis'
 import { z } from 'zod'
+import { useNativeFetch } from '../google/native-fetch.js'
 
 const GMB_SCOPE = 'https://www.googleapis.com/auth/business.manage'
 const GMB_BASE = 'https://mybusinessbusinessinformation.googleapis.com/v1'
@@ -54,10 +55,10 @@ const VerificationOptionsResponseSchema = z.object({
 })
 
 function buildOAuth2Client(gmbRefreshToken: string) {
-  const client = new google.auth.OAuth2(
+  const client = useNativeFetch(new google.auth.OAuth2(
     process.env['GOOGLE_CLIENT_ID'],
     process.env['GOOGLE_CLIENT_SECRET'],
-  )
+  ))
   client.setCredentials({ refresh_token: gmbRefreshToken, scope: GMB_SCOPE })
   return client
 }

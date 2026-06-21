@@ -1,4 +1,5 @@
 import { google } from 'googleapis'
+import { useNativeFetch } from '../google/native-fetch.js'
 import { and, eq, gt, lte, lt, gte, or } from 'drizzle-orm'
 import type {
   CalendarSlot,
@@ -22,11 +23,11 @@ const HOLD_PREFIX = '[HOLD]'
 const HOLD_COLOR_ID = '5' // banana — visually distinct in Google Calendar
 
 function buildOAuth2Client() {
-  const client = new google.auth.OAuth2(
+  const client = useNativeFetch(new google.auth.OAuth2(
     process.env['GOOGLE_CLIENT_ID'],
     process.env['GOOGLE_CLIENT_SECRET'],
     process.env['GOOGLE_REDIRECT_URI'],
-  )
+  ))
   return client
 }
 

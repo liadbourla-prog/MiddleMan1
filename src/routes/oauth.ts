@@ -8,17 +8,18 @@ import { sendMessage } from '../adapters/whatsapp/sender.js'
 import { getPrompt } from '../domain/onboarding/steps.js'
 import { t, i18n, type Lang } from '../domain/i18n/t.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
+import { useNativeFetch } from '../adapters/google/native-fetch.js'
 import { generateOnboardingReply } from '../adapters/llm/client.js'
 import { provisionBusiness } from '../domain/flows/provider-onboarding.js'
 import { registerWatchChannel } from '../domain/calendar/inbound-sync.js'
 import { logAudit } from '../domain/audit/logger.js'
 
 function buildOAuth2Client() {
-  return new google.auth.OAuth2(
+  return useNativeFetch(new google.auth.OAuth2(
     process.env['GOOGLE_CLIENT_ID'],
     process.env['GOOGLE_CLIENT_SECRET'],
     process.env['GOOGLE_REDIRECT_URI'],
-  )
+  ))
 }
 
 // The server→Google token exchange occasionally drops mid-response on Cloud Run
