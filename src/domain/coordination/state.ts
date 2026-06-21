@@ -53,7 +53,7 @@ export function nextCoordinationState(
 
   // owner_decision
   const d = event.decision
-  if (d.kind === 'confirm' && event.agreedSlot) {
+  if (d.kind === 'confirm' && event.agreedSlot && (current === 'awaiting_owner_confirm' || current === 'countered')) {
     return { status: 'confirmed', effect: { kind: 'book_and_notify', slot: event.agreedSlot }, agreedSlot: event.agreedSlot }
   }
   if (d.kind === 'counter_offer') {

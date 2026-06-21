@@ -65,6 +65,11 @@ describe('nextCoordinationState — owner decisions', () => {
     expect(r.status).toBe('abandoned')
     expect(r.effect).toEqual({ kind: 'none' })
   })
+  it('confirm from awaiting_counterparty (stale agreedSlot) is a safe no-op — never books', () => {
+    const r = nextCoordinationState('awaiting_counterparty', { type: 'owner_decision', decision: { kind: 'confirm' }, agreedSlot: c0, candidates })
+    expect(r.status).toBe('awaiting_counterparty')
+    expect(r.effect).toEqual({ kind: 'none' })
+  })
 })
 
 describe('nextCoordinationState — expiry', () => {

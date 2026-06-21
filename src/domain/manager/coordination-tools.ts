@@ -85,10 +85,15 @@ export async function executeCoordinateMeeting(args: CoordinateMeetingArgs, ctx:
   let contactPhone: string
   const phone = args.phoneNumber?.replace(/[\s-]/g, '')
   if (phone && isValidE164(phone)) {
-    const [existing] = await ctx.db.select({ id: identities.id, phone: identities.phoneNumber })
+    const [existing] = await ctx.db.select({ id: identities.id, phone: identities.phoneNumber, role: identities.role })
       .from(identities).where(and(eq(identities.businessId, ctx.businessId), eq(identities.phoneNumber, phone))).limit(1)
-    if (existing) { contactId = existing.id; contactPhone = existing.phone }
-    else { contactId = await registerContact(ctx.db, ctx.businessId, phone, args.contactName); contactPhone = phone }
+    if (existing && existing.role === 'contact') {
+      contactId = existing.id; contactPhone = existing.phone
+    } else if (existing) {
+      return { success: false, reason: 'phone_not_a_contact', guidance: `That number already belongs to ${existing.role === 'customer' ? 'a customer' : 'someone else'} on file, so I can't set them up as a separate meeting contact. If you wanted to arrange something with a customer, tell me and I'll handle it as a booking instead.` }
+    } else {
+      contactId = await registerContact(ctx.db, ctx.businessId, phone, args.contactName); contactPhone = phone
+    }
   } else if (args.contactName) {
     const [c] = await ctx.db.select({ id: identities.id, phone: identities.phoneNumber })
       .from(identities).where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'contact'), ilike(identities.displayName, `%${args.contactName}%`))).limit(1)
