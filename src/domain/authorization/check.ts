@@ -12,6 +12,7 @@ export type Action =
   | 'permission.manage'
   | 'policy.change'
   | 'staff.manage'
+  | 'meeting.coordinate'
 
 export type AuthResult =
   | { allowed: true }
@@ -36,6 +37,7 @@ const MANAGER_ACTIONS = new Set<Action>([
   'permission.manage',
   'policy.change',
   'staff.manage',
+  'meeting.coordinate',
 ])
 
 const CUSTOMER_ACTIONS = new Set<Action>([
