@@ -1,6 +1,6 @@
 import { and, eq, inArray, lt } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { meetingCoordinations } from '../../db/schema.js'
+import { meetingCoordinations, identities } from '../../db/schema.js'
 import type { CoordinationStatus, Slot } from './types.js'
 
 const ACTIVE = ['awaiting_counterparty', 'countered', 'awaiting_owner_confirm'] as const
@@ -69,16 +69,23 @@ export async function findById(db: Db, businessId: string, id: string): Promise<
 }
 
 export async function updateCoordination(db: Db, id: string, patch: {
-  status: CoordinationStatus; agreedSlot?: Slot; counterSlot?: Slot; calendarEventId?: string; googleEtag?: string | null
+  status: CoordinationStatus; agreedSlot?: Slot; counterSlot?: Slot; candidateSlots?: Slot[]; calendarEventId?: string; googleEtag?: string | null
 }): Promise<void> {
   await db.update(meetingCoordinations).set({
     status: patch.status,
     ...(patch.agreedSlot ? { agreedSlotStart: patch.agreedSlot.start, agreedSlotEnd: patch.agreedSlot.end } : {}),
     ...(patch.counterSlot ? { counterSlotStart: patch.counterSlot.start, counterSlotEnd: patch.counterSlot.end } : {}),
+    ...(patch.candidateSlots ? { candidateSlots: patch.candidateSlots.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString() })) } : {}),
     ...(patch.calendarEventId !== undefined ? { calendarEventId: patch.calendarEventId } : {}),
     ...(patch.googleEtag !== undefined ? { googleEtag: patch.googleEtag } : {}),
     updatedAt: new Date(),
   }).where(eq(meetingCoordinations.id, id))
+}
+
+export async function getIdentityContact(db: Db, identityId: string): Promise<{ phone: string | null; name: string | null }> {
+  const [row] = await db.select({ phone: identities.phoneNumber, name: identities.displayName })
+    .from(identities).where(eq(identities.id, identityId)).limit(1)
+  return { phone: row?.phone ?? null, name: row?.name ?? null }
 }
 
 export async function findExpired(db: Db, now: Date): Promise<CoordinationRow[]> {
