@@ -86,7 +86,7 @@ export const identities = pgTable(
       .notNull()
       .references(() => businesses.id),
     phoneNumber: text('phone_number').notNull(),
-    role: text('role', { enum: ['manager', 'delegated_user', 'customer', 'provider'] }).notNull(),
+    role: text('role', { enum: ['manager', 'delegated_user', 'customer', 'provider', 'contact'] }).notNull(),
     displayName: text('display_name'),
     grantedBy: uuid('granted_by'),
     grantedAt: timestamp('granted_at', { withTimezone: true }),
@@ -626,6 +626,37 @@ export const reshuffleProposals = pgTable(
   (t) => [index('reshuffle_proposals_campaign_idx').on(t.campaignId, t.status)],
 )
 
+/** One owner↔counterparty meeting negotiation. See docs/superpowers/specs/2026-06-21-meeting-coordination-design.md. */
+export const meetingCoordinations = pgTable(
+  'meeting_coordinations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    ownerId: uuid('owner_id').notNull().references(() => identities.id),
+    contactId: uuid('contact_id').notNull().references(() => identities.id),
+    title: text('title').notNull(),
+    durationMinutes: integer('duration_minutes').notNull(),
+    // [{ start: ISO, end: ISO }] — primary + fallbacks, resolved to absolute UTC.
+    candidateSlots: jsonb('candidate_slots').notNull(),
+    status: text('status', {
+      enum: ['awaiting_counterparty', 'countered', 'awaiting_owner_confirm', 'confirmed', 'declined', 'expired', 'abandoned'],
+    }).notNull().default('awaiting_counterparty'),
+    agreedSlotStart: timestamp('agreed_slot_start', { withTimezone: true }),
+    agreedSlotEnd: timestamp('agreed_slot_end', { withTimezone: true }),
+    counterSlotStart: timestamp('counter_slot_start', { withTimezone: true }),
+    counterSlotEnd: timestamp('counter_slot_end', { withTimezone: true }),
+    calendarEventId: text('calendar_event_id'),
+    googleEtag: text('google_etag'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('meeting_coordinations_contact_idx').on(t.businessId, t.contactId, t.status),
+    index('meeting_coordinations_business_idx').on(t.businessId, t.status),
+  ],
+)
+
 export const providerOnboardingSessions = pgTable('provider_onboarding_sessions', {
   id: uuid('id').primaryKey().defaultRandom(),
   managerPhone: text('manager_phone').notNull().unique(),
@@ -912,6 +943,7 @@ export type ReshuffleCampaign = typeof reshuffleCampaigns.$inferSelect
 export type ReshuffleOffer = typeof reshuffleOffers.$inferSelect
 export type ReshuffleProposal = typeof reshuffleProposals.$inferSelect
 export type FreedSlotApproval = typeof freedSlotApprovals.$inferSelect
+export type MeetingCoordination = typeof meetingCoordinations.$inferSelect
 export type IntegrityFinding = typeof integrityFindings.$inferSelect
 
 export type BookingState = Booking['state']
