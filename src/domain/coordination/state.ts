@@ -2,10 +2,28 @@ import type { CoordinationStatus, ContactReplyClass, OwnerDecision, SideEffect, 
 
 const SLOT_MATCH_MS = 5 * 60 * 1000 // a start within 5 min of a candidate counts as that candidate
 
+function sameUtcDay(a: Date, b: Date): boolean {
+  return a.toISOString().slice(0, 10) === b.toISOString().slice(0, 10)
+}
+
 export function classifyContactReply(
   proposed: Slot,
   candidates: Slot[],
+  windows?: Slot[],
 ): ContactReplyClass {
+  // Windows path (Bug 2): boundary is the owner-given day/time ranges.
+  if (windows && windows.length > 0) {
+    const inWindow = windows.find(
+      (w) => proposed.start.getTime() >= w.start.getTime() && proposed.end.getTime() <= w.end.getTime(),
+    )
+    if (inWindow) return { kind: 'accept_slot', slot: proposed }
+    // Out of every window → deviation. Frame against the same-day window when there is
+    // one, else the first window (the violated boundary shown to the owner).
+    const framed = windows.find((w) => sameUtcDay(w.start, proposed.start)) ?? windows[0]!
+    return { kind: 'deviation', slot: proposed, window: framed }
+  }
+
+  // Discrete path (unchanged): a start within 5 min of a candidate counts as that candidate.
   const idx = candidates.findIndex(
     (c) => Math.abs(c.start.getTime() - proposed.start.getTime()) <= SLOT_MATCH_MS,
   )
@@ -41,6 +59,12 @@ export function nextCoordinationState(
     if (r.kind === 'accept') {
       const slot = event.candidates[r.candidateIndex]!
       return { status: 'awaiting_owner_confirm', effect: { kind: 'ping_owner_confirm', slot }, agreedSlot: slot }
+    }
+    if (r.kind === 'accept_slot') {
+      return { status: 'awaiting_owner_confirm', effect: { kind: 'ping_owner_confirm', slot: r.slot }, agreedSlot: r.slot }
+    }
+    if (r.kind === 'deviation') {
+      return { status: 'countered', effect: { kind: 'relay_out_of_window_to_owner', slot: r.slot, window: r.window }, counterSlot: r.slot }
     }
     if (r.kind === 'counter') {
       return { status: 'countered', effect: { kind: 'relay_counter_to_owner', slot: r.slot }, counterSlot: r.slot }

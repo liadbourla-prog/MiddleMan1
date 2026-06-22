@@ -13,6 +13,7 @@ export interface CoordinationRow {
   title: string
   durationMinutes: number
   candidateSlots: Slot[]
+  allowedWindows: Slot[]
   status: CoordinationStatus
   agreedSlotStart: Date | null
   agreedSlotEnd: Date | null
@@ -21,10 +22,12 @@ export interface CoordinationRow {
 
 function hydrate(row: typeof meetingCoordinations.$inferSelect): CoordinationRow {
   const raw = (row.candidateSlots as Array<{ start: string; end: string }>)
+  const rawW = ((row.allowedWindows as Array<{ start: string; end: string }> | null) ?? [])
   return {
     id: row.id, businessId: row.businessId, ownerId: row.ownerId, contactId: row.contactId,
     title: row.title, durationMinutes: row.durationMinutes,
     candidateSlots: raw.map((s) => ({ start: new Date(s.start), end: new Date(s.end) })),
+    allowedWindows: rawW.map((s) => ({ start: new Date(s.start), end: new Date(s.end) })),
     status: row.status as CoordinationStatus,
     agreedSlotStart: row.agreedSlotStart, agreedSlotEnd: row.agreedSlotEnd, expiresAt: row.expiresAt,
   }
@@ -32,12 +35,15 @@ function hydrate(row: typeof meetingCoordinations.$inferSelect): CoordinationRow
 
 export async function insertCoordination(db: Db, input: {
   businessId: string; ownerId: string; contactId: string; title: string;
-  durationMinutes: number; candidateSlots: Slot[]; expiresAt: Date
+  durationMinutes: number; candidateSlots: Slot[]; allowedWindows?: Slot[] | null; expiresAt: Date
 }): Promise<string> {
   const [row] = await db.insert(meetingCoordinations).values({
     businessId: input.businessId, ownerId: input.ownerId, contactId: input.contactId,
     title: input.title, durationMinutes: input.durationMinutes,
     candidateSlots: input.candidateSlots.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString() })),
+    allowedWindows: input.allowedWindows && input.allowedWindows.length > 0
+      ? input.allowedWindows.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString() }))
+      : null,
     status: 'awaiting_counterparty', expiresAt: input.expiresAt,
   }).returning({ id: meetingCoordinations.id })
   return row!.id

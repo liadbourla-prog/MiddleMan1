@@ -17,6 +17,48 @@ describe('classifyContactReply', () => {
   })
 })
 
+describe('classifyContactReply — windows', () => {
+  const w0: Slot = { start: new Date('2026-06-23T07:00:00Z'), end: new Date('2026-06-23T13:00:00Z') } // Tue 10–16 local-ish
+  const w1: Slot = { start: new Date('2026-06-24T08:00:00Z'), end: new Date('2026-06-24T12:00:00Z') } // Wed 11–15 local-ish
+  const windows = [w0, w1]
+
+  it('an in-window proposal classifies as accept_slot with the proposed slot', () => {
+    const proposed: Slot = { start: new Date('2026-06-24T09:00:00Z'), end: new Date('2026-06-24T10:30:00Z') }
+    const r = classifyContactReply(proposed, [], windows)
+    expect(r).toEqual({ kind: 'accept_slot', slot: proposed })
+  })
+
+  it('an out-of-window proposal classifies as deviation with the same-day window', () => {
+    const proposed: Slot = { start: new Date('2026-06-24T07:00:00Z'), end: new Date('2026-06-24T08:30:00Z') } // before w1 start
+    const r = classifyContactReply(proposed, [], windows)
+    expect(r).toEqual({ kind: 'deviation', slot: proposed, window: w1 })
+  })
+
+  it('falls back to discrete candidate matching when no windows are given', () => {
+    const r = classifyContactReply({ start: new Date('2026-06-26T09:00:00Z'), end: new Date('2026-06-26T10:00:00Z') }, candidates)
+    expect(r).toEqual({ kind: 'accept', candidateIndex: 1 })
+  })
+})
+
+describe('nextCoordinationState — window events', () => {
+  const slot: Slot = { start: new Date('2026-06-24T09:00:00Z'), end: new Date('2026-06-24T10:30:00Z') }
+  const window: Slot = { start: new Date('2026-06-24T08:00:00Z'), end: new Date('2026-06-24T12:00:00Z') }
+
+  it('accept_slot → awaiting_owner_confirm + ping owner with the proposed slot', () => {
+    const r = nextCoordinationState('awaiting_counterparty', { type: 'contact_reply', reply: { kind: 'accept_slot', slot }, candidates })
+    expect(r.status).toBe('awaiting_owner_confirm')
+    expect(r.effect).toEqual({ kind: 'ping_owner_confirm', slot })
+    expect(r.agreedSlot).toEqual(slot)
+  })
+
+  it('deviation → countered + relay_out_of_window_to_owner', () => {
+    const r = nextCoordinationState('awaiting_counterparty', { type: 'contact_reply', reply: { kind: 'deviation', slot, window }, candidates })
+    expect(r.status).toBe('countered')
+    expect(r.effect).toEqual({ kind: 'relay_out_of_window_to_owner', slot, window })
+    expect(r.counterSlot).toEqual(slot)
+  })
+})
+
 describe('nextCoordinationState — contact events', () => {
   it('accept → awaiting_owner_confirm + ping owner', () => {
     const r = nextCoordinationState('awaiting_counterparty', { type: 'contact_reply', reply: { kind: 'accept', candidateIndex: 0 }, candidates })

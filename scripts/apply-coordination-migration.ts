@@ -15,7 +15,7 @@ import 'dotenv/config'
 import { readFileSync } from 'fs'
 import postgres from 'postgres'
 
-const MIGRATIONS = ['0024_meeting_coordination.sql']
+const MIGRATIONS = ['0024_meeting_coordination.sql', '0025_coordination_windows_identity.sql']
 const EXPECTED_TABLES = ['meeting_coordinations']
 
 async function main() {
@@ -61,6 +61,21 @@ async function main() {
       process.exit(1)
     }
     console.log('meeting_coordinations present ✓')
+
+    // Verify the round-1 columns exist (the actual guarantee for the fixes deploy).
+    const cols = await sql<{ table_name: string; column_name: string }[]>`
+      SELECT table_name, column_name FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND ((table_name = 'businesses' AND column_name = 'outreach_identity_mode')
+          OR (table_name = 'meeting_coordinations' AND column_name = 'allowed_windows'))`
+    const haveCols = new Set(cols.map((c) => `${c.table_name}.${c.column_name}`))
+    const wantCols = ['businesses.outreach_identity_mode', 'meeting_coordinations.allowed_windows']
+    const missingCols = wantCols.filter((c) => !haveCols.has(c))
+    if (missingCols.length > 0) {
+      console.error(`VERIFICATION FAILED — missing columns: ${missingCols.join(', ')}`)
+      process.exit(1)
+    }
+    console.log(`verification OK — columns present: ${wantCols.join(', ')}`)
 
     const rows = await sql<{ table_name: string }[]>`
       SELECT table_name FROM information_schema.tables

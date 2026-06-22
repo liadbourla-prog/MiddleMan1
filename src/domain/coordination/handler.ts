@@ -17,6 +17,7 @@ export interface BusinessCtx {
   businessName: string
   lang: Lang
   timezone: string
+  introducer?: string  // how the PA identifies itself in outreach; falls back to businessName
   waCredentials: { accessToken: string; phoneNumberId: string } | undefined
 }
 
@@ -29,6 +30,26 @@ function formatSlot(slot: Slot, ctx: BusinessCtx): string {
 
 function describeCandidates(slots: Slot[], ctx: BusinessCtx): string {
   return slots.map((s) => formatSlot(s, ctx)).join(' / ')
+}
+
+function formatWindow(w: Slot, ctx: BusinessCtx): string {
+  const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
+  const date = new Intl.DateTimeFormat(locale, { timeZone: ctx.timezone, weekday: 'long', day: 'numeric', month: 'long' }).format(w.start)
+  const t = (d: Date) => new Intl.DateTimeFormat(locale, { timeZone: ctx.timezone, hour: '2-digit', minute: '2-digit', hour12: false }).format(d)
+  return `${date} ${t(w.start)}–${t(w.end)}`
+}
+
+function describeWindows(windows: Slot[], ctx: BusinessCtx): string {
+  return windows.map((w) => formatWindow(w, ctx)).join(' / ')
+}
+
+// What to offer the contact: the day/time windows when present, else the discrete candidates.
+function describeOffer(row: { candidateSlots: Slot[]; allowedWindows: Slot[] }, ctx: BusinessCtx): string {
+  return row.allowedWindows.length > 0 ? describeWindows(row.allowedWindows, ctx) : describeCandidates(row.candidateSlots, ctx)
+}
+
+function introducerOf(ctx: BusinessCtx): string {
+  return ctx.introducer ?? ctx.businessName
 }
 
 async function phraseAndSend(opts: { toNumber: string; situation: string; fallback: string; ctx: BusinessCtx }): Promise<boolean> {
@@ -46,27 +67,35 @@ async function phraseAndSend(opts: { toNumber: string; situation: string; fallba
 // Owner asks the PA to coordinate. Contact already registered + slots resolved by the tool.
 export async function startCoordination(db: Db, calendar: CalendarClient, input: {
   businessId: string; ownerId: string; contactId: string; contactPhone: string;
-  title: string; durationMinutes: number; candidateSlots: Slot[]; ctx: BusinessCtx;
+  title: string; durationMinutes: number; candidateSlots: Slot[]; allowedWindows?: Slot[]; ctx: BusinessCtx;
 }): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
-  // Availability guard: keep only candidates the owner's calendar is free for.
-  const freeSlots: Slot[] = []
-  for (const s of input.candidateSlots) {
-    const avail = await calendar.checkAvailability(s)
-    if (avail.status === 'available') freeSlots.push(s)
+  const useWindows = !!input.allowedWindows && input.allowedWindows.length > 0
+
+  // Discrete path keeps the per-candidate availability pre-filter. Windows path offers the
+  // owner-given ranges as-is and relies on the book-time availability re-check (no holds).
+  let offerSlots = input.candidateSlots
+  if (!useWindows) {
+    const freeSlots: Slot[] = []
+    for (const s of input.candidateSlots) {
+      const avail = await calendar.checkAvailability(s)
+      if (avail.status === 'available') freeSlots.push(s)
+    }
+    if (freeSlots.length === 0) return { ok: false, reason: 'no_free_candidates' }
+    offerSlots = freeSlots
   }
-  if (freeSlots.length === 0) return { ok: false, reason: 'no_free_candidates' }
 
   const expiresAt = new Date(Date.now() + COORDINATION_EXPIRY_HOURS * 3_600_000)
   const id = await repo.insertCoordination(db, {
     businessId: input.businessId, ownerId: input.ownerId, contactId: input.contactId,
-    title: input.title, durationMinutes: input.durationMinutes, candidateSlots: freeSlots, expiresAt,
+    title: input.title, durationMinutes: input.durationMinutes, candidateSlots: offerSlots,
+    allowedWindows: input.allowedWindows ?? null, expiresAt,
   })
 
-  const times = describeCandidates(freeSlots, input.ctx)
+  const times = useWindows ? describeWindows(input.allowedWindows!, input.ctx) : describeCandidates(offerSlots, input.ctx)
   const sent = await phraseAndSend({
     toNumber: input.contactPhone,
     situation: `You are reaching out on behalf of the business to set up a meeting ("${input.title}"). Offer these times and invite them to pick one or propose another: ${times}.`,
-    fallback: i18n.coordination_offer_to_contact[input.ctx.lang](input.ctx.businessName, times),
+    fallback: i18n.coordination_offer_to_contact[input.ctx.lang](introducerOf(input.ctx), times),
     ctx: input.ctx,
   })
 
@@ -90,11 +119,11 @@ export async function advanceFromContact(db: Db, calendar: CalendarClient, row: 
   if (intent.kind === 'unclear') {
     const { phone } = await repo.getIdentityContact(db, row.contactId)
     if (phone) {
-      const times = describeCandidates(row.candidateSlots, ctx)
+      const times = describeOffer(row, ctx)
       await phraseAndSend({
         toNumber: phone,
         situation: `Their reply about the meeting time was unclear. Ask one short question to clarify which of these works, or what time they prefer: ${times}.`,
-        fallback: i18n.coordination_offer_to_contact[ctx.lang](ctx.businessName, times),
+        fallback: i18n.coordination_offer_to_contact[ctx.lang](introducerOf(ctx), times),
         ctx,
       })
     }
@@ -102,7 +131,7 @@ export async function advanceFromContact(db: Db, calendar: CalendarClient, row: 
   }
 
   const reply: ContactReplyClass = intent.kind === 'time'
-    ? classifyContactReply(intent.slot, row.candidateSlots)
+    ? classifyContactReply(intent.slot, row.candidateSlots, row.allowedWindows)
     : { kind: 'decline' }
 
   const t = nextCoordinationState(row.status, { type: 'contact_reply', reply, candidates: row.candidateSlots })
@@ -146,6 +175,20 @@ async function applyTransition(db: Db, calendar: CalendarClient, row: repo.Coord
       await auditContactReplied('countered', e.slot)
       break
     }
+    case 'relay_out_of_window_to_owner': {
+      // Persist the proposed slot as BOTH counter and agreed, so an owner "confirm" books it.
+      await repo.updateCoordination(db, row.id, { status: t.status, counterSlot: e.slot, agreedSlot: e.slot })
+      const time = formatSlot(e.slot, ctx)
+      const win = formatWindow(e.window, ctx)
+      if (owner.phone) await phraseAndSend({
+        toNumber: owner.phone,
+        situation: `The contact ${contactName} wants ${time} for "${row.title}", but that is OUTSIDE the owner's allowed window (${win}). Surface this as a deviation: ask the owner to accept this out-of-window time, or to have you push for a time inside the window. Do NOT say it is booked.`,
+        fallback: i18n.coordination_deviation_to_owner[ctx.lang](contactName, time, win),
+        ctx,
+      })
+      await auditContactReplied('out_of_window', e.slot)
+      break
+    }
     case 'relay_decline_to_owner': {
       await repo.updateCoordination(db, row.id, { status: t.status })
       if (owner.phone) await phraseAndSend({ toNumber: owner.phone, situation: `The contact ${contactName} declined the meeting "${row.title}".`, fallback: i18n.coordination_decline_to_owner[ctx.lang](contactName), ctx })
@@ -156,7 +199,7 @@ async function applyTransition(db: Db, calendar: CalendarClient, row: repo.Coord
       const newCandidates = [...row.candidateSlots, e.slot]
       await repo.updateCoordination(db, row.id, { status: t.status, candidateSlots: newCandidates })
       const time = formatSlot(e.slot, ctx)
-      if (contact.phone) await phraseAndSend({ toNumber: contact.phone, situation: `Offer the contact a new meeting time the owner proposed: ${time}. Ask if it works.`, fallback: i18n.coordination_offer_to_contact[ctx.lang](ctx.businessName, time), ctx })
+      if (contact.phone) await phraseAndSend({ toNumber: contact.phone, situation: `Offer the contact a new meeting time the owner proposed: ${time}. Ask if it works.`, fallback: i18n.coordination_offer_to_contact[ctx.lang](introducerOf(ctx), time), ctx })
       await logAudit(db, { businessId: ctx.businessId, actorId: row.ownerId, action: 'coordination.owner_counter_offer', entityType: 'meeting_coordination', entityId: row.id, metadata: { slotStart: e.slot.start.toISOString() } })
       break
     }
@@ -187,8 +230,8 @@ async function applyTransition(db: Db, calendar: CalendarClient, row: repo.Coord
       break
     }
     case 'message_contact_candidates': {
-      const times = describeCandidates(row.candidateSlots, ctx)
-      if (contact.phone) await phraseAndSend({ toNumber: contact.phone, situation: `Re-send the meeting time options: ${times}.`, fallback: i18n.coordination_offer_to_contact[ctx.lang](ctx.businessName, times), ctx })
+      const times = describeOffer(row, ctx)
+      if (contact.phone) await phraseAndSend({ toNumber: contact.phone, situation: `Re-send the meeting time options: ${times}.`, fallback: i18n.coordination_offer_to_contact[ctx.lang](introducerOf(ctx), times), ctx })
       break
     }
     case 'none':

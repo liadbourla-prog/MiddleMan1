@@ -63,6 +63,9 @@ export const businesses = pgTable('businesses', {
   // null = owner never asked → first freed slot asks AND offers to set a standing pref.
   // 'ask' = ask each time · 'auto' = offer automatically · 'never' = never offer.
   freedSlotOfferPolicy: text('freed_slot_offer_policy', { enum: ['ask', 'auto', 'never'] }),
+  // How the PA introduces itself when reaching out on the owner's behalf during a
+  // meeting coordination. null = not yet chosen (the PA asks the owner once).
+  outreachIdentityMode: text('outreach_identity_mode', { enum: ['business', 'owner_name'] }),
   cancellationFeeAmount: numeric('cancellation_fee_amount', { precision: 10, scale: 2 }),
   cancellationFeeCurrency: text('cancellation_fee_currency'),
   // Website builder
@@ -638,6 +641,9 @@ export const meetingCoordinations = pgTable(
     durationMinutes: integer('duration_minutes').notNull(),
     // [{ start: ISO, end: ISO }] — primary + fallbacks, resolved to absolute UTC.
     candidateSlots: jsonb('candidate_slots').notNull(),
+    // [{ start: ISO, end: ISO }] — owner-given day/time RANGES (acceptable start..end).
+    // Null/absent ⇒ the discrete candidateSlots path. The negotiation boundary.
+    allowedWindows: jsonb('allowed_windows'),
     status: text('status', {
       enum: ['awaiting_counterparty', 'countered', 'awaiting_owner_confirm', 'confirmed', 'declined', 'expired', 'abandoned'],
     }).notNull().default('awaiting_counterparty'),
