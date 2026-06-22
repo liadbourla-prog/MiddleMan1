@@ -777,8 +777,8 @@ const strings = {
 
   // ── Meeting coordination fallback strings ─────────────────────────────────
   coordination_offer_to_contact: {
-    he: (businessName: string, times: string) => `שלום, מ${businessName} — רוצים לקבוע פגישה. מתאים לך אחד מהמועדים: ${times}? אפשר גם להציע זמן אחר.`,
-    en: (businessName: string, times: string) => `Hi, this is ${businessName} — we'd like to set up a meeting. Do any of these work: ${times}? Or suggest another time.`,
+    he: (introducer: string, times: string) => `שלום, מ${introducer} — רוצים לקבוע פגישה. מתאים לך אחד מהמועדים: ${times}? אפשר גם להציע זמן אחר.`,
+    en: (introducer: string, times: string) => `Hi, this is ${introducer} — we'd like to set up a meeting. Do any of these work: ${times}? Or suggest another time.`,
   },
   coordination_confirm_to_owner: {
     he: (contact: string, time: string) => `${contact} פנוי ל${time}. לקבוע?`,
@@ -787,6 +787,10 @@ const strings = {
   coordination_counter_to_owner: {
     he: (contact: string, time: string) => `${contact} הציע ${time} במקום. לאשר, או להציע זמן אחר?`,
     en: (contact: string, time: string) => `${contact} suggested ${time} instead. Take it, or offer another time?`,
+  },
+  coordination_deviation_to_owner: {
+    he: (contact: string, time: string, window: string) => `${contact} מבקש ${time}, אבל הגדרת ${window}. לאשר בכל זאת, או שאבקש זמן בתוך החלון?`,
+    en: (contact: string, time: string, window: string) => `${contact} wants ${time}, but you set ${window}. Accept anyway, or should I ask for a time inside your window?`,
   },
   coordination_decline_to_owner: {
     he: (contact: string) => `${contact} לא יכול במועדים שהצענו.`,
