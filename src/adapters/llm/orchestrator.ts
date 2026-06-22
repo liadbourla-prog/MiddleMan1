@@ -192,7 +192,7 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'deleteCalendarEvent',
-    description: 'Delete a personal/business event, intra-day block, or scheduled class from the calendar. Only for events the manager created (meetings, blocks, personal appointments, group sessions). Never use this to cancel a customer booking — use manageBusinessSettings for booking cancellations.',
+    description: 'Delete a personal/business event, intra-day block, or scheduled class/group session from the calendar. Only for events the manager created (meetings, blocks, personal appointments, group sessions). Use this to cancel a whole class/group SESSION — it automatically cancels every booking on that session, sends each booked customer a cancellation notice that offers to rebook them, and notifies the session instructor. Do NOT use it to cancel a single customer\'s individual (1-on-1) booking — use manageBusinessSettings for that.',
     parameters: {
       type: Type.OBJECT,
       properties: {

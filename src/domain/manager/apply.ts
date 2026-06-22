@@ -9,6 +9,7 @@ import { grantDelegatedPermissions, revokeAllDelegatedPermissions } from '../aut
 import type { IdentityRole } from '../../db/schema.js'
 import { logAudit } from '../audit/logger.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
+import { notifyInstructorsOfCancelledBookings } from '../scheduling/session-cancellation.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { createBlock } from '../availability/blocks.js'
@@ -254,7 +255,7 @@ async function applyAvailabilityChange(
   // the availability table — this is what makes "block 2–4pm Tuesday" possible
   // (CALENDAR_UX_DESIGN.md §4). Whole-day blocks (no times) keep the old path.
   if (p.action === 'block' && p.specificDate && p.openTime && p.closeTime) {
-    return applyIntradayBlock(db, businessId, p.specificDate, p.openTime, p.closeTime, p.reason ?? null, lang)
+    return applyIntradayBlock(db, businessId, actorId, p.specificDate, p.openTime, p.closeTime, p.reason ?? null, lang)
   }
 
   if (p.action === 'block' || p.action === 'bulk_close') {
@@ -262,7 +263,7 @@ async function applyAvailabilityChange(
     if (p.specificDate) {
       const { dayStart, dayEndExclusive } = localDayBounds(p.specificDate, bizTz)
       const affected = await db
-        .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId })
+        .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId, providerId: bookings.providerId, serviceTypeId: bookings.serviceTypeId })
         .from(bookings)
         .where(
           and(
@@ -347,6 +348,14 @@ async function applyAvailabilityChange(
             })
             .where(eq(bookings.id, booking.id))
         }
+
+        // Notify the instructor(s) of any cancelled sessions (deduped per session).
+        await notifyInstructorsOfCancelledBookings(db, {
+          businessId,
+          lang,
+          actorId,
+          cancelled: affected.map((b) => ({ providerId: b.providerId, serviceTypeId: b.serviceTypeId, slotStart: b.slotStart })),
+        }).catch(() => { /* non-fatal */ })
       }
     }
 
@@ -470,6 +479,7 @@ async function applyAvailabilityChange(
 async function applyIntradayBlock(
   db: Db,
   businessId: string,
+  actorId: string,
   specificDate: string,
   openTime: string,
   closeTime: string,
@@ -491,7 +501,7 @@ async function applyIntradayBlock(
 
   // Cancel + notify bookings overlapping the blocked window.
   const affected = await db
-    .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId })
+    .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId, providerId: bookings.providerId, serviceTypeId: bookings.serviceTypeId })
     .from(bookings)
     .where(and(
       eq(bookings.businessId, businessId),
@@ -523,6 +533,15 @@ async function applyIntradayBlock(
     }
   }
 
+  // Notify the instructor(s) of any cancelled sessions inside the blocked window (deduped
+  // per session — a range can span several classes with different instructors).
+  const instructorsNotified = await notifyInstructorsOfCancelledBookings(db, {
+    businessId,
+    lang,
+    actorId,
+    cancelled: affected.map((b) => ({ providerId: b.providerId, serviceTypeId: b.serviceTypeId, slotStart: b.slotStart })),
+  }).catch(() => 0)
+
   const block = await createBlock(db, {
     businessId,
     type: 'block',
@@ -535,8 +554,11 @@ async function applyIntradayBlock(
   // Durable outbound mirror (Phase 2) — no-op in internal mode.
   await enqueueBlockMirror(businessId, block.id)
 
+  const instructorNote = instructorsNotified > 0
+    ? (lang === 'he' ? ` ${instructorsNotified} מדריך/ים עודכנו.` : ` ${instructorsNotified} instructor(s) notified.`)
+    : ''
   const affectedNote = affected.length > 0
-    ? (lang === 'he' ? ` ${affected.length} תורים בוטלו והלקוחות עודכנו.` : ` ${affected.length} booking(s) were cancelled and customers notified.`)
+    ? (lang === 'he' ? ` ${affected.length} תורים בוטלו והלקוחות עודכנו.${instructorNote}` : ` ${affected.length} booking(s) were cancelled and customers notified.${instructorNote}`)
     : ''
   const msg = lang === 'he'
     ? `✅ נחסם ${specificDate} בין ${openTime} ל-${closeTime}.${affectedNote}`

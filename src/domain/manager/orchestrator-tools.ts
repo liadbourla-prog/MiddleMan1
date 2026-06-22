@@ -29,6 +29,7 @@ import { sendMessage } from '../../adapters/whatsapp/sender.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
 import { logAudit } from '../audit/logger.js'
 import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
+import { cancelClassSessionBookings, summarizeSessionCancellation } from '../scheduling/session-cancellation.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -545,6 +546,24 @@ export async function executeDeleteCalendarEvent(
   // 'block:' prefix in read-back. Delete them from the internal store directly.
   const blockId = parseBlockId(args.eventId)
   if (blockId) {
+    // Read the block first: a class session may have a roster + instructor that must NOT be
+    // silently orphaned by a bare delete. Cancel the bookings (notifying each customer with a
+    // rebooking offer) and notify the instructor BEFORE removing the block.
+    const block = await getBlockById(ctx.db, ctx.businessId, blockId)
+    if (!block) {
+      return { success: false, reason: 'not_found' }
+    }
+
+    let cancellation = { cancelledCount: 0, instructorNotified: false }
+    if (block.type === 'class') {
+      cancellation = await cancelClassSessionBookings(ctx.db, {
+        businessId: ctx.businessId,
+        block,
+        actorId: ctx.identityId,
+        lang: ctx.lang,
+      })
+    }
+
     const removed = await deleteBlockById(ctx.db, ctx.businessId, blockId)
     if (!removed) {
       return { success: false, reason: 'not_found' }
@@ -552,6 +571,16 @@ export async function executeDeleteCalendarEvent(
     // Durable mirror: remove the corresponding Google event when one was created.
     if (removed.googleEventId) {
       await enqueueBlockDeletion(ctx.businessId, removed.id, removed.googleEventId)
+    }
+
+    if (block.type === 'class') {
+      return {
+        success: true,
+        deleted: { what: args.confirmationHint ?? block.title ?? null },
+        cancelledBookings: cancellation.cancelledCount,
+        instructorNotified: cancellation.instructorNotified,
+        guidance: summarizeSessionCancellation(cancellation.cancelledCount, cancellation.instructorNotified),
+      }
     }
     return { success: true, deleted: { what: args.confirmationHint ?? null } }
   }

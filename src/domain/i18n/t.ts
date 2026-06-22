@@ -545,6 +545,14 @@ const strings = {
       `Sorry for the surprise — we had to cancel your ${date} appointment because of a schedule change. Want me to find you another time? Just tell me when works and I'll sort it.`,
   },
 
+  // Sent to the session's instructor when the owner cancels a class they teach.
+  class_cancelled_instructor: {
+    he: (className: string, date: string) =>
+      `עדכון: השיעור "${className}" ב-${date} בוטל. תודה!`,
+    en: (className: string, date: string) =>
+      `Heads up — the "${className}" class on ${date} has been cancelled. Thanks!`,
+  },
+
   // ── Reminders ────────────────────────────────────────────────────────────────
   reminder_24h: {
     he: (service: string, biz: string, date: string, time: string) =>
