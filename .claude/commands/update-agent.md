@@ -70,17 +70,21 @@ Add a new business to the system without redeploying code:
 1. Start Cloud SQL proxy locally: `./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &`
 2. Ask the user for any missing provision values, then run:
    ```bash
-   LOCAL_DB_URL="postgres://pa_user:$(gcloud secrets versions access latest --secret=db-user-password --project=deepr-490316 2>/dev/null || read -s -p 'DB password: ' P && echo $P)@127.0.0.1:5433/pa4business"
+   # Derive the local proxy URL from the authoritative DATABASE_URL secret (reuses the
+   # exact stored credentials — do NOT reconstruct from a separate password secret).
+   LOCAL_DB_URL=$(gcloud secrets versions access latest --secret=DATABASE_URL --project=deepr-490316 2>/dev/null | python3 -c "import re,sys; u=sys.stdin.read().strip(); u=re.sub(r'\?host=.*$','',u); u=re.sub(r'@/','@127.0.0.1:5433/',u); print(u)")
    DATABASE_URL="$LOCAL_DB_URL" PROVISION_WA_NUMBER="..." PROVISION_MANAGER_PHONE="..." PROVISION_BUSINESS_NAME="..." PROVISION_CALENDAR_ID="..." PROVISION_TIMEZONE="..." npm run provision
    ```
-   If the `db-user-password` secret doesn't exist in Secret Manager, prompt the user for the password.
+   The credentials come from the `DATABASE_URL` secret (the same one the running service uses). Note: a standalone `db-password` secret exists but does NOT authenticate on its own — always derive the local URL from `DATABASE_URL` as shown. If reading `DATABASE_URL` fails, prompt the user for the connection string.
 
 ### Migrations only ("migrate", "migrations")
 1. Start Cloud SQL proxy: `./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &`
 2. Wait for "Listening" confirmation
 3. Run:
    ```bash
-   LOCAL_DB_URL="postgres://pa_user:$(gcloud secrets versions access latest --secret=db-user-password --project=deepr-490316 2>/dev/null || read -s -p 'DB password: ' P && echo $P)@127.0.0.1:5433/pa4business"
+   # Derive the local proxy URL from the authoritative DATABASE_URL secret (reuses the
+   # exact stored credentials — do NOT reconstruct from a separate password secret).
+   LOCAL_DB_URL=$(gcloud secrets versions access latest --secret=DATABASE_URL --project=deepr-490316 2>/dev/null | python3 -c "import re,sys; u=sys.stdin.read().strip(); u=re.sub(r'\?host=.*$','',u); u=re.sub(r'@/','@127.0.0.1:5433/',u); print(u)")
    DATABASE_URL="$LOCAL_DB_URL" npm run db:migrate
    ```
 4. **Always run migration verification after** (see below)
@@ -98,7 +102,8 @@ MiddleMan's WhatsApp number is a plain env var (not a secret). To change it:
 `npm run db:migrate` can report "applied successfully" while silently skipping new migrations (journal hash mismatch). Always verify by checking a key new column:
 
 ```bash
-LOCAL_DB_URL="postgres://pa_user:$(gcloud secrets versions access latest --secret=db-user-password --project=deepr-490316 2>/dev/null || read -s -p 'DB password: ' P && echo $P)@127.0.0.1:5433/pa4business"
+# Derive from the authoritative DATABASE_URL secret (reuses the running service's exact credentials).
+LOCAL_DB_URL=$(gcloud secrets versions access latest --secret=DATABASE_URL --project=deepr-490316 2>/dev/null | python3 -c "import re,sys; u=sys.stdin.read().strip(); u=re.sub(r'\?host=.*$','',u); u=re.sub(r'@/','@127.0.0.1:5433/',u); print(u)")
 ./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &
 sleep 4
 node --input-type=module <<EOF
