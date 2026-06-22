@@ -54,6 +54,7 @@ import { buildSkillContext } from '../domain/skills/context-builder.js'
 import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
 import { findActiveByContact } from '../domain/coordination/repository.js'
 import { advanceFromContact, type BusinessCtx } from '../domain/coordination/handler.js'
+import { resolveOutreachIntroducer } from '../domain/coordination/introducer.js'
 
 export async function webhookRoutes(app: FastifyInstance) {
   // Webhook verification handshake (GET)
@@ -206,6 +207,10 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
     metadata: { messageId: msg.messageId, role: identity.role },
   })
 
+  // Routing-first: an active coordination owns its counterparty's inbound (fixes the
+  // customer-as-counterparty hijack). Falls through for everyone else.
+  if (await tryAdvanceActiveCoordination(msg, identity, business)) return
+
   if (identity.role === 'manager' || identity.role === 'delegated_user') {
     await routeManagerMessage(msg, identity, business, app)
   } else if (identity.role === 'contact') {
@@ -270,6 +275,47 @@ async function notifyManagerOfError(msg: InboundMessage, errorMsg: string, app: 
     toNumber: managerIdentity.phoneNumber,
     body: i18n.manager_process_error[lang](msg.fromNumber, errorMsg.slice(0, 200)),
   }, waCredentials)
+}
+
+// Routing-first interception: while a coordination is active, the counterparty's inbound
+// belongs to that coordination — regardless of their role (customer or contact). Returns
+// true if the message was handled (caller must then return). Gated to non-owner senders so
+// the manager/delegated path is never touched. One indexed read; null for ~all customers.
+export async function tryAdvanceActiveCoordination(
+  msg: InboundMessage,
+  identity: ResolvedIdentity,
+  business: Business,
+): Promise<boolean> {
+  if (identity.role === 'manager' || identity.role === 'delegated_user') return false
+  const active = await findActiveByContact(db, business.id, identity.id)
+  if (!active) return false
+
+  const lang: Lang = (identity.preferredLanguage ?? (business.defaultLanguage as Lang | null | undefined)) ?? 'he'
+  const waCredentials = business.whatsappPhoneNumberId && business.whatsappAccessToken
+    ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
+    : undefined
+  const [mgr] = await db
+    .select({ name: identities.displayName })
+    .from(identities)
+    .where(and(eq(identities.businessId, business.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+  const introducer = resolveOutreachIntroducer({
+    mode: (business.outreachIdentityMode as 'business' | 'owner_name' | null) ?? null,
+    businessName: business.name,
+    ownerName: mgr?.name ?? null,
+    lang,
+  })
+  const calendar = createCalendarClient({
+    accessToken: '',
+    refreshToken: business.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
+    calendarId: business.googleCalendarId,
+    businessId: business.id,
+    calendarMode: business.calendarMode,
+    lang,
+  })
+  const ctx: BusinessCtx = { businessId: business.id, businessName: business.name, lang, timezone: business.timezone, waCredentials, introducer }
+  await advanceFromContact(db, calendar, active, msg.body, ctx)
+  return true
 }
 
 export async function routeContactMessage(
