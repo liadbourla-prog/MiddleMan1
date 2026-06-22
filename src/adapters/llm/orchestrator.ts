@@ -5,9 +5,9 @@
 
 import { GoogleGenAI, Type, FunctionCallingConfigMode } from '@google/genai'
 import type { Content, FunctionDeclaration } from '@google/genai'
-import { desc, eq } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { db } from '../../db/client.js'
-import { managerMemory } from '../../db/schema.js'
+import { managerMemory, identities, businesses as businessesTable } from '../../db/schema.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../../domain/authorization/check.js'
 import { buildInstructorRosterBlock, buildTeachingScheduleBlock, type InstructorRosterEntry, type TeachingSlot } from '../../domain/provider/roster.js'
@@ -341,17 +341,20 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'coordinateMeeting',
-    description: 'Coordinate a NEW meeting with someone on the owner\'s behalf — only when the owner has NOT already agreed a time and wants the PA to reach out. First confirm with the owner that they want you to coordinate (vs. they already set it), and capture a primary time AND one or two fallback times. Report all dates/times as structured pieces — NEVER an absolute/ISO date. For a meeting whose time is already agreed, use createCalendarEvent instead.',
+    description: 'Coordinate a NEW meeting with someone on the owner\'s behalf — only when the owner has NOT already agreed a time and wants the PA to reach out. The counterparty may be a brand-new person OR an existing customer. First confirm the owner wants you to coordinate (vs. they already set it). Provide EITHER a primary time + one or two fallbacks (discrete times) OR day/time "windows" (ranges like "Tue 10–16, Wed 11–15") plus durationMinutes. Report all dates/times as structured pieces — NEVER an absolute/ISO date. If the owner has not told you how to introduce yourself when reaching out (and there is no saved preference shown under "Outreach identity"), ask them first and pass identifyAs (and ownerName if they choose their own name). For a meeting whose time is already agreed, use createCalendarEvent instead.',
     parameters: { type: Type.OBJECT, properties: {
       contactName: { type: Type.STRING, description: 'Name of the person to meet, if given.' },
-      phoneNumber: { type: Type.STRING, description: 'Their phone in E.164 — required to reach someone new.' },
+      phoneNumber: { type: Type.STRING, description: 'Their phone in E.164 — required to reach someone new (an existing customer can be matched by this too).' },
       title: { type: Type.STRING, description: 'What the meeting is about (e.g. "Meeting with the accountant").' },
       date: DATE_PIECES_SCHEMA,
-      startTime: timeSchema('Primary start clock time the owner said, 24-hour'),
+      startTime: timeSchema('Primary start clock time the owner said, 24-hour (discrete-times path)'),
       endTime: timeSchema('Primary end clock time, 24-hour. Provide this OR durationMinutes.'),
-      durationMinutes: { type: Type.NUMBER, description: 'Meeting length in minutes; provide this OR endTime.' },
-      fallbacks: { type: Type.ARRAY, description: 'One or two backup times to offer if the primary does not work.', items: { type: Type.OBJECT, properties: { date: DATE_PIECES_SCHEMA, startTime: timeSchema('Fallback start time, 24-hour') }, required: ['date', 'startTime'] } },
-    }, required: ['title', 'date', 'startTime'] },
+      durationMinutes: { type: Type.NUMBER, description: 'Meeting length in minutes. REQUIRED when using windows; otherwise provide this OR endTime.' },
+      fallbacks: { type: Type.ARRAY, description: 'One or two backup discrete times to offer if the primary does not work.', items: { type: Type.OBJECT, properties: { date: DATE_PIECES_SCHEMA, startTime: timeSchema('Fallback start time, 24-hour') }, required: ['date', 'startTime'] } },
+      windows: { type: Type.ARRAY, description: 'Day/time RANGES the owner is available within (e.g. "Tue 10–16, Wed 11–15"). Use this when the owner gives ranges rather than exact times. Each window has a date and a start..end clock time. Requires durationMinutes.', items: { type: Type.OBJECT, properties: { date: DATE_PIECES_SCHEMA, startTime: timeSchema('Window start clock time, 24-hour'), endTime: timeSchema('Window end clock time, 24-hour') }, required: ['date', 'startTime', 'endTime'] } },
+      identifyAs: { type: Type.STRING, enum: ['business', 'owner_name'], description: 'How to introduce yourself in the outreach: as the business, or as the owner\'s assistant. Pass this once the owner has answered; it is then saved.' },
+      ownerName: { type: Type.STRING, description: "The owner's real name, when they choose to be identified by name and you don't already have it. It will be saved." },
+    }, required: ['title'] },
   },
   {
     name: 'resolveMeetingCoordination',
@@ -489,9 +492,10 @@ function buildSystemPrompt(params: {
   managerMemorySummaries: string[]
   actionLedger: string
   activeCoordinations: string
+  outreachIdentity: string
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, outreachIdentity, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -547,7 +551,8 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - lookupCustomer / saveContactNote: only for customer or contact management requests. When the owner asks whether a customer has replied or what they said, you MUST call lookupCustomer with recent_messages and answer from the result — never say "not yet" or "they replied" from memory or assumption.
 - connectGoogleCalendar: ALWAYS use this when the owner wants to connect, sync, or link Google Calendar. It returns the real sign-in link — send that link to the owner here in WhatsApp, on its own line. You have NO email and no way to send email: never offer to email the link, never ask for an email address, and never claim you emailed anything.
 - messageCustomer: use to actually send a WhatsApp message to a specific customer the owner names (e.g. "ask Harel when he's free"). Compose the message and confirm with the owner first, then call the tool. Only tell the owner the message was sent if the tool returns ok:true; if it reports the customer can't be reached (e.g. they haven't messaged recently), relay that honestly and never pretend it went out.
-- coordinateMeeting: use ONLY when the owner wants you to reach out and arrange a meeting with someone whose time is NOT yet agreed. First ask, in ONE question, whether they have already set a time (then use createCalendarEvent) or want you to coordinate; when coordinating, capture a primary time AND one or two fallback times. Never message the other person before the owner has asked you to coordinate. That person is a contact, not a customer.
+- coordinateMeeting: use ONLY when the owner wants you to reach out and arrange a meeting whose time is NOT yet agreed — with anyone, INCLUDING an existing customer. First ask, in ONE question, whether they already set a time (then use createCalendarEvent) or want you to coordinate. When coordinating, capture either a primary time + one or two fallbacks, OR day/time windows (ranges) + how long the meeting runs. ALL meeting coordination goes through this tool — never improvise a coordination with messageCustomer + createCalendarEvent. NEVER invent or guess a person's name (the owner's or anyone else's). If you don't know how to introduce yourself for outreach and no preference is shown under "Outreach identity" below, ask the owner once: whether to say you're from {business name} or {owner}'s assistant — and if they pick their own name and you don't have it, ask for it; pass identifyAs (and ownerName) to save it.
+- messageCustomer is for a SINGLE one-off ping the owner dictates (e.g. "let Dana know class is cancelled") — never for negotiating a meeting time, and never to work around coordinateMeeting. Do not use createCalendarEvent to book a meeting you coordinated; confirm it with resolveMeetingCoordination instead.
 - resolveMeetingCoordination: after the contact replies (you will see active meeting coordinations in your context), use this to confirm the agreed time (which books it and tells them), offer a different time, or abandon it. Only confirm a booking when the owner says to.
 
 ## Never claim an action you did not take
@@ -556,6 +561,7 @@ ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 ${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
 ${activeCoordinations ? `\n## Active meeting coordinations\n${activeCoordinations}` : ''}
+${outreachIdentity ? `\n## Outreach identity\n${outreachIdentity}` : ''}
 
 ## After completing actions
 If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them — phrased naturally, never the same way twice. Do not notify customers automatically — ask first.
@@ -791,6 +797,25 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
       }).join('\n')
     : ''
 
+  const [mgrName] = await db
+    .select({ name: identities.displayName })
+    .from(identities)
+    .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager')))
+    .limit(1)
+    .catch(() => [undefined as { name: string | null } | undefined])
+  const [bizRow] = await db
+    .select({ mode: businessesTable.outreachIdentityMode })
+    .from(businessesTable)
+    .where(eq(businessesTable.id, businessId))
+    .limit(1)
+    .catch(() => [undefined as { mode: 'business' | 'owner_name' | null } | undefined])
+  const ownerNameOnFile = mgrName?.name && mgrName.name.trim().toLowerCase() !== 'owner' ? mgrName.name.trim() : null
+  const outreachIdentity = bizRow?.mode === 'business'
+    ? `When reaching out on the owner's behalf, introduce yourself as "${businessName}".`
+    : bizRow?.mode === 'owner_name' && ownerNameOnFile
+      ? `When reaching out on the owner's behalf, introduce yourself as "${ownerNameOnFile}'s assistant".`
+      : `Not set yet — before your first outreach on the owner's behalf, ask whether to identify as "${businessName}" or the owner's assistant. Owner's name on file: ${ownerNameOnFile ?? '(placeholder — ask for it if they choose to be named)'}.`
+
   const systemPrompt = buildSystemPrompt({
     businessName,
     timezone,
@@ -801,6 +826,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     managerMemorySummaries,
     actionLedger,
     activeCoordinations,
+    outreachIdentity,
     conversationHistory: transcript.slice(-20),
   })
 
