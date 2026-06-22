@@ -46,6 +46,7 @@ function makeRow(): CoordinationRow {
     title: 'Intro call',
     durationMinutes: 30,
     candidateSlots: [{ start, end }],
+    allowedWindows: [],
     status: 'awaiting_owner_confirm',
     agreedSlotStart: start,
     agreedSlotEnd: end,
