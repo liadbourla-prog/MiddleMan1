@@ -1,3 +1,7 @@
+// Integration tests capture replies synchronously via AsyncLocalStorage (replyCapture.run),
+// so the debounce timer must be off — coalescing is unit-tested separately.
+process.env['MESSAGE_COALESCING'] = 'off'
+
 import crypto from 'crypto'
 import type { FastifyInstance } from 'fastify'
 import { eq, and, desc } from 'drizzle-orm'

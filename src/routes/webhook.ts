@@ -52,6 +52,7 @@ import { loadInstructorRoster, loadTeachingSchedule } from '../domain/provider/r
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
 import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
+import { bufferInbound, flushBurst, combineInbound, shouldBypassCoalescing, debounceMsForRole, coalescingEnabled } from '../domain/flows/message-coalescer.js'
 import { findActiveByContact } from '../domain/coordination/repository.js'
 import { advanceFromContact, type BusinessCtx } from '../domain/coordination/handler.js'
 import { resolveOutreachIntroducer } from '../domain/coordination/introducer.js'
@@ -211,6 +212,37 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
   // customer-as-counterparty hijack). Falls through for everyone else.
   if (await tryAdvanceActiveCoordination(msg, identity, business)) return
 
+  // Coalesce rapid bursts (Branch 3 & 4): a person sending one thought over several quick
+  // messages must get one reply, not one per message. Buffer, wait for a short silence, then
+  // process the whole burst as a single turn. Contacts and bypass cases (images, manager
+  // keyword commands) route immediately. See message-coalescer.ts.
+  if (!coalescingEnabled() || identity.role === 'contact' || shouldBypassCoalescing(msg, identity.role)) {
+    await dispatchToRole(msg, identity, business, app)
+    return
+  }
+
+  const seq = await bufferInbound(business.id, identity.id, msg)
+  setTimeout(() => {
+    void (async () => {
+      try {
+        const burst = await flushBurst(business.id, identity.id, seq)
+        if (!burst) return // a newer message arrived during the window — it owns the flush
+        await dispatchToRole(combineInbound(burst), identity, business, app)
+      } catch (err) {
+        app.log.error({ err, messageId: msg.messageId }, 'Coalesced burst flush failed')
+        await notifyManagerOfError(msg, err instanceof Error ? err.message : String(err), app).catch(() => { /* fire-and-forget */ })
+      }
+    })()
+  }, debounceMsForRole(identity.role))
+}
+
+// Run the per-role handler for a (possibly coalesced) message.
+async function dispatchToRole(
+  msg: InboundMessage,
+  identity: ResolvedIdentity,
+  business: Business,
+  app: FastifyInstance,
+) {
   if (identity.role === 'manager' || identity.role === 'delegated_user') {
     await routeManagerMessage(msg, identity, business, app)
   } else if (identity.role === 'contact') {
