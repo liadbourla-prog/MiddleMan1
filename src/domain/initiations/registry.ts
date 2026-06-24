@@ -130,6 +130,24 @@ export const INITIATORS = {
     defaultEnabled: true,
   },
 
+  // Layer C — the FIRST pay-link send for a post_payment booking (Grow Phase 2, design §3.1).
+  // Transactional ("payment due" is an always-sent operational message → the gate bypasses
+  // opt-out + quiet hours), fire_and_forget, customer audience. The owner's EXISTING
+  // automatedMessagesConfig.payment_request.enabled flag is the per-business switch (the
+  // payment-request worker is its consumer). One link per booking via dedupKey
+  // payment.request:{bookingId}; the payment.dunning_* rungs escalate separately if unpaid.
+  // windowPolicy:'skip' → no approved Meta template yet, so out-of-window sends are skipped.
+  'payment.request': {
+    id: 'payment.request',
+    layer: 'C',
+    audience: 'customer',
+    consentClass: 'transactional',
+    autonomy: 'owner_configured',
+    delivery: 'fire_and_forget',
+    windowPolicy: 'skip',
+    defaultEnabled: true,
+  },
+
   // Layer C — payment dunning over internal `pending_payment` booking state (Phase 4b). No
   // external payment processor: a booking sits in `pending_payment` until paid, and these
   // three rungs nudge the customer to complete payment as that state ages. Transactional

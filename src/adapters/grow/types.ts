@@ -29,12 +29,14 @@ export type GrowFailureReason =
 export interface CreatePaymentProcessParams {
   sum: number
   description: string
-  fullName?: string
-  phone?: string
-  email?: string
-  successUrl?: string
-  cancelUrl?: string
-  notifyUrl?: string
+  // Explicit `| undefined` so callers may pass optional customer fields straight through
+  // under exactOptionalPropertyTypes; the adapter drops undefined when building the form.
+  fullName?: string | undefined
+  phone?: string | undefined
+  email?: string | undefined
+  successUrl?: string | undefined
+  cancelUrl?: string | undefined
+  notifyUrl?: string | undefined
 }
 
 export interface CreatedPaymentProcess {

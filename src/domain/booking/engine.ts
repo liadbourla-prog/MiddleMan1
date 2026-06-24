@@ -18,7 +18,7 @@ import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { isSlotBookable } from '../availability/service.js'
 import { buildOneOnOneEventContent, refreshGroupEventRoster } from '../calendar/booking-event.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
-import type { CalendarBlockType } from '../../db/schema.js'
+import type { CalendarBlockType, Booking } from '../../db/schema.js'
 
 const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15', 10)
 
@@ -779,6 +779,36 @@ export async function confirmPaymentReceived(
 
   if (!booking) return { ok: false, reason: `No pending-payment booking found for ${customerPhone}` }
 
+  return finalizePaidBooking(
+    db,
+    calendar,
+    businessId,
+    booking,
+    { id: customer.id, preferredLanguage: customer.preferredLanguage, phoneNumber: customerPhone },
+    { actorId: manager.id, triggeredBy: 'manager_paid_command' },
+  )
+}
+
+// ── Shared paid-booking finalization ──────────────────────────────────────────
+// The single `pending_payment → confirmed/paid` edge (design §7). Drives the calendar
+// confirm, state flip, audit (with caller-supplied `triggeredBy`), spend/reminder side
+// effects, and the customer confirmation message. Two callers:
+//   • confirmPaymentReceived — the manual owner "PAID <phone>" command (triggeredBy
+//     'manager_paid_command').
+//   • PaymentService.reconcilePayment — the Grow success webhook (triggeredBy
+//     'grow_webhook'), which REPLACES the manual command on the critical path.
+// Flipping the booking out of `pending_payment` also stops the dunning worker for it
+// (that worker scans only `state = 'pending_payment'`), so cancel-on-pay is automatic.
+export async function finalizePaidBooking(
+  db: Db,
+  calendar: CalendarClient,
+  businessId: string,
+  booking: Booking,
+  customer: { id: string; preferredLanguage: string | null; phoneNumber: string },
+  opts: { actorId: string | null; triggeredBy: string },
+): Promise<BookingEngineResult> {
+  const customerPhone = customer.phoneNumber
+
   const [service] = await db
     .select({ name: serviceTypes.name })
     .from(serviceTypes)
@@ -808,13 +838,13 @@ export async function confirmPaymentReceived(
 
   await logAudit(db, {
     businessId,
-    actorId: manager.id,
+    actorId: opts.actorId,
     action: 'booking.confirmed',
     entityType: 'booking',
     entityId: booking.id,
     beforeState: { state: 'pending_payment' },
     afterState: { state: 'confirmed', paymentStatus: 'paid' },
-    metadata: { triggeredBy: 'manager_paid_command' },
+    metadata: { triggeredBy: opts.triggeredBy },
   })
 
   await recordCompletedBooking(db, businessId, customer.id, booking.id, booking.serviceTypeId)

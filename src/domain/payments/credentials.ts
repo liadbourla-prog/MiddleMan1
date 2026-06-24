@@ -174,6 +174,33 @@ export async function connectPaymentCredentials(
   return { ok: true, webhookToken }
 }
 
+/**
+ * Resolve a business + its decrypted Grow credentials from the unguessable webhook path
+ * token. Used by the payment webhook route to identify which business a Grow notify belongs
+ * to (and to re-verify / approve the transaction). Returns null for an unknown token.
+ */
+export async function getCredentialsByWebhookToken(
+  db: Db,
+  webhookToken: string,
+): Promise<(GrowCredentials & { businessId: string; webhookToken: string; webhookSecret: string }) | null> {
+  const [row] = await db
+    .select()
+    .from(businessPaymentCredentials)
+    .where(eq(businessPaymentCredentials.webhookToken, webhookToken))
+    .limit(1)
+  if (!row || row.status !== 'connected') return null
+  const apiKey = await getSecret(row.apiKeyRef)
+  return {
+    businessId: row.businessId,
+    userId: row.userId,
+    pageCode: row.pageCode,
+    apiKey,
+    environment: row.environment,
+    webhookToken: row.webhookToken,
+    webhookSecret: row.webhookSecret,
+  }
+}
+
 /** True iff this business has a connected Grow account. */
 export async function isPaymentsConnected(db: Db, businessId: string): Promise<boolean> {
   const [row] = await db

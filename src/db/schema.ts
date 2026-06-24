@@ -883,6 +883,40 @@ export const paymentConnectTokens = pgTable('payment_connect_tokens', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
+// Ledger of every charge we created (idempotency, reconciliation, audit). No secret
+// material here. See Grow design §6/§7. transaction_code is the webhook idempotency key.
+export const paymentRequests = pgTable(
+  'payment_requests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    bookingId: uuid('booking_id').references(() => bookings.id),
+    customerId: uuid('customer_id').references(() => identities.id),
+    amount: numeric('amount', { precision: 10, scale: 2 }).notNull(),
+    currency: text('currency').notNull().default('ILS'),
+    description: text('description').notNull(),
+    source: text('source', { enum: ['booking', 'owner_command', 'dunning', 'subscription'] }).notNull(),
+    growProcessId: text('grow_process_id'),
+    paymentUrl: text('payment_url'),
+    status: text('status', { enum: ['created', 'paid', 'failed', 'expired', 'refunded'] })
+      .notNull()
+      .default('created'),
+    transactionCode: text('transaction_code'),
+    invoiceNumber: text('invoice_number'),
+    invoiceUrl: text('invoice_url'),
+    dedupKey: text('dedup_key').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('payment_requests_txn_idx').on(t.transactionCode).where(sql`${t.transactionCode} IS NOT NULL`),
+    index('payment_requests_booking_idx').on(t.bookingId),
+  ],
+)
+
 // Tasks escalated to the operator (us) when a customer asks something no PA handles
 export const escalatedTasks = pgTable(
   'escalated_tasks',
@@ -1133,6 +1167,7 @@ export type WaitlistEntry = typeof waitlist.$inferSelect
 export type ImportToken = typeof importTokens.$inferSelect
 export type BusinessPaymentCredentials = typeof businessPaymentCredentials.$inferSelect
 export type PaymentConnectToken = typeof paymentConnectTokens.$inferSelect
+export type PaymentRequest = typeof paymentRequests.$inferSelect
 export type ProviderOnboardingSession = typeof providerOnboardingSessions.$inferSelect
 export type EscalatedTask = typeof escalatedTasks.$inferSelect
 export type AgentUpdateLog = typeof agentUpdateLog.$inferSelect

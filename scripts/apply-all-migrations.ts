@@ -47,11 +47,13 @@ const EXPECTED_TABLES = [
   'subscriptions',
   'business_payment_credentials',
   'payment_connect_tokens',
+  'payment_requests',
 ]
 const EXPECTED_INDEXES = [
   'initiation_log_dedup_idx',
   'initiation_approvals_dedup_idx',
   'business_payment_credentials_webhook_token_idx',
+  'payment_requests_txn_idx',
 ]
 
 // Postgres "already exists" codes — duplicate column / table-or-index / object.

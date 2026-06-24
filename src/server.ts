@@ -6,6 +6,7 @@ import { oauthRoutes } from './routes/oauth.js'
 import { calendarWebhookRoutes } from './routes/calendar-webhook.js'
 import { importRoutes } from './routes/import.js'
 import { paymentConnectRoutes } from './routes/payment-connect/index.js'
+import { paymentWebhookRoutes } from './routes/payment-webhook.js'
 import { buildSiteRoutes } from './routes/build-site/index.js'
 import { publicApiRoutes } from './routes/public-api/index.js'
 import { startHoldExpiryWorker, scheduleHoldExpiryJob } from './workers/hold-expiry.js'
@@ -28,6 +29,7 @@ import { startCoordinationExpiryWorker } from './workers/coordination-expiry.js'
 import { startWinbackWorker, scheduleWinbackJob } from './workers/winback.js'
 import { startPostAppointmentWorker, schedulePostAppointmentJob } from './workers/post-appointment.js'
 import { startDunningWorker, scheduleDunningJob } from './workers/dunning.js'
+import { startPaymentRequestWorker, schedulePaymentRequestJob } from './workers/payment-request.js'
 import { startSubscriptionRenewalWorker, scheduleSubscriptionRenewalJob } from './workers/subscription-renewal.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
@@ -80,6 +82,7 @@ await app.register(oauthRoutes)
 await app.register(calendarWebhookRoutes)
 await app.register(importRoutes)
 await app.register(paymentConnectRoutes)
+await app.register(paymentWebhookRoutes)
 await app.register(buildSiteRoutes)
 await app.register(publicApiRoutes)
 
@@ -113,6 +116,7 @@ startCoordinationExpiryWorker()
 startWinbackWorker()
 startPostAppointmentWorker()
 startDunningWorker()
+startPaymentRequestWorker()
 startSubscriptionRenewalWorker()
 await scheduleHoldExpiryJob()
 await scheduleCalendarSyncRenewalJob()
@@ -120,5 +124,6 @@ await scheduleIntegritySentinelJob()
 await scheduleWinbackJob()
 await schedulePostAppointmentJob()
 await scheduleDunningJob()
+await schedulePaymentRequestJob()
 await scheduleSubscriptionRenewalJob()
 app.log.info('Background workers started')
