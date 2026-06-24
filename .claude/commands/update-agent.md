@@ -85,9 +85,9 @@ Add a new business to the system without redeploying code:
    # Derive the local proxy URL from the authoritative DATABASE_URL secret (reuses the
    # exact stored credentials — do NOT reconstruct from a separate password secret).
    LOCAL_DB_URL=$(gcloud secrets versions access latest --secret=DATABASE_URL --project=deepr-490316 2>/dev/null | python3 -c "import re,sys; u=sys.stdin.read().strip(); u=re.sub(r'\?host=.*$','',u); u=re.sub(r'@/','@127.0.0.1:5433/',u); print(u)")
-   DATABASE_URL="$LOCAL_DB_URL" npm run db:migrate
+   DATABASE_URL="$LOCAL_DB_URL" npm run db:apply
    ```
-4. **Always run migration verification after** (see below)
+4. `db:apply` runs `scripts/apply-all-migrations.ts`, which applies **every** `src/db/migrations/*.sql` idempotently and then verifies a cross-section of tables + the `initiation_log` dedup index — exiting non-zero on any gap. This is the same step Cloud Build runs. See [Migration model](#migration-model) below.
 
 ### Change MiddleMan's number ("middleman number", "central number")
 MiddleMan's WhatsApp number is a plain env var (not a secret). To change it:
@@ -97,39 +97,39 @@ MiddleMan's WhatsApp number is a plain env var (not a secret). To change it:
 
 ---
 
-## Migration verification (REQUIRED after every deploy with new migrations)
+## Migration model
 
-`npm run db:migrate` can report "applied successfully" while silently skipping new migrations (journal hash mismatch). Always verify by checking a key new column:
+**One applier, no silent skips.** Migrations are applied by `scripts/apply-all-migrations.ts`
+(`npm run db:apply`), run automatically by Cloud Build before the image build and re-runnable
+by hand. It applies **every** `src/db/migrations/*.sql` in filename order, statement by
+statement, swallowing `42701`/`42P07`/`42710` ("already exists") so re-runs converge, then
+**verifies** a cross-section of tables + the `initiation_log` dedup index and exits non-zero
+on any gap. A silent skip therefore fails the build loudly.
 
+> History: `drizzle-kit migrate` was retired here. Its journal (`meta/_journal.json`) froze at
+> `0006`, so it silently skipped every hand-authored migration after it and required per-feature
+> apply scripts as workarounds. The applier replaces all of that. The Drizzle journal/snapshot
+> is now kept **only** as a baseline so `npm run db:generate` produces correct incremental diffs
+> when authoring a new migration's SQL — it is no longer an apply mechanism. See
+> `src/db/migrations/README.md`.
+
+### Adding a migration
+1. Edit `src/db/schema.ts`.
+2. Optionally run `npm run db:generate` to get the diff SQL as a starting point.
+3. Hand-author `src/db/migrations/NNNN_name.sql` using `IF NOT EXISTS` / `ADD COLUMN IF NOT
+   EXISTS` / `CREATE [UNIQUE] INDEX IF NOT EXISTS` so it is idempotent. Add the new table(s) to
+   `EXPECTED_TABLES` (and any load-bearing index to `EXPECTED_INDEXES`) in
+   `scripts/apply-all-migrations.ts` so the deploy verifies it.
+4. Re-run `npm run db:generate`; it should report **"No schema changes"** (snapshot back in sync).
+
+### Verify by hand (optional — Cloud Build already does this)
 ```bash
-# Derive from the authoritative DATABASE_URL secret (reuses the running service's exact credentials).
 LOCAL_DB_URL=$(gcloud secrets versions access latest --secret=DATABASE_URL --project=deepr-490316 2>/dev/null | python3 -c "import re,sys; u=sys.stdin.read().strip(); u=re.sub(r'\?host=.*$','',u); u=re.sub(r'@/','@127.0.0.1:5433/',u); print(u)")
 ./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &
 sleep 4
-node --input-type=module <<EOF
-import postgres from './node_modules/postgres/src/index.js';
-const sql = postgres('$LOCAL_DB_URL', { max: 1 });
-const cols = await sql\`SELECT column_name FROM information_schema.columns WHERE table_name='businesses' ORDER BY column_name\`;
-console.log('businesses columns:', cols.map(c => c.column_name).join(', '));
-await sql.end();
-EOF
+DATABASE_URL="$LOCAL_DB_URL" npm run db:apply   # idempotent; exits non-zero if any expected table/index is missing
 kill %1 2>/dev/null
 ```
-
-If columns from new migration files are missing, apply the SQL directly — parse and run each statement from the migration `.sql` file manually via `sql.unsafe()`, skipping `42701`/`42P07`/`42710` errors (already exists).
-
-### CRM migrations 0019 + 0020 (service_price_tiers, business_api_keys)
-
-These two were added outside the Drizzle journal, so `db:migrate` WILL skip them. Apply + verify them in one idempotent step against prod (run while the Cloud SQL proxy is up):
-
-```bash
-./cloud-sql-proxy deepr-490316:europe-west3:deepr-project --port 5433 &
-sleep 4
-DATABASE_URL="$LOCAL_DB_URL" npx tsx scripts/apply-crm-migrations.ts   # exits non-zero if tables missing
-kill %1 2>/dev/null
-```
-
-It is safe to re-run (every statement is `IF NOT EXISTS`) and it fails loudly if either table is absent — closing the silent-skip gap. The website public API (`/api/v1/*`) and the price resolver 500 without these tables, so this must succeed before/with the code deploy.
 
 ---
 

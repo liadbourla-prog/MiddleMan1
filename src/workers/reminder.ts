@@ -3,11 +3,13 @@ import { eq, and } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { bookings, identities, serviceTypes, businesses } from '../db/schema.js'
 import { enqueueMessage } from './message-retry.js'
-import { canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { sendTemplateMessage } from '../adapters/whatsapp/sender.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { getInitiator } from '../domain/initiations/registry.js'
+import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 
 const QUEUE_NAME = 'reminders'
 
@@ -134,41 +136,51 @@ async function processReminder(job: { data: ReminderJob }) {
     ? `Send a friendly 24-hour reminder: the customer has "${serviceName}" at ${biz.name} tomorrow, ${dateStr} at ${timeStr}. If they need to change or cancel, invite them to just tell you in their own words — never tell them to "reply CANCEL".`
     : `Send a friendly 1-hour reminder: the customer has "${serviceName}" at ${biz.name} in 1 hour at ${timeStr}. Warm and brief.`
 
-  const freeFormAllowed = await canSendFreeForm(customerId)
-  if (freeFormAllowed) {
-    const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: body, timeoutMs: 2500 })
-    await enqueueMessage(customer.phoneNumber, llmBody)
-  } else {
-    // Customer has not messaged in 24h — use Meta-approved template
-    const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
-      ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
-      : undefined
-    const templateName = type === '24h' ? 'appointment_reminder_24h' : 'appointment_reminder_1h'
-    await sendTemplateMessage({
-      toNumber: customer.phoneNumber,
-      templateName,
-      languageCode: lang === 'he' ? 'he' : 'en',
-      components: [{
-        type: 'body',
-        parameters: [
-          { type: 'text', text: serviceName },
-          { type: 'text', text: biz.name },
-          { type: 'text', text: type === '24h' ? dateStr : timeStr },
-        ],
-      }],
-      bodyText: body,
-      ...(waCredentials !== undefined && { credentials: waCredentials }),
-    }).catch(() => { /* non-fatal — log below */ })
-  }
+  // Out-of-window template fallback details — used by the sendTemplate executor below.
+  const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+    ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+    : undefined
+  const templateName = type === '24h' ? 'appointment_reminder_24h' : 'appointment_reminder_1h'
 
-  await logAudit(db, {
-    businessId,
-    actorId: null,
-    action: `booking.reminder_sent.${type}`,
-    entityType: 'booking',
-    entityId: bookingId,
-    metadata: { type, slotStart },
-  })
+  const decision = await dispatchInitiation(
+    db,
+    getInitiator(type === '24h' ? 'reminder.24h' : 'reminder.1h'),
+    { businessId, recipientId: customerId, dedupKey: `reminder.${type}:${bookingId}` },
+    {
+      sendFreeForm: async () => {
+        const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: body, timeoutMs: 2500 })
+        await enqueueMessage(customer.phoneNumber, llmBody)
+      },
+      sendTemplate: async () => {
+        await sendTemplateMessage({
+          toNumber: customer.phoneNumber,
+          templateName,
+          languageCode: lang === 'he' ? 'he' : 'en',
+          components: [{
+            type: 'body',
+            parameters: [
+              { type: 'text', text: serviceName },
+              { type: 'text', text: biz.name },
+              { type: 'text', text: type === '24h' ? dateStr : timeStr },
+            ],
+          }],
+          bodyText: body,
+          ...(waCredentials !== undefined && { credentials: waCredentials }),
+        }).catch(() => { /* non-fatal — log below */ })
+      },
+    },
+  )
+
+  if (decision.kind === 'send_free_form' || decision.kind === 'send_template') {
+    await logAudit(db, {
+      businessId,
+      actorId: null,
+      action: `booking.reminder_sent.${type}`,
+      entityType: 'booking',
+      entityId: bookingId,
+      metadata: { type, slotStart },
+    })
+  }
 }
 
 export function startReminderWorker() {

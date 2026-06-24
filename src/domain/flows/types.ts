@@ -20,6 +20,21 @@ export function parseConfirmation(text: string): ConfirmationParse {
   return 'unclear'
 }
 
+export type RetentionReply =
+  | { kind: 'accept'; index: number } // 0-based index into the offered slots
+  | { kind: 'decline' }
+  | { kind: 'unclear' }
+
+// Parse a customer's reply to the reschedule-retention offer. Decline reuses the shared
+// cancel/no patterns (parseConfirmation === 'no'); a bare number in [1, offeredCount] accepts
+// that slot; anything else is unclear (the handler re-asks). Mirrors parseConfirmation's purity.
+export function parseRetentionReply(text: string, offeredCount: number): RetentionReply {
+  if (parseConfirmation(text) === 'no') return { kind: 'decline' }
+  const n = parseInt(text.trim(), 10)
+  if (!isNaN(n) && n >= 1 && n <= offeredCount) return { kind: 'accept', index: n - 1 }
+  return { kind: 'unclear' }
+}
+
 export interface BookingFlowContext {
   pendingBookingId?: string
   pendingSlot?: { start: string; end: string; serviceTypeId: string; serviceName: string; providerHint?: string | null }
@@ -35,10 +50,13 @@ export interface BookingFlowContext {
   }
   // Set once a session greeting/intro has been delivered, so we never re-introduce.
   greeted?: boolean
-  awaitingConfirmationFor?: 'hold' | 'cancellation' | 'cancellation_selection'
+  awaitingConfirmationFor?: 'hold' | 'cancellation' | 'cancellation_selection' | 'retention_offer'
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'
   cancellationCandidates?: string[]
+  // Phase 3b reschedule-retention: the alternate slots offered before a confirmed cancel,
+  // carried across the turn so the customer can pick one by number.
+  retentionOfferedSlots?: Array<{ start: string; end: string; serviceTypeId: string; serviceName: string }>
   rescheduledFrom?: string
   clarificationAttempts?: number
   isReschedulingFlow?: boolean

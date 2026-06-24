@@ -24,6 +24,10 @@ import { startSeriesMaterializerWorker } from './workers/series-materializer.js'
 import { startIntegritySentinelWorker, scheduleIntegritySentinelJob } from './workers/integrity-sentinel.js'
 import { startOutreachReplyNotifyWorker } from './workers/outreach-reply-notify.js'
 import { startCoordinationExpiryWorker } from './workers/coordination-expiry.js'
+import { startWinbackWorker, scheduleWinbackJob } from './workers/winback.js'
+import { startPostAppointmentWorker, schedulePostAppointmentJob } from './workers/post-appointment.js'
+import { startDunningWorker, scheduleDunningJob } from './workers/dunning.js'
+import { startSubscriptionRenewalWorker, scheduleSubscriptionRenewalJob } from './workers/subscription-renewal.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
@@ -100,7 +104,15 @@ startReshuffleCampaignWorker()
 startIntegritySentinelWorker()
 startOutreachReplyNotifyWorker()
 startCoordinationExpiryWorker()
+startWinbackWorker()
+startPostAppointmentWorker()
+startDunningWorker()
+startSubscriptionRenewalWorker()
 await scheduleHoldExpiryJob()
 await scheduleCalendarSyncRenewalJob()
 await scheduleIntegritySentinelJob()
+await scheduleWinbackJob()
+await schedulePostAppointmentJob()
+await scheduleDunningJob()
+await scheduleSubscriptionRenewalJob()
 app.log.info('Background workers started')

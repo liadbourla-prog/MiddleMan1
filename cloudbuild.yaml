@@ -14,7 +14,10 @@ steps:
         PROXY_PID=$!
         sleep 4
         npm ci --ignore-scripts
-        DATABASE_URL="$$DB_MIGRATION_URL" npm run db:migrate
+        # Apply ALL migrations idempotently + verify (replaces drizzle-kit migrate, whose
+        # stale journal silently skips every hand-authored migration past 0006). Exits
+        # non-zero if any expected table/index is missing — a silent skip fails the build.
+        DATABASE_URL="$$DB_MIGRATION_URL" npm run db:apply
         kill $$PROXY_PID 2>/dev/null || true
 
   # Build the Docker image

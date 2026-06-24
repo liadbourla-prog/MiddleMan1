@@ -18,6 +18,8 @@ import type { EscalationRule, Business } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
+import { dispatchInitiation } from '../initiations/dispatch.js'
+import { getInitiator } from '../initiations/registry.js'
 
 export type EscalationCheckResult =
   | { escalated: false }
@@ -65,7 +67,7 @@ export async function checkOwnerEscalationRules(
 
   // Notify the business manager (look up their phone — escalation goes to manager, not customer)
   const [managerIdentity] = await db
-    .select({ phoneNumber: identities.phoneNumber })
+    .select({ id: identities.id, phoneNumber: identities.phoneNumber })
     .from(identities)
     .where(and(eq(identities.businessId, business.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
     .limit(1)
@@ -74,7 +76,13 @@ export async function checkOwnerEscalationRules(
     // Manager notification is always in the business default language (manager's language)
     const managerLang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
     const managerMessage = i18n.escalation_manager_notify[managerLang](customerPhone, messageBody.slice(0, 300))
-    await enqueueMessage(managerIdentity.phoneNumber, managerMessage).catch(() => { /* non-fatal */ })
+    await dispatchInitiation(db, getInitiator('escalation.owner_rule'), {
+      businessId: business.id,
+      recipientId: managerIdentity.id,
+      dedupKey: `escalation.owner_rule:${business.id}:${customerPhone}:${Date.now()}`,
+    }, {
+      sendFreeForm: async () => { await enqueueMessage(managerIdentity.phoneNumber, managerMessage).catch(() => {}) },
+    }).catch(() => { /* non-fatal: a ledger/notify hiccup must not break the inbound escalation flow */ })
   }
 
   // Record escalation
@@ -110,7 +118,13 @@ export async function escalateToPlatform(
     `Message: "${messageBody.slice(0, 300)}"`,
   ].join('\n')
 
-  await enqueueMessage(operatorPhone, message).catch(() => { /* non-fatal */ })
+  await dispatchInitiation(db, getInitiator('escalation.platform'), {
+    businessId: business.id,
+    recipientId: null,
+    dedupKey: `escalation.platform:${business.id}:${customerPhone}:${Date.now()}`,
+  }, {
+    sendFreeForm: async () => { await enqueueMessage(operatorPhone, message).catch(() => {}) },
+  }).catch(() => { /* non-fatal: a ledger/notify hiccup must not break platform escalation recording */ })
 
   await db.insert(escalatedTasks).values({
     businessId: business.id,

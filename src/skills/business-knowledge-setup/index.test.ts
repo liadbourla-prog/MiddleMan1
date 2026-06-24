@@ -46,6 +46,7 @@ const baseCtx: SkillContext = {
   },
   recentCompletedBooking: null,
   customerSegmentQuery: vi.fn().mockResolvedValue([]),
+  proposeInitiation: vi.fn().mockResolvedValue('proposed'),
   saveFAQs: vi.fn().mockResolvedValue(undefined),
   saveServiceNarrative: vi.fn().mockResolvedValue(undefined),
   saveBrandVoice: vi.fn().mockResolvedValue(undefined),

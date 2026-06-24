@@ -151,18 +151,34 @@ export interface CompletedBookingSummary {
   customerName: string | null
 }
 
+// Modal time band of a customer's visits (business-local). Inlined here (shared must not
+// import from core); structurally matches the core TimeBand in domain/crm/customer-profile.ts.
+export type CustomerTimeBand = 'morning' | 'afternoon' | 'evening'
+
 export interface CustomerSummary {
   identityId: string
   phoneNumber: string
   displayName: string | null
   totalBookings: number
   lastBookingAt: Date | null
+  // Behavioral profile (Phase 2). Optional so existing consumers/mocks stay valid.
+  cadenceDays?: number | null
+  preferredServiceTypeId?: string | null
+  preferredDayOfWeek?: number | null // 0=Sun..6=Sat, business-local
+  preferredTimeBand?: CustomerTimeBand | null
+  noShowRate?: number
+  vip?: boolean
 }
 
 export interface SegmentFilter {
   serviceTypeId?: string
   inactiveSinceDays?: number
   hasBooking?: boolean
+  // Behavioral targeting (Phase 2) — powers cold-fill / win-back.
+  preferredDayOfWeek?: number
+  preferredTimeBand?: CustomerTimeBand
+  lapsed?: boolean // established cadence + overshot it
+  vip?: boolean
 }
 
 export type StepStatus = 'SUCCESS' | 'RETRYABLE' | 'FATAL' | 'PAUSED'
@@ -187,6 +203,9 @@ export interface SkillContext {
   recentCompletedBooking: CompletedBookingSummary | null
   managerMemorySummaries?: string[]
   customerSegmentQuery: (filter: SegmentFilter) => Promise<CustomerSummary[]>
+  // Phase 6.3: a skill detector PROPOSES a proactive initiation; the core records the owner-confirm
+  // proposal (or sends directly once the category is ratchet-promoted). Skills never import the engine.
+  proposeInitiation: (input: ProposeInitiationInput) => Promise<ProposeInitiationOutcome>
   saveFAQs: (faqs: Array<{ question: string; answer: string }>) => Promise<void>
   saveServiceNarrative: (serviceTypeId: string, narrative: string) => Promise<void>
   saveBrandVoice: (brandVoice: string) => Promise<void>
@@ -215,6 +234,26 @@ export interface SkillContext {
     serviceArea: string[]
   }) => Promise<{ locationId: string; profileUrl: string }>
 }
+
+/**
+ * A proactive initiation a skill DETECTOR proposes (Phase 6.3; design §4.7/§5). The skill never
+ * imports the engine: it calls the injected `proposeInitiation` callback with this descriptor and
+ * the core records the owner-confirm proposal (and, once the category is ratchet-promoted, may send
+ * directly). `initiatorId` is a free string (e.g. 'churn.winback', 'hotlead.alert'); `language`
+ * defaults to the skill context language when omitted.
+ */
+export interface ProposeInitiationInput {
+  initiatorId: string
+  recipientId: string
+  recipientPhone: string
+  dedupKey: string
+  situation: string // for LLM phrasing at send time (after approval)
+  fallback: string
+  ownerSummary: string // what the owner is shown in the proposal
+  language?: 'he' | 'en'
+}
+
+export type ProposeInitiationOutcome = 'proposed' | 'duplicate' | 'recipient_opted_out'
 
 /** Everything a skill may return. The core engine decides what to do with it. */
 export interface SkillResult {

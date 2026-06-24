@@ -6,22 +6,12 @@
 
 import { and, desc, eq } from 'drizzle-orm'
 import { db } from '../../db/client.js'
-import { reshuffleOffers } from '../../db/schema.js'
-import { parseConfirmation } from '../flows/types.js'
-import { interpretOutreachReply, type OutreachClassifier } from './outreach.js'
+import { reshuffleOffers, reshuffleCampaigns, businesses } from '../../db/schema.js'
+import { interpretOutreachReply } from './outreach.js'
+import { buildOutreachClassifier } from './interpret.js'
 import { triggerReshuffleCampaign } from '../../workers/reshuffle-campaign.js'
 
 type Db = typeof db
-
-// v1 classifier: deterministic yes/no via the shared confirmation parser. Counter-offer
-// extraction (a customer naming a different slot) is a follow-on; until then a non-yes/no
-// reply is `unclear`, which the guardrail keeps safe (never a false acceptance).
-const classify: OutreachClassifier = async (text: string) => {
-  const verdict = parseConfirmation(text)
-  if (verdict === 'yes') return { intent: 'accept', confidence: 0.95 }
-  if (verdict === 'no') return { intent: 'decline', confidence: 0.95 }
-  return { intent: 'unclear' }
-}
 
 export interface ReshuffleReplyResult {
   handled: boolean
@@ -48,6 +38,21 @@ export async function handleReshuffleReply(database: Db, identityId: string, mes
     await database.update(reshuffleOffers).set({ status: 'expired' }).where(eq(reshuffleOffers.id, offer.id))
     return { handled: false }
   }
+
+  // Build the classifier for this offer: yes/no fast-path, then LLM counter-offer extraction
+  // (Phase 7.2). Needs the business timezone for slot resolution + the offered slot's duration.
+  const [biz] = await database
+    .select({ timezone: businesses.timezone })
+    .from(reshuffleCampaigns)
+    .innerJoin(businesses, eq(reshuffleCampaigns.businessId, businesses.id))
+    .where(eq(reshuffleCampaigns.id, offer.campaignId))
+    .limit(1)
+  const timezone = biz?.timezone ?? 'UTC'
+  const durationMin = Math.max(1, Math.round((offer.proposedSlotEnd.getTime() - offer.proposedSlotStart.getTime()) / 60_000))
+  const candidateSummary = offer.proposedSlotStart.toLocaleString(lang === 'he' ? 'he-IL' : 'en-GB', {
+    timeZone: timezone, weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+  const classify = buildOutreachClassifier({ durationMin, timezone, lang, candidateSummary })
 
   const verdict = await interpretOutreachReply(messageText, classify)
 
