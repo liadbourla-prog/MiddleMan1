@@ -1,10 +1,15 @@
 import { Worker, Queue } from 'bullmq'
-import { eq, and, gt, count, desc } from 'drizzle-orm'
+import { eq, and, gt, gte, lt, count, inArray } from 'drizzle-orm'
 import { db } from '../db/client.js'
-import { businesses, identities, bookings, conversationSessions } from '../db/schema.js'
+import { businesses, identities, bookings, initiationLog } from '../db/schema.js'
 import { sendMessage } from '../adapters/whatsapp/sender.js'
 import { redisConnection } from '../redis.js'
-import { i18n, type Lang } from '../domain/i18n/t.js'
+import { type Lang } from '../domain/i18n/t.js'
+import { northStarLines, ownerDigestLines } from '../domain/initiations/metrics.js'
+import { countManagedOutcomes } from '../domain/initiations/resolution-autonomy.js'
+import { resolveSlotStart, addDaysToDateStr } from '../domain/availability/resolve-slot.js'
+import { localParts } from '../domain/availability/compute.js'
+import { queryCustomerSegment } from '../domain/crm/segment-repository.js'
 
 const QUEUE_NAME = 'daily-briefing'
 const REPEAT_EVERY_MS = 15 * 60_000 // check every 15 minutes
@@ -13,7 +18,6 @@ export const dailyBriefingQueue = new Queue(QUEUE_NAME, { connection: redisConne
 
 async function processTick(): Promise<void> {
   const now = new Date()
-  const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes()
 
   // Load all businesses with daily briefing enabled
   const enabledBizList = await db
@@ -32,9 +36,6 @@ async function processTick(): Promise<void> {
   for (const biz of enabledBizList) {
     try {
       const briefingTime = biz.dailyBriefingTime ?? '09:00'
-      const [hStr = '9', mStr = '0'] = briefingTime.split(':')
-      const targetHour = parseInt(hStr, 10)
-      const targetMinute = parseInt(mStr, 10)
 
       // Convert briefing time from business timezone to UTC for comparison
       const todayLocal = new Intl.DateTimeFormat('en-CA', { timeZone: biz.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now)
@@ -102,6 +103,53 @@ async function buildBriefing(businessId: string, businessName: string, timezone:
     .from(bookings)
     .where(and(eq(bookings.businessId, businessId), eq(bookings.state, 'confirmed'), gt(bookings.slotStart, now)))
 
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60_000)
+
+  // North-star metric 1: bookings made this week (margin proxy). Count bookings CREATED in the last
+  // 7 days that became real (confirmed or attended).
+  const [bookingsWeek] = await db
+    .select({ total: count() })
+    .from(bookings)
+    .where(and(
+      eq(bookings.businessId, businessId),
+      gte(bookings.createdAt, weekAgo),
+      inArray(bookings.state, ['confirmed', 'attended']),
+    ))
+
+  // North-star metric 2: involuntary OAU this week — times the PA had to pull the owner in. Proxy =
+  // escalation initiations logged in the last 7 days (design §0.2; refined in Phase 6/7).
+  const [oauWeek] = await db
+    .select({ total: count() })
+    .from(initiationLog)
+    .where(and(
+      eq(initiationLog.businessId, businessId),
+      gte(initiationLog.createdAt, weekAgo),
+      inArray(initiationLog.initiatorId, ['escalation.owner_rule', 'escalation.platform']),
+    ))
+
+  // Managed dead-letters (reshuffle/coordination negotiations that couldn't resolve and handed back
+  // to the owner) are real involuntary OAU — add them to the escalation proxy above (design §6).
+  const managed = await countManagedOutcomes(db, businessId, weekAgo)
+
+  const metricLines = northStarLines(bookingsWeek?.total ?? 0, (oauWeek?.total ?? 0) + managed.deadLettered, lang)
+
+  // Owner-only autonomous digest (Phase 6.4; design §8.3): tomorrow's load + likely churns.
+  // Tomorrow's business-local day, resolved to UTC via the canonical slot primitives.
+  const todayStr = localParts(now, timezone).dateStr
+  const tomorrowStart = resolveSlotStart(addDaysToDateStr(todayStr, 1), { hour: 0, minute: 0 }, timezone)
+  const tomorrowEnd = resolveSlotStart(addDaysToDateStr(todayStr, 2), { hour: 0, minute: 0 }, timezone)
+  const [tomorrowCount] = await db
+    .select({ total: count() })
+    .from(bookings)
+    .where(and(
+      eq(bookings.businessId, businessId),
+      eq(bookings.state, 'confirmed'),
+      gte(bookings.slotStart, tomorrowStart),
+      lt(bookings.slotStart, tomorrowEnd),
+    ))
+  const lapsed = await queryCustomerSegment(db, businessId, { lapsed: true, hasBooking: true }, timezone)
+  const digestLines = ownerDigestLines(tomorrowCount?.total ?? 0, lapsed.length, lang)
+
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const dateStr = now.toLocaleDateString(locale, { timeZone: timezone, weekday: 'long', day: 'numeric', month: 'long' })
   const todayCount = todayBookings.length
@@ -114,7 +162,7 @@ async function buildBriefing(businessId: string, businessName: string, timezone:
     const firstAppt = todayBookings[0]
       ? `\nהתור הראשון: ${todayBookings[0].slotStart.toLocaleTimeString('he-IL', { timeZone: timezone, hour: '2-digit', minute: '2-digit' })}.`
       : ''
-    return `📅 *בוקר טוב! ${dateStr}*\n\n${todayLine}${firstAppt}\n\nסה"כ ${total} תורים מאושרים קדימה.`
+    return `📅 *בוקר טוב! ${dateStr}*\n\n${todayLine}${firstAppt}\n\nסה"כ ${total} תורים מאושרים קדימה.\n\n${digestLines}\n\n${metricLines}`
   } else {
     const todayLine = todayCount === 0
       ? 'No bookings today.'
@@ -122,7 +170,7 @@ async function buildBriefing(businessId: string, businessName: string, timezone:
     const firstAppt = todayBookings[0]
       ? `\nFirst appointment: ${todayBookings[0].slotStart.toLocaleTimeString('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit' })}.`
       : ''
-    return `📅 *Good morning! ${dateStr}*\n\n${todayLine}${firstAppt}\n\n${total} confirmed upcoming booking(s) in total.`
+    return `📅 *Good morning! ${dateStr}*\n\n${todayLine}${firstAppt}\n\n${total} confirmed upcoming booking(s) in total.\n\n${digestLines}\n\n${metricLines}`
   }
 }
 

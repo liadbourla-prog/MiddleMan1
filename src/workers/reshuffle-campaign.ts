@@ -6,18 +6,20 @@
 // file is the I/O wrapper (WhatsApp + persistence + scheduling).
 
 import { Worker, Queue } from 'bullmq'
-import { and, eq, inArray, ne } from 'drizzle-orm'
+import { and, eq, ne } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import {
-  bookings, businesses, identities, serviceTypes,
-  reshuffleCampaigns, reshuffleOffers, reshuffleProposals,
+  bookings, businesses, identities,
+  reshuffleCampaigns, reshuffleOffers,
 } from '../db/schema.js'
 import { redisConnection } from '../redis.js'
-import { sendMessage, canSendFreeForm } from '../adapters/whatsapp/sender.js'
+import { sendMessage } from '../adapters/whatsapp/sender.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { dispatchInitiation } from '../domain/initiations/dispatch.js'
+import { getInitiator } from '../domain/initiations/registry.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { type Lang } from '../domain/i18n/t.js'
-import { resolveReshuffleConfig, type ReshuffleConfig } from '../domain/reshuffle/config.js'
+import { resolveReshuffleConfig } from '../domain/reshuffle/config.js'
 import { assembleProposal } from '../domain/reshuffle/campaign.js'
 import { approveProposal } from '../domain/reshuffle/gate.js'
 import { selectBroadcastTargets, evaluateTermination, type OutreachCandidate } from '../domain/reshuffle/worker-logic.js'
@@ -53,6 +55,7 @@ async function waCredentialsFor(businessId: string) {
 
 /** Send a warm, LLM-phrased probe to one customer asking if they'll take `slotStart`. */
 async function sendProbe(
+  businessId: string,
   businessName: string,
   lang: Lang,
   customerId: string,
@@ -61,7 +64,6 @@ async function sendProbe(
   timezone: string,
   creds: { accessToken: string; phoneNumberId: string } | undefined,
 ): Promise<boolean> {
-  if (!(await canSendFreeForm(customerId))) return false // outside 24h window — skip (no reshuffle template yet)
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const dateStr = new Intl.DateTimeFormat(locale, {
     timeZone: timezone, weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit', hour12: false,
@@ -70,9 +72,17 @@ async function sendProbe(
   const fallback = lang === 'he'
     ? `שלום! נשמח לדעת אם יתאים לך להעביר את התור ל-${dateStr}? רק אם נוח לך — כלום לא משתנה בלי אישורך.`
     : `Hi! Would it work for you to move your appointment to ${dateStr}? Totally optional — nothing changes without your OK.`
-  const body = await generateProactiveCustomerMessage({ businessName, language: lang, situation, fallback, timeoutMs: 2500 })
-  await sendMessage({ toNumber: phoneNumber, body }, creds).catch(() => { /* retry queue handles transient failures */ })
-  return true
+  const decision = await dispatchInitiation(db, getInitiator('reshuffle.probe'), {
+    businessId,
+    recipientId: customerId,
+    dedupKey: `reshuffle.probe:${customerId}:${slotStart.toISOString()}`,
+  }, {
+    sendFreeForm: async () => {
+      const body = await generateProactiveCustomerMessage({ businessName, language: lang, situation, fallback, timeoutMs: 2500 })
+      await sendMessage({ toNumber: phoneNumber, body }, creds).catch(() => { /* retry queue handles transient failures */ })
+    },
+  })
+  return decision.kind === 'send_free_form'
 }
 
 /** Notify the manager that a solution is ready for approval. */
@@ -177,7 +187,7 @@ export async function processCampaignTick(campaignId: string): Promise<void> {
         campaignId, customerId: occupant.customerId, bookingId: occupant.bookingId,
         proposedSlotStart: sA, proposedSlotEnd: sAEnd, status: 'probing', offerExpiresAt,
       })
-      const sent = await sendProbe(biz.name, lang, occupant.customerId, occupant.phoneNumber, sA, biz.timezone, creds)
+      const sent = await sendProbe(campaign.businessId, biz.name, lang, occupant.customerId, occupant.phoneNumber, sA, biz.timezone, creds)
       if (sent) sentThisWave++
     }
   }
@@ -193,7 +203,7 @@ export async function processCampaignTick(campaignId: string): Promise<void> {
         campaignId, customerId: target.customerId, bookingId: target.bookingId,
         proposedSlotStart: sA, proposedSlotEnd: sAEnd, status: 'probing', offerExpiresAt,
       })
-      const sent = await sendProbe(biz.name, lang, target.customerId, who.phoneNumber, sA, biz.timezone, creds)
+      const sent = await sendProbe(campaign.businessId, biz.name, lang, target.customerId, who.phoneNumber, sA, biz.timezone, creds)
       if (sent) sentThisWave++
     }
   }
@@ -225,6 +235,7 @@ export async function processCampaignTick(campaignId: string): Promise<void> {
 
   if (verdict === 'exhausted') {
     await db.update(reshuffleCampaigns).set({ status: 'failed', resolvedAt: now }).where(eq(reshuffleCampaigns.id, campaignId))
+    await logAudit(db, { businessId: campaign.businessId, actorId: null, action: 'reshuffle.failed', entityType: 'reshuffle_campaign', entityId: campaignId, metadata: { reason: 'no_solution' } })
     await notifyRequesterFailed(campaign.businessId, campaign.requesterId)
     return
   }

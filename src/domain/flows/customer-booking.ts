@@ -12,7 +12,8 @@ import { assertsBookingConfirmed } from './reply-guard.js'
 import { inferFocusService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
-import { parseConfirmation } from './types.js'
+import { parseConfirmation, parseRetentionReply } from './types.js'
+import { logAudit } from '../audit/logger.js'
 import type { FlowResult, BookingFlowContext } from './types.js'
 import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
@@ -498,6 +499,11 @@ export async function handleBookingFlow(
   // ── Branch: waiting for cancellation confirmation ────────────────────────
   if (session.state === 'waiting_confirmation' && ctx.awaitingConfirmationFor === 'cancellation') {
     return handleCancellationConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
+  }
+
+  // ── Branch: reschedule-retention offer response ──────────────────────────
+  if (session.state === 'waiting_confirmation' && ctx.awaitingConfirmationFor === 'retention_offer') {
+    return handleRetentionResponse(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
   }
 
   // ── Branch: waiting for clarification on vague slot ──────────────────────
@@ -1718,6 +1724,14 @@ async function handleCancellationConfirmation(
     return { reply, sessionComplete: false }
   }
 
+  // Phase 3b reschedule-retention: before cancelling, optionally offer alternate slots.
+  // Returns null (and the flow proceeds to cancel as today) when the flag is OFF or no
+  // suitable slots exist — so behaviour is unchanged for every business that hasn't opted in.
+  const retention = await maybeEnterRetentionOffer(
+    db, identity, session, ctx, bookingId, businessTimezone, businessName, transcript, genReply, business,
+  )
+  if (retention) return retention
+
   const result = await cancelBooking(db, calendar, identity, bookingId, 'Customer requested via WhatsApp')
 
   if (!result.ok) {
@@ -1744,6 +1758,209 @@ async function handleCancellationConfirmation(
     customerMemory: extractMemory(ctx),
   })
   return { reply, sessionComplete: true }
+}
+
+// Phase 3b reschedule-retention (design §7.5). On a GENUINE confirmed cancellation,
+// optionally offer up to 3 open alternate slots for the same service (next 14 days)
+// before releasing the booking. Returns a FlowResult when an offer was made (the session
+// pivots to 'retention_offer'), or null to let the caller cancel exactly as today.
+// v1 scope: private/1-on-1 services only — group classes fall through to normal cancel.
+async function maybeEnterRetentionOffer(
+  db: Db,
+  identity: ResolvedIdentity,
+  session: ActiveSession,
+  ctx: BookingFlowContext,
+  bookingId: string,
+  businessTimezone: string,
+  businessName: string,
+  transcript: TranscriptTurn[],
+  genReply: GenReply,
+  business?: Business,
+): Promise<FlowResult | null> {
+  if (!business || business.rescheduleRetentionEnabled !== true) return null
+
+  const lang = ctx.detectedLanguage ?? 'en'
+
+  const [bookingRow] = await db
+    .select({ serviceTypeId: bookings.serviceTypeId })
+    .from(bookings)
+    .where(eq(bookings.id, bookingId))
+    .limit(1)
+  if (!bookingRow?.serviceTypeId) return null
+
+  const [svc] = await db
+    .select({
+      id: serviceTypes.id,
+      name: serviceTypes.name,
+      durationMinutes: serviceTypes.durationMinutes,
+      maxParticipants: serviceTypes.maxParticipants,
+    })
+    .from(serviceTypes)
+    .where(eq(serviceTypes.id, bookingRow.serviceTypeId))
+    .limit(1)
+  if (!svc) return null
+
+  // v1 scope: only private/1-on-1 services. Group classes are not retained here.
+  if ((svc.maxParticipants ?? 1) > 1) return null
+
+  const now = new Date()
+  const to = new Date(now.getTime() + 14 * 24 * 60 * 60_000)
+  const slots = await getOpenSlots(db, business, { start: now, end: to }, svc.durationMinutes, { maxSlots: 3 }).catch(() => [])
+  if (slots.length === 0) return null
+
+  const retentionOfferedSlots = slots.map((s) => ({
+    start: s.start.toISOString(),
+    end: s.end.toISOString(),
+    serviceTypeId: svc.id,
+    serviceName: svc.name,
+  }))
+
+  const newCtx: BookingFlowContext = {
+    ...ctx,
+    awaitingConfirmationFor: 'retention_offer',
+    targetBookingId: bookingId,
+    retentionOfferedSlots,
+  }
+  await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
+
+  await logAudit(db, {
+    businessId: identity.businessId,
+    actorId: null,
+    action: 'reschedule_retention.offered',
+    entityType: 'booking',
+    entityId: bookingId,
+    metadata: { offered: slots.length },
+  })
+
+  const numbered = slots
+    .map((s, i) => `${i + 1}. ${formatSlotDate(s.start, businessTimezone)} at ${formatSlotTime(s.start, businessTimezone)}`)
+    .join('; ')
+
+  const reply = await genReply({
+    businessTimezone,
+    businessName,
+    language: lang,
+    situation: `The customer asked to cancel their ${svc.name} booking. Before cancelling, warmly offer to MOVE it to one of these open times instead, listed numbered so they can reply with a number: ${numbered}. Make clear they can simply reply "cancel" to go ahead with cancelling. Brief, friendly, never pushy.`,
+    transcript,
+    ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+    customerMemory: extractMemory(ctx),
+  })
+  return { reply, sessionComplete: false }
+}
+
+// Phase 3b reschedule-retention: handle the customer's reply to the alternate-slot offer.
+// A number accepts that slot and converts the cancel into a reschedule (deferred-cancel,
+// mirroring the isReschedulingFlow accept path); 'cancel'/'no' declines and runs the same
+// cancel logic the genuine-cancel path uses; anything else re-asks.
+async function handleRetentionResponse(
+  db: Db,
+  calendar: CalendarClient,
+  identity: ResolvedIdentity,
+  session: ActiveSession,
+  ctx: BookingFlowContext,
+  messageText: string,
+  businessTimezone: string,
+  businessName: string,
+  transcript: TranscriptTurn[],
+  genReply: GenReply,
+  business?: Business,
+): Promise<FlowResult> {
+  const lang = ctx.detectedLanguage ?? 'en'
+  const offered = ctx.retentionOfferedSlots ?? []
+  const parsed = parseRetentionReply(messageText, offered.length)
+
+  if (parsed.kind === 'unclear') {
+    const reply = await genReply({
+      businessTimezone,
+      businessName,
+      language: lang,
+      situation: "The reply wasn't clear. Ask them to pick one of the offered times by number, or reply 'cancel' to cancel the booking — naturally, no menu.",
+      transcript,
+      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+      customerMemory: extractMemory(ctx),
+    })
+    return { reply, sessionComplete: false }
+  }
+
+  if (parsed.kind === 'decline') {
+    const result = await cancelBooking(db, calendar, identity, ctx.targetBookingId!, 'Customer requested via WhatsApp')
+
+    if (!result.ok) {
+      await completeSession(db, session.id)
+      const reply = await genReply({
+        businessTimezone,
+        businessName,
+        language: lang,
+        situation: `The cancellation could not be completed because ${sanitiseReason(result.reason)}. Apologise and suggest they contact the business directly.`,
+        transcript,
+        ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+        customerMemory: extractMemory(ctx),
+      })
+      return { reply, sessionComplete: true }
+    }
+
+    await completeSession(db, session.id)
+    await logAudit(db, {
+      businessId: identity.businessId,
+      actorId: null,
+      action: 'reschedule_retention.declined',
+      entityType: 'booking',
+      entityId: ctx.targetBookingId!,
+      metadata: {},
+    })
+    const reply = await genReply({
+      businessTimezone,
+      businessName,
+      language: lang,
+      situation: 'Booking successfully cancelled.',
+      transcript,
+      customerMemory: extractMemory(ctx),
+    })
+    return { reply, sessionComplete: true }
+  }
+
+  // parsed.kind === 'accept' — convert the cancel into a reschedule (deferred-cancel).
+  const chosen = offered[parsed.index]!
+  const { targetBookingId: _t, awaitingConfirmationFor: _a, retentionOfferedSlots: _r, cancellationCandidates: _c, isReschedulingFlow: _i, ...rest } = ctx
+  const lp = localParts(new Date(chosen.start), businessTimezone)
+  const slotDraft = {
+    serviceTypeId: chosen.serviceTypeId,
+    serviceName: chosen.serviceName,
+    dateStr: lp.dateStr,
+    time: { hour: Math.floor(lp.minutes / 60), minute: lp.minutes % 60 },
+  }
+  const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: ctx.targetBookingId!, slotDraft }
+
+  await logAudit(db, {
+    businessId: identity.businessId,
+    actorId: null,
+    action: 'reschedule_retention.accepted',
+    entityType: 'booking',
+    entityId: ctx.targetBookingId!,
+    metadata: { newSlot: chosen.start },
+  })
+
+  const svcRows = await db
+    .select({
+      id: serviceTypes.id,
+      name: serviceTypes.name,
+      durationMinutes: serviceTypes.durationMinutes,
+      maxParticipants: serviceTypes.maxParticipants,
+      category: serviceTypes.category,
+    })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
+  await updateSessionContext(db, session.id, newCtx, 'active')
+
+  const synthetic: CustomerIntentOutput = {
+    intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
+    participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+  }
+  return handleBookingIntent(
+    db, calendar, identity,
+    { ...session, state: 'active', context: newCtx },
+    newCtx, synthetic, svcRows, businessTimezone, businessName, transcript, genReply, '', business,
+  )
 }
 
 async function handleListBookings(

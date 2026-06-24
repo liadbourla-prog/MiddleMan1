@@ -33,8 +33,11 @@ import {
   executeResumeConversation,
   executeApproveReshuffle,
   executeRejectReshuffle,
+  executeResolveProactiveProposal,
   executeAmendReshuffle,
   executeConfigureReshuffle,
+  executeConfigureNotifications,
+  executeSetInitiationAutonomy,
   executeDecideFreedSlotOffer,
   executeCheckCalendarIntegrity,
   executeConnectGoogleCalendar,
@@ -417,6 +420,18 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'resolveProactiveProposal',
+    description: "Resolve a pending PROACTIVE suggestion the PA asked the owner about — e.g. a win-back check-in for a lapsed customer (\"Dana hasn't visited in a while — send her a friendly check-in?\"). Only call this when the owner clearly approves or declines such a suggestion ('yes, message Dana' → decision 'approve'; 'no, she's away' → decision 'decline'). On approve, the PA composes and sends the check-in itself; do not also use messageCustomer. Pass recipientName if the owner names the customer, so the right suggestion is picked when several are waiting.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        decision: { type: Type.STRING, enum: ['approve', 'decline'], description: 'Whether the owner approved (send it) or declined (do not send) the suggestion' },
+        recipientName: { type: Type.STRING, description: "The customer's name if the owner named one (partial match), to disambiguate when several suggestions are pending" },
+      },
+      required: ['decision'],
+    },
+  },
+  {
     name: 'configureReshuffle',
     description: 'Change the proactive reschedule (swap) engine settings for this business. Use when the owner adjusts how it behaves — turn it on/off, batch size for outreach, whether to require approval, how many people to contact, the protect window, who to contact.',
     parameters: {
@@ -431,6 +446,32 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         protectVip: { type: Type.BOOLEAN, description: 'Never move VIP customers to accommodate others' },
         contactScope: { type: Type.STRING, enum: ['conflicting_only', 'service_match', 'all_booked'], description: 'Who may be contacted for a swap' },
       },
+    },
+  },
+  {
+    name: 'configureNotifications',
+    description: "Set how the owner wants to be notified about a business event. Use when the owner says things like 'only tell me about cancellations within 24 hours', 'stop pinging me on every new booking', or 'handle no-shows silently'. One event per call.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        event: { type: Type.STRING, enum: ['new_booking', 'first_time_customer', 'cancellation', 'reschedule', 'no_show', 'refund_request', 'vip_return'], description: 'Which business event this rule is about' },
+        action: { type: Type.STRING, enum: ['notify', 'notify_with_actions', 'handle_silently'], description: 'notify = tell me; notify_with_actions = tell me with quick action buttons; handle_silently = do not tell me' },
+        withinHours: { type: Type.NUMBER, description: 'Optional: only apply when the affected booking is within this many hours (e.g. 24 for "cancellations inside 24h")' },
+        remove: { type: Type.BOOLEAN, description: 'Remove the existing rule for this event instead of setting one' },
+      },
+      required: ['event'],
+    },
+  },
+  {
+    name: 'setInitiationAutonomy',
+    description: "Control whether the PA handles a category of proactive outreach automatically or asks the owner to approve each one. Use when the owner says things like 'keep asking me before win-backs' or 'just handle win-backs yourself from now on'.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        category: { type: Type.STRING, enum: ['winback', 'coldfill', 'review', 'no_show', 'reshuffle'], description: 'Which outreach category' },
+        mode: { type: Type.STRING, enum: ['auto', 'ask'], description: 'auto = PA sends without asking; ask = PA proposes each one for approval (and will not auto-promote again)' },
+      },
+      required: ['category', 'mode'],
     },
   },
   {
@@ -554,6 +595,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - coordinateMeeting: use ONLY when the owner wants you to reach out and arrange a meeting whose time is NOT yet agreed — with anyone, INCLUDING an existing customer. First ask, in ONE question, whether they already set a time (then use createCalendarEvent) or want you to coordinate. When coordinating, capture either a primary time + one or two fallbacks, OR day/time windows (ranges) + how long the meeting runs. ALL meeting coordination goes through this tool — never improvise a coordination with messageCustomer + createCalendarEvent. NEVER invent or guess a person's name (the owner's or anyone else's). If you don't know how to introduce yourself for outreach and no preference is shown under "Outreach identity" below, ask the owner once: whether to say you're from {business name} or {owner}'s assistant — and if they pick their own name and you don't have it, ask for it; pass identifyAs (and ownerName) to save it.
 - messageCustomer is for a SINGLE one-off ping the owner dictates (e.g. "let Dana know class is cancelled") — never for negotiating a meeting time, and never to work around coordinateMeeting. Do not use createCalendarEvent to book a meeting you coordinated; confirm it with resolveMeetingCoordination instead.
 - resolveMeetingCoordination: after the contact replies (you will see active meeting coordinations in your context), use this to confirm the agreed time (which books it and tells them), offer a different time, or abandon it. Only confirm a booking when the owner says to.
+- resolveProactiveProposal: use when the owner replies to a proactive check-in YOU suggested for a lapsed customer (e.g. you asked "send Dana a friendly check-in?" and they say "yes, message Dana" → decision 'approve'; "no, she's away" → decision 'decline'). On approve the PA sends the check-in itself — do NOT also call messageCustomer. Pass recipientName when the owner names the customer.
 
 ## Never claim an action you did not take
 Only state something happened — a message sent, a calendar connected, a booking changed — when a tool actually returned success for it. If you have no tool for what the owner asked, or a tool reports it failed or couldn't proceed, say so plainly and offer a real next step. Never fabricate a confirmation, a link, or an email.
@@ -632,10 +674,16 @@ async function dispatchTool(
       return executeApproveReshuffle(args as unknown as Parameters<typeof executeApproveReshuffle>[0], ctx)
     case 'rejectReshuffle':
       return executeRejectReshuffle(args as unknown as Parameters<typeof executeRejectReshuffle>[0], ctx)
+    case 'resolveProactiveProposal':
+      return executeResolveProactiveProposal(args as unknown as Parameters<typeof executeResolveProactiveProposal>[0], ctx)
     case 'amendReshuffle':
       return executeAmendReshuffle(args as unknown as Parameters<typeof executeAmendReshuffle>[0], ctx)
     case 'configureReshuffle':
       return executeConfigureReshuffle(args as unknown as Parameters<typeof executeConfigureReshuffle>[0], ctx)
+    case 'configureNotifications':
+      return executeConfigureNotifications(args as unknown as Parameters<typeof executeConfigureNotifications>[0], ctx)
+    case 'setInitiationAutonomy':
+      return executeSetInitiationAutonomy(args as unknown as Parameters<typeof executeSetInitiationAutonomy>[0], ctx)
     case 'decideFreedSlotOffer':
       return executeDecideFreedSlotOffer(args as unknown as Parameters<typeof executeDecideFreedSlotOffer>[0], ctx)
     case 'checkCalendarIntegrity':
@@ -664,6 +712,11 @@ function actionsFromToolResult(name: string, result: unknown): ActionClaim[] {
   switch (name) {
     case 'messageCustomer':
       return ['message_sent']
+    case 'resolveProactiveProposal':
+      // Approving a proposal sends the check-in ONLY when the customer is in-window
+      // (outcome 'sent'). An approved-but-unreachable or a decline sends nothing, so it
+      // must NOT back a "message sent" claim.
+      return r['outcome'] === 'sent' ? ['message_sent'] : []
     case 'createCalendarEvent':
     case 'scheduleGroupSession':
     case 'scheduleRecurringClasses':

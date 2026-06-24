@@ -4,7 +4,6 @@ import type { Business } from '../../db/schema.js'
 import {
   bookings,
   serviceTypes,
-  identities,
   businessFaqs,
   businesses as businessesTable,
   deferredFeatureRequests,
@@ -26,7 +25,10 @@ import type {
   HandoffBehavior,
   AutomatedMessagesConfig,
   BookingEdgeCases,
+  ProposeInitiationInput,
 } from '../../shared/skill-types.js'
+import { queryCustomerSegment } from '../crm/segment-repository.js'
+import { proposeInitiation as proposeInitiationCore } from '../initiations/approvals.js'
 import {
   advanceWorkflow,
   completeWorkflow,
@@ -112,8 +114,20 @@ export async function buildSkillContext(params: {
     ...(managerMemorySummaries ? { managerMemorySummaries } : {}),
     customerSegmentQuery: async (filter: SegmentFilter): Promise<CustomerSummary[]> => {
       if (identity.role !== 'manager') return []
-      return queryCustomerSegment(dbInst, business.id, filter)
+      return queryCustomerSegment(dbInst, business.id, filter, business.timezone)
     },
+    proposeInitiation: async (input: ProposeInitiationInput) =>
+      proposeInitiationCore(dbInst, {
+        businessId: business.id,
+        initiatorId: input.initiatorId,
+        recipientId: input.recipientId,
+        recipientPhone: input.recipientPhone,
+        dedupKey: input.dedupKey,
+        language: input.language ?? language,
+        situation: input.situation,
+        fallback: input.fallback,
+        ownerSummary: input.ownerSummary,
+      }),
     saveFAQs: async (faqs: Array<{ question: string; answer: string }>) => {
       if (identity.role !== 'manager') return
       await dbInst.delete(businessFaqs).where(eq(businessFaqs.businessId, business.id))
@@ -266,21 +280,3 @@ async function loadRecentCompletedBooking(db: Db, identityId: string): Promise<C
   }
 }
 
-async function queryCustomerSegment(db: Db, businessId: string, filter: SegmentFilter): Promise<CustomerSummary[]> {
-  const rows = await db
-    .select({
-      identityId: identities.id,
-      phoneNumber: identities.phoneNumber,
-      displayName: identities.displayName,
-    })
-    .from(identities)
-    .where(and(eq(identities.businessId, businessId), eq(identities.role, 'customer')))
-
-  return rows.map((r) => ({
-    identityId: r.identityId,
-    phoneNumber: r.phoneNumber,
-    displayName: r.displayName,
-    totalBookings: 0,
-    lastBookingAt: null,
-  }))
-}

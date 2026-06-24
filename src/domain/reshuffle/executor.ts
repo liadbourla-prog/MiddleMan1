@@ -11,6 +11,7 @@ import { eq, inArray } from 'drizzle-orm'
 import { db } from '../../db/client.js'
 import { bookings, reshuffleCampaigns, reshuffleProposals } from '../../db/schema.js'
 import { enqueueBookingMirror } from '../../workers/calendar-mirror.js'
+import { logAudit } from '../audit/logger.js'
 import type { Move } from './types.js'
 
 type Db = typeof db
@@ -77,6 +78,7 @@ export async function applyReshuffleProposal(database: Db, proposalId: string): 
       .update(reshuffleCampaigns)
       .set({ status: 'failed', resolvedAt: new Date() })
       .where(eq(reshuffleCampaigns.id, campaign.id))
+    await logAudit(database, { businessId: campaign.businessId, actorId: null, action: 'reshuffle.failed', entityType: 'reshuffle_campaign', entityId: campaign.id, metadata: { reason: result.reason } })
     return result
   }
 
@@ -89,6 +91,7 @@ export async function applyReshuffleProposal(database: Db, proposalId: string): 
     .update(reshuffleCampaigns)
     .set({ status: 'applied', resolvedAt: new Date() })
     .where(eq(reshuffleCampaigns.id, campaign.id))
+  await logAudit(database, { businessId: campaign.businessId, actorId: null, action: 'reshuffle.applied', entityType: 'reshuffle_campaign', entityId: campaign.id, metadata: { moves: moves.length } })
 
   for (const m of moves) {
     await enqueueBookingMirror(campaign.businessId, m.bookingId).catch(() => {

@@ -54,11 +54,35 @@ export const businesses = pgTable('businesses', {
   googleReviewUrl: text('google_review_url'),
   communicationStyle: jsonb('communication_style'),
   notificationPreferences: jsonb('notification_preferences'),
+  // Dynamic owner notification rules (Phase 5.5; design §7.7) — the voluntary-OAU control dial.
+  // jsonb array of { event, action, condition? }. Layers ADDITIVELY over notificationPreferences
+  // (the legacy booleans remain the fallback). Edited conversationally via the configureNotifications
+  // Branch-3 tool; evaluated by resolveNotificationAction.
+  notificationRules: jsonb('notification_rules'),
   handoffBehavior: jsonb('handoff_behavior'),
   automatedMessagesConfig: jsonb('automated_messages_config'),
   bookingEdgeCases: jsonb('booking_edge_cases'),
   // Proactive reshuffle engine knobs (null = safe defaults; see domain/reshuffle/config.ts)
   reshuffleConfig: jsonb('reshuffle_config'),
+  // Business-level quiet hours for proactive PROMOTIONAL initiations (Phase 5.2). jsonb
+  // { start: 'HH:MM', end: 'HH:MM' } business-local; null = no quiet hours. The initiation
+  // dispatcher computes nowInQuietHours from this + the business timezone for promotional sends;
+  // transactional sends ignore it. (Distinct from reshuffleConfig.quietHours, which the reshuffle
+  // engine keeps for its own campaign cadence.)
+  quietHours: jsonb('quiet_hours'),
+  // Proactive win-back (churn) detector opt-in (Phase 4b). Default OFF — the owner
+  // enables it later via the Phase-5 control surface. The detector skips businesses
+  // where this is false.
+  proactiveWinbackEnabled: boolean('proactive_winback_enabled').notNull().default(false),
+  // Subscription renewal-reminder initiator opt-in (Phase 4c). Default OFF — the owner enables
+  // it later via the Phase-5 control surface. A dedicated boolean (mirroring proactiveWinbackEnabled)
+  // rather than an automatedMessagesConfig key, which would widen its keyof and break the skills
+  // config builder. The subscription-renewal worker skips businesses where this is false.
+  subscriptionRenewalEnabled: boolean('subscription_renewal_enabled').notNull().default(false),
+  // Reschedule-retention (Phase 3b; design §7.5). Default OFF — when enabled, a genuine
+  // cancellation first offers available alternate slots; accepting one converts the cancel
+  // into a reschedule (deferred-cancel). The customer-booking flow reads this flag.
+  rescheduleRetentionEnabled: boolean('reschedule_retention_enabled').notNull().default(false),
   // Owner-approval gate for freed-slot waitlist offers (WS-C / #6 / #8).
   // null = owner never asked → first freed slot asks AND offers to set a standing pref.
   // 'ask' = ask each time · 'auto' = offer automatically · 'never' = never offer.
@@ -95,6 +119,11 @@ export const identities = pgTable(
     grantedAt: timestamp('granted_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
     messagingOptOut: boolean('messaging_opt_out').notNull().default(false),
+    // Two-tier consent (Phase 5.1; design §7). messagingOptOut above is the GLOBAL kill-switch
+    // (set by the Meta platform opt-out). This is the per-category PROMOTIONAL opt-out: a jsonb
+    // map of consent-category → true (e.g. { winback: true } or { all: true } for stop-all-promos).
+    // Transactional sends ignore it; the dispatcher consults it for promotional customer/contact sends.
+    promotionalOptOuts: jsonb('promotional_opt_outs'),
     // Reshuffle engine: VIPs are never moved involuntarily (decision A4)
     vip: boolean('vip').notNull().default(false),
     // Customer's preferred language for PA replies; null = use business default
@@ -508,6 +537,30 @@ export const reminders = pgTable(
   (t) => [uniqueIndex('reminders_booking_trigger_idx').on(t.bookingId, t.triggerType)],
 )
 
+// Proactive Initiations spine — every proactive outbound that fired (or was deduped)
+// is recorded here. The unique (business_id, dedup_key) index IS the idempotency
+// mechanism: dispatch inserts with onConflictDoNothing; zero rows back = already sent.
+// Skips (opted-out, quiet-hours, out-of-window) are NOT written here — they go to
+// audit_log via logAudit, so this table stays a clean ledger of real sends and the
+// recipient index can later back per-recipient frequency caps cheaply.
+export const initiationLog = pgTable(
+  'initiation_log',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    initiatorId: text('initiator_id').notNull(), // e.g. 'reminder.24h'
+    recipientId: uuid('recipient_id').references(() => identities.id), // null for phone-only operator sends
+    dedupKey: text('dedup_key').notNull(),
+    decision: text('decision', { enum: ['send_free_form', 'send_template'] }).notNull(),
+    audience: text('audience', { enum: ['customer', 'owner', 'operator', 'contact'] }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('initiation_log_dedup_idx').on(t.businessId, t.dedupKey),
+    index('initiation_log_recipient_idx').on(t.recipientId, t.createdAt),
+  ],
+)
+
 export const waitlist = pgTable(
   'waitlist',
   {
@@ -558,6 +611,95 @@ export const freedSlotApprovals = pgTable(
   (t) => [
     index('freed_slot_approvals_pending_idx').on(t.businessId, t.status),
     index('freed_slot_approvals_slot_idx').on(t.businessId, t.slotStart),
+  ],
+)
+
+// Owner-confirm gate for ai_proposed initiations (Phase 6a; design §4.1/§5). A sibling
+// to freedSlotApprovals: a detector PROPOSES a customer-facing send (e.g. win-back of a
+// lapsed customer) and the owner approves/declines before anything leaves. The customer
+// send fires only on approval — the PA never messages an outside party on its own
+// judgement while an initiator is still in probation (CLAUDE.md Principle 1).
+//
+// `(businessId, dedupKey)` is unique so we never re-nag the owner about the same thing
+// (e.g. 'churn.winback:{identity}:{tier}'). `situation`/`fallback` are kept so the LLM
+// can phrase the message at SEND time (after approval), and `ownerSummary` is what the
+// owner sees in the proposal. Undecided rows expire so a stale proposal can't fire late.
+export const initiationApprovals = pgTable(
+  'initiation_approvals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    initiatorId: text('initiator_id').notNull(), // e.g. 'churn.winback'
+    recipientId: uuid('recipient_id').references(() => identities.id), // nullable: phone-only target
+    recipientPhone: text('recipient_phone').notNull(),
+    dedupKey: text('dedup_key').notNull(),
+    language: text('language').notNull(),
+    situation: text('situation').notNull(), // for LLM phrasing at send time (post-approval)
+    fallback: text('fallback').notNull(),
+    ownerSummary: text('owner_summary').notNull(), // what the owner is shown
+    status: text('status', { enum: ['pending', 'approved', 'declined', 'expired'] }).notNull().default('pending'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('initiation_approvals_dedup_idx').on(t.businessId, t.dedupKey),
+    index('initiation_approvals_pending_idx').on(t.businessId, t.status),
+  ],
+)
+
+// Per-(business, category) trust-ratchet autonomy state (Phase 6.1; design §5). Default
+// 'ai_proposed': the owner-confirm gate fires per send. A category auto-PROMOTES to
+// 'owner_configured' once precision clears θ over a minimum sample (stop confirming each send;
+// fire under the gate, surface only anomalies); a post-promotion opt-out spike auto-DEMOTES back.
+// `vetoed` = the owner declined a promotion → never auto-promote again. One row per category per
+// business (the unique index). Read at runtime by the dispatcher; the ratchet decision is pure
+// (ratchet.ts) and the read/write side is the autonomy repository (autonomy.ts).
+export const initiationAutonomy = pgTable(
+  'initiation_autonomy',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    category: text('category').notNull(),
+    state: text('state', { enum: ['ai_proposed', 'owner_configured'] }).notNull().default('ai_proposed'),
+    vetoed: boolean('vetoed').notNull().default(false),
+    promotedAt: timestamp('promoted_at', { withTimezone: true }),
+    demotedAt: timestamp('demoted_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('initiation_autonomy_biz_category_idx').on(t.businessId, t.category),
+  ],
+)
+
+// A recurring service commitment per customer (Phase 4c; design §8.3). There is NO external
+// payment processor, so this is informational + reminder-driving only — no auto-charge, no
+// auto-advance. `renewsAt` is the scan anchor for the time-before subscription.renewal_{7d,1d}
+// initiators, which remind the customer ahead of the renewal date. The renews_at index is
+// partial (active rows only) so the daily renewal scan stays cheap.
+export const subscriptions = pgTable(
+  'subscriptions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    customerId: uuid('customer_id').notNull().references(() => identities.id),
+    serviceTypeId: uuid('service_type_id').references(() => serviceTypes.id),
+    planName: text('plan_name').notNull(),
+    status: text('status', { enum: ['active', 'paused', 'cancelled', 'expired'] }).notNull().default('active'),
+    intervalUnit: text('interval_unit', { enum: ['week', 'month', 'year'] }).notNull(),
+    intervalCount: integer('interval_count').notNull().default(1),
+    renewsAt: timestamp('renews_at', { withTimezone: true }).notNull(),
+    autoRenew: boolean('auto_renew').notNull().default(true),
+    priceAmount: numeric('price_amount', { precision: 10, scale: 2 }),
+    priceCurrency: text('price_currency'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('subscriptions_business_status_idx').on(t.businessId, t.status),
+    index('subscriptions_renews_at_idx').on(t.renewsAt).where(sql`${t.status} = 'active'`),
   ],
 )
 
@@ -931,6 +1073,7 @@ export type AuditLogEntry = typeof auditLog.$inferSelect
 export type CustomerProfile = typeof customerProfiles.$inferSelect
 export type ConversationMessage = typeof conversationMessages.$inferSelect
 export type Reminder = typeof reminders.$inferSelect
+export type InitiationLogEntry = typeof initiationLog.$inferSelect
 export type WaitlistEntry = typeof waitlist.$inferSelect
 export type ImportToken = typeof importTokens.$inferSelect
 export type ProviderOnboardingSession = typeof providerOnboardingSessions.$inferSelect
@@ -949,6 +1092,9 @@ export type ReshuffleCampaign = typeof reshuffleCampaigns.$inferSelect
 export type ReshuffleOffer = typeof reshuffleOffers.$inferSelect
 export type ReshuffleProposal = typeof reshuffleProposals.$inferSelect
 export type FreedSlotApproval = typeof freedSlotApprovals.$inferSelect
+export type InitiationApproval = typeof initiationApprovals.$inferSelect
+export type InitiationAutonomy = typeof initiationAutonomy.$inferSelect
+export type Subscription = typeof subscriptions.$inferSelect
 export type MeetingCoordination = typeof meetingCoordinations.$inferSelect
 export type IntegrityFinding = typeof integrityFindings.$inferSelect
 

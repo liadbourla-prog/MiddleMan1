@@ -4,9 +4,9 @@
  * Return value is the JSON object that the Gemini model sees as the tool result.
  */
 
-import { and, desc, eq, gt, gte, ilike, inArray, lt, or } from 'drizzle-orm'
+import { and, desc, eq, gt, ilike, inArray, isNull, lt, or } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries, conversationSessions, conversationMessages } from '../../db/schema.js'
+import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries, conversationSessions, conversationMessages, initiationApprovals } from '../../db/schema.js'
 import { createSeries } from '../scheduling/series.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../authorization/check.js'
@@ -15,9 +15,13 @@ import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
 import { applyInstruction, pauseConversation, resumeConversation, applyReshuffleConfigUpdate } from './apply.js'
 import { reshuffleCampaigns, reshuffleProposals, freedSlotApprovals } from '../../db/schema.js'
 import { approveProposal, rejectProposal } from '../reshuffle/gate.js'
+import { resolveInitiationProposal } from '../initiations/approvals.js'
+import { upsertNotificationRule, removeNotificationRule, type NotificationEvent, type NotificationAction, type NotificationRule } from '../initiations/notification-rules.js'
+import { setAutonomyState } from '../initiations/autonomy.js'
 import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
 import { runSentinelForBusiness } from '../../workers/integrity-sentinel.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
+import { queryCustomerSegment } from '../crm/segment-repository.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
@@ -1112,31 +1116,20 @@ export async function executeLookupCustomer(
   }
 
   if (queryType === 'segment') {
-    const filter = args.segmentFilter ?? {}
-    const whereConditions: ReturnType<typeof and>[] = [
-      eq(identities.businessId, ctx.businessId),
-      eq(identities.role, 'customer'),
-    ]
-
-    const rows = await ctx.db
-      .select({ id: identities.id, displayName: identities.displayName, phoneNumber: identities.phoneNumber })
-      .from(identities)
-      .where(and(...whereConditions))
-      .limit(50)
-
-    // Post-filter for inactiveSinceDays if requested
-    if (filter.inactiveSinceDays) {
-      const cutoff = new Date(Date.now() - filter.inactiveSinceDays * 24 * 60 * 60_000)
-      const active = new Set<string>()
-      const activeBookings = await ctx.db
-        .select({ customerId: bookings.customerId })
-        .from(bookings)
-        .where(and(eq(bookings.businessId, ctx.businessId), gte(bookings.slotStart, cutoff)))
-      activeBookings.forEach((b) => active.add(b.customerId))
-      return { count: rows.filter((r) => !active.has(r.id)).length, customers: rows.filter((r) => !active.has(r.id)).slice(0, 20) }
+    // One shared reader (segment-repository) — derives real per-customer profiles, not the
+    // old zero-stub / partial post-filter. Behavioral filters (lapsed, preferredDay/Band)
+    // are honored when present; the manager LLM still passes the basic subset today.
+    const summaries = await queryCustomerSegment(ctx.db, ctx.businessId, args.segmentFilter ?? {}, ctx.timezone)
+    return {
+      count: summaries.length,
+      customers: summaries.slice(0, 20).map((s) => ({
+        id: s.identityId,
+        displayName: s.displayName,
+        phoneNumber: s.phoneNumber,
+        totalBookings: s.totalBookings,
+        lastBookingAt: s.lastBookingAt,
+      })),
     }
-
-    return { count: rows.length, customers: rows.slice(0, 20) }
   }
 
   return { error: 'Unknown queryType' }
@@ -1407,6 +1400,89 @@ export async function executeRejectReshuffle(_args: Record<string, never>, ctx: 
   return { success: true, fact: 'Plan rejected; nothing changed.', guidance: 'Confirm to the owner that nothing changed and anyone contacted will be told never mind.' }
 }
 
+// ── Proactive-proposal owner gate (win-back etc.) ───────────────────────────────
+//
+// The win-back detector PROPOSES to the owner (proposeInitiation records a pending
+// initiationApprovals row + pings the owner) and never messages the customer on its own
+// judgement. This tool closes the loop: the owner says "yes, send it" / "no, she's away"
+// and we resolve the pending proposal via resolveInitiationProposal — which is what
+// actually phrases + sends (or records the decline) and is idempotent under a double-tap.
+//
+// Authorization mirrors executeApproveReshuffle: no extra role gate here — the orchestrator
+// only reaches Branch-3 tools for an owner/manager (or a granted delegate).
+
+interface ResolveProactiveProposalArgs {
+  decision: 'approve' | 'decline'
+  recipientName?: string
+}
+
+export async function executeResolveProactiveProposal(
+  args: ResolveProactiveProposalArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  // Pending proposals for this business that have not expired (expiresAt null or future).
+  const rows = await ctx.db
+    .select({
+      id: initiationApprovals.id,
+      ownerSummary: initiationApprovals.ownerSummary,
+      displayName: identities.displayName,
+    })
+    .from(initiationApprovals)
+    .leftJoin(identities, eq(initiationApprovals.recipientId, identities.id))
+    .where(and(
+      eq(initiationApprovals.businessId, ctx.businessId),
+      eq(initiationApprovals.status, 'pending'),
+      or(isNull(initiationApprovals.expiresAt), gt(initiationApprovals.expiresAt, new Date())),
+    ))
+    .orderBy(desc(initiationApprovals.createdAt))
+
+  // Narrow by name when the owner named someone ("yes, message Dana").
+  const wanted = args.recipientName?.trim().toLowerCase()
+  const candidates = wanted
+    ? rows.filter((r) => (r.displayName ?? '').toLowerCase().includes(wanted))
+    : rows
+
+  if (candidates.length === 0) {
+    return { ok: false, reason: 'no_pending_proposals', guidance: 'There is no proactive suggestion waiting for a decision (matching that name, if one was given). Tell the owner that plainly.' }
+  }
+
+  if (candidates.length > 1) {
+    return {
+      ok: false,
+      reason: 'ambiguous',
+      pending: candidates.map((r) => ({ recipient: r.displayName ?? null, summary: r.ownerSummary })),
+      guidance: 'Several proactive suggestions are waiting. List who they are for and ask the owner which one to act on.',
+    }
+  }
+
+  const candidate = candidates[0]!
+  const res = await resolveInitiationProposal(ctx.db, candidate.id, args.decision)
+  if (!res.ok) {
+    // Resolved out from under us (already decided / expired) since the read above.
+    return { ok: false, reason: 'not_pending', guidance: 'That suggestion is no longer waiting (it was already handled or expired). Tell the owner plainly.' }
+  }
+
+  if (res.outcome === 'unreachable') {
+    return {
+      ok: true,
+      recipient: candidate.displayName ?? null,
+      decision: args.decision,
+      outcome: 'unreachable',
+      guidance: 'You approved the outreach, but the customer can\'t be messaged right now (more than 24h since they last wrote, and no template exists to reopen contact). The message was NOT sent. Tell the owner it is approved but couldn\'t go out yet, and you\'ll reach them once they message first.',
+    }
+  }
+
+  return {
+    ok: true,
+    recipient: candidate.displayName ?? null,
+    decision: args.decision,
+    outcome: res.outcome,
+    guidance: res.outcome === 'sent'
+      ? 'The check-in was actually sent. Confirm to the owner in your own words and offer to update them when the customer replies.'
+      : 'The suggestion was declined and nothing was sent. Confirm to the owner plainly.',
+  }
+}
+
 interface ConfigureReshuffleArgs {
   enabled?: boolean
   approvalMode?: 'require_approval' | 'auto_apply'
@@ -1427,6 +1503,60 @@ export async function executeConfigureReshuffle(args: ConfigureReshuffleArgs, ct
   const res = await applyReshuffleConfigUpdate(ctx.db, ctx.businessId, patch, ctx.identityId)
   if (!res.ok) return { success: false, reason: res.reason }
   return { success: true, fact: JSON.stringify(res.config), guidance: 'Settings saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
+}
+
+interface ConfigureNotificationsArgs {
+  event: NotificationEvent
+  action?: NotificationAction
+  withinHours?: number
+  remove?: boolean
+}
+
+export async function executeConfigureNotifications(args: ConfigureNotificationsArgs, ctx: ToolContext): Promise<object> {
+  if (!args.event) return { success: false, reason: 'missing_event', guidance: 'Ask the owner which event they want to change notifications for.' }
+
+  const [biz] = await ctx.db
+    .select({ notificationRules: businesses.notificationRules })
+    .from(businesses)
+    .where(eq(businesses.id, ctx.businessId))
+    .limit(1)
+  const current = (biz?.notificationRules as NotificationRule[] | null) ?? null
+
+  let next: NotificationRule[]
+  if (args.remove === true) {
+    next = removeNotificationRule(current, args.event)
+  } else {
+    if (!args.action) return { success: false, reason: 'missing_action', guidance: "Ask the owner whether to notify, notify with action buttons, or handle this event silently." }
+    const rule: NotificationRule = { event: args.event, action: args.action }
+    if (args.withinHours !== undefined) rule.condition = { withinHours: args.withinHours }
+    next = upsertNotificationRule(current, rule)
+  }
+
+  await ctx.db.update(businesses).set({ notificationRules: next as unknown as Record<string, unknown>[] }).where(eq(businesses.id, ctx.businessId))
+  await logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action: 'notification_rules.updated', entityType: 'business', entityId: ctx.businessId, metadata: { event: args.event, removed: args.remove === true } })
+
+  return { success: true, fact: JSON.stringify(next), guidance: 'Notification rule saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
+}
+
+interface SetInitiationAutonomyArgs {
+  category: string
+  mode: 'auto' | 'ask'
+}
+
+// Trust-ratchet owner control (Phase 6.2): the owner sets whether a proactive-outreach category is
+// handled automatically (owner_configured) or proposed for approval each time (ai_proposed). 'ask'
+// sets vetoed=true so the ratchet will not auto-promote this category again.
+export async function executeSetInitiationAutonomy(args: SetInitiationAutonomyArgs, ctx: ToolContext): Promise<object> {
+  if (!args.category || (args.mode !== 'auto' && args.mode !== 'ask')) {
+    return { success: false, reason: 'invalid_args', guidance: 'Ask the owner which outreach category and whether to handle it automatically or keep asking.' }
+  }
+  if (args.mode === 'auto') {
+    await setAutonomyState(ctx.db, ctx.businessId, args.category, 'owner_configured')
+  } else {
+    await setAutonomyState(ctx.db, ctx.businessId, args.category, 'ai_proposed', { vetoed: true })
+  }
+  await logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action: 'initiation.autonomy_set', entityType: 'initiation_autonomy', entityId: args.category, metadata: { mode: args.mode } })
+  return { success: true, fact: JSON.stringify({ category: args.category, mode: args.mode }), guidance: 'Saved. Confirm to the owner in plain words (fact is raw — never quote it).' }
 }
 
 interface AmendReshuffleArgs {
