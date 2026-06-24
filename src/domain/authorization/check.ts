@@ -13,6 +13,8 @@ export type Action =
   | 'policy.change'
   | 'staff.manage'
   | 'meeting.coordinate'
+  | 'payment.charge'
+  | 'payment.refund'
 
 export type AuthResult =
   | { allowed: true }
@@ -38,6 +40,9 @@ const MANAGER_ACTIONS = new Set<Action>([
   'policy.change',
   'staff.manage',
   'meeting.coordinate',
+  // Money plane (Grow Phase 4/5): managers always; delegated only if granted; customers never.
+  'payment.charge',
+  'payment.refund',
 ])
 
 const CUSTOMER_ACTIONS = new Set<Action>([

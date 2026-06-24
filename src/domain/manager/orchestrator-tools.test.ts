@@ -5,9 +5,11 @@ import {
   executeScheduleGroupSession,
   executeEditClassSession,
   executeScheduleRecurringClasses,
+  executeRequestPayment,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
+import type { Action } from '../authorization/check.js'
 
 // A ctx whose db/calendar throw on ANY access. If an executor returns a
 // clarification BEFORE touching either, we've proven the deterministic date
@@ -26,6 +28,58 @@ function noWriteCtx(): ToolContext {
     lang: 'en',
   }
 }
+
+// Grow Phase 4 — requestPayment (Case B). Authorization is the FIRST gate and amount/desc
+// validation is the SECOND; both run before any DB/calendar access. We use the no-write trap
+// ctx to prove the matrix without touching state: customers/contacts/un-granted delegates are
+// rejected; managers and granted delegates pass auth (and then hit the pre-DB amount guard).
+function payCtx(role: ToolContext['role'], grants?: Action[]): ToolContext {
+  return {
+    ...noWriteCtx(),
+    ...(role ? { role } : {}),
+    ...(grants ? { delegatedPermissions: new Set<Action>(grants) } : {}),
+  }
+}
+
+describe('requestPayment — authorization matrix (no state touched)', () => {
+  const validArgs = { customer: 'Dana', amount: 300, description: 'Reformer session' }
+
+  it('customer is refused', async () => {
+    const res = await executeRequestPayment(validArgs, payCtx('customer')) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('contact is refused', async () => {
+    const res = await executeRequestPayment(validArgs, payCtx('contact')) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('delegated user WITHOUT the payment.charge grant is refused', async () => {
+    const res = await executeRequestPayment(validArgs, payCtx('delegated_user', ['schedule.set_availability'])) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('delegated user WITH the grant passes auth (then hits the pre-DB amount guard)', async () => {
+    const res = await executeRequestPayment({ customer: 'Dana', amount: 0, description: 'x' }, payCtx('delegated_user', ['payment.charge'])) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('invalid_amount') // NOT not_authorized → auth passed
+  })
+
+  it('manager passes auth (then hits the pre-DB amount guard)', async () => {
+    const res = await executeRequestPayment({ customer: 'Dana', amount: -5, description: 'x' }, payCtx('manager')) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('invalid_amount')
+  })
+
+  it('a manager with a valid amount but no description is stopped before any DB access', async () => {
+    const res = await executeRequestPayment({ customer: 'Dana', amount: 300, description: '  ' }, payCtx('manager')) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('missing_description')
+  })
+})
 
 describe('manager calendar writes — deterministic date guard (no write on bad date)', () => {
   it('createCalendarEvent: explicit past year → needsClarification, no DB write', async () => {

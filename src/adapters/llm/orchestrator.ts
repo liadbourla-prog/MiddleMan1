@@ -43,6 +43,7 @@ import {
   executeCheckCalendarIntegrity,
   executeConnectGoogleCalendar,
   executeConnectPayments,
+  executeRequestPayment,
   executeMessageCustomer,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
@@ -337,6 +338,20 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     parameters: { type: Type.OBJECT, properties: {} },
   },
   {
+    name: 'requestPayment',
+    description: "Charge a specific customer — create a pay-link and send it to them — when the owner asks (e.g. \"send Dana a link for the ₪300 session\", \"charge Yossi 150 for the workshop\"). You pass ONLY who to charge, how much, and what it is for; the system creates the real Grow pay-link, delivers it to the customer, and later confirms payment + forwards the invoice automatically. Pass the customer's phone number when the owner gives one (lets you reach someone new); otherwise pass their name to match a customer on file. Only tell the owner the link was sent if this tool returns ok:true — it may report the customer can't be reached or that payments aren't connected, in which case relay that honestly.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        customer: { type: Type.STRING, description: 'The customer to charge — their name on file, or their phone number in E.164.' },
+        phoneNumber: { type: Type.STRING, description: "Customer phone in E.164 (e.g. +972541234567) when the owner provides one — preferred, lets you reach a new contact." },
+        amount: { type: Type.NUMBER, description: 'Amount to charge, in the business currency (ILS). A positive number.' },
+        description: { type: Type.STRING, description: 'Short description of what the charge is for (appears on the pay-link and invoice), e.g. "Reformer session".' },
+      },
+      required: ['amount', 'description'],
+    },
+  },
+  {
     name: 'messageCustomer',
     description: "Send a WhatsApp message to ONE specific customer on the owner's behalf (e.g. \"text Harel and ask when he's free this week\", \"let Dana know class is cancelled\"). Compose the message yourself and confirm with the owner before calling. Pass the customer's phone number when the owner gives one (lets you reach someone new); otherwise pass the name to match a customer on file. Only report the message as sent if this tool returns ok:true — it may report the customer can't be reached, in which case tell the owner the truth.",
     parameters: {
@@ -612,6 +627,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - connectGoogleCalendar: ALWAYS use this when the owner wants to connect, sync, or link Google Calendar. It returns the real sign-in link — send that link to the owner here in WhatsApp, on its own line. You have NO email and no way to send email: never offer to email the link, never ask for an email address, and never claim you emailed anything.
 - connectPayments: ALWAYS use this when the owner wants to connect, set up, or enable payments/charging/invoicing (Grow / Meshulam). It returns a secure one-time link — send that link to the owner here on its own line. The form collects API credentials, not the Grow password. If the tool reports payments are already connected, just reassure them. Same email rule: you have NO email, never offer to email the link.
 - configurePaymentTiming: use when the owner sets WHEN pay-links go out relative to the appointment (e.g. "send the payment request 24h before", "charge at booking", "1 hour after the session"). Convert their wording into policy + offsetMinutes (negative = before the appointment, positive = after) yourself, then confirm the change in plain words.
+- requestPayment: use when the owner wants to charge a specific customer now (e.g. "send Dana a link for the ₪300 session", "charge Yossi 150"). Pass only who/how much/what for — the system makes the real pay-link, sends it, and later confirms payment and forwards the invoice on its own. Only say the link was sent if the tool returns ok:true; if it reports the customer can't be reached or payments aren't connected, relay that truthfully and never pretend a link went out.
 - messageCustomer: use to actually send a WhatsApp message to a specific customer the owner names (e.g. "ask Harel when he's free"). Compose the message and confirm with the owner first, then call the tool. Only tell the owner the message was sent if the tool returns ok:true; if it reports the customer can't be reached (e.g. they haven't messaged recently), relay that honestly and never pretend it went out.
 - coordinateMeeting: use ONLY when the owner wants you to reach out and arrange a meeting whose time is NOT yet agreed — with anyone, INCLUDING an existing customer. First ask, in ONE question, whether they already set a time (then use createCalendarEvent) or want you to coordinate. When coordinating, capture either a primary time + one or two fallbacks, OR day/time windows (ranges) + how long the meeting runs. ALL meeting coordination goes through this tool — never improvise a coordination with messageCustomer + createCalendarEvent. NEVER invent or guess a person's name (the owner's or anyone else's). If you don't know how to introduce yourself for outreach and no preference is shown under "Outreach identity" below, ask the owner once: whether to say you're from {business name} or {owner}'s assistant — and if they pick their own name and you don't have it, ask for it; pass identifyAs (and ownerName) to save it.
 - messageCustomer is for a SINGLE one-off ping the owner dictates (e.g. "let Dana know class is cancelled") — never for negotiating a meeting time, and never to work around coordinateMeeting. Do not use createCalendarEvent to book a meeting you coordinated; confirm it with resolveMeetingCoordination instead.
@@ -683,6 +699,8 @@ async function dispatchTool(
       return executeConnectGoogleCalendar(args as unknown as Parameters<typeof executeConnectGoogleCalendar>[0], ctx)
     case 'connectPayments':
       return executeConnectPayments(args as unknown as Parameters<typeof executeConnectPayments>[0], ctx)
+    case 'requestPayment':
+      return executeRequestPayment(args as unknown as Parameters<typeof executeRequestPayment>[0], ctx)
     case 'messageCustomer':
       return executeMessageCustomer(args as unknown as Parameters<typeof executeMessageCustomer>[0], ctx)
     case 'coordinateMeeting':
@@ -736,6 +754,9 @@ function actionsFromToolResult(name: string, result: unknown): ActionClaim[] {
   if (failed) return []
   switch (name) {
     case 'messageCustomer':
+    case 'requestPayment':
+      // requestPayment ok:true means the pay-link was actually delivered to the customer
+      // (an outside-window / blocked send returns ok:false → caught by `failed` above).
       return ['message_sent']
     case 'resolveProactiveProposal':
       // Approving a proposal sends the check-in ONLY when the customer is in-window

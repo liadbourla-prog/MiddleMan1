@@ -9,7 +9,7 @@ import type { Db } from '../../db/client.js'
 import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries, conversationSessions, conversationMessages, initiationApprovals } from '../../db/schema.js'
 import { createSeries } from '../scheduling/series.js'
 import type { IdentityRole } from '../../db/schema.js'
-import type { Action } from '../authorization/check.js'
+import { authorize, type Action } from '../authorization/check.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
 import { applyInstruction, pauseConversation, resumeConversation, applyReshuffleConfigUpdate, applyPaymentTimingUpdate } from './apply.js'
@@ -24,6 +24,7 @@ import { runSentinelForBusiness } from '../../workers/integrity-sentinel.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import { queryCustomerSegment } from '../crm/segment-repository.js'
 import { isPaymentsConnected, createPaymentConnectToken, buildPaymentConnectUrl } from '../payments/credentials.js'
+import { createCharge } from '../payments/service.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
@@ -1693,6 +1694,125 @@ export async function executeConnectPayments(
     connectUrl,
     guidance: "Send this exact link to the owner here in WhatsApp, on its own line. Tell them it opens a secure form to paste their Grow (Meshulam) API credentials (userId, pageCode, API key) — NOT their Grow password — so the PA can send pay-links and invoices automatically. The link is valid for 30 minutes and single-use. The PA has NO email — never offer to email it or claim you did.",
   }
+}
+
+// ── requestPayment (Case B — owner-commanded charge) ─────────────────────────────
+// The owner tells the PA, in management chat, to charge a customer ("send Dana a link for
+// the ₪300 session"). Honors CLAUDE.md Principle 1: the LLM extracts only {customer, amount,
+// description}; this deterministic executor authorizes, validates the amount, asks the Grow
+// adapter (via PaymentService.createCharge) for the real pay-link, and delivers it into the
+// customer's Branch-4 conversation. Authorization-gated like other money actions: managers
+// always; delegated users only if granted payment.charge; customers/contacts never.
+
+interface RequestPaymentArgs {
+  customer?: string // name on file OR phone in E.164
+  phoneNumber?: string // explicit phone (reach a new contact)
+  amount?: number
+  description?: string
+}
+
+export async function executeRequestPayment(args: RequestPaymentArgs, ctx: ToolContext): Promise<object> {
+  // 1. Authorization — managers always; delegated only with the grant; customers never.
+  const auth = authorize(
+    { role: ctx.role ?? 'manager', ...(ctx.delegatedPermissions ? { delegatedPermissions: ctx.delegatedPermissions } : {}) },
+    'payment.charge',
+  )
+  if (!auth.allowed) {
+    return { ok: false, reason: 'not_authorized', guidance: 'This person is not allowed to charge customers. Tell them only the owner (or staff the owner has granted payments to) can send pay-links — do not send anything.' }
+  }
+
+  // 2. Validate the amount (the LLM never touches money beyond passing the number).
+  const amount = typeof args.amount === 'number' ? args.amount : Number(args.amount)
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { ok: false, reason: 'invalid_amount', guidance: 'Ask the owner how much to charge (a positive amount).' }
+  }
+  const description = (args.description ?? '').trim()
+  if (!description) {
+    return { ok: false, reason: 'missing_description', guidance: 'Ask the owner what the charge is for (a short description that appears on the customer\'s pay-link / invoice).' }
+  }
+
+  // 3. Resolve the target customer (explicit phone → existing or new; else name on file).
+  const rawPhone = (args.phoneNumber ?? '').replace(/[\s-]/g, '')
+  const customerAsPhone = (args.customer ?? '').replace(/[\s-]/g, '')
+  const phone = isValidE164(rawPhone) ? rawPhone : isValidE164(customerAsPhone) ? customerAsPhone : ''
+
+  let target: { id: string; phoneNumber: string; name: string | null } | null = null
+  if (phone) {
+    const [existing] = await ctx.db
+      .select({ id: identities.id, phoneNumber: identities.phoneNumber, name: identities.displayName })
+      .from(identities)
+      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.phoneNumber, phone)))
+      .limit(1)
+    if (existing) {
+      target = existing
+    } else {
+      const newId = await registerCustomer(ctx.db, ctx.businessId, phone, args.customer)
+      target = { id: newId, phoneNumber: phone, name: args.customer ?? null }
+    }
+  } else if (args.customer) {
+    const rows = await ctx.db
+      .select({ id: identities.id, phoneNumber: identities.phoneNumber, name: identities.displayName })
+      .from(identities)
+      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'customer'), ilike(identities.displayName, `%${args.customer}%`)))
+      .limit(5)
+    if (rows.length === 0) return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.customer}" is on file. Ask the owner for the phone number so you can reach them.` }
+    if (rows.length > 1) return { ok: false, reason: 'ambiguous_customer', guidance: `Several customers match "${args.customer}". Ask the owner which one (or for the phone number).` }
+    target = rows[0]!
+  } else {
+    return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to charge — a name on file or a phone number.' }
+  }
+
+  // 4. Create the Grow pay-link (deterministic core). Ad-hoc charge → no booking attached.
+  const charge = await createCharge(ctx.db, {
+    businessId: ctx.businessId,
+    customerId: target.id,
+    amount,
+    description,
+    source: 'owner_command',
+    dedupKey: `payment.request:owner:${target.id}:${Date.now()}`,
+    customer: { fullName: target.name ?? undefined, phone: target.phoneNumber },
+  })
+  if (!charge.ok) {
+    if (charge.reason === 'not_connected') {
+      return { ok: false, reason: 'payments_not_connected', guidance: 'Payments are not connected for this business yet. Tell the owner you can set that up first (the connectPayments link), then send the charge — do not claim a link was sent.' }
+    }
+    return { ok: false, reason: charge.reason, guidance: 'The pay-link could not be created. Tell the owner it did not go through and you will retry — do not claim a link was sent.' }
+  }
+
+  // 5. Deliver the link into the customer's Branch-4 conversation.
+  const [biz] = await ctx.db
+    .select({ defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken })
+    .from(businesses)
+    .where(eq(businesses.id, ctx.businessId))
+    .limit(1)
+  const lang: Lang = (biz?.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const body = lang === 'he'
+    ? `כדי להשלים את התשלום עבור ${description}:\n${charge.paymentUrl}`
+    : `To complete payment for ${description}:\n${charge.paymentUrl}`
+
+  const waCredentials = biz?.whatsappPhoneNumberId && biz.whatsappAccessToken
+    ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+    : undefined
+
+  const recordOutreach = (action: 'payment.link_sent' | 'payment.link_blocked', meta: Record<string, unknown>) =>
+    logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action, entityType: 'payment_request', entityId: charge.paymentRequestId, metadata: { to: target!.phoneNumber, ...meta } }).catch(() => {})
+
+  const res = await sendMessage({ toNumber: target.phoneNumber, body }, waCredentials)
+  if (!res.ok) {
+    if (res.outsideWindow) {
+      await recordOutreach('payment.link_blocked', { reason: 'outside_window' })
+      return { ok: false, reason: 'outside_messaging_window', sentTo: target.phoneNumber, guidance: 'The pay-link was created but WhatsApp would not deliver it because the customer has not messaged in over 24h (no template is set up to reopen contact). Tell the owner the link is ready and you will send it as soon as the customer writes, or they can share it — do not claim it was delivered.' }
+    }
+    if (res.userOptedOut) {
+      await recordOutreach('payment.link_blocked', { reason: 'opted_out' })
+      return { ok: false, reason: 'opted_out', guidance: 'The customer has opted out of messages, so the pay-link could not be delivered. Tell the owner honestly.' }
+    }
+    await recordOutreach('payment.link_blocked', { reason: 'send_failed' })
+    return { ok: false, reason: 'send_failed', guidance: 'The pay-link was created but failed to send. Tell the owner it did not go through and you will retry — do not claim it was delivered.' }
+  }
+
+  await recordOutreach('payment.link_sent', { amount, description })
+  return { ok: true, sentTo: target.phoneNumber, fact: JSON.stringify({ amount, description }), guidance: 'The pay-link was actually delivered to the customer. Confirm to the owner in your own words that you sent it and will let them know when it is paid (you handle the confirmation + invoice automatically).' }
 }
 
 // ── messageCustomer ─────────────────────────────────────────────────────────────
