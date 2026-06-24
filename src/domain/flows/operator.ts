@@ -23,6 +23,7 @@ import { applyInstruction } from '../manager/apply.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
 import { operatorCapabilityRegistry } from './operator-capability-registry.js'
 import { detectLang, i18n, type Lang } from '../i18n/t.js'
+import { isPaymentsConnected } from '../payments/credentials.js'
 import { redis } from '../../redis.js'
 import { loadOperatorSession, appendOperatorTurn } from '../session/operator-session.js'
 import { enqueueOperatorSummary } from '../../workers/generate-operator-summary.js'
@@ -318,6 +319,12 @@ async function handleStatusOne(db: Db, nameOrNumber: string, lang: Lang): Promis
       ? i18n.status_cal_ok[lang]
       : i18n.status_cal_missing[lang]
 
+  // Payment-processor connection health (Grow Phase 5): surface whether the money plane is live.
+  const paymentsConnected = await isPaymentsConnected(db, found.id)
+  const paymentsStatus = paymentsConnected
+    ? i18n.status_payments_connected[lang]
+    : i18n.status_payments_not_connected[lang]
+
   const confirmStatus = found.confirmationGate === 'post_payment'
     ? i18n.status_payment_post[lang](found.paymentMethod ?? (lang === 'he' ? 'לא הוגדר' : 'not set'))
     : i18n.status_payment_immediate[lang]
@@ -347,14 +354,15 @@ async function handleStatusOne(db: Db, nameOrNumber: string, lang: Lang): Promis
         : i18n.op_knowledge_failed[lang]
 
   const L = lang === 'he'
-    ? { number: 'מספר', status: 'סטטוס', calendar: 'לוח שנה', confirm: 'אישור', customers: 'לקוחות', lastBooking: 'תור אחרון', lastMsg: 'הודעה אחרונה', pending: 'הנחיות ממתינות', openEsc: 'פניות פתוחות', knowledge: i18n.op_knowledge_label.he }
-    : { number: 'Number', status: 'Status', calendar: 'Calendar', confirm: 'Confirmation', customers: 'Customers', lastBooking: 'Last booking', lastMsg: 'Last message', pending: 'Pending instructions', openEsc: 'Open escalations', knowledge: i18n.op_knowledge_label.en }
+    ? { number: 'מספר', status: 'סטטוס', calendar: 'לוח שנה', payments: 'תשלומים', confirm: 'אישור', customers: 'לקוחות', lastBooking: 'תור אחרון', lastMsg: 'הודעה אחרונה', pending: 'הנחיות ממתינות', openEsc: 'פניות פתוחות', knowledge: i18n.op_knowledge_label.he }
+    : { number: 'Number', status: 'Status', calendar: 'Calendar', payments: 'Payments', confirm: 'Confirmation', customers: 'Customers', lastBooking: 'Last booking', lastMsg: 'Last message', pending: 'Pending instructions', openEsc: 'Open escalations', knowledge: i18n.op_knowledge_label.en }
 
   const rawStatusOne = [
     `📋 *${found.name}*`,
     `${L.number}: ${found.whatsappNumber}`,
     `${L.status}: ${statusLabel}`,
     `${L.calendar}: ${calStatus}`,
+    `${L.payments}: ${paymentsStatus}`,
     `${L.confirm}: ${confirmStatus}`,
     `${L.customers}: ${customerRow?.total ?? 0}`,
     `${L.lastBooking}: ${lastBookingStr}`,

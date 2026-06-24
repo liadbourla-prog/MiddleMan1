@@ -24,7 +24,8 @@ import { runSentinelForBusiness } from '../../workers/integrity-sentinel.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import { queryCustomerSegment } from '../crm/segment-repository.js'
 import { isPaymentsConnected, createPaymentConnectToken, buildPaymentConnectUrl } from '../payments/credentials.js'
-import { createCharge } from '../payments/service.js'
+import { createCharge, refundCharge } from '../payments/service.js'
+import { paymentRequests } from '../../db/schema.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
@@ -1813,6 +1814,71 @@ export async function executeRequestPayment(args: RequestPaymentArgs, ctx: ToolC
 
   await recordOutreach('payment.link_sent', { amount, description })
   return { ok: true, sentTo: target.phoneNumber, fact: JSON.stringify({ amount, description }), guidance: 'The pay-link was actually delivered to the customer. Confirm to the owner in your own words that you sent it and will let them know when it is paid (you handle the confirmation + invoice automatically).' }
+}
+
+// ── refundTransaction (owner-commanded refund) ───────────────────────────────────
+// The owner asks to refund a customer ("refund Dana's payment", "give Yossi his ₪300 back").
+// v1 refunds are owner-commanded only (no automation, design §0/§9.5). The LLM passes only who
+// to refund; this executor authorizes (payment.refund), finds that customer's most recent
+// settled charge, and hands it to PaymentService.refundCharge (which owns the Grow call + ledger
+// flip). Guarded like requestPayment: managers always; delegated only with the grant; never customers.
+
+interface RefundTransactionArgs {
+  customer?: string // name on file OR phone in E.164
+  phoneNumber?: string
+}
+
+export async function executeRefundPayment(args: RefundTransactionArgs, ctx: ToolContext): Promise<object> {
+  const auth = authorize(
+    { role: ctx.role ?? 'manager', ...(ctx.delegatedPermissions ? { delegatedPermissions: ctx.delegatedPermissions } : {}) },
+    'payment.refund',
+  )
+  if (!auth.allowed) {
+    return { ok: false, reason: 'not_authorized', guidance: 'This person is not allowed to issue refunds. Tell them only the owner (or staff the owner has granted payments to) can refund — do not refund anything.' }
+  }
+
+  // Resolve the customer whose charge to refund (phone → exact; else name on file).
+  const rawPhone = (args.phoneNumber ?? '').replace(/[\s-]/g, '')
+  const customerAsPhone = (args.customer ?? '').replace(/[\s-]/g, '')
+  const phone = isValidE164(rawPhone) ? rawPhone : isValidE164(customerAsPhone) ? customerAsPhone : ''
+
+  let customerId: string | null = null
+  if (phone) {
+    const [c] = await ctx.db
+      .select({ id: identities.id })
+      .from(identities)
+      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.phoneNumber, phone)))
+      .limit(1)
+    customerId = c?.id ?? null
+  } else if (args.customer) {
+    const rows = await ctx.db
+      .select({ id: identities.id })
+      .from(identities)
+      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'customer'), ilike(identities.displayName, `%${args.customer}%`)))
+      .limit(5)
+    if (rows.length > 1) return { ok: false, reason: 'ambiguous_customer', guidance: `Several customers match "${args.customer}". Ask the owner which one (or for the phone number).` }
+    customerId = rows[0]?.id ?? null
+  } else {
+    return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner which customer to refund — a name on file or a phone number.' }
+  }
+  if (!customerId) return { ok: false, reason: 'customer_not_found', guidance: `No customer matching "${args.customer ?? args.phoneNumber}" is on file. Ask the owner to confirm who to refund.` }
+
+  // Find that customer's most recent settled charge.
+  const [charge] = await ctx.db
+    .select({ id: paymentRequests.id })
+    .from(paymentRequests)
+    .where(and(eq(paymentRequests.businessId, ctx.businessId), eq(paymentRequests.customerId, customerId), eq(paymentRequests.status, 'paid')))
+    .orderBy(desc(paymentRequests.updatedAt))
+    .limit(1)
+  if (!charge) return { ok: false, reason: 'no_refundable_charge', guidance: 'There is no completed payment on file for this customer to refund. Tell the owner there is nothing to refund — do not claim a refund happened.' }
+
+  const res = await refundCharge(ctx.db, { businessId: ctx.businessId, paymentRequestId: charge.id, actorId: ctx.identityId })
+  if (!res.ok) {
+    if (res.reason === 'not_connected') return { ok: false, reason: 'payments_not_connected', guidance: 'Payments are not connected for this business, so a refund cannot be issued. Tell the owner plainly.' }
+    if (res.reason === 'not_refundable') return { ok: false, reason: 'not_refundable', guidance: 'That charge cannot be refunded (it is not a completed payment). Tell the owner there is nothing to refund.' }
+    return { ok: false, reason: res.reason, guidance: 'The refund did not go through at the payment processor. Tell the owner it failed and you will look into it — do not claim it was refunded.' }
+  }
+  return { ok: true, fact: JSON.stringify(res), guidance: 'The refund was actually issued at the payment processor. Confirm to the owner in your own words (fact is raw — never quote it).' }
 }
 
 // ── messageCustomer ─────────────────────────────────────────────────────────────

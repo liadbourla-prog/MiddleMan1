@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import type { Db } from '../../src/db/client.js'
 import { businessPaymentCredentials, paymentRequests, businesses, identities } from '../../src/db/schema.js'
-import { createCharge, reconcilePayment } from '../../src/domain/payments/service.js'
+import { createCharge, reconcilePayment, refundCharge } from '../../src/domain/payments/service.js'
 import { putSecret, __resetMemorySecretStore } from '../../src/adapters/secrets.js'
 import type { GrowClient } from '../../src/adapters/grow/client.js'
 
@@ -242,6 +242,57 @@ describe('PaymentService', () => {
     expect(enqueued[0]!.phone).toBe('+972511111111')
     expect(enqueued[0]!.body).toContain('300')
     expect(enqueued[0]!.body).toContain('🟢')
+  })
+
+  // ── refundCharge (owner-commanded) ──────────────────────────────────────────
+  it('refund: not_found when the ledger row is missing', async () => {
+    const { db, queueSelect } = makeDb()
+    queueSelect(paymentRequests, [])
+    const res = await refundCharge(db, { businessId: 'biz-1', paymentRequestId: 'pr-x' }, { growClient: growStub().client })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.reason).toBe('not_found')
+  })
+
+  it('refund: not_refundable for a charge that never settled', async () => {
+    const { db, queueSelect } = makeDb()
+    queueSelect(paymentRequests, [{ id: 'pr-1', businessId: 'biz-1', status: 'created', transactionCode: null, amount: '300', description: 'Session' }])
+    const grow = growStub()
+    const res = await refundCharge(db, { businessId: 'biz-1', paymentRequestId: 'pr-1' }, { growClient: grow.client })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.reason).toBe('not_refundable')
+    expect(grow.calls).not.toContain('refundTransaction')
+  })
+
+  it('refund: not_connected when payments are no longer connected', async () => {
+    const { db, queueSelect } = makeDb()
+    queueSelect(paymentRequests, [{ id: 'pr-1', businessId: 'biz-1', status: 'paid', transactionCode: 'TX1', amount: '300', description: 'Session' }])
+    queueSelect(businessPaymentCredentials, []) // getPaymentCredentials → null
+    const res = await refundCharge(db, { businessId: 'biz-1', paymentRequestId: 'pr-1' }, { growClient: growStub().client })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.reason).toBe('not_connected')
+  })
+
+  it('refund: paid charge → Grow refund, ledger flipped to refunded', async () => {
+    const { db, queueSelect, updates } = makeDb()
+    queueSelect(paymentRequests, [{ id: 'pr-1', businessId: 'biz-1', status: 'paid', transactionCode: 'TX1', amount: '300', description: 'Session' }])
+    queueSelect(businessPaymentCredentials, [connectedCredsRow()])
+    const grow = growStub()
+    const res = await refundCharge(db, { businessId: 'biz-1', paymentRequestId: 'pr-1' }, { growClient: grow.client })
+    expect(res.ok).toBe(true)
+    if (res.ok) { expect(res.amount).toBe(300); expect(res.description).toBe('Session') }
+    expect(grow.calls).toContain('refundTransaction')
+    expect(updates.some((u) => u.set['status'] === 'refunded')).toBe(true)
+  })
+
+  it('refund: a Grow refund error is explicit and does NOT flip the ledger (fail-closed)', async () => {
+    const { db, queueSelect, updates } = makeDb()
+    queueSelect(paymentRequests, [{ id: 'pr-1', businessId: 'biz-1', status: 'paid', transactionCode: 'TX1', amount: '300', description: 'Session' }])
+    queueSelect(businessPaymentCredentials, [connectedCredsRow()])
+    const grow = growStub({ refundTransaction: async () => ({ ok: false, reason: 'invalid_request', message: 'nope' }) })
+    const res = await refundCharge(db, { businessId: 'biz-1', paymentRequestId: 'pr-1' }, { growClient: grow.client })
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.reason).toBe('grow_error')
+    expect(updates.some((u) => u.set['status'] === 'refunded')).toBe(false)
   })
 
   it('reconcile: PAYMENT_WEBHOOK_REVERIFY=off skips the probe but still approves + settles', async () => {

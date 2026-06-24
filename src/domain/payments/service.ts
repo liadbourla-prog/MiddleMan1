@@ -321,6 +321,57 @@ async function notifyOwnerPaymentReceived(
   }).catch(() => { /* non-fatal */ })
 }
 
+// ── refundCharge (owner-commanded) ───────────────────────────────────────────
+
+export type RefundResult =
+  | { ok: true; amount: number; description: string }
+  | { ok: false; reason: 'not_connected' | 'not_found' | 'not_refundable' | 'grow_error'; message?: string }
+
+/**
+ * Refund a settled charge at Grow on the owner's command (design §9.5, out-of-scope for
+ * automation — owner-driven only). Deterministic core: loads the ledger row, refuses anything
+ * that isn't a paid charge with a transactionCode, calls grow.refundTransaction, flips the row
+ * to 'refunded', and audits. The Branch-3 refundTransaction tool resolves WHICH charge; this
+ * owns the money side. Fail-explicit: a Grow refund error never marks the row refunded.
+ */
+export async function refundCharge(
+  db: Db,
+  input: { businessId: string; paymentRequestId: string; actorId?: string | null },
+  deps?: { growClient?: GrowClient },
+): Promise<RefundResult> {
+  const [charge] = await db
+    .select()
+    .from(paymentRequests)
+    .where(and(eq(paymentRequests.id, input.paymentRequestId), eq(paymentRequests.businessId, input.businessId)))
+    .limit(1)
+  if (!charge) return { ok: false, reason: 'not_found' }
+  if (charge.status !== 'paid' || !charge.transactionCode) return { ok: false, reason: 'not_refundable' }
+
+  const creds = await getPaymentCredentials(db, input.businessId)
+  if (!creds) return { ok: false, reason: 'not_connected' }
+
+  const grow = deps?.growClient ?? createGrowClient(creds)
+  const amount = Number(charge.amount)
+  const refunded = await grow.refundTransaction(charge.transactionCode, Number.isFinite(amount) ? amount : undefined)
+  if (!refunded.ok) {
+    await logAudit(db, {
+      businessId: input.businessId, actorId: input.actorId ?? null, action: 'payment.refund_failed',
+      entityType: 'payment_request', entityId: charge.id,
+      metadata: { reason: refunded.reason, transactionCode: charge.transactionCode },
+    }).catch(() => {})
+    return { ok: false, reason: 'grow_error', message: refunded.message }
+  }
+
+  await db.update(paymentRequests).set({ status: 'refunded', updatedAt: new Date() }).where(eq(paymentRequests.id, charge.id))
+  await logAudit(db, {
+    businessId: input.businessId, actorId: input.actorId ?? null, action: 'payment.refunded',
+    entityType: 'payment_request', entityId: charge.id,
+    metadata: { amount: charge.amount, transactionCode: charge.transactionCode },
+  }).catch(() => {})
+
+  return { ok: true, amount: Number.isFinite(amount) ? amount : 0, description: charge.description }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 async function calendarForBusiness(db: Db, businessId: string): Promise<CalendarClient> {

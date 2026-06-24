@@ -270,6 +270,8 @@ const strings = {
   status_cal_ok: { he: `✅ Google מחובר`, en: `✅ Google Connected` },
   status_cal_missing: { he: `❌ לא מחובר`, en: `❌ Not connected` },
   status_payment_immediate: { he: `⚡ מיידי`, en: `⚡ Immediate` },
+  status_payments_connected: { he: `✅ מחובר (Grow)`, en: `✅ Connected (Grow)` },
+  status_payments_not_connected: { he: `❌ לא מחובר`, en: `❌ Not connected` },
   status_payment_post: {
     he: (m: string) => `💳 לאחר תשלום (${m})`,
     en: (m: string) => `💳 Post-payment (${m})`,

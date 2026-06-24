@@ -6,6 +6,7 @@ import {
   executeEditClassSession,
   executeScheduleRecurringClasses,
   executeRequestPayment,
+  executeRefundPayment,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
@@ -78,6 +79,20 @@ describe('requestPayment — authorization matrix (no state touched)', () => {
     const res = await executeRequestPayment({ customer: 'Dana', amount: 300, description: '  ' }, payCtx('manager')) as { ok: boolean; reason?: string }
     expect(res.ok).toBe(false)
     expect(res.reason).toBe('missing_description')
+  })
+})
+
+describe('refundTransaction — authorization gate (no state touched on refusal)', () => {
+  it('customer is refused before any DB access', async () => {
+    const res = await executeRefundPayment({ customer: 'Dana' }, payCtx('customer')) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('delegated user WITHOUT the payment.refund grant is refused', async () => {
+    const res = await executeRefundPayment({ customer: 'Dana' }, payCtx('delegated_user', ['payment.charge'])) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized') // charge grant does NOT imply refund
   })
 })
 
