@@ -12,7 +12,7 @@ import {
 import { createCalendarClient } from '../../adapters/calendar/client.js'
 import type { RawCalendarEvent } from '../../adapters/calendar/types.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
-import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
+import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
 import { logAudit } from '../audit/logger.js'
 import { i18n, type Lang } from '../i18n/t.js'
 
@@ -248,6 +248,7 @@ export async function runInboundSync(businessId: string, opts: { full?: boolean 
 interface AffectedBooking {
   bookingId: string
   customerId: string
+  serviceTypeId: string | null
   slotStart: Date
 }
 
@@ -269,7 +270,7 @@ async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent): Pr
     const bookingId = ev.paId
     if (!bookingId) return null
     const [booking] = await db
-      .select({ id: bookings.id, customerId: bookings.customerId, slotStart: bookings.slotStart, state: bookings.state, googleEtag: bookings.googleEtag })
+      .select({ id: bookings.id, customerId: bookings.customerId, serviceTypeId: bookings.serviceTypeId, slotStart: bookings.slotStart, state: bookings.state, googleEtag: bookings.googleEtag })
       .from(bookings)
       .where(and(eq(bookings.id, bookingId), eq(bookings.businessId, businessId)))
       .limit(1)
@@ -277,7 +278,7 @@ async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent): Pr
     // Echo of our own write — identical etag means nothing changed on Google's side.
     if (!cancelled && ev.etag && booking.googleEtag && ev.etag === booking.googleEtag) return null
     if (cancelled && (booking.state === 'confirmed' || booking.state === 'held' || booking.state === 'pending_payment')) {
-      return { bookingId: booking.id, customerId: booking.customerId, slotStart: booking.slotStart }
+      return { bookingId: booking.id, customerId: booking.customerId, serviceTypeId: booking.serviceTypeId, slotStart: booking.slotStart }
     }
     return null
   }
@@ -367,12 +368,6 @@ async function applyOwnerCancellations(ctx: SyncContext, affected: AffectedBooki
   }
 
   for (const a of affected) {
-    const [customer] = await db
-      .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
-      .from(identities)
-      .where(eq(identities.id, a.customerId))
-      .limit(1)
-
     await db
       .update(bookings)
       .set({
@@ -384,20 +379,16 @@ async function applyOwnerCancellations(ctx: SyncContext, affected: AffectedBooki
       })
       .where(eq(bookings.id, a.bookingId))
 
-    if (customer) {
-      const custLang: Lang = (customer.preferredLanguage as Lang | null | undefined) ?? ctx.lang
-      const locale = custLang === 'he' ? 'he-IL' : 'en-GB'
-      const dateStr = a.slotStart.toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long' })
-      const fallback = i18n.booking_cancelled_schedule[custLang](dateStr)
-      const msg = await generateProactiveCustomerMessage({
-        businessName: ctx.business.name ?? 'the business',
-        language: custLang,
-        situation: `The customer's appointment on ${dateStr} has been cancelled due to a schedule change. Apologise briefly and tell them they can reply REBOOK to find a new slot or contact the business directly.`,
-        fallback,
-        timeoutMs: 2500,
-      }).catch(() => fallback)
-      await enqueueMessage(customer.phoneNumber, msg).catch(() => { /* non-fatal */ })
-    }
+    // Tell the customer through the initiation spine: in-window it phrases a warm note, out of
+    // window it falls back to the booking_cancelled_by_business template instead of being silently
+    // dropped by Meta (the old free-form enqueueMessage failed for cold customers). Best-effort.
+    await notifyBusinessBookingChange(db, businessId, {
+      kind: 'cancelled',
+      bookingId: a.bookingId,
+      customerId: a.customerId,
+      serviceTypeId: a.serviceTypeId,
+      slotStart: a.slotStart,
+    })
 
     await logAudit(db, {
       businessId,

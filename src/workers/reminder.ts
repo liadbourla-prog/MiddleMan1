@@ -4,6 +4,7 @@ import { db } from '../db/client.js'
 import { bookings, identities, serviceTypes, businesses } from '../db/schema.js'
 import { enqueueMessage } from './message-retry.js'
 import { sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
@@ -13,8 +14,13 @@ import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 
 const QUEUE_NAME = 'reminders'
 
+// The "primary" (further-out) reminder is configurable per business/service (template catalog
+// #15). When the effective offset is the historical 24h default it stays type '24h' with the
+// appointment_reminder_24h template; any other offset becomes type 'custom' with the
+// neutral-worded appointment_reminder_custom template (no "tomorrow", so any offset reads right).
+// The 1h reminder is always scheduled as before.
 interface ReminderJob {
-  type: '24h' | '1h'
+  type: '24h' | '1h' | 'custom'
   bookingId: string
   businessId: string
   customerId: string
@@ -23,6 +29,22 @@ interface ReminderJob {
 }
 
 export const reminderQueue = new Queue<ReminderJob>(QUEUE_NAME, { connection: redisConnection })
+
+/** Effective reminder offset in hours: per-service override → business default → 24. */
+async function resolveReminderOffsetHours(businessId: string, serviceTypeId: string): Promise<number> {
+  const [svc] = await db
+    .select({ off: serviceTypes.reminderOffsetHours })
+    .from(serviceTypes)
+    .where(eq(serviceTypes.id, serviceTypeId))
+    .limit(1)
+  if (svc?.off != null) return svc.off
+  const [biz] = await db
+    .select({ off: businesses.reminderOffsetHours })
+    .from(businesses)
+    .where(eq(businesses.id, businessId))
+    .limit(1)
+  return biz?.off ?? 24
+}
 
 export async function scheduleReminders(
   businessId: string,
@@ -42,11 +64,15 @@ export async function scheduleReminders(
     slotStart: slotStart.toISOString(),
   }
 
-  const delay24h = slotMs - now - 24 * 60 * 60 * 1_000
-  if (delay24h > 0) {
-    await reminderQueue.add('24h', { ...base, type: '24h' }, {
-      delay: delay24h,
-      jobId: `reminder-24h-${bookingId}`,
+  // Primary reminder at slotStart − effectiveOffset. offset 24 → the canonical '24h' reminder;
+  // any other value → the neutral 'custom' reminder. One job per booking either way.
+  const offsetHours = await resolveReminderOffsetHours(businessId, serviceTypeId)
+  const primaryType: ReminderJob['type'] = offsetHours === 24 ? '24h' : 'custom'
+  const delayPrimary = slotMs - now - offsetHours * 60 * 60 * 1_000
+  if (delayPrimary > 0) {
+    await reminderQueue.add(primaryType, { ...base, type: primaryType }, {
+      delay: delayPrimary,
+      jobId: `reminder-${primaryType}-${bookingId}`,
       attempts: 2,
       backoff: { type: 'fixed', delay: 60_000 },
     })
@@ -64,12 +90,12 @@ export async function scheduleReminders(
 }
 
 export async function cancelReminders(bookingId: string): Promise<void> {
-  const job24 = await reminderQueue.getJob(`reminder-24h-${bookingId}`)
-  const job1h = await reminderQueue.getJob(`reminder-1h-${bookingId}`)
-  await Promise.allSettled([
-    job24?.remove(),
-    job1h?.remove(),
+  const jobs = await Promise.all([
+    reminderQueue.getJob(`reminder-24h-${bookingId}`),
+    reminderQueue.getJob(`reminder-custom-${bookingId}`),
+    reminderQueue.getJob(`reminder-1h-${bookingId}`),
   ])
+  await Promise.allSettled(jobs.map((j) => j?.remove()))
 }
 
 async function processReminder(job: { data: ReminderJob }) {
@@ -128,42 +154,51 @@ async function processReminder(job: { data: ReminderJob }) {
 
   const serviceName = service?.name ?? (lang === 'he' ? 'התור שלך' : 'your appointment')
 
+  // Per-type wording, initiator, template, and positional template variables. The 'custom'
+  // reminder is neutral (no "tomorrow") so any owner-configured offset reads correctly; it
+  // shares the date+time variable shape with the 24h reminder. The 1h reminder carries time only.
+  const customFallback = lang === 'he'
+    ? `תזכורת — ${serviceName} ב${biz.name} בתאריך ${dateStr} בשעה ${timeStr}. אם משהו השתנה, רק תכתבו לי ונסדר 🙂`
+    : `Reminder — ${serviceName} at ${biz.name} on ${dateStr} at ${timeStr}. If anything changed, just message me and we'll sort it 🙂`
+
   const body = type === '24h'
     ? i18n.reminder_24h[lang](serviceName, biz.name, dateStr, timeStr)
-    : i18n.reminder_1h[lang](serviceName, biz.name, timeStr)
+    : type === '1h'
+      ? i18n.reminder_1h[lang](serviceName, biz.name, timeStr)
+      : customFallback
 
   const situation = type === '24h'
     ? `Send a friendly 24-hour reminder: the customer has "${serviceName}" at ${biz.name} tomorrow, ${dateStr} at ${timeStr}. If they need to change or cancel, invite them to just tell you in their own words — never tell them to "reply CANCEL".`
-    : `Send a friendly 1-hour reminder: the customer has "${serviceName}" at ${biz.name} in 1 hour at ${timeStr}. Warm and brief.`
+    : type === '1h'
+      ? `Send a friendly 1-hour reminder: the customer has "${serviceName}" at ${biz.name} in 1 hour at ${timeStr}. Warm and brief.`
+      : `Send a friendly reminder: the customer has "${serviceName}" at ${biz.name} on ${dateStr} at ${timeStr}. Do NOT say "tomorrow" (the timing varies). If they need to change or cancel, invite them to just tell you in their own words.`
 
   // Out-of-window template fallback details — used by the sendTemplate executor below.
   const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
     ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
     : undefined
-  const templateName = type === '24h' ? 'appointment_reminder_24h' : 'appointment_reminder_1h'
+  const initiatorId = type === '24h' ? 'reminder.24h' : type === '1h' ? 'reminder.1h' : 'reminder.custom'
+  // Positional template variables match each template's params in templates.ts: 1h → [service,
+  // business, time]; 24h/custom → [service, business, date, time].
+  const templateValues = type === '1h'
+    ? [serviceName, biz.name, timeStr]
+    : [serviceName, biz.name, dateStr, timeStr]
 
   const decision = await dispatchInitiation(
     db,
-    getInitiator(type === '24h' ? 'reminder.24h' : 'reminder.1h'),
+    getInitiator(initiatorId),
     { businessId, recipientId: customerId, dedupKey: `reminder.${type}:${bookingId}` },
     {
       sendFreeForm: async () => {
         const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: body, timeoutMs: 2500 })
         await enqueueMessage(customer.phoneNumber, llmBody)
       },
-      sendTemplate: async () => {
+      sendTemplate: async (templateName) => {
         await sendTemplateMessage({
           toNumber: customer.phoneNumber,
           templateName,
           languageCode: lang === 'he' ? 'he' : 'en',
-          components: [{
-            type: 'body',
-            parameters: [
-              { type: 'text', text: serviceName },
-              { type: 'text', text: biz.name },
-              { type: 'text', text: type === '24h' ? dateStr : timeStr },
-            ],
-          }],
+          components: bodyComponents(templateValues),
           bodyText: body,
           ...(waCredentials !== undefined && { credentials: waCredentials }),
         }).catch(() => { /* non-fatal — log below */ })

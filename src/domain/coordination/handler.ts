@@ -6,7 +6,8 @@ import * as repo from './repository.js'
 import type { ContactReplyClass, OwnerDecision, Slot } from './types.js'
 import { renderBookingEvent } from '../calendar/event-content.js'
 import { logAudit } from '../audit/logger.js'
-import { sendMessage } from '../../adapters/whatsapp/sender.js'
+import { sendMessage, sendTemplateMessage, canSendFreeForm } from '../../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { i18n, type Lang } from '../i18n/t.js'
 
@@ -64,6 +65,32 @@ async function phraseAndSend(opts: { toNumber: string; situation: string; fallba
   return res.ok
 }
 
+// First outreach to a contact. A cold external contact has never messaged the PA, so the
+// 24-hour customer-service window is always closed on the first send — Meta rejects the
+// free-form text. Fall back to the approved `contact_meeting_outreach` template
+// ([sender_name, proposed_times]) when out of window; once the contact replies the window
+// opens and every later turn in applyTransition goes free-form as before.
+async function sendInitialOutreach(opts: { toNumber: string; contactId: string; situation: string; times: string; ctx: BusinessCtx }): Promise<boolean> {
+  const introducer = introducerOf(opts.ctx)
+  if (await canSendFreeForm(opts.contactId)) {
+    return phraseAndSend({
+      toNumber: opts.toNumber,
+      situation: opts.situation,
+      fallback: i18n.coordination_offer_to_contact[opts.ctx.lang](introducer, opts.times),
+      ctx: opts.ctx,
+    })
+  }
+  const res = await sendTemplateMessage({
+    toNumber: opts.toNumber,
+    templateName: 'contact_meeting_outreach',
+    languageCode: opts.ctx.lang === 'he' ? 'he' : 'en',
+    components: bodyComponents([introducer, opts.times]),
+    bodyText: i18n.coordination_offer_to_contact[opts.ctx.lang](introducer, opts.times),
+    ...(opts.ctx.waCredentials !== undefined && { credentials: opts.ctx.waCredentials }),
+  })
+  return res.ok
+}
+
 // Owner asks the PA to coordinate. Contact already registered + slots resolved by the tool.
 export async function startCoordination(db: Db, calendar: CalendarClient, input: {
   businessId: string; ownerId: string; contactId: string; contactPhone: string;
@@ -92,10 +119,11 @@ export async function startCoordination(db: Db, calendar: CalendarClient, input:
   })
 
   const times = useWindows ? describeWindows(input.allowedWindows!, input.ctx) : describeCandidates(offerSlots, input.ctx)
-  const sent = await phraseAndSend({
+  const sent = await sendInitialOutreach({
     toNumber: input.contactPhone,
+    contactId: input.contactId,
     situation: `You are reaching out on behalf of the business to set up a meeting ("${input.title}"). Offer these times and invite them to pick one or propose another: ${times}.`,
-    fallback: i18n.coordination_offer_to_contact[input.ctx.lang](introducerOf(input.ctx), times),
+    times,
     ctx: input.ctx,
   })
 

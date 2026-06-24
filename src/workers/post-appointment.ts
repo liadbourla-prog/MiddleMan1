@@ -15,9 +15,11 @@ import { enqueueMessage } from './message-retry.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 import { getInitiator } from '../domain/initiations/registry.js'
-import { reviewDueWindow, noShowFollowupWindow } from '../domain/crm/post-appointment.js'
+import { reviewDueWindow, noShowFollowupWindow, thankYouDueWindow } from '../domain/crm/post-appointment.js'
 
 const QUEUE_NAME = 'post-appointment'
 const REPEAT_EVERY_MS = 60 * 60 * 1000 // hourly
@@ -36,7 +38,7 @@ interface SendableBooking {
 async function sendPostAppointment(
   initiatorId: 'review.request' | 'booking.no_show_followup',
   b: SendableBooking,
-  biz: { id: string; name: string; defaultLanguage: string | null },
+  biz: { id: string; name: string; defaultLanguage: string | null; whatsappPhoneNumberId: string | null; whatsappAccessToken: string | null },
 ): Promise<void> {
   const lang: Lang = b.customerLang ?? (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
   const serviceName = b.serviceName ?? (lang === 'he' ? 'התור שלך' : 'your appointment')
@@ -53,6 +55,13 @@ async function sendPostAppointment(
       ? `היי, התגעגענו אליך ב${biz.name}. נשמח לעזור לקבוע תור חדש מתי שנוח לך 💛`
       : `Hi, we missed you at ${biz.name}. Happy to help you book a new time whenever suits you 💛`)
 
+  // Out-of-window template fallback. Both review_request and no_show_followup take a single
+  // positional variable: the business name (matches their .params in templates.ts).
+  const templateName = initiatorId === 'review.request' ? 'review_request' : 'no_show_followup'
+  const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+    ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+    : undefined
+
   await dispatchInitiation(db, getInitiator(initiatorId), {
     businessId: biz.id,
     recipientId: b.customerId,
@@ -61,6 +70,55 @@ async function sendPostAppointment(
     sendFreeForm: async () => {
       const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
       await enqueueMessage(b.customerPhone, body)
+    },
+    sendTemplate: async () => {
+      await sendTemplateMessage({
+        toNumber: b.customerPhone,
+        templateName,
+        languageCode: lang === 'he' ? 'he' : 'en',
+        components: bodyComponents([biz.name]),
+        bodyText: fallback,
+        ...(waCredentials !== undefined && { credentials: waCredentials }),
+      }).catch(() => { /* non-fatal — next tick / retry handles transient failures */ })
+    },
+  })
+}
+
+/** Send one post-appointment thank-you (template catalog #14). Template vars: [service, business]. */
+async function sendThankYou(
+  b: SendableBooking,
+  biz: { id: string; name: string; defaultLanguage: string | null; whatsappPhoneNumberId: string | null; whatsappAccessToken: string | null },
+): Promise<void> {
+  const lang: Lang = b.customerLang ?? (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const serviceName = b.serviceName ?? (lang === 'he' ? 'הביקור שלך' : 'your visit')
+
+  const situation = `The customer just had "${serviceName}" at ${biz.name}. Send a short, warm thank-you for choosing the business and a hope they enjoyed it — genuine, never salesy, no ask.`
+  const fallback = lang === 'he'
+    ? `תודה שבחרת ב${biz.name}! מקווים שנהנית מ${serviceName}. נשמח לראות אותך שוב 💛`
+    : `Thank you for choosing ${biz.name}! We hope you enjoyed ${serviceName}. We'd love to see you again 💛`
+
+  const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+    ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+    : undefined
+
+  await dispatchInitiation(db, getInitiator('post.thank_you'), {
+    businessId: biz.id,
+    recipientId: b.customerId,
+    dedupKey: `post.thank_you:${b.bookingId}`,
+  }, {
+    sendFreeForm: async () => {
+      const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
+      await enqueueMessage(b.customerPhone, body)
+    },
+    sendTemplate: async (templateName) => {
+      await sendTemplateMessage({
+        toNumber: b.customerPhone,
+        templateName,
+        languageCode: lang === 'he' ? 'he' : 'en',
+        components: bodyComponents([serviceName, biz.name]),
+        bodyText: fallback,
+        ...(waCredentials !== undefined && { credentials: waCredentials }),
+      }).catch(() => { /* non-fatal — next tick / retry handles transient failures */ })
     },
   })
 }
@@ -100,13 +158,26 @@ async function dueBookings(
 
 export async function runPostAppointmentTick(now: Date = new Date()): Promise<void> {
   const bizRows = await db
-    .select({ id: businesses.id, name: businesses.name, defaultLanguage: businesses.defaultLanguage, automatedMessagesConfig: businesses.automatedMessagesConfig })
+    .select({ id: businesses.id, name: businesses.name, defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken, automatedMessagesConfig: businesses.automatedMessagesConfig, postAppointmentThankyouEnabled: businesses.postAppointmentThankyouEnabled })
     .from(businesses)
 
   for (const biz of bizRows) {
     const cfg = biz.automatedMessagesConfig as AutomatedMessagesConfig | null
 
     try {
+      // Thank-you (#14): opt-in via the dedicated postAppointmentThankyouEnabled flag (not an
+      // automatedMessagesConfig key). Fires ~1–4h after an attended appointment ended.
+      if (biz.postAppointmentThankyouEnabled === true) {
+        const due = await dueBookings(biz.id, 'attended', 'slotEnd', thankYouDueWindow(now))
+        for (const b of due) {
+          try { await sendThankYou(b, biz) }
+          catch (err) { console.error('[post-appointment] thank-you send failed', { bookingId: b.bookingId, err: (err as Error).message }) }
+        }
+        if (due.length > 0) {
+          await logAudit(db, { businessId: biz.id, actorId: null, action: 'post_thank_you.swept', entityType: 'initiation', metadata: { due: due.length } })
+        }
+      }
+
       if (cfg?.review_request?.enabled === true) {
         const due = await dueBookings(biz.id, 'attended', 'slotEnd', reviewDueWindow(now))
         for (const b of due) {

@@ -21,6 +21,8 @@ import { runRatchet } from '../domain/initiations/ratchet-runner.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 import { getInitiator } from '../domain/initiations/registry.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { enqueueMessage } from './message-retry.js'
 
 const QUEUE_NAME = 'winback-detector'
@@ -42,6 +44,8 @@ export async function runWinbackTick(): Promise<number> {
       name: businesses.name,
       timezone: businesses.timezone,
       defaultLanguage: businesses.defaultLanguage,
+      whatsappPhoneNumberId: businesses.whatsappPhoneNumberId,
+      whatsappAccessToken: businesses.whatsappAccessToken,
     })
     .from(businesses)
     .where(and(eq(businesses.proactiveWinbackEnabled, true), isNotNull(businesses.onboardingCompletedAt)))
@@ -62,6 +66,9 @@ export async function runWinbackTick(): Promise<number> {
           if (!proposal) continue
           if (autonomy.state === 'owner_configured') {
             // Promoted: the owner has delegated win-backs — send directly under the gate.
+            const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+              ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+              : undefined
             const decision = await dispatchInitiation(db, getInitiator('churn.winback'), {
               businessId: biz.id,
               recipientId: summary.identityId,
@@ -70,6 +77,17 @@ export async function runWinbackTick(): Promise<number> {
               sendFreeForm: async () => {
                 const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: biz.defaultLanguage, situation: proposal.situation, fallback: proposal.fallback, timeoutMs: 2500 })
                 await enqueueMessage(summary.phoneNumber, body)
+              },
+              sendTemplate: async () => {
+                // Out-of-window: winback_reengage template — [business].
+                await sendTemplateMessage({
+                  toNumber: summary.phoneNumber,
+                  templateName: 'winback_reengage',
+                  languageCode: biz.defaultLanguage === 'he' ? 'he' : 'en',
+                  components: bodyComponents([biz.name]),
+                  bodyText: proposal.fallback,
+                  ...(waCredentials !== undefined && { credentials: waCredentials }),
+                }).catch(() => { /* retry queue handles transient failures */ })
               },
             })
             if (decision.kind !== 'skip') proposed++

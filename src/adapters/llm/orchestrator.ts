@@ -46,6 +46,7 @@ import {
   executeRequestPayment,
   executeRefundPayment,
   executeMessageCustomer,
+  executeBroadcastAnnouncement,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
 import { executeCoordinateMeeting, executeResolveMeetingCoordination } from '../../domain/manager/coordination-tools.js'
@@ -365,15 +366,37 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'messageCustomer',
-    description: "Send a WhatsApp message to ONE specific customer on the owner's behalf (e.g. \"text Harel and ask when he's free this week\", \"let Dana know class is cancelled\"). Compose the message yourself and confirm with the owner before calling. Pass the customer's phone number when the owner gives one (lets you reach someone new); otherwise pass the name to match a customer on file. Only report the message as sent if this tool returns ok:true — it may report the customer can't be reached, in which case tell the owner the truth.",
+    description: "Send a WhatsApp message to ONE specific customer on the owner's behalf (e.g. \"text Harel and ask when he's free this week\", \"let Dana know class is cancelled\"). Compose the message yourself and confirm with the owner before calling. Pass the customer's phone number when the owner gives one (lets you reach someone new); otherwise pass the name to match a customer on file. Only report the message as sent if this tool returns ok:true — it may report the customer can't be reached, in which case tell the owner the truth. When the owner is asking the customer to MOVE an existing appointment as a favour (\"ask Dana to push her 14:00 to 16:00\"), also pass rescheduleFavor with the current and new times — that lets the message still reach the customer (via an approved template) even if they're outside the 24-hour window.",
     parameters: {
       type: Type.OBJECT,
       properties: {
         phoneNumber: { type: Type.STRING, description: "Customer phone in E.164 (e.g. +972541234567) when the owner provides it. Preferred — lets you message a new contact." },
         name: { type: Type.STRING, description: 'Customer name to match an existing customer, when no phone number is given.' },
         message: { type: Type.STRING, description: "The full message text to send, composed in the customer's language. Warm and natural — this is what the customer receives verbatim." },
+        rescheduleFavor: {
+          type: Type.OBJECT,
+          description: "Only when the message is asking the customer to move an existing appointment as a favour. Carries the current and new times so an out-of-window send can fall back to the approved reschedule-favour template. Times are short human-readable strings in the customer's language (e.g. \"מחר 14:00\", \"Tomorrow 16:00\").",
+          properties: {
+            currentTime: { type: Type.STRING, description: "The appointment's current time, human-readable." },
+            newTime: { type: Type.STRING, description: 'The proposed new time, human-readable.' },
+          },
+          required: ['currentTime', 'newTime'],
+        },
       },
       required: ['message'],
+    },
+  },
+  {
+    name: 'broadcastAnnouncement',
+    description: "Send a one-off announcement to MANY customers at once on the owner's behalf — only one of three fixed kinds: a change of opening HOURS, a change of ADDRESS, or a PROMO/special offer. Use this (not messageCustomer, which is for ONE person) when the owner wants to tell their customers something like \"let everyone know we're closed Friday\" or \"tell my regulars about the holiday sale\". Confirm the exact wording of the detail with the owner first. By default it reaches all customers; pass segmentFilter to narrow it (e.g. only lapsed customers, or only a service's customers). Report the real send counts the tool returns — never inflate them.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        kind: { type: Type.STRING, enum: ['hours_change', 'address_change', 'promo'], description: 'Which fixed-shape announcement: new opening hours, new address, or a promotion.' },
+        detail: { type: Type.STRING, description: "The specific detail to announce, in the customers' language — the new hours (\"א-ה 9:00-18:00\"), the new address, or the promo terms (\"20% הנחה עד סוף החודש\"). This is the only free part; keep it short." },
+        segmentFilter: { type: Type.OBJECT, description: 'Optional segment to narrow recipients: { serviceTypeId?, inactiveSinceDays?, hasBooking?, lapsed?, vip?, providerId? }. Omit to reach all customers.' },
+      },
+      required: ['kind', 'detail'],
     },
   },
   {
@@ -718,6 +741,8 @@ async function dispatchTool(
       return executeRefundPayment(args as unknown as Parameters<typeof executeRefundPayment>[0], ctx)
     case 'messageCustomer':
       return executeMessageCustomer(args as unknown as Parameters<typeof executeMessageCustomer>[0], ctx)
+    case 'broadcastAnnouncement':
+      return executeBroadcastAnnouncement(args as unknown as Parameters<typeof executeBroadcastAnnouncement>[0], ctx)
     case 'coordinateMeeting':
       return executeCoordinateMeeting(args as unknown as Parameters<typeof executeCoordinateMeeting>[0], ctx)
     case 'resolveMeetingCoordination':

@@ -13,7 +13,8 @@ import {
   reshuffleCampaigns, reshuffleOffers,
 } from '../db/schema.js'
 import { redisConnection } from '../redis.js'
-import { sendMessage } from '../adapters/whatsapp/sender.js'
+import { sendMessage, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 import { getInitiator } from '../domain/initiations/registry.js'
@@ -81,8 +82,19 @@ async function sendProbe(
       const body = await generateProactiveCustomerMessage({ businessName, language: lang, situation, fallback, timeoutMs: 2500 })
       await sendMessage({ toNumber: phoneNumber, body }, creds).catch(() => { /* retry queue handles transient failures */ })
     },
+    sendTemplate: async () => {
+      // Out-of-window: reshuffle_probe template — [business, proposed_time].
+      await sendTemplateMessage({
+        toNumber: phoneNumber,
+        templateName: 'reshuffle_probe',
+        languageCode: lang === 'he' ? 'he' : 'en',
+        components: bodyComponents([businessName, dateStr]),
+        bodyText: fallback,
+        ...(creds !== undefined && { credentials: creds }),
+      }).catch(() => { /* retry queue handles transient failures */ })
+    },
   })
-  return decision.kind === 'send_free_form'
+  return decision.kind === 'send_free_form' || decision.kind === 'send_template'
 }
 
 /** Notify the manager that a solution is ready for approval. */

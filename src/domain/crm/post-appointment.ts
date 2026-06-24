@@ -16,6 +16,12 @@ const REVIEW_BEFORE_MS = 24 * HOUR_MS
 // dedup ledger prevents a second nudge once the first has fired).
 const NO_SHOW_LOOKBACK_MS = 48 * HOUR_MS
 
+// Thank-you (template catalog #14): a warm note soon after an attended appointment ended —
+// earlier than the next-day review request. A booking whose slotEnd lands in [now-4h, now-1h]
+// is due. The band absorbs hourly tick jitter; the per-booking dedupKey guarantees one send.
+const THANKYOU_AFTER_MS = 4 * HOUR_MS
+const THANKYOU_BEFORE_MS = 1 * HOUR_MS
+
 /**
  * Attended bookings whose slotEnd falls in [now-48h, now-24h] are due for a review request.
  * `after` is the inclusive lower bound, `before` the inclusive upper bound on slotEnd.
@@ -34,4 +40,16 @@ export function reviewDueWindow(now: Date): { after: Date; before: Date } {
  */
 export function noShowFollowupWindow(now: Date): { after: Date } {
   return { after: new Date(now.getTime() - NO_SHOW_LOOKBACK_MS) }
+}
+
+/**
+ * Attended bookings whose slotEnd falls in [now-4h, now-1h] are due for a thank-you.
+ * `after` is the inclusive lower bound, `before` the inclusive upper bound on slotEnd.
+ */
+export function thankYouDueWindow(now: Date): { after: Date; before: Date } {
+  const ms = now.getTime()
+  return {
+    after: new Date(ms - THANKYOU_AFTER_MS),
+    before: new Date(ms - THANKYOU_BEFORE_MS),
+  }
 }

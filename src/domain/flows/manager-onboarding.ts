@@ -4,6 +4,7 @@ import type { Db } from '../../db/client.js'
 import { businesses, importTokens, managerInstructions, serviceTypes, availability } from '../../db/schema.js'
 import type { Business, OnboardingStep, EscalationRule } from '../../db/schema.js'
 import type { InboundMessage } from '../../adapters/whatsapp/types.js'
+import { provisionTemplatesForBusiness } from '../../adapters/whatsapp/template-provisioning.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import { classifyManagerInstruction, generateOnboardingReply, generateManagerCommandReply, parseOnboardingAnswer, parseBusinessName, parseOnboardingServices, parseOnboardingHours, parseCalendarChoice, parseImportChoice, detectOnboardingAmendment, type OnboardingHourEntry } from '../../adapters/llm/client.js'
 import { applyInstruction } from '../manager/apply.js'
@@ -764,6 +765,13 @@ async function handleVerifyStep(
       .set({ onboardingCompletedAt: new Date(), onboardingStep: null })
       .where(eq(businesses.id, business.id))
     log.info({ businessId: business.id }, 'Onboarding: complete via GO')
+
+    // Replicate the WhatsApp template catalog into this business's own WABA so out-of-window
+    // proactive sends have approved templates. Best-effort + idempotent: no-ops (skippedReason)
+    // until the WABA id is captured, and a failure here must not block onboarding completion.
+    await provisionTemplatesForBusiness(db, business.id).catch((err) => {
+      log.warn({ err, businessId: business.id }, 'Failed to provision WhatsApp templates after onboarding')
+    })
 
     await createWorkflow(db, business.id, identity.id, 'business-knowledge-setup', 'brand-voice').catch((err) => {
       log.warn({ err, businessId: business.id }, 'Failed to create business-knowledge-setup workflow after onboarding')

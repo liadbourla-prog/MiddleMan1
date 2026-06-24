@@ -19,6 +19,8 @@ import { enqueueMessage } from './message-retry.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 import { getInitiator } from '../domain/initiations/registry.js'
 import { renewalScanWindow, renewalTierForRenewsAt, initiatorIdForRenewalTier, type RenewalTier } from '../domain/crm/subscription-renewal.js'
@@ -43,7 +45,7 @@ interface RenewableSubscription {
 async function sendRenewal(
   tier: RenewalTier,
   s: RenewableSubscription,
-  biz: { id: string; name: string; defaultLanguage: string | null },
+  biz: { id: string; name: string; defaultLanguage: string | null; whatsappPhoneNumberId: string | null; whatsappAccessToken: string | null },
 ): Promise<void> {
   const initiatorId = initiatorIdForRenewalTier(tier)
   const lang: Lang = s.customerLang ?? (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
@@ -68,6 +70,13 @@ async function sendRenewal(
   const renewsAtBucket = s.renewsAt.toISOString().slice(0, 10) // YYYY-MM-DD
   const dedupKey = `subscription.${tier}:${s.subscriptionId}:${renewsAtBucket}`
 
+  // Out-of-window template fallback — same proven copy as `fallback`, with plan/business/date as
+  // positional variables (matches subscription_renewal_{7d,1d}.params in templates.ts). Price is
+  // intentionally omitted: it's optional in the data, and a template's variable count is fixed.
+  const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+    ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+    : undefined
+
   await dispatchInitiation(db, getInitiator(initiatorId), {
     businessId: biz.id,
     recipientId: s.customerId,
@@ -76,6 +85,16 @@ async function sendRenewal(
     sendFreeForm: async () => {
       const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
       await enqueueMessage(s.customerPhone, body)
+    },
+    sendTemplate: async (templateName) => {
+      await sendTemplateMessage({
+        toNumber: s.customerPhone,
+        templateName,
+        languageCode: lang === 'he' ? 'he' : 'en',
+        components: bodyComponents([s.planName, biz.name, dateStr]),
+        bodyText: fallback,
+        ...(waCredentials !== undefined && { credentials: waCredentials }),
+      }).catch(() => { /* retry queue / next tick handles transient failures */ })
     },
   })
 }
@@ -119,7 +138,7 @@ async function renewableSubscriptions(
 
 export async function runSubscriptionRenewalTick(now: Date = new Date()): Promise<void> {
   const bizRows = await db
-    .select({ id: businesses.id, name: businesses.name, defaultLanguage: businesses.defaultLanguage, subscriptionRenewalEnabled: businesses.subscriptionRenewalEnabled })
+    .select({ id: businesses.id, name: businesses.name, defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken, subscriptionRenewalEnabled: businesses.subscriptionRenewalEnabled })
     .from(businesses)
     .where(eq(businesses.subscriptionRenewalEnabled, true))
 

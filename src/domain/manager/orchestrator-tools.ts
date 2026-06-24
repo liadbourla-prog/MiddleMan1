@@ -17,6 +17,8 @@ import type { PaymentLinkSendPolicy } from '../payments/timing.js'
 import { reshuffleCampaigns, reshuffleProposals, freedSlotApprovals } from '../../db/schema.js'
 import { approveProposal, rejectProposal } from '../reshuffle/gate.js'
 import { resolveInitiationProposal } from '../initiations/approvals.js'
+import { runBroadcast } from '../initiations/broadcast.js'
+import type { SegmentFilter } from '../../shared/skill-types.js'
 import { upsertNotificationRule, removeNotificationRule, type NotificationEvent, type NotificationAction, type NotificationRule } from '../initiations/notification-rules.js'
 import { setAutonomyState } from '../initiations/autonomy.js'
 import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
@@ -33,7 +35,8 @@ import { getOpenSlots } from '../availability/service.js'
 import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
 import { findProviderByName } from '../provider/lookup.js'
-import { sendMessage } from '../../adapters/whatsapp/sender.js'
+import { sendMessage, sendTemplateMessage } from '../../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
 import { logAudit } from '../audit/logger.js'
 import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
@@ -1887,6 +1890,10 @@ interface MessageCustomerArgs {
   phoneNumber?: string
   name?: string
   message: string
+  // Present only when the owner is asking the customer to move an existing appointment as a
+  // favour. Carries human-readable current/new times so an out-of-window send can fall back to
+  // the approved reschedule_favor_request template instead of failing silently.
+  rescheduleFavor?: { currentTime: string; newTime: string }
 }
 
 // Proactively send a WhatsApp message to one specific customer on the owner's behalf
@@ -1903,6 +1910,7 @@ export async function executeMessageCustomer(
 
   const [biz] = await ctx.db
     .select({
+      name: businesses.name,
       defaultLanguage: businesses.defaultLanguage,
       whatsappPhoneNumberId: businesses.whatsappPhoneNumberId,
       whatsappAccessToken: businesses.whatsappAccessToken,
@@ -1980,6 +1988,24 @@ export async function executeMessageCustomer(
       return { ok: false, reason: 'opted_out', guidance: 'The customer has blocked/opted out. Tell the owner the message could not be delivered.' }
     }
     if (res.outsideWindow) {
+      // Reschedule-favour fallback: when the owner is asking the customer to move an appointment
+      // and the window is closed, the approved reschedule_favor_request template can still reopen
+      // contact (the free-form note can't). [business, current_time, new_time].
+      if (args.rescheduleFavor?.currentTime && args.rescheduleFavor?.newTime) {
+        const lang = (biz?.defaultLanguage as 'he' | 'en' | null | undefined) ?? 'he'
+        const tmpl = await sendTemplateMessage({
+          toNumber: target.phoneNumber,
+          templateName: 'reschedule_favor_request',
+          languageCode: lang === 'he' ? 'he' : 'en',
+          components: bodyComponents([biz?.name ?? '', args.rescheduleFavor.currentTime, args.rescheduleFavor.newTime]),
+          bodyText: body,
+          ...(waCredentials !== undefined && { credentials: waCredentials }),
+        })
+        if (tmpl.ok) {
+          await recordOutreach('outreach.message_sent', { body, viaTemplate: 'reschedule_favor_request' })
+          return { ok: true, sentTo: target.phoneNumber, guidance: 'The customer is outside the 24-hour window, so the reschedule request went out as an approved template asking them to move the appointment. Tell the owner it was sent and you will update them when the customer replies.' }
+        }
+      }
       await recordOutreach('outreach.message_blocked', { reason: 'outside_window', body })
       return {
         ok: false,
@@ -1993,4 +2019,57 @@ export async function executeMessageCustomer(
 
   await recordOutreach('outreach.message_sent', { body })
   return { ok: true, sentTo: target.phoneNumber, guidance: 'The message was actually delivered. Confirm to the owner in your own words that you sent it and will update them when the customer replies.' }
+}
+
+// ── broadcastAnnouncement ─────────────────────────────────────────────────────
+
+interface BroadcastAnnouncementArgs {
+  kind?: string
+  detail?: string
+  segmentFilter?: SegmentFilter
+}
+
+// Owner-triggered fan-out of one of three fixed-shape announcements (hours / address / promo) to
+// a customer segment. The runner enforces the gate per recipient (opt-out + quiet hours + budget)
+// and a blast-radius breaker; out-of-window recipients receive the matching broadcast_* template.
+export async function executeBroadcastAnnouncement(args: BroadcastAnnouncementArgs, ctx: ToolContext): Promise<object> {
+  // Owner-level action — delegated staff cannot blast the customer base.
+  if (ctx.role && ctx.role !== 'manager') {
+    return { ok: false, reason: 'not_authorized', guidance: "Only the business owner can send a broadcast. Tell the user you can't do this on their behalf." }
+  }
+  const kind = args.kind
+  if (kind !== 'hours_change' && kind !== 'address_change' && kind !== 'promo') {
+    return { ok: false, reason: 'invalid_kind', guidance: 'Ask the owner whether this is a change of opening hours, a change of address, or a promotion — broadcasts come in those three fixed shapes.' }
+  }
+  const detail = (args.detail ?? '').trim()
+  if (!detail) {
+    return { ok: false, reason: 'missing_detail', guidance: 'Ask the owner for the specific detail to announce (the new hours, the new address, or the promo terms).' }
+  }
+
+  const result = await runBroadcast(ctx.db, {
+    businessId: ctx.businessId,
+    kind,
+    detail,
+    ...(args.segmentFilter ? { filter: args.segmentFilter } : {}),
+  })
+
+  await logAudit(ctx.db, {
+    businessId: ctx.businessId,
+    actorId: ctx.identityId,
+    action: 'broadcast.triggered',
+    entityType: 'business',
+    entityId: ctx.businessId,
+    metadata: { kind, matched: result.matched, sent: result.sent, optOuts: result.optOuts, errors: result.errors, aborted: result.aborted },
+  }).catch(() => { /* ledger write is best-effort */ })
+
+  return {
+    ok: true,
+    matched: result.matched,
+    sent: result.sent,
+    skipped: result.matched - result.sent,
+    aborted: result.aborted,
+    guidance: result.matched === 0
+      ? 'No customers matched, so nothing was sent. Tell the owner there was no one to reach with this segment.'
+      : `Sent the announcement to ${result.sent} of ${result.matched} matched customer(s) — some may be outside the 24-hour window or opted out.${result.aborted ? ' It was stopped early as a safety measure after unusual delivery results, so some were not reached.' : ''} Confirm the outcome to the owner honestly, in your own words.`,
+  }
 }

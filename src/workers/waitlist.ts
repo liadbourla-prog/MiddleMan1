@@ -3,6 +3,7 @@ import { eq, and, asc } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { waitlist, identities, businesses, serviceTypes, bookings } from '../db/schema.js'
 import { sendMessage, canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
@@ -117,6 +118,21 @@ async function attemptColdFill(
           await sendMessage({ toNumber: pick.phoneNumber, body }, creds)
         } catch {
           sendFailed = true // retry queue still handles transient failures; we only count for the breaker
+        }
+      },
+      sendTemplate: async () => {
+        // Out-of-window: coldfill_invite template — [business, service, date].
+        try {
+          await sendTemplateMessage({
+            toNumber: pick.phoneNumber,
+            templateName: 'coldfill_invite',
+            languageCode: lang === 'he' ? 'he' : 'en',
+            components: bodyComponents([biz.name, serviceName, localDateStr]),
+            bodyText: fallback,
+            ...(creds !== undefined && { credentials: creds }),
+          })
+        } catch {
+          sendFailed = true
         }
       },
     })

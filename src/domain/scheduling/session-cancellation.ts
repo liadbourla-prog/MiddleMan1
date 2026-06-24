@@ -6,6 +6,7 @@ import { enqueueMessage } from '../../workers/message-retry.js'
 import { enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { logAudit } from '../audit/logger.js'
+import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
 import { i18n, type Lang } from '../i18n/t.js'
 
 // Cancelling a class session is a state change that touches three parties: the booked
@@ -73,18 +74,17 @@ export async function cancelClassSessionBookings(
         await enqueueBookingDeletion(businessId, b.id, b.calendarEventId).catch(() => { /* non-fatal */ })
       }
 
-      const [customer] = await db
-        .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
-        .from(identities)
-        .where(eq(identities.id, b.customerId))
-        .limit(1)
-      if (customer?.phoneNumber) {
-        const custLang: Lang = (customer.preferredLanguage as Lang | null | undefined) ?? lang
-        // booking_cancelled_schedule already offers a rebooking ("Want me to find you
-        // another time?") — the alternatives ask the scenario calls for.
-        await enqueueMessage(customer.phoneNumber, i18n.booking_cancelled_schedule[custLang](slotDateStr(block.startTs, custLang)))
-          .catch(() => { /* non-fatal — queued send */ })
-      }
+      // Notify the customer through the initiation spine: in-window it phrases a warm note that
+      // offers to rebook, out of window it falls back to the booking_cancelled_by_business
+      // template instead of being silently dropped by Meta (the old free-form enqueueMessage
+      // failed for cold customers). Best-effort.
+      await notifyBusinessBookingChange(db, businessId, {
+        kind: 'cancelled',
+        bookingId: b.id,
+        customerId: b.customerId,
+        serviceTypeId: block.serviceTypeId,
+        slotStart: block.startTs,
+      })
 
       await logAudit(db, {
         businessId,

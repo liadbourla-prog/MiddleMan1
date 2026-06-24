@@ -22,6 +22,10 @@ export const businesses = pgTable('businesses', {
   whatsappPhoneNumberId: text('whatsapp_phone_number_id'),
   whatsappAccessToken: text('whatsapp_access_token'),
   whatsappAppSecret: text('whatsapp_app_secret'),
+  // WABA (WhatsApp Business Account) id — required to CREATE message templates via the Graph API
+  // (distinct from the phone_number_id). Each business has its own WABA (Embedded Signup), so the
+  // template catalog is provisioned per-WABA. Captured at onboarding; null until then.
+  whatsappBusinessAccountId: text('whatsapp_business_account_id'),
   googleCalendarId: text('google_calendar_id').notNull(),
   googleRefreshToken: text('google_refresh_token'),
   timezone: text('timezone').notNull().default('UTC'),
@@ -79,6 +83,23 @@ export const businesses = pgTable('businesses', {
   // rather than an automatedMessagesConfig key, which would widen its keyof and break the skills
   // config builder. The subscription-renewal worker skips businesses where this is false.
   subscriptionRenewalEnabled: boolean('subscription_renewal_enabled').notNull().default(false),
+  // Post-appointment thank-you opt-in (Tier 2; template catalog #14). Default OFF — a dedicated
+  // boolean (mirroring subscriptionRenewalEnabled) rather than an automatedMessagesConfig key,
+  // which would widen its keyof and break the skills config builder. The post-appointment worker
+  // skips the thank-you when this is false.
+  postAppointmentThankyouEnabled: boolean('post_appointment_thankyou_enabled').notNull().default(false),
+  // Configurable reminder offset (Tier 2; template catalog #15). Hours before slot_start to send
+  // the appointment reminder; default 24 (today's behavior). A per-service override may sharpen
+  // this (service_types.reminder_offset_hours). When the effective offset is NOT 24, reminders use
+  // the neutral-worded `appointment_reminder_custom` template (no "tomorrow") so any offset reads
+  // correctly.
+  reminderOffsetHours: integer('reminder_offset_hours').notNull().default(24),
+  // Periodic-treatment nudge opt-in (Tier 2; template catalog #16). Default OFF. A detector worker
+  // nudges customers whose last visit exceeds the service's recommended_interval_days.
+  periodicTreatmentEnabled: boolean('periodic_treatment_enabled').notNull().default(false),
+  // Birthday-greeting opt-in (Tier 2; template catalog #17). Default OFF. A detector worker greets
+  // customers whose `identities.birthday` falls today.
+  birthdayGreetingsEnabled: boolean('birthday_greetings_enabled').notNull().default(false),
   // Reschedule-retention (Phase 3b; design §7.5). Default OFF — when enabled, a genuine
   // cancellation first offers available alternate slots; accepting one converts the cancel
   // into a reschedule (deferred-cancel). The customer-booking flow reads this flag.
@@ -161,6 +182,12 @@ export const serviceTypes = pgTable('service_types', {
   isActive: boolean('is_active').notNull().default(true),
   deactivatedAt: timestamp('deactivated_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  // Per-service reminder-offset override (Tier 2; template catalog #15). null = inherit the
+  // business-level businesses.reminder_offset_hours. Hours before slot_start to remind.
+  reminderOffsetHours: integer('reminder_offset_hours'),
+  // Recommended interval between visits, in days (Tier 2; template catalog #16). null = no periodic
+  // nudge for this service. The periodic-treatment detector compares last-visit age against this.
+  recommendedIntervalDays: integer('recommended_interval_days'),
   // Skills layer
   narrative: text('narrative'),
   intakeRequired: boolean('intake_required').notNull().default(false),
@@ -572,6 +599,30 @@ export const initiationLog = pgTable(
   (t) => [
     uniqueIndex('initiation_log_dedup_idx').on(t.businessId, t.dedupKey),
     index('initiation_log_recipient_idx').on(t.recipientId, t.createdAt),
+  ],
+)
+
+// Per-WABA template provisioning ledger. One row per (business, template, language): tracks
+// whether the catalog template (src/adapters/whatsapp/templates.ts) has been created in that
+// business's own WABA and Meta's review status. The unique index makes provisioning idempotent —
+// re-running upserts the same row. `metaTemplateId` is the id Meta returns on create.
+export const waTemplateProvisioning = pgTable(
+  'wa_template_provisioning',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    templateName: text('template_name').notNull(),
+    languageCode: text('language_code').notNull(),
+    // pending → submitted to Meta, awaiting review · approved/rejected → Meta verdict ·
+    // exists → already present in the WABA (idempotent re-create) · error → submit failed.
+    status: text('status', { enum: ['pending', 'approved', 'rejected', 'exists', 'error'] }).notNull().default('pending'),
+    metaTemplateId: text('meta_template_id'),
+    lastError: text('last_error'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('wa_template_provisioning_unique_idx').on(t.businessId, t.templateName, t.languageCode),
   ],
 )
 

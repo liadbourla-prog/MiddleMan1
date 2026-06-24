@@ -31,6 +31,8 @@ import { startPostAppointmentWorker, schedulePostAppointmentJob } from './worker
 import { startDunningWorker, scheduleDunningJob } from './workers/dunning.js'
 import { startPaymentRequestWorker, schedulePaymentRequestJob } from './workers/payment-request.js'
 import { startSubscriptionRenewalWorker, scheduleSubscriptionRenewalJob } from './workers/subscription-renewal.js'
+import { startPeriodicTreatmentWorker, schedulePeriodicTreatmentJob } from './workers/periodic-treatment.js'
+import { startBirthdayWorker, scheduleBirthdayJob } from './workers/birthday.js'
 
 const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
@@ -118,6 +120,8 @@ startPostAppointmentWorker()
 startDunningWorker()
 startPaymentRequestWorker()
 startSubscriptionRenewalWorker()
+startPeriodicTreatmentWorker()
+startBirthdayWorker()
 await scheduleHoldExpiryJob()
 await scheduleCalendarSyncRenewalJob()
 await scheduleIntegritySentinelJob()
@@ -126,4 +130,6 @@ await schedulePostAppointmentJob()
 await scheduleDunningJob()
 await schedulePaymentRequestJob()
 await scheduleSubscriptionRenewalJob()
+await schedulePeriodicTreatmentJob()
+await scheduleBirthdayJob()
 app.log.info('Background workers started')

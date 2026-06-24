@@ -13,6 +13,7 @@ import { logAudit } from '../audit/logger.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
+import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { isSlotBookable } from '../availability/service.js'
@@ -723,6 +724,19 @@ export async function cancelBooking(
 
   // Cancel any pending reminders for this booking
   cancelReminders(bookingId).catch(() => { /* non-fatal */ })
+
+  // Business-originated cancel (manager actor): the customer didn't ask for this, so tell them —
+  // through the initiation spine, which falls back to the booking_cancelled_by_business template
+  // when they're outside the 24h window. Best-effort; never roll back the cancel on a notify miss.
+  if (cancelledByRole === 'manager' && booking.customerId !== actor.id) {
+    notifyBusinessBookingChange(db, actor.businessId, {
+      kind: 'cancelled',
+      bookingId,
+      customerId: booking.customerId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+    }).catch(() => { /* non-fatal */ })
+  }
 
   // Freed-slot handling now passes through the owner-approval gate (WS-C / #6 / #8):
   // it offers automatically only if the owner opted in, otherwise asks first. Best-effort.

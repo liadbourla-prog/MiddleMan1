@@ -15,10 +15,13 @@ import { eq, and, isNull } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { initiationApprovals, initiationLog, identities, businesses } from '../../db/schema.js'
 import type { InitiationApproval } from '../../db/schema.js'
-import { canSendFreeForm, sendMessage } from '../../adapters/whatsapp/sender.js'
+import { canSendFreeForm, sendMessage, sendTemplateMessage } from '../../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { logAudit } from '../audit/logger.js'
+import { getInitiator } from './registry.js'
+import type { InitiatorId } from './registry.js'
 import { runRatchet, categoryForInitiator } from './ratchet-runner.js'
 
 const DEFAULT_EXPIRES_IN_HOURS = 72
@@ -179,29 +182,8 @@ export async function resolveInitiationProposal(
   }
 
   // ── approve ──
-  // The send is now owner-approved. Resolve the 24h window: ai_proposed has no template
-  // yet, so out-of-window can't be delivered — record the approval but report unreachable.
-  const inWindow = approval.recipientId ? await canSendFreeForm(approval.recipientId) : false
-
-  if (!inWindow) {
-    await db
-      .update(initiationApprovals)
-      .set({ status: 'approved', decidedAt: now })
-      .where(eq(initiationApprovals.id, approvalId))
-    await logAudit(db, {
-      businessId: approval.businessId,
-      actorId: null,
-      action: 'initiation.approved_unreachable',
-      entityType: 'initiation_approval',
-      entityId: approvalId,
-      metadata: { initiatorId: approval.initiatorId, dedupKey: approval.dedupKey },
-    })
-    const cat = categoryForInitiator(approval.initiatorId)
-    if (cat) await runRatchet(db, approval.businessId, cat).catch(() => {})
-    return { ok: true, outcome: 'unreachable' }
-  }
-
-  // In-window: phrase + send. Load the business for name + WA credentials.
+  // The send is now owner-approved. Load the business (name + WA credentials) up front — needed
+  // for both the in-window free-form send and the out-of-window template fallback.
   const [biz] = await db
     .select({
       name: businesses.name,
@@ -216,7 +198,71 @@ export async function resolveInitiationProposal(
   const creds = biz?.whatsappPhoneNumberId && biz?.whatsappAccessToken
     ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
     : undefined
+  const cat = categoryForInitiator(approval.initiatorId)
+  const inWindow = approval.recipientId ? await canSendFreeForm(approval.recipientId) : false
 
+  // Out of window: only an approved template can be delivered. The only ai_proposed templated
+  // initiator today is churn.winback (winback_reengage, params [business]); a future ai_proposed
+  // initiator with different params would need a per-initiator param resolver here.
+  if (!inWindow) {
+    const windowPolicy = getInitiator(approval.initiatorId as InitiatorId)?.windowPolicy
+    const templateName = windowPolicy && windowPolicy !== 'skip' ? windowPolicy.templateName : null
+
+    if (!templateName) {
+      // No template → record approval but report unreachable (owner knows it couldn't send now).
+      await db
+        .update(initiationApprovals)
+        .set({ status: 'approved', decidedAt: now })
+        .where(eq(initiationApprovals.id, approvalId))
+      await logAudit(db, {
+        businessId: approval.businessId,
+        actorId: null,
+        action: 'initiation.approved_unreachable',
+        entityType: 'initiation_approval',
+        entityId: approvalId,
+        metadata: { initiatorId: approval.initiatorId, dedupKey: approval.dedupKey },
+      })
+      if (cat) await runRatchet(db, approval.businessId, cat).catch(() => {})
+      return { ok: true, outcome: 'unreachable' }
+    }
+
+    await sendTemplateMessage({
+      toNumber: approval.recipientPhone,
+      templateName,
+      languageCode: approval.language === 'en' ? 'en' : 'he',
+      components: bodyComponents([businessName]),
+      bodyText: approval.fallback,
+      ...(creds !== undefined && { credentials: creds }),
+    }).catch(() => {})
+
+    await db
+      .insert(initiationLog)
+      .values({
+        businessId: approval.businessId,
+        initiatorId: approval.initiatorId,
+        recipientId: approval.recipientId,
+        dedupKey: approval.dedupKey,
+        decision: 'send_template',
+        audience: 'customer',
+      })
+      .onConflictDoNothing({ target: [initiationLog.businessId, initiationLog.dedupKey] })
+    await db
+      .update(initiationApprovals)
+      .set({ status: 'approved', decidedAt: now })
+      .where(eq(initiationApprovals.id, approvalId))
+    await logAudit(db, {
+      businessId: approval.businessId,
+      actorId: null,
+      action: 'initiation.approved_sent',
+      entityType: 'initiation_approval',
+      entityId: approvalId,
+      metadata: { initiatorId: approval.initiatorId, dedupKey: approval.dedupKey, template: templateName },
+    })
+    if (cat) await runRatchet(db, approval.businessId, cat).catch(() => {})
+    return { ok: true, outcome: 'sent' }
+  }
+
+  // In-window: phrase + send free-form.
   const body = await generateProactiveCustomerMessage({
     businessName,
     language: approval.language === 'en' ? 'en' : 'he',
@@ -254,7 +300,6 @@ export async function resolveInitiationProposal(
     metadata: { initiatorId: approval.initiatorId, dedupKey: approval.dedupKey },
   })
 
-  const cat = categoryForInitiator(approval.initiatorId)
   if (cat) await runRatchet(db, approval.businessId, cat).catch(() => {})
 
   return { ok: true, outcome: 'sent' }

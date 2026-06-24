@@ -36,6 +36,9 @@ type CollectedData = {
   _signupState?: string
   phoneNumberId?: string
   accessToken?: string
+  // WABA id captured from the Embedded Signup widget event / token debug. Required to provision
+  // the per-WABA template catalog; persisted onto businesses.whatsappBusinessAccountId.
+  whatsappBusinessAccountId?: string
   paPhoneNumber?: string
   language?: Lang
   _wabaType?: 'app' | 'meta'
@@ -462,7 +465,7 @@ export async function provisionBusiness(
   managerPhone: string,
   data: CollectedData,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const { businessName, timezone, calendarMode, calendarId, services, phoneNumberId, accessToken, paPhoneNumber } = data
+  const { businessName, timezone, calendarMode, calendarId, services, phoneNumberId, accessToken, whatsappBusinessAccountId, paPhoneNumber } = data
 
   if (!businessName || !timezone || !phoneNumberId || !accessToken || !paPhoneNumber) {
     return { ok: false, error: 'Missing required fields' }
@@ -486,6 +489,8 @@ export async function provisionBusiness(
       whatsappNumber: paPhoneNumber,
       whatsappPhoneNumberId: phoneNumberId,
       whatsappAccessToken: accessToken,
+      // Per-WABA template provisioning reads this; null until Embedded Signup captures it.
+      ...(whatsappBusinessAccountId ? { whatsappBusinessAccountId } : {}),
       // Never store a phone number here. The column is NOT NULL, but a non-calendar
       // value (the old `paPhoneNumber` placeholder) made every Google write 404 while
       // the internal write succeeded — the PA reported "done" while nothing landed in

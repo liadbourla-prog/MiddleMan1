@@ -18,6 +18,8 @@ import { enqueueMessage } from './message-retry.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 import { getInitiator } from '../domain/initiations/registry.js'
 import { dunningActiveWindow, dunningTierForAge, initiatorIdForTier, type DunningTier } from '../domain/crm/dunning.js'
@@ -69,7 +71,7 @@ async function livePayLink(
 async function sendDunning(
   tier: DunningTier,
   b: DunnableBooking,
-  biz: { id: string; name: string; defaultLanguage: string | null },
+  biz: { id: string; name: string; defaultLanguage: string | null; whatsappPhoneNumberId: string | null; whatsappAccessToken: string | null },
 ): Promise<void> {
   const initiatorId = initiatorIdForTier(tier)
   const lang: Lang = b.customerLang ?? (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
@@ -101,6 +103,15 @@ async function sendDunning(
       : `Final reminder: your ${serviceName} at ${biz.name} may be released if payment isn't completed. If you need anything at all, just reply 💛`) + linkFallback
   }
 
+  // Out-of-window template fallback. Link-LESS by design: a Meta Utility template must not carry
+  // a raw payment URL, so the template just nudges the customer to complete payment ([service,
+  // business] — matches payment_dunning_{1,2,final}.params). The pay-link rides the free-form path;
+  // once the customer replies (opening the window) the next nudge / their reply delivers the link.
+  const templateName = `payment_${tier}` // dunning_1 → payment_dunning_1, etc.
+  const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+    ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+    : undefined
+
   await dispatchInitiation(db, getInitiator(initiatorId), {
     businessId: biz.id,
     recipientId: b.customerId,
@@ -112,6 +123,16 @@ async function sendDunning(
       // link the LLM dropped.
       if (payUrl && !body.includes(payUrl)) body = `${body}\n${payUrl}`
       await enqueueMessage(b.customerPhone, body)
+    },
+    sendTemplate: async () => {
+      await sendTemplateMessage({
+        toNumber: b.customerPhone,
+        templateName,
+        languageCode: lang === 'he' ? 'he' : 'en',
+        components: bodyComponents([serviceName, biz.name]),
+        bodyText: fallback,
+        ...(waCredentials !== undefined && { credentials: waCredentials }),
+      }).catch(() => { /* non-fatal — next tick / retry handles transient failures */ })
     },
   })
 }
@@ -159,7 +180,7 @@ async function dunnableBookings(
 
 export async function runDunningTick(now: Date = new Date()): Promise<void> {
   const bizRows = await db
-    .select({ id: businesses.id, name: businesses.name, defaultLanguage: businesses.defaultLanguage, automatedMessagesConfig: businesses.automatedMessagesConfig })
+    .select({ id: businesses.id, name: businesses.name, defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken, automatedMessagesConfig: businesses.automatedMessagesConfig })
     .from(businesses)
 
   const window = dunningActiveWindow(now)

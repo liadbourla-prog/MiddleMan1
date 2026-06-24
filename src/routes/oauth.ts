@@ -712,6 +712,9 @@ export async function oauthRoutes(app: FastifyInstance) {
           ...collectedData,
           phoneNumberId,
           accessToken,
+          // Capture the WABA id so per-WABA template provisioning can fire (it was previously
+          // never persisted, leaving provisioning a no-op with skippedReason 'no_waba').
+          ...(resolvedWabaId ? { whatsappBusinessAccountId: resolvedWabaId } : {}),
           paPhoneNumber,
         }
 
