@@ -11,7 +11,7 @@ import { logAudit } from '../audit/logger.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { notifyInstructorsOfCancelledBookings } from '../scheduling/session-cancellation.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
-import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
+import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
 import { createBlock } from '../availability/blocks.js'
 import { localTimeToUtc, localParts } from '../availability/compute.js'
 import { enqueueBlockMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
@@ -357,32 +357,6 @@ async function applyAvailabilityChange(
             await calClient.deleteEvent(booking.calendarEventId).catch(() => { /* non-fatal — log but continue */ })
           }
 
-          const [customerIdentity] = await db
-            .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
-            .from(identities)
-            .where(eq(identities.id, booking.customerId))
-            .limit(1)
-
-          if (customerIdentity) {
-            const custLang: Lang = (customerIdentity.preferredLanguage as Lang | null | undefined) ?? 'he'
-            const locale = custLang === 'he' ? 'he-IL' : 'en-GB'
-            const dateStr = booking.slotStart.toLocaleDateString(locale, {
-              weekday: 'long', day: 'numeric', month: 'long',
-            })
-            const cancelFallback = i18n.booking_cancelled_schedule[custLang](dateStr)
-            const cancelMsg = await generateProactiveCustomerMessage({
-              businessName: biz?.name ?? biz?.whatsappNumber ?? 'the business',
-              language: custLang,
-              situation: `The customer's appointment on ${dateStr} has been cancelled due to a schedule change. Apologise briefly and tell them they can reply REBOOK to find a new slot or contact the business directly.`,
-              fallback: cancelFallback,
-              timeoutMs: 2500,
-            }).catch(() => cancelFallback)
-            await enqueueMessage(
-              customerIdentity.phoneNumber,
-              cancelMsg,
-            ).catch(() => { /* non-fatal */ })
-          }
-
           await db
             .update(bookings)
             .set({
@@ -393,6 +367,17 @@ async function applyAvailabilityChange(
               updatedAt: new Date(),
             })
             .where(eq(bookings.id, booking.id))
+
+          // Business-originated cancel → notify the customer through the initiation spine, which
+          // falls back to the booking_cancelled_by_business template when they're out of window
+          // (the old free-form enqueueMessage was silently dropped by Meta for cold customers).
+          await notifyBusinessBookingChange(db, businessId, {
+            kind: 'cancelled',
+            bookingId: booking.id,
+            customerId: booking.customerId,
+            serviceTypeId: booking.serviceTypeId,
+            slotStart: booking.slotStart,
+          })
         }
 
         // Notify the instructor(s) of any cancelled sessions (deduped per session).
@@ -566,17 +551,15 @@ async function applyIntradayBlock(
       await enqueueBookingDeletion(businessId, booking.id, booking.calendarEventId)
     }
 
-    const [customer] = await db
-      .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
-      .from(identities)
-      .where(eq(identities.id, booking.customerId))
-      .limit(1)
-    if (customer) {
-      const custLang: Lang = (customer.preferredLanguage as Lang | null | undefined) ?? 'he'
-      const locale = custLang === 'he' ? 'he-IL' : 'en-GB'
-      const dateStr = booking.slotStart.toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long' })
-      await enqueueMessage(customer.phoneNumber, i18n.booking_cancelled_schedule[custLang](dateStr)).catch(() => { /* non-fatal */ })
-    }
+    // Business-originated cancel → notify through the spine (booking_cancelled_by_business
+    // template fallback out of window; the old free-form send was dropped for cold customers).
+    await notifyBusinessBookingChange(db, businessId, {
+      kind: 'cancelled',
+      bookingId: booking.id,
+      customerId: booking.customerId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+    })
   }
 
   // Notify the instructor(s) of any cancelled sessions inside the blocked window (deduped
@@ -1088,12 +1071,16 @@ async function applyBookingCancellation(
     .where(eq(identities.id, bookingRow.customerId))
     .limit(1)
 
-  if (customer) {
-    const custLang: Lang = (customer.preferredLanguage as Lang | null | undefined) ?? lang
-    const locale = custLang === 'he' ? 'he-IL' : 'en-GB'
-    const dateStr = bookingRow.slotStart.toLocaleDateString(locale, { weekday: 'long', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' })
-    await enqueueMessage(customer.phoneNumber, i18n.booking_cancelled_schedule[custLang](dateStr)).catch(() => { /* non-fatal */ })
-  }
+  // Business-originated cancel → notify through the spine, which falls back to the
+  // booking_cancelled_by_business template when the customer is out of window (the old free-form
+  // enqueueMessage was silently dropped by Meta for cold customers).
+  await notifyBusinessBookingChange(db, businessId, {
+    kind: 'cancelled',
+    bookingId: bookingRow.id,
+    customerId: bookingRow.customerId,
+    serviceTypeId: bookingRow.serviceTypeId,
+    slotStart: bookingRow.slotStart,
+  })
 
   await logAudit(db, {
     businessId,

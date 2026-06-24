@@ -97,8 +97,9 @@ export async function runBroadcast(db: Db, input: {
   let aborted: string | null = null
 
   // Fresh id per run so a deliberately-repeated announcement is NOT deduped against a prior one,
-  // while each recipient still gets exactly one send within this run.
-  const broadcastId = Date.now().toString(36)
+  // while each recipient still gets exactly one send within this run. A random suffix guards
+  // against two same-kind runs landing in the same millisecond (which would otherwise collide).
+  const broadcastId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 
   const situation = cfg.situation(biz.name, input.detail)
   const fallback = cfg.fallback(lang, biz.name, input.detail)
