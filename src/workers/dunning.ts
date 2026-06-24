@@ -21,6 +21,7 @@ import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 import { getInitiator } from '../domain/initiations/registry.js'
 import { dunningActiveWindow, dunningTierForAge, initiatorIdForTier, type DunningTier } from '../domain/crm/dunning.js'
+import { createCharge } from '../domain/payments/service.js'
 
 const QUEUE_NAME = 'dunning'
 const REPEAT_EVERY_MS = 60 * 60 * 1000 // hourly
@@ -31,9 +32,37 @@ interface DunnableBooking {
   bookingId: string
   customerId: string
   customerPhone: string
+  customerName: string | null
   customerLang: Lang | null
   serviceName: string | null
+  amount: string | null
   createdAt: Date
+}
+
+/**
+ * Resolve the live Grow pay-link for this booking so the dunning nudge carries a real link
+ * instead of a bare "please pay" (design §7). createCharge is idempotent per booking: it
+ * reuses the link the payment.request initiator already created, or mints one now. Returns
+ * null when payments aren't connected / the amount is unknown / Grow erred — the caller then
+ * sends the linkless nudge (graceful degradation, the pre-Phase-3 behavior).
+ */
+async function livePayLink(
+  b: DunnableBooking,
+  biz: { id: string; name: string },
+  serviceName: string,
+): Promise<string | null> {
+  if (b.amount == null || Number.isNaN(Number(b.amount))) return null
+  const charge = await createCharge(db, {
+    businessId: biz.id,
+    bookingId: b.bookingId,
+    customerId: b.customerId,
+    amount: Number(b.amount),
+    description: `${serviceName} — ${biz.name}`,
+    source: 'dunning',
+    dedupKey: `payment.request:${b.bookingId}`,
+    customer: { fullName: b.customerName ?? undefined, phone: b.customerPhone },
+  }).catch(() => null)
+  return charge && charge.ok ? charge.paymentUrl : null
 }
 
 /** Send one dunning rung through the gate (mirrors post-appointment.ts's free-form path). */
@@ -46,23 +75,30 @@ async function sendDunning(
   const lang: Lang = b.customerLang ?? (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
   const serviceName = b.serviceName ?? (lang === 'he' ? 'התור שלך' : 'your appointment')
 
+  // Each rung now carries the live pay-link when payments are connected (design §7).
+  const payUrl = await livePayLink(b, biz, serviceName)
+  const linkSituation = payUrl
+    ? ` They can pay right now via this secure link: ${payUrl}. Include the link on its own line, exactly as given — never invent a different link.`
+    : ''
+  const linkFallback = payUrl ? `\n${payUrl}` : ''
+
   let situation: string
   let fallback: string
   if (tier === 'dunning_1') {
-    situation = `The customer booked "${serviceName}" at ${biz.name} but payment is still pending, so the slot isn't confirmed yet. Send a gentle, friendly reminder to complete the payment to confirm the slot, and offer help if they ran into any trouble paying. Brief and warm, never pushy.`
-    fallback = lang === 'he'
+    situation = `The customer booked "${serviceName}" at ${biz.name} but payment is still pending, so the slot isn't confirmed yet. Send a gentle, friendly reminder to complete the payment to confirm the slot, and offer help if they ran into any trouble paying. Brief and warm, never pushy.${linkSituation}`
+    fallback = (lang === 'he'
       ? `היי! נשאר רק להשלים את התשלום כדי לאשר את ${serviceName} ב${biz.name}. אם נתקלת בבעיה נשמח לעזור 🙂`
-      : `Hi! Just need the payment completed to confirm your ${serviceName} at ${biz.name}. Happy to help if you ran into any trouble 🙂`
+      : `Hi! Just need the payment completed to confirm your ${serviceName} at ${biz.name}. Happy to help if you ran into any trouble 🙂`) + linkFallback
   } else if (tier === 'dunning_2') {
-    situation = `The customer booked "${serviceName}" at ${biz.name} and payment is still not completed, so the slot remains unconfirmed and will be released if payment isn't completed soon. Send a firmer but still friendly reminder to complete the payment to keep the slot. Polite, never threatening.`
-    fallback = lang === 'he'
+    situation = `The customer booked "${serviceName}" at ${biz.name} and payment is still not completed, so the slot remains unconfirmed and will be released if payment isn't completed soon. Send a firmer but still friendly reminder to complete the payment to keep the slot. Polite, never threatening.${linkSituation}`
+    fallback = (lang === 'he'
       ? `תזכורת ידידותית: ${serviceName} ב${biz.name} עדיין לא מאושר ועלול להשתחרר אם התשלום לא יושלם בקרוב. נשמח אם תוכל/י להשלים את התשלום 🙏`
-      : `Friendly reminder: your ${serviceName} at ${biz.name} isn't confirmed yet and may be released if payment isn't completed soon. We'd appreciate it if you could complete the payment 🙏`
+      : `Friendly reminder: your ${serviceName} at ${biz.name} isn't confirmed yet and may be released if payment isn't completed soon. We'd appreciate it if you could complete the payment 🙏`) + linkFallback
   } else {
-    situation = `This is the final reminder for the customer's "${serviceName}" at ${biz.name}: payment is still not completed and the slot may be released. Send a courteous, last-notice message that the slot may be released if payment isn't completed, and warmly invite them to reply if they need anything. Never threatening or guilt-inducing.`
-    fallback = lang === 'he'
+    situation = `This is the final reminder for the customer's "${serviceName}" at ${biz.name}: payment is still not completed and the slot may be released. Send a courteous, last-notice message that the slot may be released if payment isn't completed, and warmly invite them to reply if they need anything. Never threatening or guilt-inducing.${linkSituation}`
+    fallback = (lang === 'he'
       ? `תזכורת אחרונה: ${serviceName} ב${biz.name} עלול להשתחרר אם התשלום לא יושלם. אם צריך עזרה בכל דבר — פשוט תכתבו לנו 💛`
-      : `Final reminder: your ${serviceName} at ${biz.name} may be released if payment isn't completed. If you need anything at all, just reply 💛`
+      : `Final reminder: your ${serviceName} at ${biz.name} may be released if payment isn't completed. If you need anything at all, just reply 💛`) + linkFallback
   }
 
   await dispatchInitiation(db, getInitiator(initiatorId), {
@@ -71,7 +107,10 @@ async function sendDunning(
     dedupKey: `payment.dunning:${b.bookingId}:${tier}`,
   }, {
     sendFreeForm: async () => {
-      const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
+      let body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
+      // Guard: when we have a link it MUST appear — never send a dunning nudge that promises a
+      // link the LLM dropped.
+      if (payUrl && !body.includes(payUrl)) body = `${body}\n${payUrl}`
       await enqueueMessage(b.customerPhone, body)
     },
   })
@@ -87,8 +126,11 @@ async function dunnableBookings(
       bookingId: bookings.id,
       customerId: bookings.customerId,
       customerPhone: identities.phoneNumber,
+      customerName: identities.displayName,
       customerLang: identities.preferredLanguage,
       serviceName: serviceTypes.name,
+      bookingAmount: bookings.amount,
+      serviceAmount: serviceTypes.paymentAmount,
       createdAt: bookings.createdAt,
     })
     .from(bookings)
@@ -106,8 +148,11 @@ async function dunnableBookings(
     bookingId: r.bookingId,
     customerId: r.customerId,
     customerPhone: r.customerPhone,
+    customerName: r.customerName,
     customerLang: r.customerLang as Lang | null,
     serviceName: r.serviceName,
+    // Per-booking price snapshot when present, else the service base price.
+    amount: r.bookingAmount ?? r.serviceAmount,
     createdAt: r.createdAt,
   }))
 }

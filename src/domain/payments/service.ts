@@ -6,7 +6,7 @@
 // Honors CLAUDE.md Principle 1: the LLM never reaches here with money — callers pass a
 // validated {amount, description, customer}; this module talks to Grow and writes state.
 
-import { and, eq, inArray } from 'drizzle-orm'
+import { and, eq, inArray, isNull } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { bookings, businesses, identities, paymentRequests } from '../../db/schema.js'
 import type { Booking } from '../../db/schema.js'
@@ -16,6 +16,11 @@ import { getPaymentCredentials, getCredentialsByWebhookToken } from './credentia
 import { finalizePaidBooking } from '../booking/engine.js'
 import { logAudit } from '../audit/logger.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
+import { dispatchInitiation } from '../initiations/dispatch.js'
+import { getInitiator } from '../initiations/registry.js'
+import { resolveNotificationAction } from '../initiations/notification-rules.js'
+import type { NotificationPreferences } from '../../shared/skill-types.js'
+import type { NotificationRule } from '../initiations/notification-rules.js'
 import type { Lang } from '../i18n/t.js'
 
 function paymentBaseUrl(): string {
@@ -252,10 +257,68 @@ export async function reconcilePayment(
     }
   }
 
-  // NOTE (Phase 3): owner "payment received" notification fires here, under the owner's
-  // notification rules (voluntary OAU). Deliberately not sent in Phase 2.
+  // Owner "payment received" notification (Phase 3, design §7) — voluntary OAU. Sent ONLY if
+  // the owner's notification rules say so (defaults to silent: payments confirm themselves end
+  // to end and the owner's involuntary attention is driven toward zero). Best-effort: a notify
+  // hiccup must never un-settle a payment the customer already made.
+  await notifyOwnerPaymentReceived(db, businessId, charge, deps?.enqueue).catch(() => { /* non-fatal */ })
 
   return { ok: true, outcome }
+}
+
+/**
+ * Notify the owner that a payment landed — but only as voluntary OAU, gated by the business's
+ * notification rules (resolveNotificationAction for 'payment_received', which defaults to
+ * handle_silently). Routed through the `payment.received` initiator so it is logged on the
+ * spine and remains trust-ratchet-eligible. Owner-facing copy is in the business language.
+ */
+async function notifyOwnerPaymentReceived(
+  db: Db,
+  businessId: string,
+  charge: { id: string; amount: string | null; description: string | null; source: string },
+  enqueue?: (phone: string, body: string) => Promise<void>,
+): Promise<void> {
+  const [biz] = await db
+    .select({
+      name: businesses.name,
+      defaultLanguage: businesses.defaultLanguage,
+      notificationRules: businesses.notificationRules,
+      notificationPreferences: businesses.notificationPreferences,
+    })
+    .from(businesses)
+    .where(eq(businesses.id, businessId))
+    .limit(1)
+
+  const action = resolveNotificationAction(
+    (biz?.notificationRules as NotificationRule[] | null) ?? null,
+    (biz?.notificationPreferences as NotificationPreferences | null) ?? null,
+    'payment_received',
+  )
+  if (action === 'handle_silently') return
+
+  // Owner notifications go to the business manager.
+  const [manager] = await db
+    .select({ id: identities.id, phoneNumber: identities.phoneNumber })
+    .from(identities)
+    .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+  if (!manager) return
+
+  const lang: Lang = (biz?.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const amount = charge.amount != null && !Number.isNaN(Number(charge.amount)) ? `₪${Number(charge.amount)}` : null
+  const what = charge.description ?? (lang === 'he' ? 'תשלום' : 'a payment')
+  const body = lang === 'he'
+    ? `🟢 התקבל תשלום${amount ? ` (${amount})` : ''} — ${what}.`
+    : `🟢 Payment received${amount ? ` (${amount})` : ''} — ${what}.`
+
+  const send = enqueue ?? enqueueMessage
+  await dispatchInitiation(db, getInitiator('payment.received'), {
+    businessId,
+    recipientId: manager.id,
+    dedupKey: `payment.received:${charge.id}`,
+  }, {
+    sendFreeForm: async () => { await send(manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
+  }).catch(() => { /* non-fatal */ })
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

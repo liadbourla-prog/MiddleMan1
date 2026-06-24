@@ -188,6 +188,24 @@ export const INITIATORS = {
     defaultEnabled: true,
   },
 
+  // Layer B — owner "payment received" notification (Grow Phase 3, design §7). The spine's
+  // "🔴 needs processor webhook" row, now filled: when a Grow webhook confirms a payment,
+  // reconcilePayment fires this so the owner can SEE money landed — but only as VOLUNTARY OAU.
+  // The notification-rules resolver defaults payment_received to handle_silently (North Star:
+  // drive the owner's involuntary attention toward zero); the owner opts in via
+  // configureNotifications, and the Phase-6 trust ratchet can later ratchet it back to silent.
+  // Owner audience, transactional, window-ungated (operational message to the business).
+  'payment.received': {
+    id: 'payment.received',
+    layer: 'B',
+    audience: 'owner',
+    consentClass: 'transactional',
+    autonomy: 'owner_configured',
+    delivery: 'fire_and_forget',
+    windowPolicy: 'skip',
+    defaultEnabled: true,
+  },
+
   // Layer C — time-before subscription-renewal reminders over the internal `subscriptions`
   // table (Phase 4c). No external processor: a subscription's `renewsAt` is just the scan
   // anchor, and these two rungs remind the customer ahead of that date (no auto-charge).

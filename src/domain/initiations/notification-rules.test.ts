@@ -75,6 +75,16 @@ describe('resolveNotificationAction', () => {
     const rules: NotificationRule[] = [{ event: 'no_show', action: 'notify_with_actions' }]
     expect(resolveNotificationAction(rules, allFalsePrefs, 'no_show')).toBe('notify_with_actions')
   })
+
+  it('voluntary-OAU payment_received defaults to handle_silently (opt-in, not surfaced)', () => {
+    expect(resolveNotificationAction(null, null, 'payment_received')).toBe('handle_silently')
+    expect(resolveNotificationAction(null, allTruePrefs, 'payment_received')).toBe('handle_silently')
+  })
+
+  it('an explicit payment_received rule opts the owner back in', () => {
+    const rules: NotificationRule[] = [{ event: 'payment_received', action: 'notify' }]
+    expect(resolveNotificationAction(rules, null, 'payment_received')).toBe('notify')
+  })
 })
 
 describe('upsertNotificationRule', () => {

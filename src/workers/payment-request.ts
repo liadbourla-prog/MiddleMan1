@@ -5,8 +5,10 @@
 //
 // Default `at_booking` policy: the booking is already in pending_payment from the moment the
 // engine applied the post_payment gate, so the link goes out on the next scan. Owner-
-// configurable offset timing (slot_start − offset) is Phase 3 — this worker is the mechanism
-// it will extend, structurally identical to the reminder/dunning workers.
+// configurable offset timing (slot_start + offset, design §3.1) defers the first send to a
+// fixed offset before/after the appointment — structurally identical to the reminder workers
+// firing at a fixed offset before the slot. The send/skip decision is the pure
+// isPaymentLinkDue (domain/payments/timing.ts).
 //
 // Per-business switch: the owner's EXISTING automatedMessagesConfig.payment_request.enabled
 // flag (this worker is its consumer, same as the dunning worker). When payments aren't
@@ -26,6 +28,7 @@ import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
 import { getInitiator } from '../domain/initiations/registry.js'
 import { createCharge } from '../domain/payments/service.js'
+import { isPaymentLinkDue, type PaymentLinkSendPolicy } from '../domain/payments/timing.js'
 
 const QUEUE_NAME = 'payment-request'
 const REPEAT_EVERY_MS = 60 * 60 * 1000 // hourly, like reminder/dunning
@@ -40,6 +43,7 @@ interface ChargeableBooking {
   customerLang: Lang | null
   serviceName: string | null
   amount: string | null
+  slotStart: Date
 }
 
 /** Bookings awaiting payment that still need their first pay-link. */
@@ -54,6 +58,7 @@ async function chargeableBookings(businessId: string): Promise<ChargeableBooking
       serviceName: serviceTypes.name,
       bookingAmount: bookings.amount,
       serviceAmount: serviceTypes.paymentAmount,
+      slotStart: bookings.slotStart,
     })
     .from(bookings)
     .innerJoin(identities, eq(bookings.customerId, identities.id))
@@ -73,6 +78,7 @@ async function chargeableBookings(businessId: string): Promise<ChargeableBooking
     serviceName: r.serviceName,
     // Charge the per-booking price snapshot when present, else the service base price.
     amount: r.bookingAmount ?? r.serviceAmount,
+    slotStart: r.slotStart,
   }))
 }
 
@@ -120,9 +126,16 @@ async function sendPaymentLink(
   })
 }
 
-export async function runPaymentRequestTick(): Promise<void> {
+export async function runPaymentRequestTick(now: Date = new Date()): Promise<void> {
   const bizRows = await db
-    .select({ id: businesses.id, name: businesses.name, defaultLanguage: businesses.defaultLanguage, automatedMessagesConfig: businesses.automatedMessagesConfig })
+    .select({
+      id: businesses.id,
+      name: businesses.name,
+      defaultLanguage: businesses.defaultLanguage,
+      automatedMessagesConfig: businesses.automatedMessagesConfig,
+      paymentLinkSendPolicy: businesses.paymentLinkSendPolicy,
+      paymentLinkOffsetMinutes: businesses.paymentLinkOffsetMinutes,
+    })
     .from(businesses)
 
   for (const biz of bizRows) {
@@ -130,9 +143,14 @@ export async function runPaymentRequestTick(): Promise<void> {
     try {
       if (cfg?.payment_request?.enabled !== true) continue
 
+      const policy = biz.paymentLinkSendPolicy as PaymentLinkSendPolicy | null
+      const offset = biz.paymentLinkOffsetMinutes
       const due = await chargeableBookings(biz.id)
       let sent = 0
       for (const b of due) {
+        // Owner timing gate (§3.1): 'at_booking' is always due; 'offset' waits until
+        // slot_start + offset arrives. Not-yet-due bookings are picked up on a later tick.
+        if (!isPaymentLinkDue(policy, offset, b.slotStart, now)) continue
         try {
           await sendPaymentLink(b, biz)
           sent++

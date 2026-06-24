@@ -8,7 +8,7 @@ import type { NotificationPreferences } from '../../shared/skill-types.js'
 
 export type NotificationEvent =
   | 'new_booking' | 'first_time_customer' | 'cancellation' | 'reschedule'
-  | 'no_show' | 'refund_request' | 'vip_return'
+  | 'no_show' | 'refund_request' | 'vip_return' | 'payment_received'
 
 export type NotificationAction = 'notify' | 'notify_with_actions' | 'handle_silently'
 
@@ -22,8 +22,15 @@ export interface NotificationRule {
 }
 
 export const NOTIFICATION_EVENTS: NotificationEvent[] = [
-  'new_booking', 'first_time_customer', 'cancellation', 'reschedule', 'no_show', 'refund_request', 'vip_return',
+  'new_booking', 'first_time_customer', 'cancellation', 'reschedule', 'no_show', 'refund_request', 'vip_return', 'payment_received',
 ]
+
+// VOLUNTARY-OAU events (design §4, §7): the PA handles them fully autonomously, so the owner
+// is NOT notified unless he explicitly opts in. For these the resolver defaults to
+// handle_silently (rather than the surface-by-default 'notify') — honoring the North Star of
+// driving the owner's involuntary attention toward zero. payments confirm themselves end to
+// end; the owner sees them only if he set a rule. A matching rule still wins.
+const VOLUNTARY_OAU_EVENTS: ReadonlySet<NotificationEvent> = new Set(['payment_received'])
 
 // Map a fixed event to its legacy NotificationPreferences boolean (decision D fallback). Events
 // with no legacy equivalent (refund_request, vip_return) return undefined → caller uses the default.
@@ -60,7 +67,8 @@ export function resolveNotificationAction(
   if (rule) return rule.action
   const legacy = legacyPrefFor(event, legacyPrefs)
   if (legacy !== undefined) return legacy ? 'notify' : 'handle_silently'
-  return 'notify'
+  // Voluntary-OAU events default to silent (opt-in); all others surface by default.
+  return VOLUNTARY_OAU_EVENTS.has(event) ? 'handle_silently' : 'notify'
 }
 
 /** Upsert a rule for an event (replace any existing rule for the same event). Pure. */

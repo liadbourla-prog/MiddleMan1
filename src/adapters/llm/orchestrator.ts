@@ -37,6 +37,7 @@ import {
   executeAmendReshuffle,
   executeConfigureReshuffle,
   executeConfigureNotifications,
+  executeConfigurePaymentTiming,
   executeSetInitiationAutonomy,
   executeDecideFreedSlotOffer,
   executeCheckCalendarIntegrity,
@@ -456,16 +457,28 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'configureNotifications',
-    description: "Set how the owner wants to be notified about a business event. Use when the owner says things like 'only tell me about cancellations within 24 hours', 'stop pinging me on every new booking', or 'handle no-shows silently'. One event per call.",
+    description: "Set how the owner wants to be notified about a business event. Use when the owner says things like 'only tell me about cancellations within 24 hours', 'stop pinging me on every new booking', 'handle no-shows silently', or 'let me know when someone pays'. One event per call. Note: payment_received is SILENT by default (the PA handles payments end to end) — use it when the owner wants to start (or stop) being told about incoming payments.",
     parameters: {
       type: Type.OBJECT,
       properties: {
-        event: { type: Type.STRING, enum: ['new_booking', 'first_time_customer', 'cancellation', 'reschedule', 'no_show', 'refund_request', 'vip_return'], description: 'Which business event this rule is about' },
+        event: { type: Type.STRING, enum: ['new_booking', 'first_time_customer', 'cancellation', 'reschedule', 'no_show', 'refund_request', 'vip_return', 'payment_received'], description: 'Which business event this rule is about' },
         action: { type: Type.STRING, enum: ['notify', 'notify_with_actions', 'handle_silently'], description: 'notify = tell me; notify_with_actions = tell me with quick action buttons; handle_silently = do not tell me' },
         withinHours: { type: Type.NUMBER, description: 'Optional: only apply when the affected booking is within this many hours (e.g. 24 for "cancellations inside 24h")' },
         remove: { type: Type.BOOLEAN, description: 'Remove the existing rule for this event instead of setting one' },
       },
       required: ['event'],
+    },
+  },
+  {
+    name: 'configurePaymentTiming',
+    description: "Set WHEN the PA sends the pay-link for a booking that needs payment, relative to the appointment. Use when the owner says things like 'send pay-links 24 hours before the appointment', 'send the payment request at booking', or 'charge them an hour after the session'. Pass policy 'at_booking' to send as soon as the booking is made (the default), or policy 'offset' with offsetMinutes = how far from the appointment start to send: NEGATIVE for before (24h before = -1440, 1h before = -60), POSITIVE for after (1h after = 60). Convert the owner's wording into minutes yourself.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        policy: { type: Type.STRING, enum: ['at_booking', 'offset'], description: "'at_booking' = send the pay-link as soon as the booking is made; 'offset' = send it a fixed time before/after the appointment (provide offsetMinutes)" },
+        offsetMinutes: { type: Type.NUMBER, description: 'Required when policy is offset. Minutes relative to the appointment start: negative = before (24h before = -1440), positive = after (1h after = 60)' },
+      },
+      required: ['policy'],
     },
   },
   {
@@ -598,6 +611,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - lookupCustomer / saveContactNote: only for customer or contact management requests. When the owner asks whether a customer has replied or what they said, you MUST call lookupCustomer with recent_messages and answer from the result — never say "not yet" or "they replied" from memory or assumption.
 - connectGoogleCalendar: ALWAYS use this when the owner wants to connect, sync, or link Google Calendar. It returns the real sign-in link — send that link to the owner here in WhatsApp, on its own line. You have NO email and no way to send email: never offer to email the link, never ask for an email address, and never claim you emailed anything.
 - connectPayments: ALWAYS use this when the owner wants to connect, set up, or enable payments/charging/invoicing (Grow / Meshulam). It returns a secure one-time link — send that link to the owner here on its own line. The form collects API credentials, not the Grow password. If the tool reports payments are already connected, just reassure them. Same email rule: you have NO email, never offer to email the link.
+- configurePaymentTiming: use when the owner sets WHEN pay-links go out relative to the appointment (e.g. "send the payment request 24h before", "charge at booking", "1 hour after the session"). Convert their wording into policy + offsetMinutes (negative = before the appointment, positive = after) yourself, then confirm the change in plain words.
 - messageCustomer: use to actually send a WhatsApp message to a specific customer the owner names (e.g. "ask Harel when he's free"). Compose the message and confirm with the owner first, then call the tool. Only tell the owner the message was sent if the tool returns ok:true; if it reports the customer can't be reached (e.g. they haven't messaged recently), relay that honestly and never pretend it went out.
 - coordinateMeeting: use ONLY when the owner wants you to reach out and arrange a meeting whose time is NOT yet agreed — with anyone, INCLUDING an existing customer. First ask, in ONE question, whether they already set a time (then use createCalendarEvent) or want you to coordinate. When coordinating, capture either a primary time + one or two fallbacks, OR day/time windows (ranges) + how long the meeting runs. ALL meeting coordination goes through this tool — never improvise a coordination with messageCustomer + createCalendarEvent. NEVER invent or guess a person's name (the owner's or anyone else's). If you don't know how to introduce yourself for outreach and no preference is shown under "Outreach identity" below, ask the owner once: whether to say you're from {business name} or {owner}'s assistant — and if they pick their own name and you don't have it, ask for it; pass identifyAs (and ownerName) to save it.
 - messageCustomer is for a SINGLE one-off ping the owner dictates (e.g. "let Dana know class is cancelled") — never for negotiating a meeting time, and never to work around coordinateMeeting. Do not use createCalendarEvent to book a meeting you coordinated; confirm it with resolveMeetingCoordination instead.
@@ -691,6 +705,8 @@ async function dispatchTool(
       return executeConfigureReshuffle(args as unknown as Parameters<typeof executeConfigureReshuffle>[0], ctx)
     case 'configureNotifications':
       return executeConfigureNotifications(args as unknown as Parameters<typeof executeConfigureNotifications>[0], ctx)
+    case 'configurePaymentTiming':
+      return executeConfigurePaymentTiming(args as unknown as Parameters<typeof executeConfigurePaymentTiming>[0], ctx)
     case 'setInitiationAutonomy':
       return executeSetInitiationAutonomy(args as unknown as Parameters<typeof executeSetInitiationAutonomy>[0], ctx)
     case 'decideFreedSlotOffer':

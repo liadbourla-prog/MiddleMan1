@@ -12,7 +12,8 @@ import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../authorization/check.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
-import { applyInstruction, pauseConversation, resumeConversation, applyReshuffleConfigUpdate } from './apply.js'
+import { applyInstruction, pauseConversation, resumeConversation, applyReshuffleConfigUpdate, applyPaymentTimingUpdate } from './apply.js'
+import type { PaymentLinkSendPolicy } from '../payments/timing.js'
 import { reshuffleCampaigns, reshuffleProposals, freedSlotApprovals } from '../../db/schema.js'
 import { approveProposal, rejectProposal } from '../reshuffle/gate.js'
 import { resolveInitiationProposal } from '../initiations/approvals.js'
@@ -1537,6 +1538,34 @@ export async function executeConfigureNotifications(args: ConfigureNotifications
   await logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action: 'notification_rules.updated', entityType: 'business', entityId: ctx.businessId, metadata: { event: args.event, removed: args.remove === true } })
 
   return { success: true, fact: JSON.stringify(next), guidance: 'Notification rule saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
+}
+
+interface ConfigurePaymentTimingArgs {
+  policy?: PaymentLinkSendPolicy
+  offsetMinutes?: number
+}
+
+// Owner-configurable pay-link timing (Grow Phase 3, §3.1): the owner says WHEN the first
+// pay-link goes out relative to the appointment ("send pay-links 24h before the session",
+// "send it at booking", "1 hour after the appointment"). The LLM converts the phrase into a
+// policy + a minute offset (negative = before slot_start, positive = after); the deterministic
+// applyPaymentTimingUpdate clamps and persists it.
+export async function executeConfigurePaymentTiming(args: ConfigurePaymentTimingArgs, ctx: ToolContext): Promise<object> {
+  if (args.policy !== 'at_booking' && args.policy !== 'offset') {
+    return { success: false, reason: 'missing_policy', guidance: 'Ask the owner whether to send pay-links right when the booking is made, or a set time before/after the appointment.' }
+  }
+  if (args.policy === 'offset' && (args.offsetMinutes == null || !Number.isFinite(args.offsetMinutes))) {
+    return { success: false, reason: 'missing_offset', guidance: 'Ask the owner how long before or after the appointment to send the pay-link (you pass minutes — negative for before, positive for after).' }
+  }
+
+  const res = await applyPaymentTimingUpdate(
+    ctx.db,
+    ctx.businessId,
+    { policy: args.policy, ...(args.offsetMinutes != null ? { offsetMinutes: args.offsetMinutes } : {}) },
+    ctx.identityId,
+  )
+  if (!res.ok) return { success: false, reason: res.reason }
+  return { success: true, fact: JSON.stringify(res), guidance: 'Pay-link timing saved. Confirm the change to the owner in plain words (e.g. "I\'ll send pay-links 24 hours before each appointment") — fact is raw config, never quote it.' }
 }
 
 interface SetInitiationAutonomyArgs {

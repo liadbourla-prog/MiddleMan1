@@ -17,6 +17,7 @@ import { localTimeToUtc, localParts } from '../availability/compute.js'
 import { enqueueBlockMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
 import { findProviderByName } from '../provider/lookup.js'
 import { resolveReshuffleConfig, type ReshuffleConfig } from '../reshuffle/config.js'
+import { clampPaymentOffsetMinutes, type PaymentLinkSendPolicy } from '../payments/timing.js'
 
 /**
  * Deterministic writer for the reshuffle engine knobs. Merges an owner patch over the
@@ -43,6 +44,51 @@ export async function applyReshuffleConfigUpdate(
     metadata: merged as unknown as Record<string, unknown>,
   })
   return { ok: true, config: merged }
+}
+
+/**
+ * Deterministic writer for the owner-configurable pay-link send timing (Grow Phase 3, §3.1).
+ * 'at_booking' clears any offset (send as soon as the booking enters pending_payment, today's
+ * behavior); 'offset' pins a clamped minute offset vs slot_start (negative = before, positive
+ * = after). The owner sets this conversationally via the `configurePaymentTiming` tool; the
+ * payment-request worker reads it. Persists + audits.
+ */
+export async function applyPaymentTimingUpdate(
+  database: Db,
+  businessId: string,
+  input: { policy: PaymentLinkSendPolicy; offsetMinutes?: number | null },
+  actorId?: string,
+): Promise<{ ok: true; policy: PaymentLinkSendPolicy; offsetMinutes: number | null } | { ok: false; reason: string }> {
+  const [biz] = await database.select({ id: businesses.id }).from(businesses).where(eq(businesses.id, businessId)).limit(1)
+  if (!biz) return { ok: false, reason: 'business_not_found' }
+
+  let policy: PaymentLinkSendPolicy
+  let offsetMinutes: number | null
+  if (input.policy === 'offset') {
+    if (input.offsetMinutes == null || !Number.isFinite(input.offsetMinutes)) {
+      return { ok: false, reason: 'missing_offset' }
+    }
+    policy = 'offset'
+    offsetMinutes = clampPaymentOffsetMinutes(input.offsetMinutes)
+  } else {
+    // 'at_booking' has no offset — null it out so the worker takes the always-due path.
+    policy = 'at_booking'
+    offsetMinutes = null
+  }
+
+  await database
+    .update(businesses)
+    .set({ paymentLinkSendPolicy: policy, paymentLinkOffsetMinutes: offsetMinutes })
+    .where(eq(businesses.id, businessId))
+  await logAudit(database, {
+    businessId,
+    actorId: actorId ?? null,
+    action: 'payment.timing_updated',
+    entityType: 'business',
+    entityId: businessId,
+    metadata: { policy, offsetMinutes },
+  })
+  return { ok: true, policy, offsetMinutes }
 }
 
 // Bilingual day names (Sun=0 … Sat=6)

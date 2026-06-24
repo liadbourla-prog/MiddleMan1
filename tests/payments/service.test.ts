@@ -37,6 +37,8 @@ function makeDb() {
         return {
           returning: async () => [{ id: 'pr-1' }],
           onConflictDoUpdate: async () => {},
+          // dispatchInitiation's idempotency insert: returns a non-empty row → "first insert wins".
+          onConflictDoNothing: () => ({ returning: async () => [{ id: 'il-1' }] }),
           then: (res: (v: undefined) => unknown) => res(undefined),
         }
       },
@@ -211,6 +213,35 @@ describe('PaymentService', () => {
     expect(updates.some((u) => u.set['status'] === 'paid' && u.set['transactionCode'] === 'TX1')).toBe(true)
     expect(enqueued).toHaveLength(1)
     expect(enqueued[0]!.body).toContain('https://grow/inv.pdf')
+  })
+
+  it('reconcile: owner is NOT notified by default (payment_received is voluntary OAU)', async () => {
+    const { db, queueSelect } = makeDb()
+    queueSelect(businessPaymentCredentials, [connectedCredsRow()])
+    queueSelect(paymentRequests, [{ id: 'pr-1', status: 'created', transactionCode: null, growProcessId: 'PR1', bookingId: null, customerId: null, amount: '300', description: 'Session', source: 'owner_command' }])
+    // notify helper reads the business; no rule + no legacy pref → handle_silently.
+    queueSelect(businesses, [{ name: 'Biz', defaultLanguage: 'en', notificationRules: null, notificationPreferences: null }])
+    const grow = growStub()
+    const enqueued: { phone: string; body: string }[] = []
+    const res = await reconcilePayment(db, 'wh-tok-123', { transactionCode: 'TX1', processId: 'PR1' }, { growClient: grow.client, enqueue: async (phone, body) => { enqueued.push({ phone, body }) } })
+    expect(res.ok).toBe(true)
+    expect(enqueued).toHaveLength(0) // no invoice (none on this webhook) and silent owner notify
+  })
+
+  it('reconcile: owner IS notified when a payment_received rule says notify', async () => {
+    const { db, queueSelect } = makeDb()
+    queueSelect(businessPaymentCredentials, [connectedCredsRow()])
+    queueSelect(paymentRequests, [{ id: 'pr-1', status: 'created', transactionCode: null, growProcessId: 'PR1', bookingId: null, customerId: null, amount: '300', description: 'Session', source: 'owner_command' }])
+    queueSelect(businesses, [{ name: 'Biz', defaultLanguage: 'en', notificationRules: [{ event: 'payment_received', action: 'notify' }], notificationPreferences: null }])
+    queueSelect(identities, [{ id: 'mgr-1', phoneNumber: '+972511111111' }]) // manager lookup
+    const grow = growStub()
+    const enqueued: { phone: string; body: string }[] = []
+    const res = await reconcilePayment(db, 'wh-tok-123', { transactionCode: 'TX1', processId: 'PR1' }, { growClient: grow.client, enqueue: async (phone, body) => { enqueued.push({ phone, body }) } })
+    expect(res.ok).toBe(true)
+    expect(enqueued).toHaveLength(1)
+    expect(enqueued[0]!.phone).toBe('+972511111111')
+    expect(enqueued[0]!.body).toContain('300')
+    expect(enqueued[0]!.body).toContain('🟢')
   })
 
   it('reconcile: PAYMENT_WEBHOOK_REVERIFY=off skips the probe but still approves + settles', async () => {

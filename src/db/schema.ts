@@ -103,6 +103,13 @@ export const businesses = pgTable('businesses', {
   // Daily briefing (opt-in manager summary)
   dailyBriefingEnabled: boolean('daily_briefing_enabled').notNull().default(false),
   dailyBriefingTime: text('daily_briefing_time').default('09:00'),
+  // Owner-configurable pay-link send timing (Grow Phase 3; design §3.1). 'at_booking' (default)
+  // sends the first pay-link as soon as the booking enters pending_payment — today's behavior.
+  // 'offset' defers it to slot_start + paymentLinkOffsetMinutes (negative = before, positive =
+  // after; e.g. -1440 = 24h before). Edited via the configurePaymentTiming Branch-3 tool; read
+  // by the payment-request worker. Mirrors how reminder timing is owner-controlled.
+  paymentLinkSendPolicy: text('payment_link_send_policy', { enum: ['at_booking', 'offset'] }).notNull().default('at_booking'),
+  paymentLinkOffsetMinutes: integer('payment_link_offset_minutes'),
 })
 
 export const identities = pgTable(
