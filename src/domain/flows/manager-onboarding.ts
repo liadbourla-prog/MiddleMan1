@@ -10,6 +10,7 @@ import { applyInstruction } from '../manager/apply.js'
 import { getPrompt, getRetryPrompt, isAffirmative, isNegative } from '../onboarding/steps.js'
 import { i18n, t, type Lang } from '../i18n/t.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
+import { createPaymentConnectToken, buildPaymentConnectUrl } from '../payments/credentials.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 
 export interface OnboardingResult {
@@ -49,7 +50,7 @@ export async function handleOnboardingMessage(
     case 'cancellation_policy':
       return handleCancellationPolicyStep(db, msg, business, lang, log, transcript)
     case 'payment':
-      return handlePaymentStep(db, msg, business, lang, log, transcript)
+      return handlePaymentStep(db, msg, business, baseUrl, lang, log, transcript)
     case 'escalation_policy':
       return handleEscalationPolicyStep(db, msg, business, baseUrl, lang, log, transcript)
     case 'calendar':
@@ -423,10 +424,32 @@ async function handleCancellationPolicyStep(
   return { reply: nextQ }
 }
 
+// When the owner sets up prepayment, offer to connect a real payment processor (Grow) so the
+// PA can send pay-links + invoices automatically (design §4.1). Additive and graceful: a link
+// failure never blocks onboarding, and skipping it leaves payments simply not_connected.
+async function paymentConnectOffer(
+  db: Db,
+  businessId: string,
+  managerPhone: string,
+  baseUrl: string,
+  lang: Lang,
+): Promise<string> {
+  try {
+    const token = await createPaymentConnectToken(db, businessId, managerPhone)
+    const url = buildPaymentConnectUrl(baseUrl || process.env['PUBLIC_BASE_URL'] || '', token)
+    return lang === 'he'
+      ? `\n\n💳 רוצה שאני אטפל בתשלומים אוטומטית — קישורי תשלום וחשבוניות? חברו את חשבון Grow כאן (הקישור תקף 30 דק׳):\n${url}`
+      : `\n\n💳 Want me to handle payments automatically — pay-links and invoices? Connect your Grow account here (link valid 30 min):\n${url}`
+  } catch {
+    return ''
+  }
+}
+
 async function handlePaymentStep(
   db: Db,
   msg: InboundMessage,
   business: Business,
+  baseUrl: string,
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
@@ -468,7 +491,8 @@ async function handlePaymentStep(
       justConfirmed: i18n.ob_payment_method_confirm[lang](method),
       transcript,
     })
-    return { reply: nextQ }
+    const offer = await paymentConnectOffer(db, business.id, msg.fromNumber, baseUrl, lang)
+    return { reply: nextQ + offer }
   }
 
   // First message: try LLM to extract both requiresPayment + method in one shot
@@ -518,7 +542,8 @@ async function handlePaymentStep(
       justConfirmed: i18n.ob_payment_method_confirm[lang](paymentMethod),
       transcript,
     })
-    return { reply: nextQ }
+    const offer = await paymentConnectOffer(db, business.id, msg.fromNumber, baseUrl, lang)
+    return { reply: nextQ + offer }
   }
 
   // Yes but no method — store sentinel and ask for method

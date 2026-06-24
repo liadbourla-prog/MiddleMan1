@@ -5,6 +5,7 @@ import { webhookRoutes } from './routes/webhook.js'
 import { oauthRoutes } from './routes/oauth.js'
 import { calendarWebhookRoutes } from './routes/calendar-webhook.js'
 import { importRoutes } from './routes/import.js'
+import { paymentConnectRoutes } from './routes/payment-connect/index.js'
 import { buildSiteRoutes } from './routes/build-site/index.js'
 import { publicApiRoutes } from './routes/public-api/index.js'
 import { startHoldExpiryWorker, scheduleHoldExpiryJob } from './workers/hold-expiry.js'
@@ -33,10 +34,14 @@ const PORT = parseInt(process.env['PORT'] ?? '3000', 10)
 
 const isDev = process.env['NODE_ENV'] !== 'production'
 
+// Defense-in-depth (Grow design §8): even though the payment adapter never logs the raw
+// apiKey, redact it at the logger so a stray object spread can't leak it into Cloud Run logs.
+const REDACT_PATHS = ['apiKey', 'api_key', '*.apiKey', '*.api_key', 'payload.apiKey', 'fields.apiKey']
+
 const app = Fastify({
   logger: isDev
-    ? { level: 'debug', transport: { target: 'pino-pretty' } }
-    : { level: 'info' },
+    ? { level: 'debug', redact: REDACT_PATHS, transport: { target: 'pino-pretty' } }
+    : { level: 'info', redact: REDACT_PATHS },
 })
 
 // Rate limit inbound webhook by sender phone number (extracted from body)
@@ -74,6 +79,7 @@ await app.register(webhookRoutes)
 await app.register(oauthRoutes)
 await app.register(calendarWebhookRoutes)
 await app.register(importRoutes)
+await app.register(paymentConnectRoutes)
 await app.register(buildSiteRoutes)
 await app.register(publicApiRoutes)
 

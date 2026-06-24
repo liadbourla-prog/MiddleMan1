@@ -16,6 +16,7 @@ const REPORTABLE_ACTIONS = [
   'outreach.message_blocked',
   'outreach.reply_notified',
   'calendar.connected',
+  'payment.connected',
   'booking.confirmed',
   'booking.cancelled',
   'booking.manager_cancelled',
@@ -59,6 +60,8 @@ function renderAction(action: string, metadata: Record<string, unknown> | null, 
       return `${when} — You were already told ${to} replied${m['replyText'] ? `: "${truncate(String(m['replyText']))}"` : ''} — do not re-announce it as new.`
     case 'calendar.connected':
       return `${when} — Google Calendar was connected.`
+    case 'payment.connected':
+      return `${when} — Payments (Grow) were connected — the PA can now send pay-links and invoices.`
     case 'booking.confirmed':
       return `${when} — A booking was confirmed.`
     case 'booking.cancelled':

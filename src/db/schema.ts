@@ -835,6 +835,54 @@ export const importTokens = pgTable('import_tokens', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
+// ── Payments (Grow) — credential onboarding ─────────────────────────────────────
+// See docs/superpowers/specs/2026-06-24-grow-payments-integration-design.md §6.
+// Encrypted/at-rest per-business processor credentials. The raw Grow apiKey is NEVER
+// stored in this table — apiKeyRef holds the Secret Manager resource name (§8). userId /
+// pageCode are merchant identifiers stored as columns (at-rest encrypted by Cloud SQL,
+// matching how the Google refresh token / WA access token are stored today).
+export const businessPaymentCredentials = pgTable(
+  'business_payment_credentials',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id')
+      .notNull()
+      .references(() => businesses.id),
+    provider: text('provider').notNull().default('grow'),
+    userId: text('user_id').notNull(),
+    pageCode: text('page_code').notNull(),
+    apiKeyRef: text('api_key_ref').notNull(),
+    environment: text('environment', { enum: ['sandbox', 'production'] })
+      .notNull()
+      .default('production'),
+    webhookToken: text('webhook_token').notNull(),
+    webhookSecret: text('webhook_secret').notNull(),
+    status: text('status', { enum: ['pending', 'connected', 'invalid', 'revoked'] })
+      .notNull()
+      .default('pending'),
+    connectedAt: timestamp('connected_at', { withTimezone: true }),
+    lastValidatedAt: timestamp('last_validated_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('business_payment_credentials_biz_provider_idx').on(t.businessId, t.provider),
+    uniqueIndex('business_payment_credentials_webhook_token_idx').on(t.webhookToken),
+  ],
+)
+
+// One-time signed link for the credential-capture web form (clone of import_tokens).
+export const paymentConnectTokens = pgTable('payment_connect_tokens', {
+  token: uuid('token').primaryKey().defaultRandom(),
+  businessId: uuid('business_id')
+    .notNull()
+    .references(() => businesses.id),
+  managerPhone: text('manager_phone').notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  usedAt: timestamp('used_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+})
+
 // Tasks escalated to the operator (us) when a customer asks something no PA handles
 export const escalatedTasks = pgTable(
   'escalated_tasks',
@@ -1083,6 +1131,8 @@ export type Reminder = typeof reminders.$inferSelect
 export type InitiationLogEntry = typeof initiationLog.$inferSelect
 export type WaitlistEntry = typeof waitlist.$inferSelect
 export type ImportToken = typeof importTokens.$inferSelect
+export type BusinessPaymentCredentials = typeof businessPaymentCredentials.$inferSelect
+export type PaymentConnectToken = typeof paymentConnectTokens.$inferSelect
 export type ProviderOnboardingSession = typeof providerOnboardingSessions.$inferSelect
 export type EscalatedTask = typeof escalatedTasks.$inferSelect
 export type AgentUpdateLog = typeof agentUpdateLog.$inferSelect

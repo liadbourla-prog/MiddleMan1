@@ -45,8 +45,14 @@ const EXPECTED_TABLES = [
   'initiation_approvals',
   'initiation_autonomy',
   'subscriptions',
+  'business_payment_credentials',
+  'payment_connect_tokens',
 ]
-const EXPECTED_INDEXES = ['initiation_log_dedup_idx', 'initiation_approvals_dedup_idx']
+const EXPECTED_INDEXES = [
+  'initiation_log_dedup_idx',
+  'initiation_approvals_dedup_idx',
+  'business_payment_credentials_webhook_token_idx',
+]
 
 // Postgres "already exists" codes — duplicate column / table-or-index / object.
 const ALREADY_EXISTS = new Set(['42701', '42P07', '42710'])

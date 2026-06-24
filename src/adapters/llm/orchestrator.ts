@@ -41,6 +41,7 @@ import {
   executeDecideFreedSlotOffer,
   executeCheckCalendarIntegrity,
   executeConnectGoogleCalendar,
+  executeConnectPayments,
   executeMessageCustomer,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
@@ -330,6 +331,11 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     parameters: { type: Type.OBJECT, properties: {} },
   },
   {
+    name: 'connectPayments',
+    description: "Generate the link the owner taps to connect their payments processor (Grow / Meshulam) so the PA can send pay-links and invoices automatically. Use this WHENEVER the owner wants to connect/set up/enable payments, charging, or invoicing. It returns a secure one-time URL — send that link to the owner here in WhatsApp on its own line. The form collects API credentials (not the Grow password). You have NO email; never say you emailed a link.",
+    parameters: { type: Type.OBJECT, properties: {} },
+  },
+  {
     name: 'messageCustomer',
     description: "Send a WhatsApp message to ONE specific customer on the owner's behalf (e.g. \"text Harel and ask when he's free this week\", \"let Dana know class is cancelled\"). Compose the message yourself and confirm with the owner before calling. Pass the customer's phone number when the owner gives one (lets you reach someone new); otherwise pass the name to match a customer on file. Only report the message as sent if this tool returns ok:true — it may report the customer can't be reached, in which case tell the owner the truth.",
     parameters: {
@@ -591,6 +597,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - searchWeb: only when the manager explicitly needs external information.
 - lookupCustomer / saveContactNote: only for customer or contact management requests. When the owner asks whether a customer has replied or what they said, you MUST call lookupCustomer with recent_messages and answer from the result — never say "not yet" or "they replied" from memory or assumption.
 - connectGoogleCalendar: ALWAYS use this when the owner wants to connect, sync, or link Google Calendar. It returns the real sign-in link — send that link to the owner here in WhatsApp, on its own line. You have NO email and no way to send email: never offer to email the link, never ask for an email address, and never claim you emailed anything.
+- connectPayments: ALWAYS use this when the owner wants to connect, set up, or enable payments/charging/invoicing (Grow / Meshulam). It returns a secure one-time link — send that link to the owner here on its own line. The form collects API credentials, not the Grow password. If the tool reports payments are already connected, just reassure them. Same email rule: you have NO email, never offer to email the link.
 - messageCustomer: use to actually send a WhatsApp message to a specific customer the owner names (e.g. "ask Harel when he's free"). Compose the message and confirm with the owner first, then call the tool. Only tell the owner the message was sent if the tool returns ok:true; if it reports the customer can't be reached (e.g. they haven't messaged recently), relay that honestly and never pretend it went out.
 - coordinateMeeting: use ONLY when the owner wants you to reach out and arrange a meeting whose time is NOT yet agreed — with anyone, INCLUDING an existing customer. First ask, in ONE question, whether they already set a time (then use createCalendarEvent) or want you to coordinate. When coordinating, capture either a primary time + one or two fallbacks, OR day/time windows (ranges) + how long the meeting runs. ALL meeting coordination goes through this tool — never improvise a coordination with messageCustomer + createCalendarEvent. NEVER invent or guess a person's name (the owner's or anyone else's). If you don't know how to introduce yourself for outreach and no preference is shown under "Outreach identity" below, ask the owner once: whether to say you're from {business name} or {owner}'s assistant — and if they pick their own name and you don't have it, ask for it; pass identifyAs (and ownerName) to save it.
 - messageCustomer is for a SINGLE one-off ping the owner dictates (e.g. "let Dana know class is cancelled") — never for negotiating a meeting time, and never to work around coordinateMeeting. Do not use createCalendarEvent to book a meeting you coordinated; confirm it with resolveMeetingCoordination instead.
@@ -660,6 +667,8 @@ async function dispatchTool(
       return executeSaveContactNote(args as unknown as Parameters<typeof executeSaveContactNote>[0], ctx)
     case 'connectGoogleCalendar':
       return executeConnectGoogleCalendar(args as unknown as Parameters<typeof executeConnectGoogleCalendar>[0], ctx)
+    case 'connectPayments':
+      return executeConnectPayments(args as unknown as Parameters<typeof executeConnectPayments>[0], ctx)
     case 'messageCustomer':
       return executeMessageCustomer(args as unknown as Parameters<typeof executeMessageCustomer>[0], ctx)
     case 'coordinateMeeting':

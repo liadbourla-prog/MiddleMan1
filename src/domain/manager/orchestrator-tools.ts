@@ -22,6 +22,7 @@ import { triggerWaitlistForSlot } from '../../workers/waitlist.js'
 import { runSentinelForBusiness } from '../../workers/integrity-sentinel.js'
 import { tavilySearch, TavilyRateLimitError } from '../../adapters/tavily/client.js'
 import { queryCustomerSegment } from '../crm/segment-repository.js'
+import { isPaymentsConnected, createPaymentConnectToken, buildPaymentConnectUrl } from '../payments/credentials.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
@@ -1623,6 +1624,45 @@ export async function executeConnectGoogleCalendar(
     ok: true,
     connectUrl,
     guidance: 'Send this exact link to the owner here in WhatsApp, on its own line. Tell them it opens a standard Google sign-in that lets the PA read and sync their calendar so bookings never clash, it is safe, and they can disconnect any time. The PA has NO email — never offer to email the link or claim you did.',
+  }
+}
+
+// ── connectPayments ─────────────────────────────────────────────────────────────
+// On-demand counterpart to the onboarding payment step (design §4.1): generates the signed
+// one-time link the owner taps to connect their Grow (Meshulam) merchant account so the PA
+// can send pay-links + invoices automatically. Mirrors executeConnectGoogleCalendar: it
+// only produces a link — connecting actually happens on the web form, which live-validates
+// against Grow and writes the payment.connected audit row.
+export async function executeConnectPayments(
+  _args: Record<string, never>,
+  ctx: ToolContext,
+): Promise<object> {
+  if (await isPaymentsConnected(ctx.db, ctx.businessId)) {
+    return {
+      ok: true,
+      alreadyConnected: true,
+      guidance: 'Payments are already connected for this business — the PA can send pay-links and invoices. Reassure the owner; do not send another link unless they explicitly want to reconnect with different credentials.',
+    }
+  }
+
+  const base = publicBaseUrl()
+  if (!base) {
+    return { ok: false, reason: 'no_base_url', guidance: 'Tell the owner you hit a configuration problem generating the connect link and will follow up — do not invent a link or claim it was sent.' }
+  }
+
+  // The connect token records who initiated it (for the WhatsApp confirmation after connect).
+  const [caller] = await ctx.db
+    .select({ phoneNumber: identities.phoneNumber })
+    .from(identities)
+    .where(eq(identities.id, ctx.identityId))
+    .limit(1)
+
+  const token = await createPaymentConnectToken(ctx.db, ctx.businessId, caller?.phoneNumber ?? '')
+  const connectUrl = buildPaymentConnectUrl(base, token)
+  return {
+    ok: true,
+    connectUrl,
+    guidance: "Send this exact link to the owner here in WhatsApp, on its own line. Tell them it opens a secure form to paste their Grow (Meshulam) API credentials (userId, pageCode, API key) — NOT their Grow password — so the PA can send pay-links and invoices automatically. The link is valid for 30 minutes and single-use. The PA has NO email — never offer to email it or claim you did.",
   }
 }
 
