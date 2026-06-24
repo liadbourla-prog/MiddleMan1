@@ -155,6 +155,16 @@ export const WA_TEMPLATES = {
     params: ['sender_name', 'proposed_times'],
     bodies: { he: 'שלום! מדבר/ת העוזר/ת של {{1}}. רצינו לתאם פגישה — האם {{2}} מתאים לך? אשמח לתאם מועד נוח.' },
   },
+  // Generic out-of-window reach-out for the owner's ad-hoc messageCustomer ping: when a customer
+  // hasn't written in 24h, WhatsApp won't deliver a free-form note, so this approved nudge reopens
+  // contact and the owner's actual message follows once the customer replies. Utility (the business
+  // is trying to reach an existing customer), single business-name variable.
+  business_outreach_nudge: {
+    name: 'business_outreach_nudge',
+    category: 'utility',
+    params: ['business'],
+    bodies: { he: 'היי! כאן {{1}} — ניסינו ליצור איתך קשר 🙂 אפשר לחזור אלינו כשנוח לך? נשמח לעזור.' },
+  },
 
   // ── Broadcast — fixed-shape announcements ───────────────────────────────────
   broadcast_hours_change: {

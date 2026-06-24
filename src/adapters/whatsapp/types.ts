@@ -35,6 +35,16 @@ export interface WhatsAppWebhookPayload {
           text?: { body: string }
           image?: { id: string; mime_type: string; caption?: string }
         }>
+        // Delivery-status callbacks (sent/delivered/read/failed). A `failed` status is how Meta
+        // reports an ASYNCHRONOUS delivery failure — e.g. re-engagement (code 131047) when a
+        // free-form message was accepted (HTTP 200) but the recipient is outside the 24h window.
+        statuses?: Array<{
+          id: string // the outbound message's wamid
+          status: 'sent' | 'delivered' | 'read' | 'failed'
+          timestamp: string
+          recipient_id: string // E.164 without leading '+'
+          errors?: Array<{ code: number; title?: string; message?: string }>
+        }>
       }
       field: string
     }>

@@ -35,7 +35,7 @@ import { getOpenSlots } from '../availability/service.js'
 import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
 import { findProviderByName } from '../provider/lookup.js'
-import { sendMessage, sendTemplateMessage } from '../../adapters/whatsapp/sender.js'
+import { sendMessage, sendTemplateMessage, canSendFreeForm } from '../../adapters/whatsapp/sender.js'
 import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
 import { logAudit } from '../audit/logger.js'
@@ -1975,12 +1975,66 @@ export async function executeMessageCustomer(
   const waCredentials = biz?.whatsappPhoneNumberId && biz.whatsappAccessToken
     ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
     : undefined
+  const lang = (biz?.defaultLanguage as 'he' | 'en' | null | undefined) ?? 'he'
 
-  // Attempt the send and let Meta be the authority on the 24h window. We do NOT pre-gate
-  // on our local conversation_sessions table (canSendFreeForm): that proxy produces false
-  // negatives — most sharply right after a chat reset, which wipes the very sessions it
-  // reads — and would block sends WhatsApp would actually accept. Meta returns the
-  // re-engagement error (outsideWindow) when the window is genuinely closed.
+  // Out-of-window fallback. A free-form message to a customer who hasn't written in 24h is
+  // ACCEPTED by Meta (HTTP 200 + message id) but then fails delivery asynchronously
+  // (re-engagement 131047) — so "let Meta be the authority on the synchronous response" silently
+  // drops the message while we report success (the bug behind the false "I sent it"). Instead,
+  // when the window is closed we send an APPROVED template (always deliverable) and report
+  // honestly: a reschedule-favour ask if the owner supplied times, else a generic reach-out nudge
+  // that invites the customer to reply (the owner's verbatim message can follow once they do).
+  const outOfWindowFallback = async (): Promise<object> => {
+    if (args.rescheduleFavor?.currentTime && args.rescheduleFavor?.newTime) {
+      const tmpl = await sendTemplateMessage({
+        toNumber: target!.phoneNumber,
+        templateName: 'reschedule_favor_request',
+        languageCode: lang === 'he' ? 'he' : 'en',
+        components: bodyComponents([biz?.name ?? '', args.rescheduleFavor.currentTime, args.rescheduleFavor.newTime]),
+        bodyText: body,
+        ...(waCredentials !== undefined && { credentials: waCredentials }),
+      })
+      if (tmpl.ok) {
+        await recordOutreach('outreach.message_sent', { body, viaTemplate: 'reschedule_favor_request' })
+        return { ok: true, sentTo: target!.phoneNumber, guidance: 'The customer is outside the 24-hour window, so the reschedule request went out as an approved template asking them to move the appointment. Tell the owner it was sent and you will update them when the customer replies.' }
+      }
+      await recordOutreach('outreach.message_blocked', { reason: 'template_send_failed', viaTemplate: 'reschedule_favor_request' })
+      return { ok: false, reason: 'send_failed', guidance: 'The reschedule request could not be sent. Tell the owner it did not go through — do not claim it was delivered.' }
+    }
+    // Generic reach-out nudge (the owner's free-text cannot ride a template, so the verbatim
+    // message is NOT delivered here — only an invitation to re-establish contact).
+    const tmpl = await sendTemplateMessage({
+      toNumber: target!.phoneNumber,
+      templateName: 'business_outreach_nudge',
+      languageCode: lang === 'he' ? 'he' : 'en',
+      components: bodyComponents([biz?.name ?? '']),
+      ...(waCredentials !== undefined && { credentials: waCredentials }),
+    })
+    if (tmpl.ok) {
+      await recordOutreach('outreach.message_sent', { body, viaTemplate: 'business_outreach_nudge', verbatimDelivered: false })
+      return {
+        ok: true,
+        sentTo: target!.phoneNumber,
+        outsideWindow: true,
+        guidance: "This customer hasn't messaged in 24h, so WhatsApp will NOT deliver a free-form message — your exact wording was NOT sent. I sent an approved short note inviting them to get back in touch instead. Tell the owner this honestly: do not claim their message was delivered; say you reached out asking the customer to reply, and you'll pass their message along as soon as the customer does.",
+      }
+    }
+    await recordOutreach('outreach.message_blocked', { reason: 'outside_window' })
+    return {
+      ok: false,
+      reason: 'outside_messaging_window',
+      guidance: 'The customer is outside the 24-hour window and the reach-out note could not be sent either. The message was NOT delivered. Tell the owner plainly and suggest the customer message first.',
+    }
+  }
+
+  // Pre-check the window. Closed → go straight to the template fallback: a free-form send here
+  // would be accepted-then-silently-dropped by Meta and falsely reported as delivered. The old
+  // "don't pre-gate, let Meta decide" concern (false negatives after a chat reset) is now benign:
+  // a false negative just sends a template, which delivers in-window too — never a wrong claim.
+  if (!(await canSendFreeForm(target.id))) {
+    return await outOfWindowFallback()
+  }
+
   const res = await sendMessage({ toNumber: target.phoneNumber, body }, waCredentials)
   if (!res.ok) {
     if (res.userOptedOut) {
@@ -1988,30 +2042,8 @@ export async function executeMessageCustomer(
       return { ok: false, reason: 'opted_out', guidance: 'The customer has blocked/opted out. Tell the owner the message could not be delivered.' }
     }
     if (res.outsideWindow) {
-      // Reschedule-favour fallback: when the owner is asking the customer to move an appointment
-      // and the window is closed, the approved reschedule_favor_request template can still reopen
-      // contact (the free-form note can't). [business, current_time, new_time].
-      if (args.rescheduleFavor?.currentTime && args.rescheduleFavor?.newTime) {
-        const lang = (biz?.defaultLanguage as 'he' | 'en' | null | undefined) ?? 'he'
-        const tmpl = await sendTemplateMessage({
-          toNumber: target.phoneNumber,
-          templateName: 'reschedule_favor_request',
-          languageCode: lang === 'he' ? 'he' : 'en',
-          components: bodyComponents([biz?.name ?? '', args.rescheduleFavor.currentTime, args.rescheduleFavor.newTime]),
-          bodyText: body,
-          ...(waCredentials !== undefined && { credentials: waCredentials }),
-        })
-        if (tmpl.ok) {
-          await recordOutreach('outreach.message_sent', { body, viaTemplate: 'reschedule_favor_request' })
-          return { ok: true, sentTo: target.phoneNumber, guidance: 'The customer is outside the 24-hour window, so the reschedule request went out as an approved template asking them to move the appointment. Tell the owner it was sent and you will update them when the customer replies.' }
-        }
-      }
-      await recordOutreach('outreach.message_blocked', { reason: 'outside_window', body })
-      return {
-        ok: false,
-        reason: 'outside_messaging_window',
-        guidance: 'WhatsApp blocked the first message because more than 24 hours have passed since this customer last messaged the business (only a pre-approved template can reopen contact, and none is set up). The message was NOT sent. Tell the owner plainly and suggest the customer message first, or that you can reach out once they do.',
-      }
+      // Our session view said in-window but Meta disagrees synchronously → use the template fallback.
+      return await outOfWindowFallback()
     }
     await recordOutreach('outreach.message_blocked', { reason: 'send_failed' })
     return { ok: false, reason: 'send_failed', guidance: 'The message failed to send. Tell the owner it did not go through and you will retry — do not claim it was delivered.' }

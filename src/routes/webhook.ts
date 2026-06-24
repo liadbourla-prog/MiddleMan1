@@ -91,6 +91,11 @@ export async function webhookRoutes(app: FastifyInstance) {
 
       const { messages, nonTextReplies } = normalizeWebhookPayload(request.body)
 
+      // Delivery-status callbacks (esp. `failed`): Meta accepts an out-of-window free-form send
+      // synchronously (HTTP 200) then fails delivery asynchronously here. Reconcile so an
+      // optimistic "sent" is corrected and the owner is told honestly. Best-effort, never blocks.
+      await handleDeliveryStatuses(request.body, app).catch((err) => app.log.warn({ err }, 'Delivery-status handling failed'))
+
       // Reply to non-text messages immediately (no DB work needed)
       for (const { toNumber, body } of nonTextReplies) {
         await sendMessage({ toNumber, body }).catch(() => { /* fire-and-forget */ })
@@ -104,6 +109,97 @@ export async function webhookRoutes(app: FastifyInstance) {
       }
     },
   )
+}
+
+const WA_REENGAGEMENT_CODE = 131047 // Meta: free-form message outside the 24h window
+
+/**
+ * Reconcile Meta delivery-status callbacks. A `failed` status is the only signal that a message
+ * Meta accepted synchronously (HTTP 200) was NOT actually delivered — most importantly the
+ * re-engagement failure (131047) for a free-form send to an out-of-window customer. Without this,
+ * an optimistic `outreach.message_sent` stands uncorrected and the owner is told a message went
+ * out when it didn't. We log the failure to the ledger and tell the owner honestly.
+ */
+async function handleDeliveryStatuses(payload: WhatsAppWebhookPayload, app: FastifyInstance): Promise<void> {
+  for (const entry of payload.entry ?? []) {
+    for (const change of entry.changes ?? []) {
+      const value = change.value
+      const statuses = value?.statuses
+      if (!statuses?.length) continue
+      const phoneNumberId = value.metadata?.phone_number_id
+      for (const st of statuses) {
+        if (st.status !== 'failed') continue
+        await handleFailedDelivery(phoneNumberId, st, app).catch((err) =>
+          app.log.warn({ err, wamid: st.id }, 'Failed-delivery handling error'))
+      }
+    }
+  }
+}
+
+async function handleFailedDelivery(
+  phoneNumberId: string | undefined,
+  st: { id: string; recipient_id: string; errors?: Array<{ code: number; title?: string; message?: string }> },
+  app: FastifyInstance,
+): Promise<void> {
+  if (!phoneNumberId) return
+
+  // Resolve the business that sent this. The MiddleMan/provider number isn't a business → skip.
+  const [business] = await db
+    .select()
+    .from(businesses)
+    .where(eq(businesses.whatsappPhoneNumberId, phoneNumberId))
+    .limit(1)
+  if (!business) return
+
+  // Dedup: one reconciliation per failed wamid (Meta may re-deliver the status).
+  const inserted = await db
+    .insert(processedMessages)
+    .values({ messageId: `status:${st.id}`, businessId: business.id })
+    .onConflictDoNothing()
+    .returning({ messageId: processedMessages.messageId })
+  if (inserted.length === 0) return
+
+  const recipientPhone = st.recipient_id.startsWith('+') ? st.recipient_id : `+${st.recipient_id}`
+  const errCode = st.errors?.[0]?.code
+  const errTitle = st.errors?.[0]?.title ?? st.errors?.[0]?.message
+
+  await logAudit(db, {
+    businessId: business.id,
+    actorId: null,
+    action: 'whatsapp.delivery_failed',
+    entityType: 'identity',
+    metadata: { to: recipientPhone, wamid: st.id, code: errCode ?? null, title: errTitle ?? null },
+  }).catch(() => { /* ledger write is best-effort */ })
+
+  // Tell the owner honestly — but never about a failed send to the owner's own number (would loop).
+  const [manager] = await db
+    .select({ phoneNumber: identities.phoneNumber })
+    .from(identities)
+    .where(and(eq(identities.businessId, business.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+  if (!manager?.phoneNumber || manager.phoneNumber === recipientPhone) return
+
+  const [cust] = await db
+    .select({ displayName: identities.displayName })
+    .from(identities)
+    .where(and(eq(identities.businessId, business.id), eq(identities.phoneNumber, recipientPhone)))
+    .limit(1)
+
+  const lang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const who = cust?.displayName ?? recipientPhone
+  const reason = errCode === WA_REENGAGEMENT_CODE
+    ? (lang === 'he'
+      ? 'הם לא כתבו לנו ב-24 השעות האחרונות, אז וואטסאפ לא מאפשר לשלוח להם הודעה חופשית. אפשר לנסות שוב אחרי שהם יכתבו.'
+      : "they haven't messaged us in the last 24 hours, so WhatsApp won't deliver a free-form message. We can try again once they write.")
+    : (errTitle ?? (lang === 'he' ? 'המסירה נכשלה.' : 'delivery failed.'))
+  const body = lang === 'he'
+    ? `⚠️ שים לב: ההודעה ל${who} לא נמסרה בפועל — ${reason}`
+    : `⚠️ Heads up: the message to ${who} wasn't actually delivered — ${reason}`
+
+  const creds = business.whatsappPhoneNumberId && business.whatsappAccessToken
+    ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
+    : undefined
+  await sendMessage({ toNumber: manager.phoneNumber, body }, creds).catch(() => { /* best-effort */ })
 }
 
 const PROVIDER_WA_NUMBER = process.env['PROVIDER_WA_NUMBER'] ?? ''
