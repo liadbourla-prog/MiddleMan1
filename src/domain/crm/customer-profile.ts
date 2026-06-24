@@ -12,6 +12,7 @@ export interface ProfileBooking {
   state: string
   serviceTypeId: string
   providerId?: string | null // the staff member / instructor the visit was with; null for solo operators
+  amount?: string | null // price snapshot at booking time (numeric as string); null = free / pre-Phase-3
 }
 
 export type TimeBand = 'morning' | 'afternoon' | 'evening'
@@ -27,6 +28,7 @@ export interface CustomerProfile {
   preferredServiceTypeId: string | null // most-booked service
   preferredProviderId: string | null // most-booked instructor/staff; null if no provider-scoped visits
   providerVisitCounts: Record<string, number> // visits per instructor (value-model weighting / instructor-fit)
+  lifetimeSpend: number // sum of pinned amounts across visit-state bookings; 0 if none priced (value model / LTV)
   preferredDayOfWeek: number | null // 0=Sun..6=Sat, business-local, modal
   preferredTimeBand: TimeBand | null // modal local time band
 }
@@ -99,6 +101,10 @@ export function computeCustomerProfile(bookings: ProfileBooking[], timezone: str
   const providerVisitCounts: Record<string, number> = {}
   for (const p of providerIds) providerVisitCounts[p] = (providerVisitCounts[p] ?? 0) + 1
 
+  // Lifetime spend: sum the pinned price snapshot across visit-state bookings. Unpriced /
+  // historical (null amount) contribute 0. Forward-accurate; not backfilled.
+  const lifetimeSpend = visits.reduce((sum, v) => sum + (v.amount != null ? Number(v.amount) || 0 : 0), 0)
+
   const local = visits.map((v) => localDowAndBand(v.slotStart, timezone))
   const preferredDayOfWeek = local.length > 0 ? modal(local.map((l) => l.dow)) : null
   const preferredTimeBand = local.length > 0 ? modal(local.map((l) => l.band)) : null
@@ -114,6 +120,7 @@ export function computeCustomerProfile(bookings: ProfileBooking[], timezone: str
     preferredServiceTypeId,
     preferredProviderId,
     providerVisitCounts,
+    lifetimeSpend,
     preferredDayOfWeek,
     preferredTimeBand,
   }

@@ -12,7 +12,7 @@ import { computeCustomerProfile, matchesSegment, type ProfileBooking, type Segme
 /** Load one customer's full behavioral profile (Phase 3 cold-fill / value scoring read this). */
 export async function loadCustomerProfile(db: Db, businessId: string, identityId: string, timezone: string) {
   const rows = await db
-    .select({ slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId, providerId: bookings.providerId })
+    .select({ slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId, providerId: bookings.providerId, amount: bookings.amount })
     .from(bookings)
     .where(and(eq(bookings.businessId, businessId), eq(bookings.customerId, identityId)))
   return computeCustomerProfile(rows as ProfileBooking[], timezone)
@@ -39,14 +39,14 @@ export async function queryCustomerSegment(
   // One pass over this business's bookings, grouped by customer (avoids N queries).
   const customerIds = customers.map((c) => c.id)
   const allBookings = await db
-    .select({ customerId: bookings.customerId, slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId, providerId: bookings.providerId })
+    .select({ customerId: bookings.customerId, slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId, providerId: bookings.providerId, amount: bookings.amount })
     .from(bookings)
     .where(and(eq(bookings.businessId, businessId), inArray(bookings.customerId, customerIds)))
 
   const byCustomer = new Map<string, ProfileBooking[]>()
   for (const b of allBookings) {
     const list = byCustomer.get(b.customerId) ?? []
-    list.push({ slotStart: b.slotStart, state: b.state, serviceTypeId: b.serviceTypeId, providerId: b.providerId })
+    list.push({ slotStart: b.slotStart, state: b.state, serviceTypeId: b.serviceTypeId, providerId: b.providerId, amount: b.amount })
     byCustomer.set(b.customerId, list)
   }
 
@@ -91,6 +91,7 @@ export async function queryCustomerSegment(
     preferredServiceTypeId: profile.preferredServiceTypeId,
     preferredProviderId: profile.preferredProviderId,
     preferredProviderName: profile.preferredProviderId ? (providerNames.get(profile.preferredProviderId) ?? null) : null,
+    lifetimeSpend: profile.lifetimeSpend,
     preferredDayOfWeek: profile.preferredDayOfWeek,
     preferredTimeBand: profile.preferredTimeBand,
     noShowRate: profile.noShowRate,

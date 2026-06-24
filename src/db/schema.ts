@@ -128,6 +128,9 @@ export const identities = pgTable(
     vip: boolean('vip').notNull().default(false),
     // Customer's preferred language for PA replies; null = use business default
     preferredLanguage: text('preferred_language', { enum: ['he', 'en'] }),
+    // Birthday (Phase 2; design §7.6) — cheap nullable field that unlocks the birthday/holiday
+    // initiator. Date only (no year required, but stored as a full date); null = unknown.
+    birthday: date('birthday'),
     conversationPausedUntil: timestamp('conversation_paused_until', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -305,6 +308,10 @@ export const bookings = pgTable(
     })
       .notNull()
       .default('not_required'),
+    // Price snapshot at booking creation (Phase 3; design §0.3/§7.6). Pinned from the service
+    // price at the time of booking so lifetime-spend / LTV stays historically accurate even
+    // after the owner changes prices. Null = free service or pre-Phase-3 historical booking.
+    amount: numeric('amount', { precision: 10, scale: 2 }),
     cancellationReason: text('cancellation_reason'),
     cancelledByRole: text('cancelled_by_role', { enum: ['customer', 'manager', 'system'] }),
     slotTzAtCreation: text('slot_tz_at_creation'),

@@ -4,11 +4,18 @@ import { computeCustomerProfile, isLapsed, matchesSegment, type ProfileBooking }
 const TZ = 'Asia/Jerusalem'
 
 // Helper: a visit (confirmed/attended/no_show) at a given UTC instant.
-const b = (iso: string, state: string, serviceTypeId = 'svc-a', providerId: string | null = null): ProfileBooking => ({
+const b = (
+  iso: string,
+  state: string,
+  serviceTypeId = 'svc-a',
+  providerId: string | null = null,
+  amount: string | null = null,
+): ProfileBooking => ({
   slotStart: new Date(iso),
   state,
   serviceTypeId,
   providerId,
+  amount,
 })
 
 describe('computeCustomerProfile', () => {
@@ -80,6 +87,24 @@ describe('computeCustomerProfile', () => {
     )
     expect(p.preferredProviderId).toBeNull()
     expect(p.providerVisitCounts).toEqual({})
+  })
+
+  it('lifetime spend sums pinned amounts over visit-state bookings; nulls count as 0', () => {
+    const p = computeCustomerProfile(
+      [
+        b('2026-01-01T10:00:00Z', 'attended', 'svc-a', null, '50.00'),
+        b('2026-01-08T10:00:00Z', 'confirmed', 'svc-a', null, '50.00'),
+        b('2026-01-15T10:00:00Z', 'attended', 'svc-a', null, null), // free / historical → 0
+        b('2026-01-20T10:00:00Z', 'cancelled', 'svc-a', null, '99.00'), // not a visit → excluded
+      ],
+      TZ,
+    )
+    expect(p.lifetimeSpend).toBe(100)
+  })
+
+  it('lifetime spend is 0 when nothing is priced', () => {
+    const p = computeCustomerProfile([b('2026-01-01T10:00:00Z', 'attended')], TZ)
+    expect(p.lifetimeSpend).toBe(0)
   })
 
   it('preferred day-of-week and time band are business-local and modal', () => {

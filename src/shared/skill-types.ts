@@ -168,6 +168,8 @@ export interface CustomerSummary {
   // name so proactive copy can say "with Dana" without a second lookup. Null for solo operators.
   preferredProviderId?: string | null
   preferredProviderName?: string | null
+  // Lifetime spend (Phase 3) — sum of pinned booking amounts; the value model's LTV input.
+  lifetimeSpend?: number
   preferredDayOfWeek?: number | null // 0=Sun..6=Sat, business-local
   preferredTimeBand?: CustomerTimeBand | null
   noShowRate?: number

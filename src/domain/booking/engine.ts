@@ -199,7 +199,7 @@ async function requestPrivateBooking(
   calendar: CalendarClient,
   actor: ResolvedIdentity,
   request: BookingSlotRequest,
-  service: { id: string; name: string; durationMinutes: number; maxParticipants: number },
+  service: { id: string; name: string; durationMinutes: number; maxParticipants: number; paymentAmount: string | null },
   businessTz: string,
   confirmationGate: string,
   paymentMethod: string | null,
@@ -247,6 +247,8 @@ async function requestPrivateBooking(
           slotEnd: request.slotEnd,
           slotTzAtCreation: businessTz,
           state: 'requested',
+          // Pin the price at booking time for accurate lifetime-spend (Phase 3).
+          amount: service.paymentAmount ?? null,
         })
         .returning()
 
@@ -365,7 +367,7 @@ async function requestGroupClassBooking(
   calendar: CalendarClient,
   actor: ResolvedIdentity,
   request: BookingSlotRequest,
-  service: { id: string; name: string; durationMinutes: number; maxParticipants: number },
+  service: { id: string; name: string; durationMinutes: number; maxParticipants: number; paymentAmount: string | null },
   businessTz: string,
   confirmationGate: string,
   paymentMethod: string | null,
@@ -441,6 +443,8 @@ async function requestGroupClassBooking(
           slotEnd: request.slotEnd,
           slotTzAtCreation: businessTz,
           state: 'requested',
+          // Pin the price at booking time for accurate lifetime-spend (Phase 3).
+          amount: service.paymentAmount ?? null,
         })
         .returning()
 
