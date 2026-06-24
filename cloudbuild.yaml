@@ -6,6 +6,7 @@ steps:
     args:
       - '-c'
       - |
+        set -euo pipefail
         apt-get update -qq && apt-get install -y -qq curl
         curl -sSLo /usr/local/bin/cloud-sql-proxy \
           https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.1/cloud-sql-proxy.linux.amd64
@@ -17,8 +18,18 @@ steps:
         # Apply ALL migrations idempotently + verify (replaces drizzle-kit migrate, whose
         # stale journal silently skips every hand-authored migration past 0006). Exits
         # non-zero if any expected table/index is missing — a silent skip fails the build.
+        # Capture the exit code so the proxy is always torn down, then FAIL the build if
+        # the migration failed (previously `kill ... || true` was the last line and masked
+        # a non-zero db:apply, silently shipping a stale schema).
+        set +e
         DATABASE_URL="$$DB_MIGRATION_URL" npm run db:apply
+        APPLY_RC=$?
+        set -e
         kill $$PROXY_PID 2>/dev/null || true
+        if [ "$$APPLY_RC" -ne 0 ]; then
+          echo "Migration step FAILED (db:apply exit $$APPLY_RC) — aborting build."
+          exit "$$APPLY_RC"
+        fi
 
   # Build the Docker image
   - name: 'gcr.io/cloud-builders/docker'

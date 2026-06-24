@@ -59,13 +59,58 @@ function migrationFiles(): string[] {
 
 function statementsOf(file: string): string[] {
   const text = readFileSync(join(MIGRATIONS_DIR, file), 'utf8')
-  // Strip line comments FIRST (they may contain semicolons), THEN split. These migrations
-  // are plain DDL with no dollar-quoted bodies, so a ';' split is correct once comments go.
-  return text
-    .replace(/--.*$/gm, '')
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
+  return splitSqlStatements(text)
+}
+
+/**
+ * Split a SQL script into statements on top-level `;` only — i.e. NOT inside dollar-quoted
+ * bodies (`$$ ... $$` / `$tag$ ... $tag$`, as used by `DO $$ ... END $$;` blocks in 0016+),
+ * single-quoted string literals, or comments. A naive `;`-split shears a `DO $$ ... ; ... $$`
+ * block into fragments and Postgres rejects it as an "unterminated dollar-quoted string"
+ * (which is exactly how the whole migrate step was silently dying at 0016). Line (`--`) and
+ * block (`/* *​/`) comments are dropped at the top level but preserved verbatim inside bodies.
+ */
+function splitSqlStatements(text: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let dollarTag: string | null = null
+  let inSingle = false
+  let inLineComment = false
+  let inBlockComment = false
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]!
+    const next = text[i + 1]
+    if (inLineComment) {
+      if (ch === '\n') { inLineComment = false; cur += ch }
+      i++; continue
+    }
+    if (inBlockComment) {
+      if (ch === '*' && next === '/') { inBlockComment = false; i += 2 } else { i++ }
+      continue
+    }
+    if (dollarTag) {
+      if (text.startsWith(dollarTag, i)) { cur += dollarTag; i += dollarTag.length; dollarTag = null } else { cur += ch; i++ }
+      continue
+    }
+    if (inSingle) {
+      cur += ch
+      if (ch === "'") inSingle = false
+      i++; continue
+    }
+    if (ch === '-' && next === '-') { inLineComment = true; i += 2; continue }
+    if (ch === '/' && next === '*') { inBlockComment = true; i += 2; continue }
+    if (ch === "'") { inSingle = true; cur += ch; i++; continue }
+    if (ch === '$') {
+      const m = /^\$[A-Za-z_0-9]*\$/.exec(text.slice(i))
+      if (m) { dollarTag = m[0]; cur += dollarTag; i += dollarTag.length; continue }
+    }
+    if (ch === ';') { const t = cur.trim(); if (t) out.push(t); cur = ''; i++; continue }
+    cur += ch; i++
+  }
+  const tail = cur.trim()
+  if (tail) out.push(tail)
+  return out
 }
 
 async function main() {
