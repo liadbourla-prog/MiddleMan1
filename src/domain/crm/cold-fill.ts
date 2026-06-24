@@ -15,17 +15,25 @@ const NO_SHOW_EXCLUSION_THRESHOLD = 0.5
 /**
  * Rank a lapsed segment for a freed slot and return the best `batchSize` to invite.
  *
- * Best fit = warmest first: most-recently-active (`lastBookingAt` desc), tie-broken by
- * lower `noShowRate` (more reliable). Customers with `noShowRate >= 0.5` are excluded.
+ * Best fit = instructor-match first (when the freed slot has a known instructor, customers
+ * whose usual instructor is that person rank above everyone else — the strongest fit signal
+ * in a studio/salon), then warmest: most-recently-active (`lastBookingAt` desc), tie-broken
+ * by lower `noShowRate` (more reliable). Customers with `noShowRate >= 0.5` are excluded.
  * Pure: no clock, no I/O.
  */
 export function selectColdFillCandidates(
   candidates: CustomerSummary[],
-  opts: { batchSize: number },
+  opts: { batchSize: number; slotProviderId?: string | null },
 ): CustomerSummary[] {
+  const slotProvider = opts.slotProviderId ?? null
   return candidates
     .filter((c) => (c.noShowRate ?? 0) < NO_SHOW_EXCLUSION_THRESHOLD)
     .sort((a, b) => {
+      if (slotProvider) {
+        const aFit = a.preferredProviderId === slotProvider ? 1 : 0
+        const bFit = b.preferredProviderId === slotProvider ? 1 : 0
+        if (bFit !== aFit) return bFit - aFit // customers of this instructor first
+      }
       const aLast = a.lastBookingAt ? a.lastBookingAt.getTime() : 0
       const bLast = b.lastBookingAt ? b.lastBookingAt.getTime() : 0
       if (bLast !== aLast) return bLast - aLast // most-recently-active first

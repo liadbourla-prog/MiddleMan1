@@ -7,6 +7,7 @@ const c = (
   id: string,
   lastBookingAt: string | null,
   noShowRate = 0,
+  preferredProviderId: string | null = null,
 ): CustomerSummary => ({
   identityId: id,
   phoneNumber: `+1${id}`,
@@ -14,6 +15,7 @@ const c = (
   totalBookings: 1,
   lastBookingAt: lastBookingAt ? new Date(lastBookingAt) : null,
   noShowRate,
+  preferredProviderId,
 })
 
 describe('selectColdFillCandidates', () => {
@@ -90,5 +92,36 @@ describe('selectColdFillCandidates', () => {
     expect(
       selectColdFillCandidates([c('a', '2026-01-01T10:00:00Z')], { batchSize: 0 }),
     ).toEqual([])
+  })
+
+  it('instructor-fit ranks the slot instructor’s customers above warmer non-matches', () => {
+    const picks = selectColdFillCandidates(
+      [
+        c('newer_other', '2026-03-01T10:00:00Z', 0, 'amir'),
+        c('older_dana', '2026-01-01T10:00:00Z', 0, 'dana'),
+      ],
+      { batchSize: 2, slotProviderId: 'dana' },
+    )
+    // Dana's customer wins despite being less recent.
+    expect(picks.map((p) => p.identityId)).toEqual(['older_dana', 'newer_other'])
+  })
+
+  it('within the same instructor-fit tier, recency still decides', () => {
+    const picks = selectColdFillCandidates(
+      [
+        c('dana_old', '2026-01-01T10:00:00Z', 0, 'dana'),
+        c('dana_new', '2026-03-01T10:00:00Z', 0, 'dana'),
+      ],
+      { batchSize: 2, slotProviderId: 'dana' },
+    )
+    expect(picks.map((p) => p.identityId)).toEqual(['dana_new', 'dana_old'])
+  })
+
+  it('no slotProviderId → instructor is ignored, pure recency ordering', () => {
+    const picks = selectColdFillCandidates(
+      [c('older_dana', '2026-01-01T10:00:00Z', 0, 'dana'), c('newer_other', '2026-03-01T10:00:00Z', 0, 'amir')],
+      { batchSize: 2 },
+    )
+    expect(picks.map((p) => p.identityId)).toEqual(['newer_other', 'older_dana'])
   })
 })

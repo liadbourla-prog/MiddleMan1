@@ -61,16 +61,22 @@ export function buildWinbackProposal(
       ? 'הלקוח/ה'
       : 'this customer'
   const cadence = summary.cadenceDays ?? null
+  const instructor = summary.preferredProviderName?.trim() || null
 
   const ownerSummary =
     lang === 'he'
       ? buildOwnerSummaryHe(name, cadence, daysSince)
       : buildOwnerSummaryEn(name, cadence, daysSince)
 
+  // When we know the customer's usual instructor, name them — a far warmer, higher-converting
+  // framing than a generic business-level check-in.
+  const withInstructorHe = instructor ? ` הלקוח/ה בדרך כלל מגיע/ה ל${instructor} — אפשר להזכיר את זה אם זה משתלב טבעי.` : ''
+  const withInstructorEn = instructor ? ` They usually come to ${instructor} — mention that if it fits naturally.` : ''
+
   const situation =
     lang === 'he'
-      ? `יצירת קשר חמה לחזרת לקוח/ה שלא ביקר/ה כבר ${daysSince} ימים אצל ${businessName}. להזכיר שהתגעגענו ולהזמין בעדינות לחזור — בלי לבקש תגובת אישור, בלי לחץ.`
-      : `Warm win-back outreach to a customer who hasn't visited ${businessName} in ${daysSince} days. Let them know we've missed them and would love to see them back — gentle, no confirmation-word demand, no pressure.`
+      ? `יצירת קשר חמה לחזרת לקוח/ה שלא ביקר/ה כבר ${daysSince} ימים אצל ${businessName}. להזכיר שהתגעגענו ולהזמין בעדינות לחזור — בלי לבקש תגובת אישור, בלי לחץ.${withInstructorHe}`
+      : `Warm win-back outreach to a customer who hasn't visited ${businessName} in ${daysSince} days. Let them know we've missed them and would love to see them back — gentle, no confirmation-word demand, no pressure.${withInstructorEn}`
 
   const fallback =
     lang === 'he'

@@ -107,4 +107,16 @@ describe('buildWinbackProposal — normal candidate', () => {
     expect(p.ownerSummary).toContain('40')
     expect(p.ownerSummary).not.toMatch(/every \d+ days/)
   })
+
+  it('names the usual instructor in the situation when known (EN + HE)', () => {
+    const en = buildWinbackProposal({ ...base, preferredProviderName: 'Amir' }, 'Glow Studio', 'en', NOW)!
+    expect(en.situation).toContain('Amir')
+    const he = buildWinbackProposal({ ...base, preferredProviderName: 'אמיר' }, 'סטודיו', 'he', NOW)!
+    expect(he.situation).toContain('אמיר')
+  })
+
+  it('omits the instructor clause when no preferred instructor is known', () => {
+    const p = buildWinbackProposal(base, 'Glow Studio', 'en', NOW)!
+    expect(p.situation.toLowerCase()).not.toContain('they usually come to')
+  })
 })

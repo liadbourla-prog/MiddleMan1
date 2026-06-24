@@ -11,6 +11,7 @@ export interface ProfileBooking {
   slotStart: Date
   state: string
   serviceTypeId: string
+  providerId?: string | null // the staff member / instructor the visit was with; null for solo operators
 }
 
 export type TimeBand = 'morning' | 'afternoon' | 'evening'
@@ -24,6 +25,8 @@ export interface CustomerProfile {
   cadenceDays: number | null // median gap (days) between consecutive visits; null if <2 visits
   serviceTypeIds: string[] // distinct services across visits (for segment membership)
   preferredServiceTypeId: string | null // most-booked service
+  preferredProviderId: string | null // most-booked instructor/staff; null if no provider-scoped visits
+  providerVisitCounts: Record<string, number> // visits per instructor (value-model weighting / instructor-fit)
   preferredDayOfWeek: number | null // 0=Sun..6=Sat, business-local, modal
   preferredTimeBand: TimeBand | null // modal local time band
 }
@@ -89,6 +92,13 @@ export function computeCustomerProfile(bookings: ProfileBooking[], timezone: str
   const serviceTypeIds = [...new Set(visits.map((v) => v.serviceTypeId))]
   const preferredServiceTypeId = modal(visits.map((v) => v.serviceTypeId))
 
+  // Instructor affinity: only provider-scoped visits count. Solo-operator / unscoped visits
+  // (providerId null) contribute nothing — preferredProviderId stays null in that case.
+  const providerIds = visits.map((v) => v.providerId).filter((p): p is string => !!p)
+  const preferredProviderId = modal(providerIds)
+  const providerVisitCounts: Record<string, number> = {}
+  for (const p of providerIds) providerVisitCounts[p] = (providerVisitCounts[p] ?? 0) + 1
+
   const local = visits.map((v) => localDowAndBand(v.slotStart, timezone))
   const preferredDayOfWeek = local.length > 0 ? modal(local.map((l) => l.dow)) : null
   const preferredTimeBand = local.length > 0 ? modal(local.map((l) => l.band)) : null
@@ -102,6 +112,8 @@ export function computeCustomerProfile(bookings: ProfileBooking[], timezone: str
     cadenceDays,
     serviceTypeIds,
     preferredServiceTypeId,
+    preferredProviderId,
+    providerVisitCounts,
     preferredDayOfWeek,
     preferredTimeBand,
   }
@@ -121,6 +133,7 @@ export interface SegmentMatchFilter {
   preferredDayOfWeek?: number
   preferredTimeBand?: TimeBand
   lapsed?: boolean
+  providerId?: string // customers who have visited this instructor (membership, not "preferred")
 }
 
 /** Booking-derived segment membership test. Identity-level facts (e.g. VIP) are filtered by
@@ -130,6 +143,7 @@ export function matchesSegment(profile: CustomerProfile, filter: SegmentMatchFil
     if (filter.hasBooking !== profile.lifetimeBookings > 0) return false
   }
   if (filter.serviceTypeId && !profile.serviceTypeIds.includes(filter.serviceTypeId)) return false
+  if (filter.providerId && !(filter.providerId in profile.providerVisitCounts)) return false
   if (filter.inactiveSinceDays !== undefined) {
     if (!profile.lastBookingAt) return false
     const sinceDays = (now.getTime() - profile.lastBookingAt.getTime()) / 86_400_000

@@ -4,10 +4,11 @@ import { computeCustomerProfile, isLapsed, matchesSegment, type ProfileBooking }
 const TZ = 'Asia/Jerusalem'
 
 // Helper: a visit (confirmed/attended/no_show) at a given UTC instant.
-const b = (iso: string, state: string, serviceTypeId = 'svc-a'): ProfileBooking => ({
+const b = (iso: string, state: string, serviceTypeId = 'svc-a', providerId: string | null = null): ProfileBooking => ({
   slotStart: new Date(iso),
   state,
   serviceTypeId,
+  providerId,
 })
 
 describe('computeCustomerProfile', () => {
@@ -59,6 +60,28 @@ describe('computeCustomerProfile', () => {
     expect(p.serviceTypeIds.sort()).toEqual(['pilates', 'yoga'])
   })
 
+  it('preferred instructor is the modal provider across visits; counts are per-instructor', () => {
+    const p = computeCustomerProfile(
+      [
+        b('2026-01-01T10:00:00Z', 'attended', 'yoga', 'dana'),
+        b('2026-01-08T10:00:00Z', 'attended', 'yoga', 'dana'),
+        b('2026-01-15T10:00:00Z', 'attended', 'yoga', 'amir'),
+      ],
+      TZ,
+    )
+    expect(p.preferredProviderId).toBe('dana')
+    expect(p.providerVisitCounts).toEqual({ dana: 2, amir: 1 })
+  })
+
+  it('null providerId (solo operator / unscoped) yields no instructor affinity', () => {
+    const p = computeCustomerProfile(
+      [b('2026-01-01T10:00:00Z', 'attended'), b('2026-01-08T10:00:00Z', 'attended')],
+      TZ,
+    )
+    expect(p.preferredProviderId).toBeNull()
+    expect(p.providerVisitCounts).toEqual({})
+  })
+
   it('preferred day-of-week and time band are business-local and modal', () => {
     // 2026-01-06 and 2026-01-13 are Tuesdays; 18:00 UTC = 20:00 Jerusalem (evening).
     const p = computeCustomerProfile(
@@ -108,5 +131,14 @@ describe('matchesSegment', () => {
   it('lapsed filter combines cadence + recency', () => {
     expect(matchesSegment(p, { lapsed: true }, now)).toBe(true)
     expect(matchesSegment(p, { lapsed: false }, now)).toBe(false)
+  })
+  it('providerId filter matches any customer who has visited that instructor', () => {
+    const withDana = computeCustomerProfile(
+      [b('2026-01-01T10:00:00Z', 'attended', 'yoga', 'dana'), b('2026-01-15T10:00:00Z', 'attended', 'yoga', 'amir')],
+      TZ,
+    )
+    expect(matchesSegment(withDana, { providerId: 'dana' }, now)).toBe(true) // membership, not "preferred"
+    expect(matchesSegment(withDana, { providerId: 'amir' }, now)).toBe(true)
+    expect(matchesSegment(withDana, { providerId: 'noa' }, now)).toBe(false)
   })
 })

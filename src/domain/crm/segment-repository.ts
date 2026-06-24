@@ -12,7 +12,7 @@ import { computeCustomerProfile, matchesSegment, type ProfileBooking, type Segme
 /** Load one customer's full behavioral profile (Phase 3 cold-fill / value scoring read this). */
 export async function loadCustomerProfile(db: Db, businessId: string, identityId: string, timezone: string) {
   const rows = await db
-    .select({ slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId })
+    .select({ slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId, providerId: bookings.providerId })
     .from(bookings)
     .where(and(eq(bookings.businessId, businessId), eq(bookings.customerId, identityId)))
   return computeCustomerProfile(rows as ProfileBooking[], timezone)
@@ -39,14 +39,14 @@ export async function queryCustomerSegment(
   // One pass over this business's bookings, grouped by customer (avoids N queries).
   const customerIds = customers.map((c) => c.id)
   const allBookings = await db
-    .select({ customerId: bookings.customerId, slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId })
+    .select({ customerId: bookings.customerId, slotStart: bookings.slotStart, state: bookings.state, serviceTypeId: bookings.serviceTypeId, providerId: bookings.providerId })
     .from(bookings)
     .where(and(eq(bookings.businessId, businessId), inArray(bookings.customerId, customerIds)))
 
   const byCustomer = new Map<string, ProfileBooking[]>()
   for (const b of allBookings) {
     const list = byCustomer.get(b.customerId) ?? []
-    list.push({ slotStart: b.slotStart, state: b.state, serviceTypeId: b.serviceTypeId })
+    list.push({ slotStart: b.slotStart, state: b.state, serviceTypeId: b.serviceTypeId, providerId: b.providerId })
     byCustomer.set(b.customerId, list)
   }
 
@@ -58,26 +58,42 @@ export async function queryCustomerSegment(
     ...(filter.preferredDayOfWeek !== undefined && { preferredDayOfWeek: filter.preferredDayOfWeek }),
     ...(filter.preferredTimeBand !== undefined && { preferredTimeBand: filter.preferredTimeBand }),
     ...(filter.lapsed !== undefined && { lapsed: filter.lapsed }),
+    ...(filter.providerId !== undefined && { providerId: filter.providerId }),
   }
 
-  const out: CustomerSummary[] = []
+  // First pass: derive + filter, keeping each survivor's profile.
+  const matched: { c: (typeof customers)[number]; profile: ReturnType<typeof computeCustomerProfile> }[] = []
   for (const c of customers) {
     if (filter.vip !== undefined && filter.vip !== c.vip) continue
     const profile = computeCustomerProfile(byCustomer.get(c.id) ?? [], timezone)
     if (!matchesSegment(profile, bookingFilter, now)) continue
-    out.push({
-      identityId: c.id,
-      phoneNumber: c.phoneNumber,
-      displayName: c.displayName,
-      totalBookings: profile.lifetimeBookings,
-      lastBookingAt: profile.lastBookingAt,
-      cadenceDays: profile.cadenceDays,
-      preferredServiceTypeId: profile.preferredServiceTypeId,
-      preferredDayOfWeek: profile.preferredDayOfWeek,
-      preferredTimeBand: profile.preferredTimeBand,
-      noShowRate: profile.noShowRate,
-      vip: c.vip,
-    })
+    matched.push({ c, profile })
   }
-  return out
+
+  // Resolve preferred-instructor display names in one query so copy can say "with Dana".
+  const providerIds = [...new Set(matched.map((m) => m.profile.preferredProviderId).filter((p): p is string => !!p))]
+  const providerNames = new Map<string, string | null>()
+  if (providerIds.length > 0) {
+    const rows = await db
+      .select({ id: identities.id, displayName: identities.displayName })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), inArray(identities.id, providerIds)))
+    for (const r of rows) providerNames.set(r.id, r.displayName)
+  }
+
+  return matched.map(({ c, profile }) => ({
+    identityId: c.id,
+    phoneNumber: c.phoneNumber,
+    displayName: c.displayName,
+    totalBookings: profile.lifetimeBookings,
+    lastBookingAt: profile.lastBookingAt,
+    cadenceDays: profile.cadenceDays,
+    preferredServiceTypeId: profile.preferredServiceTypeId,
+    preferredProviderId: profile.preferredProviderId,
+    preferredProviderName: profile.preferredProviderId ? (providerNames.get(profile.preferredProviderId) ?? null) : null,
+    preferredDayOfWeek: profile.preferredDayOfWeek,
+    preferredTimeBand: profile.preferredTimeBand,
+    noShowRate: profile.noShowRate,
+    vip: c.vip,
+  }))
 }

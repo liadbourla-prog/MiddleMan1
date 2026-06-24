@@ -1,7 +1,7 @@
 import { Worker, Queue } from 'bullmq'
 import { eq, and, asc } from 'drizzle-orm'
 import { db } from '../db/client.js'
-import { waitlist, identities, businesses, serviceTypes } from '../db/schema.js'
+import { waitlist, identities, businesses, serviceTypes, bookings } from '../db/schema.js'
 import { sendMessage, canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
@@ -57,7 +57,15 @@ async function attemptColdFill(
     { serviceTypeId, lapsed: true, hasBooking: true },
     biz.timezone,
   )
-  const picks = selectColdFillCandidates(candidates, { batchSize: COLD_FILL_BATCH })
+
+  // Instructor-fit: who was due to take this slot? Customers loyal to that instructor are the
+  // warmest invitees. Best-effort — null (solo operator / no scoped booking) falls back to recency.
+  const [freed] = await database
+    .select({ providerId: bookings.providerId })
+    .from(bookings)
+    .where(and(eq(bookings.businessId, businessId), eq(bookings.serviceTypeId, serviceTypeId), eq(bookings.slotStart, slotStart)))
+    .limit(1)
+  const picks = selectColdFillCandidates(candidates, { batchSize: COLD_FILL_BATCH, slotProviderId: freed?.providerId ?? null })
 
   const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'

@@ -164,6 +164,10 @@ export interface CustomerSummary {
   // Behavioral profile (Phase 2). Optional so existing consumers/mocks stay valid.
   cadenceDays?: number | null
   preferredServiceTypeId?: string | null
+  // Instructor affinity (Phase 1b). The most-visited staff member, plus their resolved display
+  // name so proactive copy can say "with Dana" without a second lookup. Null for solo operators.
+  preferredProviderId?: string | null
+  preferredProviderName?: string | null
   preferredDayOfWeek?: number | null // 0=Sun..6=Sat, business-local
   preferredTimeBand?: CustomerTimeBand | null
   noShowRate?: number
@@ -179,6 +183,7 @@ export interface SegmentFilter {
   preferredTimeBand?: CustomerTimeBand
   lapsed?: boolean // established cadence + overshot it
   vip?: boolean
+  providerId?: string // instructor targeting (Phase 1b) — "invite Dana's regulars"
 }
 
 export type StepStatus = 'SUCCESS' | 'RETRYABLE' | 'FATAL' | 'PAUSED'
