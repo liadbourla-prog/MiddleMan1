@@ -1,6 +1,8 @@
-import { and, eq, ilike } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { authorize } from '../authorization/check.js'
 import { isValidE164, registerContact } from '../identity/resolver.js'
+import { resolveTargetForOwnerAction } from '../identity/customer-resolver.js'
+import { disambiguationGuidance } from './orchestrator-tools.js'
 import { resolveSlotRange } from '../availability/resolve-slot.js'
 import { startCoordination, advanceFromOwner, type BusinessCtx } from '../coordination/handler.js'
 import { findActiveByContact, findById } from '../coordination/repository.js'
@@ -147,10 +149,16 @@ export async function executeCoordinateMeeting(args: CoordinateMeetingArgs, ctx:
       contactId = await registerContact(ctx.db, ctx.businessId, phone, args.contactName); contactPhone = phone
     }
   } else if (args.contactName) {
-    const [c] = await ctx.db.select({ id: identities.id, phone: identities.phoneNumber })
-      .from(identities).where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'contact'), ilike(identities.displayName, `%${args.contactName}%`))).limit(1)
-    if (!c) return { success: false, reason: 'need_phone', guidance: `I don't have a number for ${args.contactName}. Ask the owner for their phone number.` }
-    contactId = c.id; contactPhone = c.phone
+    const resolution = await resolveTargetForOwnerAction(ctx.db, ctx.businessId, {
+      role: 'contact', name: args.contactName, timezone: ctx.timezone, lang: ctx.lang,
+    })
+    if (resolution.status === 'ambiguous') {
+      return { success: false, reason: 'ambiguous_contact', candidates: resolution.candidates, guidance: disambiguationGuidance(args.contactName, resolution.candidates, 'coordinateMeeting') }
+    }
+    if (resolution.status !== 'resolved') {
+      return { success: false, reason: 'need_phone', guidance: `I don't have a number for ${args.contactName}. Ask the owner for their phone number.` }
+    }
+    contactId = resolution.target.id; contactPhone = resolution.target.phoneNumber
   } else {
     return { success: false, reason: 'no_recipient', guidance: 'Ask the owner who to coordinate with — a name on file or a phone number.' }
   }

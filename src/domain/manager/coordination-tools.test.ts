@@ -16,6 +16,7 @@ vi.mock('../identity/resolver.js', () => ({
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import { executeCoordinateMeeting } from './coordination-tools.js'
+import type { ToolContext } from './orchestrator-tools.js'
 
 // Minimal chainable DB stub: select().from().where().limit() resolves to `rows`,
 // update().set().where() resolves undefined. Each select consumes the next queued rows.
@@ -73,5 +74,37 @@ describe('executeCoordinateMeeting — customer counterparty', () => {
     const input = startCoordination.mock.calls[0]![2] as { allowedWindows?: unknown[] }
     expect(Array.isArray(input.allowedWindows)).toBe(true)
     expect(input.allowedWindows!.length).toBe(1)
+  })
+})
+
+describe('coordinateMeeting — contact disambiguation', () => {
+  it('two same-name contacts → ambiguous, no silent first-pick', async () => {
+    let call = 0
+    const chain: Record<string, unknown> = {}
+    for (const m of ['select', 'from', 'leftJoin', 'orderBy']) chain[m] = () => chain
+    chain['where'] = () => chain
+    chain['limit'] = () => {
+      call += 1
+      if (call === 1) return Promise.resolve([
+        { id: 'k1', displayName: 'Guy Supplier', lastName: 'Supplier', phoneNumber: '+972500000003' },
+        { id: 'k2', displayName: 'Guy Landlord', lastName: 'Landlord', phoneNumber: '+972500000004' },
+      ])
+      return Promise.resolve([])
+    }
+    // executeCoordinateMeeting calls persistOutreachIdentity (which may touch update()) before the
+    // contact lookup; with identifyAs omitted it early-returns, but stub update() so the fake never throws.
+    const updateChain: Record<string, unknown> = { set: () => updateChain, where: () => Promise.resolve(undefined) }
+    const ctx: ToolContext = {
+      db: { select: () => chain, update: () => updateChain } as unknown as ToolContext['db'],
+      calendar: {} as ToolContext['calendar'],
+      businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he', role: 'manager',
+    }
+    const res = await executeCoordinateMeeting(
+      { contactName: 'Guy', title: 'Sync', date: { relativeDay: 'tomorrow' }, startTime: { hour: 10, minute: 0 }, durationMinutes: 60 } as never,
+      ctx,
+    ) as { success: boolean; reason?: string; candidates?: unknown[] }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('ambiguous_contact')
+    expect(res.candidates).toHaveLength(2)
   })
 })
