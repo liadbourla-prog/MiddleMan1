@@ -14,7 +14,7 @@ import { buildBookingAuditMeta, initiatorFromActor } from './audit-meta.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
-import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
+import { notifyBusinessBookingChange, notifyOwnerNewBooking } from '../initiations/booking-notify.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { isSlotBookable } from '../availability/service.js'
@@ -538,6 +538,17 @@ async function requestGroupClassBooking(
     .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (group):', err))
   await scheduleReminders(actor.businessId, actor.id, txResult.bookingId, request.serviceTypeId, request.slotStart).catch(() => { /* non-fatal */ })
 
+  // Reflect a customer self-booking to the owner (INV-3 proactive). Owner-/PA-initiated bookings
+  // don't reach this customer-booking engine, so this is always a customer self-commit.
+  if (initiatorFromActor(actor) === 'customer_self') {
+    await notifyOwnerNewBooking(db, actor.businessId, {
+      bookingId: txResult.bookingId,
+      customerId: actor.id,
+      serviceTypeId: request.serviceTypeId,
+      slotStart: request.slotStart,
+    }).catch(() => { /* non-fatal */ })
+  }
+
   const spotsLeft = maxParticipants - txResult.currentCount - 1
 
   return {
@@ -625,6 +636,15 @@ export async function confirmBooking(
   await recordCompletedBooking(db, actor.businessId, actor.id, bookingId, booking.serviceTypeId)
     .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (confirm):', err))
   await scheduleReminders(actor.businessId, actor.id, bookingId, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
+
+  if (initiatorFromActor(actor) === 'customer_self') {
+    await notifyOwnerNewBooking(db, actor.businessId, {
+      bookingId,
+      customerId: booking.customerId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+    }).catch(() => { /* non-fatal */ })
+  }
 
   return { ok: true, bookingId, message: 'Booking confirmed.' }
 }
@@ -901,6 +921,12 @@ export async function finalizePaidBooking(
   await recordCompletedBooking(db, businessId, customer.id, booking.id, booking.serviceTypeId)
     .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (paid):', err))
   await scheduleReminders(businessId, customer.id, booking.id, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
+
+  // NOTE: deliberately NO owner new-booking reflection here. This is the post-payment finalize
+  // path — the autonomous payment loop, which §10 keeps owner-silent (zero owner involvement on
+  // the payment critical path). The owner reflection fires at the booking-confirm moment on the
+  // immediate-gate self-book paths instead. (Owner reflection for post_payment bookings is a
+  // deferred follow-up — see the 2026-06-25 design §9.)
 
   // Send confirmation to the customer
   const [biz] = await db

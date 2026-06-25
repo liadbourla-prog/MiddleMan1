@@ -207,6 +207,23 @@ export const INITIATORS = {
     defaultEnabled: true,
   },
 
+  // Layer B — owner "a customer just booked" reflection (cross-branch consistency, 2026-06-25
+  // design §4.1.4 / INV-3 proactive). When a CUSTOMER self-books, the owner gets a true reflection
+  // of it on his channel — so he is never blind to a commitment made on the customer side. Owner
+  // audience, transactional, window-ungated (operational). Gated by the notification-rules resolver
+  // ('new_booking'): it defaults to 'notify' (surface by default), and the owner can mute or tune
+  // it via configureNotifications ("stop pinging me on every new booking").
+  'booking.new_for_owner': {
+    id: 'booking.new_for_owner',
+    layer: 'B',
+    audience: 'owner',
+    consentClass: 'transactional',
+    autonomy: 'owner_configured',
+    delivery: 'fire_and_forget',
+    windowPolicy: 'skip',
+    defaultEnabled: true,
+  },
+
   // Layer C — time-before subscription-renewal reminders over the internal `subscriptions`
   // table (Phase 4c). No external processor: a subscription's `renewsAt` is just the scan
   // anchor, and these two rungs remind the customer ahead of that date (no auto-charge).
