@@ -2,7 +2,7 @@ import { eq, and, or, lte, gte, gt, lt, count, desc, isNull, ilike, inArray } fr
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { Db } from '../../db/client.js'
-import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages, classSeries, providerAssignments } from '../../db/schema.js'
+import { availability, serviceTypes, identities, managerInstructions, bookings, businesses, processedMessages, classSeries, calendarBlocks, providerAssignments } from '../../db/schema.js'
 import { createSeries, stopSeries, cancelOccurrence } from '../scheduling/series.js'
 import { requiredActionForInstruction, DEFAULT_DELEGATED_CALENDAR_ACTIONS, type Action } from '../authorization/check.js'
 import { grantDelegatedPermissions, revokeAllDelegatedPermissions } from '../authorization/permissions.js'
@@ -14,7 +14,8 @@ import { i18n, t, type Lang } from '../i18n/t.js'
 import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
 import { createBlock } from '../availability/blocks.js'
 import { localTimeToUtc, localParts } from '../availability/compute.js'
-import { enqueueBlockMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
+import { enqueueBlockMirror, enqueueBookingMirror, enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
+import { colorWordToGoogleId } from './color-vocab.js'
 import { findProviderByName } from '../provider/lookup.js'
 import { resolveReshuffleConfig, type ReshuffleConfig } from '../reshuffle/config.js'
 import { clampPaymentOffsetMinutes, type PaymentLinkSendPolicy } from '../payments/timing.js'
@@ -149,6 +150,12 @@ const serviceChangeSchema = z.object({
   requiresPayment: z.boolean().nullable().optional(),
   category: z.string().nullable().optional(),
   maxParticipants: z.coerce.number().int().positive().nullable().optional(),
+  // Owner-configurable booking model: 'class' = group, schedule-driven; 'appointment' = private 1-on-1.
+  schedulingMode: z.enum(['class', 'appointment']).nullable().optional(),
+  // Raw owner color word ("blue", "כחול") → mapped to a Google colorId by color-vocab.
+  color: z.string().nullable().optional(),
+  // Set by the LLM only when the owner confirms a previously-warned destructive switch.
+  confirm: z.boolean().optional(),
 })
 
 const permissionChangeSchema = z.object({
@@ -666,7 +673,12 @@ async function applyServiceChange(
 
   // update
   const [existing] = await db
-    .select({ id: serviceTypes.id })
+    .select({
+      id: serviceTypes.id,
+      maxParticipants: serviceTypes.maxParticipants,
+      schedulingMode: serviceTypes.schedulingMode,
+      colorId: serviceTypes.colorId,
+    })
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.name, p.name)))
     .limit(1)
@@ -685,11 +697,107 @@ async function applyServiceChange(
     updates.requiresPayment = p.requiresPayment
   }
 
+  // Calendar color: owner says a color word → nearest of Google's 11 colors. An
+  // unrecognised word isn't applied — we ask which color instead. A real change
+  // also triggers a re-mirror so already-pushed events recolor (see below).
+  let colorChanged = false
+  if (p.color != null && p.color.trim().length > 0) {
+    const colorId = colorWordToGoogleId(p.color)
+    if (colorId === null) {
+      return { ok: false, reason: i18n.apply_service_color_unknown[lang](p.color) }
+    }
+    updates.colorId = colorId
+    colorChanged = colorId !== (existing.colorId ?? null)
+  }
+
+  // Scheduling mode (class ↔ appointment). Consequential switches are guarded.
+  let modeMessage: string | null = null
+  if (p.schedulingMode === 'class') {
+    // A class needs a real group capacity — don't silently keep cap=1.
+    const currentCap = existing.maxParticipants ?? 1
+    if (p.maxParticipants == null && currentCap <= 1) {
+      return { ok: false, reason: i18n.schedule_private_service_needs_capacity[lang](p.name) }
+    }
+    updates.schedulingMode = 'class'
+    // It's class-mode but unbookable until a schedule exists — nudge if there's none.
+    const activeSeries = await db
+      .select({ id: classSeries.id })
+      .from(classSeries)
+      .where(and(eq(classSeries.businessId, businessId), eq(classSeries.serviceTypeId, existing.id), eq(classSeries.isActive, true)))
+    modeMessage = activeSeries.length > 0
+      ? i18n.apply_service_mode_class_set[lang](p.name)
+      : i18n.apply_service_mode_class_no_series[lang](p.name)
+  } else if (p.schedulingMode === 'appointment') {
+    const now = new Date()
+    const activeSeries = await db
+      .select({ id: classSeries.id })
+      .from(classSeries)
+      .where(and(eq(classSeries.businessId, businessId), eq(classSeries.serviceTypeId, existing.id), eq(classSeries.isActive, true)))
+    const [bookedRow] = await db
+      .select({ n: count() })
+      .from(bookings)
+      .where(and(
+        eq(bookings.businessId, businessId),
+        eq(bookings.serviceTypeId, existing.id),
+        eq(bookings.state, 'confirmed'),
+        gt(bookings.slotStart, now),
+      ))
+    const bookedCount = bookedRow?.n ?? 0
+    // Consequential switch: stops the weekly classes. Warn once, apply on confirm.
+    if ((activeSeries.length > 0 || bookedCount > 0) && !p.confirm) {
+      return { ok: false, reason: i18n.apply_service_mode_appointment_warn[lang](p.name, bookedCount) }
+    }
+    updates.schedulingMode = 'appointment'
+    updates.maxParticipants = 1
+    // Stop future materialization; booked instances + existing bookings are kept.
+    for (const s of activeSeries) {
+      await stopSeries(db, s.id)
+    }
+    modeMessage = i18n.apply_service_mode_appointment_set[lang](p.name)
+  }
+
   if (Object.keys(updates).length > 0) {
     await db.update(serviceTypes).set(updates).where(eq(serviceTypes.id, existing.id))
   }
 
-  return { ok: true, confirmationMessage: i18n.apply_service_updated[lang](p.name) }
+  // Re-mirror so existing Google events pick up the new color. Best-effort; the
+  // integrity sentinel reconciles anything that fails to enqueue.
+  if (colorChanged) {
+    const now = new Date()
+    const futureBlocks = await db
+      .select({ id: calendarBlocks.id })
+      .from(calendarBlocks)
+      .where(and(
+        eq(calendarBlocks.businessId, businessId),
+        eq(calendarBlocks.serviceTypeId, existing.id),
+        eq(calendarBlocks.type, 'class'),
+        gt(calendarBlocks.startTs, now),
+      ))
+    const futureBookings = await db
+      .select({ id: bookings.id })
+      .from(bookings)
+      .where(and(
+        eq(bookings.businessId, businessId),
+        eq(bookings.serviceTypeId, existing.id),
+        eq(bookings.state, 'confirmed'),
+        gt(bookings.slotStart, now),
+      ))
+    await Promise.all([
+      ...futureBlocks.map((b) => enqueueBlockMirror(businessId, b.id)),
+      ...futureBookings.map((b) => enqueueBookingMirror(businessId, b.id)),
+    ]).catch(() => { /* non-fatal — sentinel reconciles */ })
+  }
+
+  let confirmationMessage: string
+  if (modeMessage) {
+    confirmationMessage = colorChanged ? `${modeMessage} ${i18n.apply_service_color_set[lang](p.name)}` : modeMessage
+  } else if (p.color != null && p.color.trim().length > 0) {
+    confirmationMessage = i18n.apply_service_color_set[lang](p.name)
+  } else {
+    confirmationMessage = i18n.apply_service_updated[lang](p.name)
+  }
+
+  return { ok: true, confirmationMessage }
 }
 
 // ── Permission change ─────────────────────────────────────────────────────────

@@ -424,6 +424,38 @@ const strings = {
     en: (name: string, count: number, date: string) =>
       `Cannot deactivate "${name}" — ${count} future booking(s) still active (earliest: ${date}). Cancel them first.`,
   },
+  apply_service_color_set: {
+    he: (name: string) => `עדכנתי את הצבע של "${name}" ביומן. האירועים הקיימים יתעדכנו תוך כמה רגעים.`,
+    en: (name: string) => `Updated the calendar color for "${name}". Existing events will recolor in a few moments.`,
+  },
+  apply_service_color_unknown: {
+    he: (word: string) =>
+      `לא הצלחתי לזהות את הצבע "${word}". יומן Google תומך ב-11 צבעים: אדום, כתום, צהוב, ירוק, ירוק בהיר, כחול, כחול כהה, סגול, סגול בהיר, ורוד, אפור. איזה מהם?`,
+    en: (word: string) =>
+      `I couldn't recognise the color "${word}". Google Calendar supports 11 colors: red, orange, yellow, green, light green, blue, dark blue, purple, light purple, pink, gray. Which one?`,
+  },
+  apply_service_mode_class_set: {
+    he: (name: string) => `"${name}" מוגדר עכשיו כשיעור קבוצתי.`,
+    en: (name: string) => `"${name}" is now set up as a group class.`,
+  },
+  apply_service_mode_class_no_series: {
+    he: (name: string) => `"${name}" מוגדר עכשיו כשיעור קבוצתי. עכשיו תגיד/י לי מתי הוא מתקיים (למשל "כל יום שני ב-10:00") כדי שאפשר יהיה להירשם.`,
+    en: (name: string) => `"${name}" is now set up as a group class. Now tell me when it runs (e.g. "every Monday at 10:00") so customers can book it.`,
+  },
+  apply_service_mode_appointment_warn: {
+    he: (name: string, count: number) =>
+      count > 0
+        ? `אם אעביר את "${name}" לפגישה אחת-על-אחד, השיעורים הקבועים השבועיים יפסיקו, ויש ${count} אנשים שכבר רשומים למפגשים עתידיים (ההרשמות שלהם יישארו). להמשיך?`
+        : `אם אעביר את "${name}" לפגישה אחת-על-אחד, השיעורים הקבועים השבועיים יפסיקו. להמשיך?`,
+    en: (name: string, count: number) =>
+      count > 0
+        ? `Switching "${name}" to 1-on-1 will stop its weekly recurring classes, and ${count} person(s) are already booked into upcoming sessions (their bookings stay). Go ahead?`
+        : `Switching "${name}" to 1-on-1 will stop its weekly recurring classes. Go ahead?`,
+  },
+  apply_service_mode_appointment_set: {
+    he: (name: string) => `"${name}" מוגדר עכשיו כפגישה אחת-על-אחד. השיעורים הקבועים הופסקו; הרשמות קיימות נשמרו.`,
+    en: (name: string) => `"${name}" is now set up as 1-on-1. The recurring classes were stopped; existing bookings are kept.`,
+  },
   apply_permission_granted: {
     he: (who: string) => `נתתי ל${who} גישה כמשתמש מורשה.`,
     en: (who: string) => `Gave ${who} delegated access.`,
