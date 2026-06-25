@@ -149,6 +149,11 @@ export const identities = pgTable(
     phoneNumber: text('phone_number').notNull(),
     role: text('role', { enum: ['manager', 'delegated_user', 'customer', 'provider', 'contact'] }).notNull(),
     displayName: text('display_name'),
+    // Structured family name for disambiguation + verification when the owner targets a
+    // customer/contact by name (e.g. two customers both named "Guy"). Nullable; displayName
+    // remains the name as captured. Populated via migration backfill, booking capture, the
+    // owner setCustomerName tool, and opportunistic save at disambiguation time.
+    lastName: text('last_name'),
     grantedBy: uuid('granted_by'),
     grantedAt: timestamp('granted_at', { withTimezone: true }),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
