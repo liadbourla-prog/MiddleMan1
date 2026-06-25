@@ -1790,14 +1790,15 @@ export async function executeRequestPayment(args: RequestPaymentArgs, ctx: ToolC
       target = { id: newId, phoneNumber: phone, name: args.customer ?? null }
     }
   } else if (args.customer) {
-    const rows = await ctx.db
-      .select({ id: identities.id, phoneNumber: identities.phoneNumber, name: identities.displayName })
-      .from(identities)
-      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'customer'), ilike(identities.displayName, `%${args.customer}%`)))
-      .limit(5)
-    if (rows.length === 0) return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.customer}" is on file. Ask the owner for the phone number so you can reach them.` }
-    if (rows.length > 1) return { ok: false, reason: 'ambiguous_customer', guidance: `Several customers match "${args.customer}". Ask the owner which one (or for the phone number).` }
-    target = rows[0]!
+    const resolution = await resolveTargetForOwnerAction(ctx.db, ctx.businessId, {
+      role: 'customer', name: args.customer, timezone: ctx.timezone, lang: ctx.lang,
+    })
+    if (resolution.status === 'not_found') return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.customer}" is on file. Ask the owner for the phone number so you can reach them.` }
+    if (resolution.status === 'ambiguous') {
+      return { ok: false, reason: 'ambiguous_customer', candidates: resolution.candidates, guidance: disambiguationGuidance(args.customer, resolution.candidates, 'requestPayment') }
+    }
+    if (resolution.status === 'phone_unknown') return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to charge — a name on file or a phone number.' }
+    target = { id: resolution.target.id, phoneNumber: resolution.target.phoneNumber, name: resolution.target.displayName }
   } else {
     return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to charge — a name on file or a phone number.' }
   }

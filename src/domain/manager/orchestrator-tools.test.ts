@@ -379,3 +379,31 @@ describe('messageCustomer — disambiguation', () => {
     expect(res.candidates).toHaveLength(2)
   })
 })
+
+describe('requestPayment — disambiguation', () => {
+  it('two same-name customers → refuses to charge, returns candidates', async () => {
+    let call = 0
+    const chain: Record<string, unknown> = {}
+    for (const m of ['select', 'from', 'leftJoin', 'orderBy']) chain[m] = () => chain
+    chain['where'] = () => chain
+    chain['limit'] = () => {
+      call += 1
+      if (call === 1) return Promise.resolve([
+        { id: 'c1', displayName: 'Dana Cohen', lastName: 'Cohen', phoneNumber: '+972500000001' },
+        { id: 'c2', displayName: 'Dana Levi', lastName: 'Levi', phoneNumber: '+972500000002' },
+      ])
+      return Promise.resolve([]) // booking lookups
+    }
+    const ctx: ToolContext = {
+      db: { select: () => chain } as unknown as ToolContext['db'],
+      calendar: {} as ToolContext['calendar'],
+      businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he', role: 'manager',
+    }
+    const res = await executeRequestPayment({ customer: 'Dana', amount: 300, description: 'Session' }, ctx) as {
+      ok: boolean; reason?: string; candidates?: unknown[]
+    }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('ambiguous_customer')
+    expect(res.candidates).toHaveLength(2)
+  })
+})
