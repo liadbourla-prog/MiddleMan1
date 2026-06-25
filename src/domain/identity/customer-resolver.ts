@@ -102,6 +102,22 @@ async function toCandidate(
   return { id: row.id, displayName: row.displayName, lastName: row.lastName, phoneNumber: row.phoneNumber, lastBooking }
 }
 
+/** Shared deterministic write for a target's name fields. Skips the DB entirely when no field
+ *  is supplied. Used by booking capture, the owner setCustomerName tool, and opportunistic
+ *  save at disambiguation. */
+export async function setCustomerName(
+  db: Db,
+  businessId: string,
+  identityId: string,
+  fields: { displayName?: string | null; lastName?: string | null },
+): Promise<void> {
+  const patch: Record<string, unknown> = {}
+  if (fields.displayName !== undefined) patch['displayName'] = fields.displayName
+  if (fields.lastName !== undefined) patch['lastName'] = fields.lastName
+  if (Object.keys(patch).length === 0) return
+  await db.update(identities).set(patch).where(and(eq(identities.businessId, businessId), eq(identities.id, identityId)))
+}
+
 /** Most recent booking (date + service name) for an identity, or null if none. */
 export async function latestBookingFor(
   db: Db,

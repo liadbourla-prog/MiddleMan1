@@ -129,3 +129,32 @@ describe('resolveTargetForOwnerAction', () => {
     expect(r.status).toBe('resolved')
   })
 })
+
+import { setCustomerName } from './customer-resolver.js'
+
+function updateCapturingDb(): { db: Db; captured: { patch?: Record<string, unknown> } } {
+  const captured: { patch?: Record<string, unknown> } = {}
+  const chain: Record<string, unknown> = {}
+  chain['set'] = (patch: Record<string, unknown>) => { captured.patch = patch; return chain }
+  chain['where'] = () => Promise.resolve(undefined)
+  const db = { update: () => chain } as unknown as Db
+  return { db, captured }
+}
+
+describe('setCustomerName', () => {
+  it('writes only the provided fields', async () => {
+    const { db, captured } = updateCapturingDb()
+    await setCustomerName(db, 'biz1', 'id1', { lastName: 'Cohen' })
+    expect(captured.patch).toEqual({ lastName: 'Cohen' })
+  })
+  it('writes both displayName and lastName when given', async () => {
+    const { db, captured } = updateCapturingDb()
+    await setCustomerName(db, 'biz1', 'id1', { displayName: 'Guy Cohen', lastName: 'Cohen' })
+    expect(captured.patch).toEqual({ displayName: 'Guy Cohen', lastName: 'Cohen' })
+  })
+  it('no-ops (no update) when given nothing', async () => {
+    const { db, captured } = updateCapturingDb()
+    await setCustomerName(db, 'biz1', 'id1', {})
+    expect(captured.patch).toBeUndefined()
+  })
+})
