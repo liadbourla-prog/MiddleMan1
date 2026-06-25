@@ -373,6 +373,7 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
       properties: {
         phoneNumber: { type: Type.STRING, description: "Customer phone in E.164 (e.g. +972541234567) when the owner provides it. Preferred — lets you message a new contact." },
         name: { type: Type.STRING, description: 'Customer name to match an existing customer, when no phone number is given.' },
+        lastName: { type: Type.STRING, description: "The customer's last name, supplied by the owner to disambiguate when several customers share a first name." },
         message: { type: Type.STRING, description: "The full message text to send, composed in the customer's language. Warm and natural — this is what the customer receives verbatim." },
         rescheduleFavor: {
           type: Type.OBJECT,
