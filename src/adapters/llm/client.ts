@@ -201,11 +201,14 @@ availability_change:
   { "action": "set_hours"|"block"|"unblock", "dayOfWeek": 0-6|null, "specificDate": "YYYY-MM-DD"|null, "openTime": "HH:MM"|null, "closeTime": "HH:MM"|null, "reason": string|null }
 
 service_change:
-  { "action": "create"|"update"|"deactivate", "name": string, "durationMinutes": number|null, "bufferMinutes": number|null, "paymentAmount": number|null, "requiresPayment": boolean|null, "category": string|null, "maxParticipants": number|null }
+  { "action": "create"|"update"|"deactivate", "name": string, "durationMinutes": number|null, "bufferMinutes": number|null, "paymentAmount": number|null, "requiresPayment": boolean|null, "category": string|null, "maxParticipants": number|null, "schedulingMode": "class"|"appointment"|null, "color": string|null, "confirm": boolean|null }
   - category: logical grouping (e.g. "Yoga", "Pilates", "Haircut"). Infer from name if not stated.
   - maxParticipants: 1 for private/1-on-1 sessions (default), >1 for group classes (yoga class, pilates class, etc.)
   - paymentAmount: price in the business currency, or null if not mentioned
   - requiresPayment: true if a price is specified
+  - schedulingMode: set "class" when the owner says a service is a group/class or schedule-driven session (e.g. "Pilates is a group class for 8", "make Yoga a class", "פילאטיס זה שיעור קבוצתי"); also fill maxParticipants when a group size is given. Set "appointment" when the owner makes a service private/1-on-1 (e.g. "switch physio to 1-on-1", "make X private / by appointment", "תהפוך את שיקום לפגישה אחת על אחד"). Leave null when the owner isn't changing the booking model. Use action "update" for an existing service.
+  - color: the owner's raw color word for this service's calendar events (e.g. "make Yoga blue" → "blue"; "color X red" → "red"; "תצבע את היוגה בכחול" → "כחול"). Pass the word as-is in the owner's language; leave null if no color is mentioned. Use action "update".
+  - confirm: set true ONLY when, earlier in this conversation, you warned the owner that switching a service to 1-on-1 would stop its recurring classes, and the owner has now answered yes/confirmed. Otherwise null.
 
 permission_change:
   { "action": "grant"|"revoke", "phoneNumber": "+E164", "displayName": string|null }
