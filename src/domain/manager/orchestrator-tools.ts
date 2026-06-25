@@ -31,6 +31,9 @@ import { paymentRequests } from '../../db/schema.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
+import { reconcileScheduleWindowOnRead } from '../calendar/inbound-sync.js'
+import type { ListedEvent } from '../../adapters/calendar/types.js'
+import type { CalendarBlock } from '../../db/schema.js'
 import { getOpenSlots } from '../availability/service.js'
 import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
@@ -121,6 +124,61 @@ interface ListCalendarEventsArgs {
   dateTo?: DatePieces
 }
 
+interface ScheduleViewEntry {
+  eventId: string
+  title: string
+  start: string
+  end: string
+  isBooking: boolean
+  kind: string
+}
+
+/**
+ * Merge the two internal-truth sources — the calendar client's events and the
+ * `calendar_blocks` rows — into one sorted schedule view.
+ *
+ * In connected Google mode the client's `listEvents` reads LIVE from Google, which
+ * already contains every block we mirror out there (classes, personal events,
+ * intra-day blocks). Re-adding those same rows from `calendar_blocks` would
+ * double-count them — and would resurrect a block the owner deleted in Google
+ * whose row still lingers internally until reconcile catches up. That double-count
+ * + resurrection was the live bug. So in google mode we fold in ONLY blocks not
+ * yet mirrored (no googleEventId); the mirrored ones — and the owner's own edits —
+ * come from the live read, the single source that reflects what the owner sees.
+ * In internal mode there is no Google read, so every block must be included.
+ */
+export function buildScheduleView(
+  events: ListedEvent[],
+  blocks: CalendarBlock[],
+  opts: { calendarMode?: 'google' | 'internal'; lang: 'he' | 'en'; locale: string; tz: string },
+): ScheduleViewEntry[] {
+  const visibleBlocks = opts.calendarMode === 'google'
+    ? blocks.filter((b) => !b.googleEventId)
+    : blocks
+
+  return [
+    ...events.map((ev) => ({
+      eventId: ev.eventId,
+      title: ev.title,
+      start: ev.start.toLocaleString(opts.locale, { timeZone: opts.tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+      end: ev.end.toLocaleString(opts.locale, { timeZone: opts.tz, hour: '2-digit', minute: '2-digit' }),
+      isBooking: ev.isBooking,
+      kind: 'booking',
+      _sortTs: ev.start.getTime(),
+    })),
+    ...visibleBlocks.map((b) => ({
+      eventId: `${BLOCK_ID_PREFIX}${b.id}`,
+      title: blockLabel(b, opts.lang),
+      start: b.startTs.toLocaleString(opts.locale, { timeZone: opts.tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+      end: b.endTs.toLocaleString(opts.locale, { timeZone: opts.tz, hour: '2-digit', minute: '2-digit' }),
+      isBooking: false,
+      kind: b.type,
+      _sortTs: b.startTs.getTime(),
+    })),
+  ].sort((a, b) => a._sortTs - b._sortTs)
+    .map(({ _sortTs: _omit, ...rest }) => rest)
+}
+
 export async function executeListCalendarEvents(
   args: ListCalendarEventsArgs,
   ctx: ToolContext,
@@ -165,6 +223,15 @@ export async function executeListCalendarEvents(
 
   const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
 
+  // Reconcile-on-read (connected Google mode): fold the owner's own Google edits —
+  // events they added or deleted directly in Google Calendar — back into the
+  // internal record BEFORE we read it, so both the schedule we show and the
+  // availability we compute match what the owner sees in Google. Best-effort: a
+  // Google hiccup must never break the read (see inbound-sync §reconcile-on-read).
+  if (ctx.calendarMode === 'google') {
+    await reconcileScheduleWindowOnRead(ctx.businessId, { from, to }).catch(() => { /* non-fatal */ })
+  }
+
   // Proactive open-slot suggestion — the canonical availability spine enumerates
   // bookable gaps (working hours − blocks − bookings) over the next 7 days.
   if (args.intent === 'check_free_slots') {
@@ -206,27 +273,12 @@ export async function executeListCalendarEvents(
     const events = await ctx.calendar.listEvents(from, to)
     const blocks = await listBlocksInRange(ctx.db, ctx.businessId, from, to)
 
-    const formatted = [
-      ...events.map((ev) => ({
-        eventId: ev.eventId,
-        title: ev.title,
-        start: ev.start.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
-        end: ev.end.toLocaleString(locale, { timeZone: tz, hour: '2-digit', minute: '2-digit' }),
-        isBooking: ev.isBooking,
-        kind: 'booking' as const,
-        _sortTs: ev.start.getTime(),
-      })),
-      ...blocks.map((b) => ({
-        eventId: `${BLOCK_ID_PREFIX}${b.id}`,
-        title: blockLabel(b, ctx.lang === 'he' ? 'he' : 'en'),
-        start: b.startTs.toLocaleString(locale, { timeZone: tz, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
-        end: b.endTs.toLocaleString(locale, { timeZone: tz, hour: '2-digit', minute: '2-digit' }),
-        isBooking: false,
-        kind: b.type,
-        _sortTs: b.startTs.getTime(),
-      })),
-    ].sort((a, b) => a._sortTs - b._sortTs)
-      .map(({ _sortTs: _omit, ...rest }) => rest)
+    const formatted = buildScheduleView(events, blocks, {
+      ...(ctx.calendarMode ? { calendarMode: ctx.calendarMode } : {}),
+      lang: ctx.lang === 'he' ? 'he' : 'en',
+      locale,
+      tz,
+    })
 
     if (formatted.length === 0) {
       return { events: [], count: 0 }

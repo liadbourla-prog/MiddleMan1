@@ -8,6 +8,7 @@ import { resolveServicePrice } from '../../domain/pricing/resolver.js'
 import { loadInstructorRoster } from '../../domain/provider/roster.js'
 import { getOpenSlots } from '../../domain/availability/service.js'
 import { listBlocksInRange } from '../../domain/availability/blocks.js'
+import { reconcileScheduleWindowOnRead } from '../../domain/calendar/inbound-sync.js'
 import { loadSessionRoster } from '../../domain/booking/roster.js'
 import { readRateLimit } from './rate-limit.js'
 
@@ -55,6 +56,14 @@ export function registerReadRoutes(app: FastifyInstance): void {
     const to = request.query.to ? new Date(request.query.to) : new Date(Date.now() + 14 * 86_400_000)
     if (isNaN(from.getTime()) || isNaN(to.getTime())) return apiError(reply, 422, 'validation_error', 'Invalid from/to')
 
+    // Reconcile-on-read (connected Google mode): fold the owner's own Google edits
+    // back into the internal record so the public roster never shows a class the
+    // owner deleted in Google (nor misses one they added). Best-effort — a Google
+    // hiccup must never break a public read.
+    if (biz.calendarMode === 'google') {
+      await reconcileScheduleWindowOnRead(auth.businessId, { from, to }).catch(() => { /* best-effort */ })
+    }
+
     const blocks = (await listBlocksInRange(db, auth.businessId, from, to)).filter((b) => b.type === 'class' && b.serviceTypeId)
     const classes = []
     for (const b of blocks) {
@@ -89,6 +98,12 @@ export function registerReadRoutes(app: FastifyInstance): void {
     const from = request.query.from ? new Date(request.query.from) : new Date()
     const to = request.query.to ? new Date(request.query.to) : new Date(Date.now() + 7 * 86_400_000)
     if (isNaN(from.getTime()) || isNaN(to.getTime())) return apiError(reply, 422, 'validation_error', 'Invalid from/to')
+    // Reconcile-on-read (connected Google mode): owner Google deletions free up
+    // slots and owner additions occupy them — fold those in before computing open
+    // slots so the website's bookable times match the owner's live calendar.
+    if (biz.calendarMode === 'google') {
+      await reconcileScheduleWindowOnRead(auth.businessId, { from, to }).catch(() => { /* best-effort */ })
+    }
     const slots = await getOpenSlots(db, biz, { start: from, end: to }, svc.durationMinutes)
     return reply.send({ timezone: biz.timezone, slots: slots.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString() })) })
   })

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { and, eq, inArray } from 'drizzle-orm'
+import { and, eq, gte, inArray, lt } from 'drizzle-orm'
 import { db } from '../../db/client.js'
 import {
   bookings,
@@ -465,5 +465,80 @@ export async function renewExpiringChannels(lookaheadMs = 24 * 60 * 60 * 1000): 
       await runInboundSync(row.businessId, { full: true }).catch(() => { /* non-fatal */ })
     }
   }
+}
+
+// ── Reconcile-on-read ─────────────────────────────────────────────────────────
+
+/**
+ * Fold the owner's own Google edits — events they ADDED or DELETED directly in
+ * Google Calendar within a bounded window — back into the internal record on
+ * demand. This runs when the manager asks to see their schedule in connected
+ * Google mode (Branch 3), so the picture we show, AND the availability we compute,
+ * match what the owner sees in Google even before the push/cron inbound sync is
+ * provisioned. It is therefore deliberately NOT gated by isInboundSyncEnabled():
+ * that flag guards the standing watch-channel + cron machinery (which needs the
+ * ops webhook); this is a pull triggered by an explicit read.
+ *
+ * Scope is owner-visible *schedule* items only — classes, personal events,
+ * intra-day blocks, and owner-imported events (all `calendar_blocks`). Customer
+ * bookings are intentionally OUT of scope here: owner-cancelling a booking has
+ * customer-notification side effects (applyOwnerCancellations) that must never
+ * fire from a passive read — those stay on the gated owner-wins path.
+ *
+ * Deletions are detected by DIFF, not by trusting Google to still return a
+ * 'cancelled' tombstone for the window: any internal block we had mirrored to a
+ * Google event that is no longer present was removed by the owner. Best-effort —
+ * on any Google error we return without mutating, so a hiccup never deletes data
+ * or breaks the read.
+ */
+export async function reconcileScheduleWindowOnRead(
+  businessId: string,
+  window: { from: Date; to: Date },
+): Promise<{ ok: boolean; reason?: string }> {
+  const ctx = await loadSyncContext(businessId)
+  if (!ctx) return { ok: false, reason: 'business not in connected Google mode' }
+
+  const calendar = buildCalendar(ctx)
+  const result = await calendar.incrementalSync({ timeMin: window.from, timeMax: window.to })
+  if (result.status !== 'ok') {
+    return { ok: false, reason: result.status === 'expired' ? 'windowed reconcile token unexpectedly expired' : result.reason }
+  }
+
+  // Index every event Google currently returns for the window. Owner-created
+  // events (not PA-managed) are folded in as opaque busy-blocks so they occupy
+  // availability; PA-managed echoes of our own writes are left to the diff below.
+  const presentGoogleIds = new Set<string>()
+  for (const ev of result.events) {
+    if (!ev.eventId || ev.status === 'cancelled') continue
+    presentGoogleIds.add(ev.eventId)
+    if (!ev.paManaged) await reconcileOwnerEvent(ctx, ev)
+  }
+
+  // Diff-based deletion. We only ever consider blocks that START inside the window
+  // (matching Google's overlap windowing) and that we had mirrored (carry a
+  // googleEventId) — a not-yet-mirrored block has no Google counterpart to be
+  // absent from, so its absence proves nothing.
+  const blocks = await db
+    .select({ id: calendarBlocks.id, googleEventId: calendarBlocks.googleEventId })
+    .from(calendarBlocks)
+    .where(and(
+      eq(calendarBlocks.businessId, businessId),
+      gte(calendarBlocks.startTs, window.from),
+      lt(calendarBlocks.startTs, window.to),
+    ))
+  for (const b of blocks) {
+    if (!b.googleEventId || presentGoogleIds.has(b.googleEventId)) continue
+    await db.delete(calendarBlocks).where(eq(calendarBlocks.id, b.id))
+    await logAudit(db, {
+      businessId,
+      actorId: null,
+      action: 'calendar.owner_deleted_block',
+      entityType: 'calendar_block',
+      entityId: b.id,
+      metadata: { googleEventId: b.googleEventId, via: 'reconcile_on_read' },
+    })
+  }
+
+  return { ok: true }
 }
 
