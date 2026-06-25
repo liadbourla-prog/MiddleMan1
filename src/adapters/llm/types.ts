@@ -20,6 +20,7 @@ export interface CustomerIntentOutput {
   } | null
   serviceTypeHint: string | null
   providerHint: string | null
+  customerNameHint: string | null
   participantsHint: number | null
   summary: string | null
   rawEntities: Record<string, string>

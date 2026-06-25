@@ -8,6 +8,7 @@ import { buildActionLedgerBlock } from '../audit/ledger-block.js'
 import { updateSessionContext, completeSession, failSession } from '../session/manager.js'
 import { requestBooking, confirmBooking, cancelBooking } from '../booking/engine.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
+import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
 import { inferFocusService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
@@ -26,6 +27,21 @@ import { listDayOptions } from '../availability/day-options.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
 import { validateSlotTiming } from '../booking/engine.js'
+
+/** Persist a customer's self-stated name the first time we learn it. Only writes when we have no
+ *  name on file yet (never clobbers an existing displayName). Best-effort: never throws into the
+ *  booking flow. */
+export async function persistCapturedName(
+  db: Db,
+  businessId: string,
+  identityId: string,
+  storedDisplayName: string | null,
+  capturedName: string | null | undefined,
+): Promise<void> {
+  const name = capturedName?.trim()
+  if (!name || storedDisplayName) return
+  await setCustomerName(db, businessId, identityId, { displayName: name, lastName: deriveLastName(name) }).catch(() => {})
+}
 
 type CustomerMemoryInput = {
   returningCustomer: boolean
@@ -554,6 +570,8 @@ export async function handleBookingFlow(
   }
 
   const intent = intentResult.data
+  // Capture the customer's name the first time they state it (non-blocking, never clobbers).
+  await persistCapturedName(db, identity.businessId, identity.id, identity.displayName ?? null, intent.customerNameHint ?? null)
   const detectedLanguage = intent.detectedLanguage
 
   // Determine whether to append an inline language switch offer after this reply.
@@ -1703,7 +1721,7 @@ async function handleCancellationConfirmation(
       // Synthetic intent: the slot is already in the draft, so no new pieces to merge.
       const synthetic: CustomerIntentOutput = {
         intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
-        participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+        customerNameHint: null, participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
       }
       return handleBookingIntent(
         db, calendar, identity,
@@ -1954,7 +1972,7 @@ async function handleRetentionResponse(
 
   const synthetic: CustomerIntentOutput = {
     intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
-    participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+    customerNameHint: null, participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
   }
   return handleBookingIntent(
     db, calendar, identity,
