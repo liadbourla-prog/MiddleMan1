@@ -42,9 +42,35 @@ function truncate(s: string, max = 140): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s
 }
 
-function renderAction(action: string, metadata: Record<string, unknown> | null, when: string): string {
+function formatSlot(iso: unknown, tz: string, locale: string): string | null {
+  if (typeof iso !== 'string') return null
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toLocaleString(locale, {
+    timeZone: tz,
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+}
+
+// Exported for unit testing the owner-facing wording (cross-branch consistency, INV-3/INV-4).
+export function renderAction(
+  action: string,
+  metadata: Record<string, unknown> | null,
+  when: string,
+  tz: string,
+  locale: string,
+): string {
   const m = metadata ?? {}
   const to = m['to'] ? String(m['to']) : 'a customer'
+  const who = m['customerName'] ? String(m['customerName']) : 'a customer'
+  const svc = m['serviceName'] ? String(m['serviceName']) : 'an appointment'
+  const slot = formatSlot(m['slotStart'], tz, locale)
+  const slotPhrase = slot ? ` for ${slot}` : ''
   switch (action) {
     case 'outreach.message_sent':
       return `${when} — Message actually SENT to ${to}${m['body'] ? `: "${truncate(String(m['body']))}"` : ''}.`
@@ -63,10 +89,16 @@ function renderAction(action: string, metadata: Record<string, unknown> | null, 
     case 'payment.connected':
       return `${when} — Payments (Grow) were connected — the PA can now send pay-links and invoices.`
     case 'booking.confirmed':
-      return `${when} — A booking was confirmed.`
+      if (m['initiator'] === 'customer_self') {
+        return `${when} — ${who} booked ${svc} themselves${slotPhrase}. ALREADY DONE — reflect this to the owner; do NOT ask the owner to approve or re-book it.`
+      }
+      return `${when} — You booked ${svc} for ${who}${slotPhrase} — done.`
     case 'booking.cancelled':
     case 'booking.manager_cancelled':
-      return `${when} — A booking was cancelled.`
+      if (m['initiator'] === 'customer_self') {
+        return `${when} — ${who} cancelled their ${svc}${slotPhrase} themselves. ALREADY DONE — reflect this to the owner; do NOT ask the owner to approve the cancellation.`
+      }
+      return `${when} — ${svc} for ${who}${slotPhrase} was cancelled — done.`
     case 'booking.failed':
       return `${when} — A booking attempt FAILED (no booking was made).`
     default:
@@ -125,7 +157,7 @@ export async function buildActionLedgerBlock(db: Db, opts: LedgerOptions): Promi
         minute: '2-digit',
         hour12: false,
       })
-      return `- ${renderAction(r.action, r.metadata as Record<string, unknown> | null, when)}`
+      return `- ${renderAction(r.action, r.metadata as Record<string, unknown> | null, when, opts.timezone, locale)}`
     })
 
   return `## What actually happened (ground truth — trust this over anything stated in the chat above)

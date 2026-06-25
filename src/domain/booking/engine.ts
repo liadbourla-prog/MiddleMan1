@@ -10,6 +10,7 @@ import { authorize } from '../authorization/check.js'
 import { transition } from './state-machine.js'
 import type { BookingSlotRequest } from './types.js'
 import { logAudit } from '../audit/logger.js'
+import { buildBookingAuditMeta, initiatorFromActor } from './audit-meta.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
@@ -522,6 +523,15 @@ async function requestGroupClassBooking(
     entityId: txResult.bookingId,
     beforeState: { state: 'requested' },
     afterState: { state: 'confirmed', calendarEventId, groupClass: true },
+    metadata: await buildBookingAuditMeta(db, {
+      customerId: actor.id,
+      serviceTypeId: request.serviceTypeId,
+      slotStart: request.slotStart,
+      slotEnd: request.slotEnd,
+      initiator: initiatorFromActor(actor),
+      customerName: actor.displayName ?? actor.phoneNumber,
+      serviceName: service.name,
+    }),
   })
 
   await recordCompletedBooking(db, actor.businessId, actor.id, txResult.bookingId, request.serviceTypeId)
@@ -601,6 +611,15 @@ export async function confirmBooking(
     entityId: bookingId,
     beforeState: { state: 'held' },
     afterState: { state: 'confirmed' },
+    metadata: await buildBookingAuditMeta(db, {
+      customerId: booking.customerId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+      slotEnd: booking.slotEnd,
+      initiator: initiatorFromActor(actor),
+      customerName,
+      serviceName: service?.name ?? null,
+    }),
   })
 
   await recordCompletedBooking(db, actor.businessId, actor.id, bookingId, booking.serviceTypeId)
@@ -720,6 +739,13 @@ export async function cancelBooking(
     entityId: bookingId,
     beforeState: { state: booking.state },
     afterState: { state: 'cancelled', reason, cancelledByRole },
+    metadata: await buildBookingAuditMeta(db, {
+      customerId: booking.customerId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+      slotEnd: booking.slotEnd,
+      initiator: initiatorFromActor(actor),
+    }),
   })
 
   // Cancel any pending reminders for this booking
@@ -858,7 +884,18 @@ export async function finalizePaidBooking(
     entityId: booking.id,
     beforeState: { state: 'pending_payment' },
     afterState: { state: 'confirmed', paymentStatus: 'paid' },
-    metadata: { triggeredBy: opts.triggeredBy },
+    metadata: {
+      triggeredBy: opts.triggeredBy,
+      ...(await buildBookingAuditMeta(db, {
+        customerId: booking.customerId,
+        serviceTypeId: booking.serviceTypeId,
+        slotStart: booking.slotStart,
+        slotEnd: booking.slotEnd,
+        initiator: 'customer_self',
+        customerName: customerPhone,
+        serviceName: service?.name ?? null,
+      })),
+    },
   })
 
   await recordCompletedBooking(db, businessId, customer.id, booking.id, booking.serviceTypeId)

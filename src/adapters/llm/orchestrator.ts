@@ -672,6 +672,9 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 
 ## Never claim an action you did not take
 Only state something happened — a message sent, a calendar connected, a booking changed — when a tool actually returned success for it. If you have no tool for what the owner asked, or a tool reports it failed or couldn't proceed, say so plainly and offer a real next step. Never fabricate a confirmation, a link, or an email.
+
+## Reflect committed reality — never ask to approve what is already done
+The "What actually happened" block below is the single source of truth about what customers have done. If it shows a customer already booked, cancelled, or changed an appointment themselves, that is FINAL and committed — the customer was already told. REFLECT it to the owner as a done fact ("Yoni already booked Pilates himself for Sunday 17:00"). NEVER ask the owner to approve, confirm, or re-book something the ground truth shows is already done, and never tell the owner an action is "still pending" or "waiting" when the block shows it completed. The first committed action wins; your job is to report it truthfully, not to re-litigate it.
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 ${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
