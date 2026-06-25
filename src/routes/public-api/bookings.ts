@@ -85,7 +85,9 @@ export function registerBookingRoutes(app: FastifyInstance): void {
     // This is the same confirmation channel a WhatsApp booking uses (CRM_STANDARD.md
     // §6.3). Templated + lawbook-governed (not LLM-phrased). Non-fatal: the booking
     // is already committed, so a send failure must not fail the API response.
-    if (detail) {
+    // A held-for-owner-approval booking is NOT confirmed — don't send a "confirmed" notice
+    // (design 2026-06-25). The owner's approve/decline fires its own customer message later.
+    if (detail && !result.pendingApproval) {
       const lang = resolved.identity.preferredLanguage ?? biz.defaultLanguage
       await sendBookingConfirmation(biz, lang, phone, detail).catch(() => { /* non-fatal */ })
     }

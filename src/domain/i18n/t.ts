@@ -858,6 +858,54 @@ const strings = {
     he: (contact: string) => `לא קיבלתי תשובה מ${contact} על הפגישה. רוצה שאנסה שוב?`,
     en: (contact: string) => `I didn't hear back from ${contact} about the meeting. Want me to try again?`,
   },
+
+  // ── Per-service owner approval of customer self-bookings (design 2026-06-25) ──
+  // Owner-facing (Branch 3): MANDATORY approval-request notification + post-decision confirmations.
+  approval_request_owner: {
+    he: (who: string, service: string, date: string, time: string) =>
+      `🔔 ${who} מבקש/ת לקבוע ${service} ל${date} בשעה ${time}. לאשר? ענו "כן לאשר" לאישור או "לא" לדחייה.`,
+    en: (who: string, service: string, date: string, time: string) =>
+      `🔔 ${who} wants to book ${service} for ${date} at ${time}. Approve it? Reply "yes approve" to confirm or "no" to decline.`,
+  },
+  approval_resolved_confirmed_owner: {
+    he: (who: string, service: string) => `אישרת — קבעתי את ${service} של ${who} ועדכנתי אותו/ה.`,
+    en: (who: string, service: string) => `Approved — ${who}'s ${service} is booked and they've been notified.`,
+  },
+  approval_resolved_declined_owner: {
+    he: (who: string, service: string) => `דחית — הבקשה ל${service} של ${who} בוטלה והוא/היא עודכן/ה.`,
+    en: (who: string, service: string) => `Declined — ${who}'s ${service} request was turned down and they've been notified.`,
+  },
+  approval_expired_owner: {
+    he: (who: string, service: string, date: string) =>
+      `⌛ הבקשה של ${who} ל${service} ב${date} פגה — לא אושרה בזמן, אז המקום שוחרר.`,
+    en: (who: string, service: string, date: string) =>
+      `⌛ ${who}'s ${service} request for ${date} expired — it wasn't approved in time, so the slot was released.`,
+  },
+  // Customer-facing fallbacks (Branch-4 transactional layer; the LLM phrases the live wording).
+  approval_declined_customer: {
+    he: (service: string, date: string) =>
+      `לגבי הבקשה שלך ל${service} ב${date} — לצערנו לא הצלחנו לאשר אותה הפעם. נשמח למצוא לך מועד אחר — רק תכתבו לי מתי נוח 🙏`,
+    en: (service: string, date: string) =>
+      `About your request for ${service} on ${date} — unfortunately we couldn't confirm it this time. We'd be glad to find you another time — just let me know when works 🙏`,
+  },
+  approval_expired_customer: {
+    he: `הבקשה שלך לא אושרה בזמן על ידי העסק, אז לא נקבעה. אתם מוזמנים לנסות מועד אחר בכל עת.`,
+    en: `The business didn't confirm your request in time, so it wasn't booked. Feel free to try another time whenever you're ready.`,
+  },
+
+  // ── Apply confirmations for the approval service flag + window policy ─────────
+  apply_service_approval_on: {
+    he: (name: string) => `מעכשיו אבדוק איתך לפני שאקבע תור של לקוח ל"${name}".`,
+    en: (name: string) => `From now on I'll check with you before booking a customer for "${name}".`,
+  },
+  apply_service_approval_off: {
+    he: (name: string) => `מעכשיו אקבע תורים של לקוחות ל"${name}" בלי לבקש אישור.`,
+    en: (name: string) => `From now on I'll book customers for "${name}" without asking for your approval.`,
+  },
+  apply_policy_approval_window: {
+    he: (hours: number) => `עדכנתי — בקשות אישור ימתינו עד ${hours} שעות לפני שיפוגו.`,
+    en: (hours: number) => `Done — approval requests will wait up to ${hours} hours before they expire.`,
+  },
 } as const
 
 // Type-safe accessor — falls back to 'en' if a key is missing for 'he'

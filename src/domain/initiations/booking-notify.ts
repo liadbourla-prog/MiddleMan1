@@ -11,7 +11,7 @@
 import { and, eq, isNull } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { businesses, identities, serviceTypes } from '../../db/schema.js'
-import { type Lang } from '../i18n/t.js'
+import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { sendTemplateMessage } from '../../adapters/whatsapp/sender.js'
 import { bodyComponents } from '../../adapters/whatsapp/templates.js'
@@ -218,5 +218,160 @@ export async function notifyOwnerNewBooking(
     }).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] owner new-booking notify failed', { businessId, bookingId: booking.bookingId, err: (err as Error).message })
+  }
+}
+
+// ── Per-service owner approval of customer self-bookings (design 2026-06-25) ─────
+
+/**
+ * Fire the MANDATORY owner notification when a customer self-booking is held for the owner's
+ * approval. Names the customer, service, and time, and asks the owner to confirm or decline by
+ * replying. Unlike notifyOwnerNewBooking, this is NOT governed by notificationRules — opting a
+ * service into approval IS the consent to be asked (design §2). Best-effort: never throws (the
+ * held booking has already committed; a notify miss must not roll it back).
+ */
+export async function notifyOwnerApprovalRequest(
+  db: Db,
+  businessId: string,
+  booking: { customerId: string; serviceTypeId: string | null; slotStart: Date },
+): Promise<void> {
+  try {
+    const [biz] = await db
+      .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage })
+      .from(businesses)
+      .where(eq(businesses.id, businessId))
+      .limit(1)
+    if (!biz) return
+
+    const [manager] = await db
+      .select({ phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+      .limit(1)
+    if (!manager) return
+
+    const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+
+    const [cust] = await db
+      .select({ displayName: identities.displayName, phone: identities.phoneNumber })
+      .from(identities)
+      .where(eq(identities.id, booking.customerId))
+      .limit(1)
+    const who = cust?.displayName ?? (cust?.phone ? cust.phone.slice(-4) : (lang === 'he' ? 'לקוח' : 'a customer'))
+
+    let serviceName: string | null = null
+    if (booking.serviceTypeId) {
+      const [svc] = await db.select({ name: serviceTypes.name }).from(serviceTypes).where(eq(serviceTypes.id, booking.serviceTypeId)).limit(1)
+      serviceName = svc?.name ?? null
+    }
+    const svc = serviceName ?? (lang === 'he' ? 'תור' : 'an appointment')
+
+    const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+    const dateStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, weekday: 'long', day: 'numeric', month: 'long' }).format(booking.slotStart)
+    const timeStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, hour: '2-digit', minute: '2-digit', hour12: false }).format(booking.slotStart)
+
+    const body = i18n.approval_request_owner[lang](who, svc, dateStr, timeStr)
+    await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ })
+  } catch (err) {
+    console.error('[booking-notify] owner approval-request notify failed', { businessId, err: (err as Error).message })
+  }
+}
+
+/**
+ * Tell the customer the business DECLINED their pending self-booking request, and invite them to
+ * pick another time. Best-effort free-form send (parity with the hold-expiry customer note) — never
+ * throws (the cancel write already committed).
+ */
+export async function notifyCustomerApprovalDeclined(
+  db: Db,
+  businessId: string,
+  booking: { customerId: string; serviceTypeId: string | null; slotStart: Date },
+): Promise<void> {
+  try {
+    const [biz] = await db
+      .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage })
+      .from(businesses)
+      .where(eq(businesses.id, businessId))
+      .limit(1)
+    if (!biz) return
+
+    const [customer] = await db
+      .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
+      .from(identities)
+      .where(eq(identities.id, booking.customerId))
+      .limit(1)
+    if (!customer) return
+
+    const lang: Lang = (customer.preferredLanguage as Lang | null | undefined) ?? (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+
+    let serviceName: string | null = null
+    if (booking.serviceTypeId) {
+      const [svc] = await db.select({ name: serviceTypes.name }).from(serviceTypes).where(eq(serviceTypes.id, booking.serviceTypeId)).limit(1)
+      serviceName = svc?.name ?? null
+    }
+    const service = serviceName ?? (lang === 'he' ? 'התור שלך' : 'your appointment')
+    const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+    const dateStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, weekday: 'long', day: 'numeric', month: 'long' }).format(booking.slotStart)
+
+    const fallback = i18n.approval_declined_customer[lang](service, dateStr)
+    const body = await generateProactiveCustomerMessage({
+      businessName: biz.name,
+      language: lang,
+      situation: `The business could not approve the customer's request for "${service}" on ${dateStr}, so it was not booked. Let them know warmly and without blame that it didn't work out this time, and invite them to pick another time and you'll be glad to help.`,
+      fallback,
+      timeoutMs: 2500,
+    }).catch(() => fallback)
+    await enqueueMessage(customer.phoneNumber, body).catch(() => { /* non-fatal */ })
+  } catch (err) {
+    console.error('[booking-notify] customer approval-declined notify failed', { businessId, err: (err as Error).message })
+  }
+}
+
+/**
+ * Brief owner note that a held approval request EXPIRED with no decision (the window elapsed). Sent
+ * by the hold-expiry worker alongside the customer "didn't confirm in time" message. Best-effort.
+ */
+export async function notifyOwnerApprovalExpired(
+  db: Db,
+  businessId: string,
+  booking: { customerId: string; serviceTypeId: string | null; slotStart: Date },
+): Promise<void> {
+  try {
+    const [biz] = await db
+      .select({ timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage })
+      .from(businesses)
+      .where(eq(businesses.id, businessId))
+      .limit(1)
+    if (!biz) return
+
+    const [manager] = await db
+      .select({ phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+      .limit(1)
+    if (!manager) return
+
+    const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+
+    const [cust] = await db
+      .select({ displayName: identities.displayName, phone: identities.phoneNumber })
+      .from(identities)
+      .where(eq(identities.id, booking.customerId))
+      .limit(1)
+    const who = cust?.displayName ?? (cust?.phone ? cust.phone.slice(-4) : (lang === 'he' ? 'לקוח' : 'a customer'))
+
+    let serviceName: string | null = null
+    if (booking.serviceTypeId) {
+      const [svc] = await db.select({ name: serviceTypes.name }).from(serviceTypes).where(eq(serviceTypes.id, booking.serviceTypeId)).limit(1)
+      serviceName = svc?.name ?? null
+    }
+    const svc = serviceName ?? (lang === 'he' ? 'תור' : 'an appointment')
+    const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+    const dateStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, weekday: 'long', day: 'numeric', month: 'long' }).format(booking.slotStart)
+
+    const body = i18n.approval_expired_owner[lang](who, svc, dateStr)
+    await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ })
+  } catch (err) {
+    console.error('[booking-notify] owner approval-expired notify failed', { businessId, err: (err as Error).message })
   }
 }
