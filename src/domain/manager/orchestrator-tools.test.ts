@@ -7,6 +7,8 @@ import {
   executeScheduleRecurringClasses,
   executeRequestPayment,
   executeRefundPayment,
+  executeMessageCustomer,
+  executeSetCustomerName,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
@@ -343,5 +345,92 @@ describe('scheduleRecurringClasses — fail-fast guards before any DB read (WS-D
     ) as { success: boolean; needsClarification?: boolean }
     expect(res.success).toBe(false)
     expect(res.needsClarification).toBe(true)
+  })
+})
+
+function twoGuysCtx(): ToolContext {
+  let call = 0
+  const chain: Record<string, unknown> = {}
+  for (const m of ['select', 'from', 'leftJoin', 'orderBy']) chain[m] = () => chain
+  chain['where'] = () => chain
+  chain['limit'] = () => {
+    call += 1
+    // 1st query: business row (messageCustomer loads it first). 2nd: identity name match (two rows).
+    if (call === 1) return Promise.resolve([{ name: 'Studio', defaultLanguage: 'he', whatsappPhoneNumberId: 'wa', whatsappAccessToken: 'tok' }])
+    if (call === 2) return Promise.resolve([
+      { id: 'c1', displayName: 'Guy Cohen', lastName: 'Cohen', phoneNumber: '+972500000001' },
+      { id: 'c2', displayName: 'Guy Levi', lastName: 'Levi', phoneNumber: '+972500000002' },
+    ])
+    return Promise.resolve([]) // latestBookingFor for each candidate
+  }
+  return {
+    db: { select: () => chain } as unknown as ToolContext['db'],
+    calendar: {} as ToolContext['calendar'],
+    businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he', role: 'manager',
+  }
+}
+
+describe('messageCustomer — disambiguation', () => {
+  it('two same-name customers → ambiguous, no send, candidates returned', async () => {
+    const res = await executeMessageCustomer({ name: 'Guy', message: 'Hi' }, twoGuysCtx()) as {
+      ok: boolean; reason?: string; candidates?: unknown[]
+    }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('ambiguous_customer')
+    expect(res.candidates).toHaveLength(2)
+  })
+})
+
+describe('requestPayment — disambiguation', () => {
+  it('two same-name customers → refuses to charge, returns candidates', async () => {
+    let call = 0
+    const chain: Record<string, unknown> = {}
+    for (const m of ['select', 'from', 'leftJoin', 'orderBy']) chain[m] = () => chain
+    chain['where'] = () => chain
+    chain['limit'] = () => {
+      call += 1
+      if (call === 1) return Promise.resolve([
+        { id: 'c1', displayName: 'Dana Cohen', lastName: 'Cohen', phoneNumber: '+972500000001' },
+        { id: 'c2', displayName: 'Dana Levi', lastName: 'Levi', phoneNumber: '+972500000002' },
+      ])
+      return Promise.resolve([]) // booking lookups
+    }
+    const ctx: ToolContext = {
+      db: { select: () => chain } as unknown as ToolContext['db'],
+      calendar: {} as ToolContext['calendar'],
+      businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he', role: 'manager',
+    }
+    const res = await executeRequestPayment({ customer: 'Dana', amount: 300, description: 'Session' }, ctx) as {
+      ok: boolean; reason?: string; candidates?: unknown[]
+    }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('ambiguous_customer')
+    expect(res.candidates).toHaveLength(2)
+  })
+})
+
+describe('setCustomerName', () => {
+  it('rejects a non-manager/non-granted caller', async () => {
+    const res = await executeSetCustomerName(
+      { identityId: 'c1', displayName: 'Guy Cohen', lastName: 'Cohen' },
+      payCtx('customer'),
+    ) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('writes the name for the owner and derives lastName when only displayName is given', async () => {
+    const captured: { patch?: Record<string, unknown> } = {}
+    const chain: Record<string, unknown> = {}
+    chain['set'] = (p: Record<string, unknown>) => { captured.patch = p; return chain }
+    chain['where'] = () => Promise.resolve(undefined)
+    const ctx: ToolContext = {
+      db: { update: () => chain } as unknown as ToolContext['db'],
+      calendar: {} as ToolContext['calendar'],
+      businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he', role: 'manager',
+    }
+    const res = await executeSetCustomerName({ identityId: 'c1', displayName: 'Guy Cohen' }, ctx) as { ok: boolean }
+    expect(res.ok).toBe(true)
+    expect(captured.patch).toEqual({ displayName: 'Guy Cohen', lastName: 'Cohen' })
   })
 })

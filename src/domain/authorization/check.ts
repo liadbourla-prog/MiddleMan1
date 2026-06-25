@@ -13,6 +13,7 @@ export type Action =
   | 'policy.change'
   | 'staff.manage'
   | 'meeting.coordinate'
+  | 'customer.manage'
   | 'payment.charge'
   | 'payment.refund'
 
@@ -40,6 +41,7 @@ const MANAGER_ACTIONS = new Set<Action>([
   'policy.change',
   'staff.manage',
   'meeting.coordinate',
+  'customer.manage',
   // Money plane (Grow Phase 4/5): managers always; delegated only if granted; customers never.
   'payment.charge',
   'payment.refund',

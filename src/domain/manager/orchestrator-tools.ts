@@ -38,6 +38,7 @@ import { findProviderByName } from '../provider/lookup.js'
 import { sendMessage, sendTemplateMessage, canSendFreeForm } from '../../adapters/whatsapp/sender.js'
 import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
+import { resolveTargetForOwnerAction, setCustomerName, deriveLastName, type CandidateView } from '../identity/customer-resolver.js'
 import { logAudit } from '../audit/logger.js'
 import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
 import { cancelClassSessionBookings, summarizeSessionCancellation } from '../scheduling/session-cancellation.js'
@@ -97,6 +98,19 @@ export interface ToolContext {
   // staff at the apply seam. Optional so existing test contexts default to manager.
   role?: IdentityRole
   delegatedPermissions?: Set<Action>
+}
+
+// Builds the guidance string the orchestrator LLM relays when a name is ambiguous. Lists each
+// candidate's last name (when known), full phone, and last booking so the owner can verify which
+// person is meant, and tells the model to re-call the SAME tool with the chosen lastName or phone.
+export function disambiguationGuidance(query: string, candidates: CandidateView[], tool: string): string {
+  const lines = candidates.map((c) => {
+    const name = c.displayName ?? query
+    const last = c.lastName ? ` (last name ${c.lastName})` : ' (no last name on file)'
+    const booking = c.lastBooking ? `, last booking ${c.lastBooking.date}${c.lastBooking.service ? ` for ${c.lastBooking.service}` : ''}` : ', no bookings on file'
+    return `• ${name}${last} — ${c.phoneNumber}${booking}`
+  })
+  return `Several people match "${query}". Ask the owner which one, showing these details so they can confirm:\n${lines.join('\n')}\nThen call ${tool} again with the chosen person's lastName (or their phoneNumber).`
 }
 
 // ── listCalendarEvents ────────────────────────────────────────────────────────
@@ -1083,6 +1097,7 @@ export async function executeLookupCustomer(
       .select({
         id: identities.id,
         displayName: identities.displayName,
+        lastName: identities.lastName,
         phoneNumber: identities.phoneNumber,
         preferredLanguage: identities.preferredLanguage,
       })
@@ -1272,6 +1287,40 @@ export async function executeSaveContactNote(
   }
 
   return { error: 'Unknown targetType' }
+}
+
+// ── setCustomerName ───────────────────────────────────────────────────────────
+
+// Owner sets/corrects a customer's name (e.g. after disambiguating two same-name customers, or
+// fixing a typo). Authorization-gated like other customer-management actions. Derives the last
+// name from displayName when the owner gives only a full name and no explicit lastName.
+interface SetCustomerNameArgs {
+  identityId?: string
+  displayName?: string
+  lastName?: string
+}
+
+export async function executeSetCustomerName(args: SetCustomerNameArgs, ctx: ToolContext): Promise<object> {
+  const auth = authorize(
+    { role: ctx.role ?? 'manager', ...(ctx.delegatedPermissions ? { delegatedPermissions: ctx.delegatedPermissions } : {}) },
+    'customer.manage',
+  )
+  if (!auth.allowed) {
+    return { ok: false, reason: 'not_authorized', guidance: 'This person is not allowed to edit customer details. Tell them only the owner (or granted staff) can do that.' }
+  }
+  if (!args.identityId) {
+    return { ok: false, reason: 'no_target', guidance: 'Look up the customer first (lookupCustomer) to get their id, then set the name.' }
+  }
+  const displayName = args.displayName?.trim()
+  const lastName = args.lastName?.trim() || deriveLastName(displayName ?? null) || undefined
+  if (!displayName && !lastName) {
+    return { ok: false, reason: 'nothing_to_set', guidance: 'Ask the owner what name to save (a first/display name and optionally a last name).' }
+  }
+  await setCustomerName(ctx.db, ctx.businessId, args.identityId, {
+    ...(displayName !== undefined ? { displayName } : {}),
+    ...(lastName !== undefined ? { lastName } : {}),
+  })
+  return { ok: true, guidance: 'Tell the owner the name is saved, in your own words.' }
 }
 
 // ── pauseConversation ─────────────────────────────────────────────────────────
@@ -1821,14 +1870,15 @@ export async function executeRequestPayment(args: RequestPaymentArgs, ctx: ToolC
       target = { id: newId, phoneNumber: phone, name: args.customer ?? null }
     }
   } else if (args.customer) {
-    const rows = await ctx.db
-      .select({ id: identities.id, phoneNumber: identities.phoneNumber, name: identities.displayName })
-      .from(identities)
-      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'customer'), ilike(identities.displayName, `%${args.customer}%`)))
-      .limit(5)
-    if (rows.length === 0) return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.customer}" is on file. Ask the owner for the phone number so you can reach them.` }
-    if (rows.length > 1) return { ok: false, reason: 'ambiguous_customer', guidance: `Several customers match "${args.customer}". Ask the owner which one (or for the phone number).` }
-    target = rows[0]!
+    const resolution = await resolveTargetForOwnerAction(ctx.db, ctx.businessId, {
+      role: 'customer', name: args.customer, timezone: ctx.timezone, lang: ctx.lang,
+    })
+    if (resolution.status === 'not_found') return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.customer}" is on file. Ask the owner for the phone number so you can reach them.` }
+    if (resolution.status === 'ambiguous') {
+      return { ok: false, reason: 'ambiguous_customer', candidates: resolution.candidates, guidance: disambiguationGuidance(args.customer, resolution.candidates, 'requestPayment') }
+    }
+    if (resolution.status === 'phone_unknown') return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to charge — a name on file or a phone number.' }
+    target = { id: resolution.target.id, phoneNumber: resolution.target.phoneNumber, name: resolution.target.displayName }
   } else {
     return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to charge — a name on file or a phone number.' }
   }
@@ -1956,6 +2006,7 @@ export async function executeRefundPayment(args: RefundTransactionArgs, ctx: Too
 interface MessageCustomerArgs {
   phoneNumber?: string
   name?: string
+  lastName?: string
   message: string
   // Present only when the owner is asking the customer to move an existing appointment as a
   // favour. Carries human-readable current/new times so an out-of-window send can fall back to
@@ -2005,18 +2056,33 @@ export async function executeMessageCustomer(
       target = { id: newId, phoneNumber: phone, optOut: false }
     }
   } else if (args.name) {
-    const rows = await ctx.db
-      .select({ id: identities.id, phoneNumber: identities.phoneNumber, optOut: identities.messagingOptOut })
-      .from(identities)
-      .where(and(eq(identities.businessId, ctx.businessId), eq(identities.role, 'customer'), ilike(identities.displayName, `%${args.name}%`)))
-      .limit(5)
-    if (rows.length === 0) {
+    const resolution = await resolveTargetForOwnerAction(ctx.db, ctx.businessId, {
+      role: 'customer', name: args.name, ...(args.lastName ? { lastName: args.lastName } : {}),
+      timezone: ctx.timezone, lang: ctx.lang,
+    })
+    if (resolution.status === 'not_found') {
       return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.name}" is on file. Ask the owner for the phone number so you can reach them.` }
     }
-    if (rows.length > 1) {
-      return { ok: false, reason: 'ambiguous_customer', guidance: `Several customers match "${args.name}". Ask the owner which one (or for the phone number).` }
+    if (resolution.status === 'ambiguous') {
+      return {
+        ok: false,
+        reason: 'ambiguous_customer',
+        candidates: resolution.candidates,
+        guidance: disambiguationGuidance(args.name, resolution.candidates, 'messageCustomer'),
+      }
     }
-    target = rows[0]!
+    if (resolution.status !== 'resolved') {
+      return { ok: false, reason: 'customer_not_found', guidance: `No customer named "${args.name}" is on file. Ask the owner for the phone number so you can reach them.` }
+    }
+    // resolved — opportunistic save: the owner disambiguated by a last name we didn't have on file.
+    const t = resolution.target
+    if (args.lastName && !t.lastName) {
+      await setCustomerName(ctx.db, ctx.businessId, t.id, { lastName: args.lastName.trim() }).catch(() => {})
+    }
+    const [optRow] = await ctx.db
+      .select({ optOut: identities.messagingOptOut })
+      .from(identities).where(eq(identities.id, t.id)).limit(1)
+    target = { id: t.id, phoneNumber: t.phoneNumber, optOut: optRow?.optOut ?? false }
   } else {
     return { ok: false, reason: 'no_recipient', guidance: 'Ask the owner who to message — a name on file or a phone number.' }
   }

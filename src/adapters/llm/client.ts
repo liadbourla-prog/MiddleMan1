@@ -82,6 +82,7 @@ const customerIntentSchema = z.object({
     .catch(null),
   serviceTypeHint: z.string().nullable().catch(null),
   providerHint: z.string().nullable().catch(null),
+  customerNameHint: z.string().nullable().catch(null),
   participantsHint: z.number().int().positive().nullable().catch(null),
   summary: z.string().nullable().catch(null),
   rawEntities: z.record(z.unknown()).transform((v) =>
@@ -152,6 +153,7 @@ Return a JSON object with EXACTLY this structure (all fields required):
   } | null,
   "serviceTypeHint": "service name from message" | null,
   "providerHint": "staff name from message" | null,
+  "customerNameHint": "the customer's own name if they state it (e.g. 'I'm Guy Cohen', 'שמי גיא כהן')" | null,
   "participantsHint": number | null,
   "summary": "one sentence summary" | null,
   "rawEntities": {},
@@ -172,6 +174,7 @@ Rules:
   - hasSpecificTime: true only when "time" is filled. false for vague ("morning").
   - dateAmbiguous: true ONLY for "this_week"/"next_week" with no weekday. Explicit day+month dates and named weekdays are NEVER ambiguous — set false.
 - serviceTypeHint: extract the service name the customer mentions (e.g. "תספורת" → "תספורת", "haircut" → "Haircut"). null if none.
+- customerNameHint: the customer's OWN name when they introduce themselves ("I'm Guy Cohen", "this is Dana", "שמי גיא"). null if they don't state their own name. Never put a staff or third-party name here.
 - participantsHint: number of people if the customer states a party size ("for 3 people"/"לשלושה אנשים"→3). null if not stated.
 - detectedLanguage: "he" if message is in Hebrew; "en" for English or any other language.
 - Respond only with valid JSON matching the structure above. No explanation.`
