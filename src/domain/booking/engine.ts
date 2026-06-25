@@ -189,7 +189,15 @@ export async function requestBooking(
     // customer into a slot the owner has already taken in Google. Internal SoT
     // stays authoritative: a freebusy *error* fails open (we don't block a valid
     // booking just because Google is unreachable).
-    if (business.calendarMode === 'google') {
+    //
+    // SKIP for group classes. A class slot is, by design, an event already on the
+    // calendar (its own mirrored 'class' event), and many customers book INTO it up
+    // to capacity. freebusy.query returns that class event as busy, so the probe would
+    // report EVERY class slot 'occupied' and make group classes unbookable in Google
+    // mode. Capacity for the instance is enforced authoritatively inside
+    // requestGroupClassBooking (advisory-lock + count vs maxParticipants) — NOT here —
+    // so skipping the freebusy probe never loosens the per-class limit.
+    if (business.calendarMode === 'google' && !isGroupClass) {
       const fb = await calendar.checkAvailability({ start: request.slotStart, end: request.slotEnd })
       if (fb.status === 'occupied') {
         return { ok: false, reason: 'Slot is no longer available' }

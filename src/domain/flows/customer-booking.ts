@@ -310,6 +310,29 @@ export async function classInstanceMissing(
   return !block.found
 }
 
+/** Is this service schedule-driven (a 'class' that runs only at fixed instances)? */
+async function isClassModeService(db: Db, serviceTypeId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ schedulingMode: serviceTypes.schedulingMode })
+    .from(serviceTypes)
+    .where(eq(serviceTypes.id, serviceTypeId))
+    .limit(1)
+  return row?.schedulingMode === 'class'
+}
+
+/**
+ * Memory for a reply made WHILE a specific service is in flight. Cross-session
+ * "preferred service" memory names a service the customer often books — which may be a
+ * DIFFERENT service than the one being booked right now. Left as-is, the LLM can silently
+ * switch the conversation to it (e.g. drop yoga, offer pilates). Anchor the preferred
+ * service to the in-flight one so the reply stays on the service actually in play.
+ */
+export function memoryForActiveService(ctx: BookingFlowContext, activeServiceName: string | null): CustomerMemoryInput {
+  const mem = extractMemory(ctx)
+  if (!mem || activeServiceName == null) return mem
+  return { ...mem, preferredServiceName: activeServiceName }
+}
+
 // Safe clarification used when the LLM keeps asserting a booking that was never
 // made (cardinal "said done, didn't do" backstop — see reply-guard.ts).
 // How many slot/date clarification fumbles before the PA nudges toward a phone
@@ -404,7 +427,7 @@ export async function handleBookingFlow(
   businessKnowledge?: BusinessKnowledge,
   isFirstMessage?: boolean,
 ): Promise<FlowResult> {
-  const ctx = {
+  let ctx = {
     ...(session.context as BookingFlowContext),
     ...(botPersona ? { botPersona } : {}),
   } as BookingFlowContext
@@ -532,7 +555,15 @@ export async function handleBookingFlow(
 
   // ── Branch: waiting for hold confirmation ────────────────────────────────
   if (session.state === 'waiting_confirmation' && ctx.awaitingConfirmationFor === 'hold') {
-    return handleHoldConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
+    const holdResult = await handleHoldConfirmation(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
+    if (!holdResult.redispatch) return holdResult
+    // Customer redirected away from the pending slot (an inquiry / a different request).
+    // handleHoldConfirmation already cleared the hold from the session in the DB; mirror
+    // that in-memory and fall through to fresh intent handling so their actual request is
+    // answered instead of the stale slot being re-asked.
+    const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, ...clearedCtx } = ctx
+    ctx = clearedCtx as BookingFlowContext
+    session = { ...session, state: 'active', context: ctx }
   }
 
   // ── Branch: waiting for cancellation confirmation ────────────────────────
@@ -899,7 +930,17 @@ async function rebuildOnSlotPivot(
   const hasNewSlot =
     intent.serviceTypeHint != null ||
     (ns != null && (ns.time != null || ns.relativeDay != null || ns.weekday != null || ns.explicitDate != null))
-  if ((intent.intent !== 'booking' && intent.intent !== 'rescheduling') || !hasNewSlot) return null
+
+  // The reply may not answer the pending slot at all. Two escape hatches:
+  //  • REBUILD — a fresh booking/reschedule with a new slot → re-run the booking flow.
+  //  • REDIRECT — an inquiry / cancellation / list ("what's free Wednesday?", "cancel
+  //    Monday") → the customer has moved on; hand back to the dispatcher to answer it.
+  // Without these, such a message parses as an 'unclear' confirmation and the PA re-asks
+  // the SAME stale slot indefinitely (the live-test confirmation loop).
+  const isRebuild = (intent.intent === 'booking' || intent.intent === 'rescheduling') && hasNewSlot
+  const isRedirect = !isRebuild &&
+    (intent.intent === 'inquiry' || intent.intent === 'cancellation' || intent.intent === 'list_bookings')
+  if (!isRebuild && !isRedirect) return null
 
   // Release any hold already placed for the stale slot so it isn't orphaned.
   if (ctx.pendingBookingId) {
@@ -915,6 +956,11 @@ async function rebuildOnSlotPivot(
     clarificationAttempts: 0,
   }
   await updateSessionContext(db, session.id, rebuildCtx, 'active')
+
+  // Redirect: the hold is now cleared in the DB; bubble a sentinel up so the dispatcher
+  // re-routes the message through normal intent handling (the inquiry/cancellation
+  // handlers there carry full business-knowledge context this helper doesn't).
+  if (isRedirect) return { reply: '', sessionComplete: false, redispatch: true }
 
   return handleBookingIntent(
     db, calendar, identity,
@@ -1278,21 +1324,24 @@ async function handleHoldConfirmation(
       situation: `The customer's reply wasn't a clear yes or no. The slot waiting to be confirmed is: ${slotPhrase}. Restate exactly that slot (service, day, time) and ask in plain words whether to lock it in — no menu. Use ONLY these details; ignore any different service/day/time mentioned earlier in the chat.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
+      customerMemory: memoryForActiveService(ctx, ctx.pendingSlot?.serviceName ?? null),
     })
     return { reply, sessionComplete: false }
   }
 
   if (confirmation === 'no') {
     await completeSession(db, session.id)
+    const declinedService = ctx.pendingSlot?.serviceName ?? null
     const reply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
-      situation: 'Customer declined the slot. Booking not made. Offer to try a different time.',
+      situation: declinedService
+        ? `Customer declined the ${declinedService} slot. Booking not made. Offer to try a different time — stay on ${declinedService} unless THEY ask for something else; do NOT switch to a different service on your own.`
+        : 'Customer declined the slot. Booking not made. Offer to try a different time.',
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
-      customerMemory: extractMemory(ctx),
+      customerMemory: memoryForActiveService(ctx, declinedService),
     })
     return { reply, sessionComplete: true }
   }
@@ -1407,7 +1456,11 @@ async function handleHoldConfirmation(
     // Bug E: a schedule-driven ('class') service asked for at a time with no class.
     // Offer the ACTUAL scheduled class times for that service/day — never arbitrary
     // open slots (this is exactly how a customer got booked into a 17:00 with no class).
+    // This applies to EVERY conflict on a class-mode service, not just 'no_class_at_time':
+    // a class that's full (or any other refusal) must still be re-offered as real class
+    // times, never as open-slot gaps between classes (13:00/15:00… are not class times).
     const classModeMiss = result.reason === 'no_class_at_time'
+      || (business ? await isClassModeService(db, pendingSlot.serviceTypeId) : false)
     const hoursSummary = !classModeMiss && business ? await loadHoursSummary(db, business.id) : null
     // Proactive suggestion: enumerate real bookable openings near the request so
     // we can offer concrete alternatives ("I have 3pm or 4:30 free") instead of a
