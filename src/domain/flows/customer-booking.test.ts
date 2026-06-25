@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { persistCapturedName, classInstanceMissing } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService } from './customer-booking.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
   setCustomerName: vi.fn().mockResolvedValue(undefined),
@@ -52,5 +52,29 @@ describe('classInstanceMissing — Branch 4 anti-invented-time gate', () => {
     vi.mocked(findClassBlockProviderForSlot).mockResolvedValue({ found: true, providerId: null, maxParticipants: 8 })
     const svc = { id: 'svc-yoga', schedulingMode: 'class' as const }
     expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(false)
+  })
+})
+
+describe('memoryForActiveService — Root D: do not switch service from cross-session memory', () => {
+  // Mirrors the live bug: customer is mid-yoga-booking but cross-session memory says the
+  // customer's "preferred service" is pilates; the reply must stay anchored to yoga.
+  const baseCtx = {
+    returningCustomer: true,
+    preferredServiceName: 'פילאטיס',
+    customerMemory: { displayName: 'Dana' },
+  } as never
+
+  it('overrides the cross-session preferred service with the in-flight service', () => {
+    const mem = memoryForActiveService(baseCtx, 'יוגה')
+    expect(mem?.preferredServiceName).toBe('יוגה')
+  })
+
+  it('passes memory through unchanged when there is no in-flight service', () => {
+    const mem = memoryForActiveService(baseCtx, null)
+    expect(mem?.preferredServiceName).toBe('פילאטיס')
+  })
+
+  it('returns null when the customer has no memory at all', () => {
+    expect(memoryForActiveService({} as never, 'יוגה')).toBeNull()
   })
 })

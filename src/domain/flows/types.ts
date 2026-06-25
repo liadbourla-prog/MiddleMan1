@@ -4,6 +4,11 @@ export interface FlowResult {
   sessionFailed?: boolean
   escalated?: boolean
   paused?: boolean
+  // Set by a state handler (e.g. hold-confirmation) when the customer's message is NOT
+  // an answer to the pending question but a fresh intent (an inquiry, a different
+  // booking, a cancellation). The dispatcher clears the pending state and re-routes the
+  // message through normal intent handling instead of re-asking the stale prompt.
+  redispatch?: boolean
 }
 
 export type ConfirmationParse = 'yes' | 'no' | 'unclear'
