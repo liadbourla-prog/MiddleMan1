@@ -2310,9 +2310,10 @@ export async function executeMessageCustomer(
   }
 
   // Pre-check the window. Closed → go straight to the template fallback: a free-form send here
-  // would be accepted-then-silently-dropped by Meta and falsely reported as delivered. The old
-  // "don't pre-gate, let Meta decide" concern (false negatives after a chat reset) is now benign:
-  // a false negative just sends a template, which delivers in-window too — never a wrong claim.
+  // would be accepted-then-silently-dropped by Meta and falsely reported as delivered. canSendFreeForm
+  // now reads identities.lastInboundAt (written on every inbound), so it tracks Meta's real window —
+  // the old false-negative class ("hasn't messaged in 24h" when they actually had) that made this
+  // report a wrong claim to the owner is fixed at the source (2026-06-25).
   if (!(await canSendFreeForm(target.id))) {
     return await outOfWindowFallback()
   }

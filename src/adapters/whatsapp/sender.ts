@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'async_hooks'
 import type { OutboundMessage, SendResult } from './types.js'
-import { and, eq, gte } from 'drizzle-orm'
+import { eq } from 'drizzle-orm'
 
 // When set, sendMessage captures replies into the array instead of posting to WA.
 // Used by the /simulate route and integration tests.
@@ -30,17 +30,23 @@ function resolveCredentials(override?: WaCredentials): WaCredentials {
 /**
  * Returns true when we are inside WhatsApp's 24-hour customer service window for this identity.
  * Outside the window, only Meta-approved template messages may be sent (use sendTemplateMessage).
+ *
+ * Source of truth is identities.lastInboundAt — the timestamp of the person's last INBOUND message,
+ * written by the webhook on every inbound before any early return. This matches Meta's real window.
+ * (It was previously inferred from conversation_sessions.last_message_at, a session-lifecycle field
+ * that diverged from the true last inbound and produced false "24h limit" claims — 2026-06-25 fix.)
+ * null lastInboundAt = we've never received a message from them → window closed (template-only).
  */
 export async function canSendFreeForm(identityId: string): Promise<boolean> {
   const { db } = await import('../../db/client.js')
-  const { conversationSessions } = await import('../../db/schema.js')
+  const { identities } = await import('../../db/schema.js')
   const cutoff = new Date(Date.now() - 24 * 60 * 60_000)
   const [row] = await db
-    .select({ id: conversationSessions.id })
-    .from(conversationSessions)
-    .where(and(eq(conversationSessions.identityId, identityId), gte(conversationSessions.lastMessageAt, cutoff)))
+    .select({ lastInboundAt: identities.lastInboundAt })
+    .from(identities)
+    .where(eq(identities.id, identityId))
     .limit(1)
-  return !!row
+  return !!row?.lastInboundAt && row.lastInboundAt >= cutoff
 }
 
 /**

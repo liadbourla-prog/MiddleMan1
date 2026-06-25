@@ -291,6 +291,16 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
   if (!identityResult.found) return
   const identity = identityResult.identity
 
+  // Record the inbound timestamp NOW — before any early return below (opt-out, coordination,
+  // paused business) and before burst buffering. identities.lastInboundAt is the source of truth
+  // for Meta's 24h customer-service window (canSendFreeForm); writing it here, unconditionally,
+  // keeps it from going stale relative to Meta's real window and prevents false "24h limit" claims.
+  await db
+    .update(identities)
+    .set({ lastInboundAt: new Date() })
+    .where(eq(identities.id, identity.id))
+    .catch((err) => app.log.warn({ err }, 'Failed to update lastInboundAt'))
+
   if (identity.messagingOptOut) {
     app.log.info({ phoneNumber: msg.fromNumber }, 'Skipping message — user has opted out of messaging')
     return

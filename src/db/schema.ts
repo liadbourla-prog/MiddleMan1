@@ -176,6 +176,14 @@ export const identities = pgTable(
     // initiator. Date only (no year required, but stored as a full date); null = unknown.
     birthday: date('birthday'),
     conversationPausedUntil: timestamp('conversation_paused_until', { withTimezone: true }),
+    // Authoritative timestamp of this person's last INBOUND WhatsApp message to us. This — not
+    // any session-lifecycle field — is the source of truth for Meta's 24-hour customer-service
+    // window (canSendFreeForm). Written on EVERY inbound (webhook, before any early return) so it
+    // never goes stale relative to Meta's real window; null = we've never received a message from
+    // them (window closed → template-only). Previously the window was inferred from
+    // conversation_sessions.last_message_at, a session field that diverged from the true last
+    // inbound and produced false "24h limit" claims (see 2026-06-25 fix).
+    lastInboundAt: timestamp('last_inbound_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex('identities_business_phone_idx').on(t.businessId, t.phoneNumber)],
