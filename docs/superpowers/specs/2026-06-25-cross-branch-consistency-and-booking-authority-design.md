@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-25
 **Branch context:** `dev/system/*` (Developer A — core engine; not skills)
-**Status:** Design — pending implementation approval
+**Status:** Partially implemented (branch `dev/system/cross-branch-consistency`) — see §9.
 **Triggered by:** 2026-06-25 morning test simulation in business *סטודיוגה* (Owner +972…3704, customer "Yoni" +972…7775, "Harel" +972…2400). See "Incident" below.
 
 ---
@@ -147,3 +147,18 @@ Migration: default `'auto'` ⇒ zero behavior change for existing businesses (D2
 
 - "First commit wins" reconciliation (INV-2) for the rare true race (both commit within the same second on the same slot) relies on the existing booking-engine overlap guard (`engine.ts` conflict predicate) — confirm it rejects the second write cleanly and the losing channel surfaces a reconcile message rather than a raw failure.
 - Proactive owner-notification default vs the existing "never notify on your own" voice rule (`voice.ts:44`) — this design treats a **customer-initiated commit** as a notifiable business event (via notification_rules), distinct from the PA *spontaneously* messaging a customer. Confirm wording so the two don't conflict.
+
+---
+
+## 9. Implementation status (2026-06-25)
+
+**Shipped (committed on `dev/system/cross-branch-consistency`):**
+- ✅ **Consistency fix (the bug — INV-1/INV-4).** Enriched booking audit metadata (customer/slot/service/initiator) at all four engine commit/cancel sites; ledger renderer now prints the real subject + an explicit "ALREADY DONE — reflect, do not ask to approve"; Branch 3 system-prompt rule "reflect committed reality, never re-ask approval for a done action." Unit-tested (`ledger-block.test.ts`). *This fully closes the Yoni reactive contradiction.*
+- ✅ **Booking authority feature.** `businesses.booking_authority` (migration 0042, default `auto`); deterministic owner-approval gate in `createCalendarEvent` (first call → `awaiting_owner_approval`, no write; re-call with `ownerApproved:true` after the owner's yes); mode-aware Branch 3 prompt; conversational config via `manageBusinessSettings` policy subtype `booking_authority` (he/en). Gate unit-tested.
+
+**Remaining (follow-up — scoped, not yet built):**
+1. **INV-3 proactive owner-notification** on a *customer* self-commit (owner gets pinged "Yoni just booked X"), gated by `notification_rules` (`new_booking`). Needs a registered initiator on the initiations spine — non-trivial. *Reactive* reflection is already correct; this is the unprompted ping.
+2. **Broaden the owner-approval gate** beyond `createCalendarEvent` to the other PA-initiated calendar writes (`scheduleGroupSession`, `scheduleRecurringClasses`, `editClassSession`) using the same gate helper.
+3. **Integration test** for the `booking_authority` config setter (needs migration applied to the test DB) and an end-to-end replay of the Yoni incident through the orchestrator.
+4. **Determinism hardening (optional):** replace the LLM-set `ownerApproved` flag with a two-call `proposalId` protocol (call 1 stores a pending proposal, call 2 approves by id) so the core — not the model — holds the approval token. Current approach matches existing codebase owner-approval patterns (`messageCustomer`, `resolveMeetingCoordination`).
+5. **First-commit-wins (INV-2)** explicit reconciliation message on the rare true same-slot race relies today on the booking-engine overlap guard; verify it surfaces a clean reconcile rather than a raw failure.
