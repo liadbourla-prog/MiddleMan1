@@ -8,6 +8,8 @@ import { redisConnection } from '../redis.js'
 import { enqueueMessage } from './message-retry.js'
 import { t } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { notifyOwnerApprovalExpired } from '../domain/initiations/booking-notify.js'
+import { isApprovalExpiry } from '../domain/booking/approval.js'
 
 const QUEUE_NAME = 'hold-expiry'
 const REPEAT_EVERY_MS = 60_000
@@ -27,6 +29,11 @@ export async function expireHeldBookings() {
       businessId: bookings.businessId,
       calendarEventId: bookings.calendarEventId,
       customerId: bookings.customerId,
+      // Owner-approval bookings (design 2026-06-25) expire on the SAME holdExpiresAt key, but get
+      // an approval-flavored customer message + an owner "request expired" note.
+      approvalStatus: bookings.approvalStatus,
+      serviceTypeId: bookings.serviceTypeId,
+      slotStart: bookings.slotStart,
     })
     .from(bookings)
     .where(and(eq(bookings.state, 'held'), lt(bookings.holdExpiresAt, cutoff)))
@@ -95,15 +102,29 @@ export async function expireHeldBookings() {
 
       if (customer) {
         const lang: 'he' | 'en' = ((customer.preferredLanguage ?? business.defaultLanguage) as 'he' | 'en' | null) ?? 'he'
-        const fallback = t('hold_expired', lang)
+        const isApproval = isApprovalExpiry(booking.approvalStatus)
+        // Approval-pending holds expire because the BUSINESS didn't decide in time — not because the
+        // customer failed to confirm. Use approval-flavored wording, and brief the owner separately.
+        const fallback = isApproval ? t('approval_expired_customer', lang) : t('hold_expired', lang)
+        const situation = isApproval
+          ? 'The customer\'s booking request expired because the business did not confirm it in time, so it was not booked. Let them know warmly and without blame, and invite them to try another time whenever they\'re ready.'
+          : 'The customer\'s booking hold has expired because they did not confirm in time. Let them know briefly and invite them to book again whenever they\'re ready.'
         const msg = await generateProactiveCustomerMessage({
           businessName: business.name,
           language: lang,
-          situation: 'The customer\'s booking hold has expired because they did not confirm in time. Let them know briefly and invite them to book again whenever they\'re ready.',
+          situation,
           fallback,
           timeoutMs: 2500,
         })
         await enqueueMessage(customer.phoneNumber, msg)
+
+        if (isApproval) {
+          await notifyOwnerApprovalExpired(db, booking.businessId, {
+            customerId: booking.customerId,
+            serviceTypeId: booking.serviceTypeId,
+            slotStart: booking.slotStart,
+          }).catch(() => { /* non-fatal */ })
+        }
       }
     }
   }

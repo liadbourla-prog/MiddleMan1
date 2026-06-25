@@ -14,7 +14,8 @@ import { buildBookingAuditMeta, initiatorFromActor } from './audit-meta.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
-import { notifyBusinessBookingChange, notifyOwnerNewBooking } from '../initiations/booking-notify.js'
+import { notifyBusinessBookingChange, notifyOwnerNewBooking, notifyOwnerApprovalRequest } from '../initiations/booking-notify.js'
+import { shouldHoldForApproval } from './approval.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { isSlotBookable } from '../availability/service.js'
@@ -25,7 +26,7 @@ import type { CalendarBlockType, Booking } from '../../db/schema.js'
 const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15', 10)
 
 export type BookingEngineResult =
-  | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean; pendingPayment?: boolean }
+  | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean; pendingPayment?: boolean; pendingApproval?: boolean }
   | { ok: false; reason: string }
 
 // Temporal policy gate: past-slot, min-buffer, max-days-ahead. Returns a human
@@ -197,10 +198,23 @@ export async function requestBooking(
   }
 
   if (isGroupClass) {
+    // Owner-approval is scoped to private/1-on-1 (appointment) services in v1. Group-class
+    // bookings carry per-instance capacity + a shared calendar event whose hold/confirm/roster
+    // mechanics don't compose with the held-for-approval reservation, so a class service keeps
+    // today's direct-confirm path even if requires_owner_approval is on (documented limitation;
+    // never gated → no behavior change, only "approval not yet honored for classes").
     return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, instanceCapacity)
   }
 
-  return requestPrivateBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName)
+  // Per-service owner-approval gate (design 2026-06-25, §2). Fires ONLY when the service opted in
+  // AND the caller is a customer (never-default guarantee, enforced in the core via
+  // shouldHoldForApproval). PA/owner-initiated bookings never reach with role 'customer', so they
+  // are not gated (decision D1). When it fires, the booking is held + pending the owner's decision
+  // for the business's approval window instead of confirming/charging now.
+  const requiresApproval = shouldHoldForApproval(service.requiresOwnerApproval, actor.role)
+  const approvalWindowHours = business?.bookingApprovalWindowHours ?? 24
+
+  return requestPrivateBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, requiresApproval, approvalWindowHours)
 }
 
 // ── Private (1-on-1) booking — hold/confirm two-step flow ────────────────────
@@ -215,8 +229,14 @@ async function requestPrivateBooking(
   confirmationGate: string,
   paymentMethod: string | null,
   providerDisplayName: string | null = null,
+  requiresApproval = false,
+  approvalWindowHours = 24,
 ): Promise<BookingEngineResult> {
-  const holdExpiresAt = new Date(Date.now() + HOLD_EXPIRY_MINUTES * 60 * 1000)
+  // An approval-gated request reserves the slot for the whole owner-decision window (default 24h),
+  // not the short interactive hold TTL — the owner, not a re-prompt, is what releases it.
+  const holdExpiresAt = requiresApproval
+    ? new Date(Date.now() + approvalWindowHours * 60 * 60 * 1000)
+    : new Date(Date.now() + HOLD_EXPIRY_MINUTES * 60 * 1000)
 
   // Wrap conflict check + insert in a transaction to prevent race conditions.
   // The SELECT uses FOR UPDATE on the bookings table to lock conflicting rows
@@ -286,6 +306,55 @@ async function requestPrivateBooking(
   if (holdResult.status === 'error') {
     await markFailed(db, result.bookingId, actor.id, holdResult.reason)
     return { ok: false, reason: 'Could not place hold — please try again' }
+  }
+
+  // Owner-approval gate (design 2026-06-25, §2). Hold the slot + mark it pending the owner's
+  // Branch-3 decision, and fire the MANDATORY owner notification (NOT governed by notificationRules).
+  // Takes precedence over the payment gate — approve-first-then-pay (decision 6): a payment-gated
+  // service only sends the pay-link after the owner approves (handled in resolveBookingApproval).
+  // The customer is told their request is received and pending the business's confirmation; they
+  // are NOT asked to confirm again.
+  if (requiresApproval) {
+    const toHeld = transition('requested', 'held')
+    if (!toHeld.ok) {
+      await markFailed(db, result.bookingId, actor.id, toHeld.reason)
+      return { ok: false, reason: 'Internal state error' }
+    }
+
+    await db
+      .update(bookings)
+      .set({
+        state: 'held',
+        approvalStatus: 'pending',
+        holdExpiresAt,
+        calendarEventId: holdResult.eventId,
+        googleEtag: holdResult.etag ?? null,
+        updatedAt: new Date(),
+      })
+      .where(eq(bookings.id, result.bookingId))
+
+    await logAudit(db, {
+      businessId: actor.businessId,
+      actorId: actor.id,
+      action: 'booking.held_for_approval',
+      entityType: 'booking',
+      entityId: result.bookingId,
+      beforeState: { state: 'requested' },
+      afterState: { state: 'held', approvalStatus: 'pending', holdExpiresAt, calendarEventId: holdResult.eventId },
+    })
+
+    await notifyOwnerApprovalRequest(db, actor.businessId, {
+      customerId: actor.id,
+      serviceTypeId: service.id,
+      slotStart: request.slotStart,
+    }).catch(() => { /* non-fatal — the held request still stands; the owner can also see it on lookup */ })
+
+    return {
+      ok: true,
+      bookingId: result.bookingId,
+      message: 'Request received — pending the business\'s confirmation.',
+      pendingApproval: true,
+    }
   }
 
   if (confirmationGate === 'post_payment') {

@@ -45,6 +45,7 @@ import { resolveTargetForOwnerAction, setCustomerName, deriveLastName, type Cand
 import { logAudit } from '../audit/logger.js'
 import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
 import { cancelClassSessionBookings, summarizeSessionCancellation } from '../scheduling/session-cancellation.js'
+import { resolveBookingApproval, selectPendingApproval, type PendingApprovalCandidate } from '../booking/approval.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -1655,6 +1656,102 @@ export async function executeResolveProactiveProposal(
     guidance: res.outcome === 'sent'
       ? 'The check-in was actually sent. Confirm to the owner in your own words and offer to update them when the customer replies.'
       : 'The suggestion was declined and nothing was sent. Confirm to the owner plainly.',
+  }
+}
+
+// ── resolveBookingApproval ────────────────────────────────────────────────────
+
+interface ResolveBookingApprovalArgs {
+  decision: 'approve' | 'decline'
+  customerHint?: string
+  serviceHint?: string
+  bookingId?: string
+}
+
+/**
+ * Free-text resolution of a customer self-booking that is HELD for the owner's approval
+ * (design 2026-06-25, §4). Looks up THIS business's pending requests, maps the owner's reply onto
+ * exactly one (by customer / service / explicit id), and calls the deterministic resolver. Several
+ * pending + an ambiguous reference → returns a disambiguation prompt rather than guessing.
+ */
+export async function executeResolveBookingApproval(
+  args: ResolveBookingApprovalArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const rows = await ctx.db
+    .select({
+      bookingId: bookings.id,
+      slotStart: bookings.slotStart,
+      customerName: identities.displayName,
+      customerPhone: identities.phoneNumber,
+      serviceName: serviceTypes.name,
+    })
+    .from(bookings)
+    .leftJoin(identities, eq(bookings.customerId, identities.id))
+    .leftJoin(serviceTypes, eq(bookings.serviceTypeId, serviceTypes.id))
+    .where(and(
+      eq(bookings.businessId, ctx.businessId),
+      eq(bookings.state, 'held'),
+      eq(bookings.approvalStatus, 'pending'),
+    ))
+    .orderBy(bookings.slotStart)
+
+  const locale = ctx.lang === 'he' ? 'he-IL' : 'en-GB'
+  const candidates: PendingApprovalCandidate[] = rows.map((r) => ({
+    bookingId: r.bookingId,
+    customerName: r.customerName ?? null,
+    customerPhone: r.customerPhone ?? null,
+    serviceName: r.serviceName ?? null,
+    slotLabel: r.slotStart.toLocaleString(locale, { timeZone: ctx.timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }),
+  }))
+
+  const selection = selectPendingApproval(candidates, {
+    bookingId: args.bookingId ?? null,
+    customerHint: args.customerHint ?? null,
+    serviceHint: args.serviceHint ?? null,
+  })
+
+  if (selection.kind === 'none') {
+    return {
+      success: false,
+      reason: 'no_pending_request',
+      guidance: 'There is no customer booking request waiting for your approval (matching what was said, if anything). Tell the owner plainly.',
+    }
+  }
+
+  if (selection.kind === 'ambiguous') {
+    return {
+      success: false,
+      reason: 'ambiguous',
+      pending: selection.candidates.map((c) => ({ customer: c.customerName ?? c.customerPhone, service: c.serviceName, when: c.slotLabel })),
+      guidance: 'Several booking requests are waiting for approval. List who they are for (customer, service, time) and ask the owner which one they mean — do not guess.',
+    }
+  }
+
+  const chosen = selection.booking
+  const res = await resolveBookingApproval(ctx.db, chosen.bookingId, args.decision, ctx.identityId)
+  if (!res.ok) {
+    // Resolved out from under us (already decided / expired) since the read above.
+    return { success: false, reason: 'not_pending', guidance: 'That request is no longer waiting for a decision (it was already handled or expired). Tell the owner plainly.' }
+  }
+
+  const who = chosen.customerName ?? chosen.customerPhone ?? (ctx.lang === 'he' ? 'הלקוח' : 'the customer')
+  const svc = chosen.serviceName ?? (ctx.lang === 'he' ? 'התור' : 'the appointment')
+  if (res.outcome === 'declined') {
+    return {
+      success: true,
+      outcome: 'declined',
+      fact: i18n.approval_resolved_declined_owner[ctx.lang](who, svc),
+      guidance: 'The request was declined, the slot released, and the customer told (with an invitation to rebook). fact is raw — confirm it to the owner in your own words.',
+    }
+  }
+  return {
+    success: true,
+    outcome: res.outcome, // 'confirmed' | 'pending_payment'
+    fact: i18n.approval_resolved_confirmed_owner[ctx.lang](who, svc),
+    guidance: res.outcome === 'pending_payment'
+      ? 'You approved the request; because this service is paid, the customer now gets a pay-link and the booking confirms on payment. Tell the owner it is approved and awaiting payment, in your own words.'
+      : 'You approved the request: it is now booked, mirrored to the calendar, and the customer has been notified. Confirm to the owner in your own words.',
   }
 }
 

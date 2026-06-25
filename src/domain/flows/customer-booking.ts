@@ -1403,6 +1403,34 @@ async function handleHoldConfirmation(
     return { reply, sessionComplete: false }
   }
 
+  // Owner-approval gate (design 2026-06-25): this service requires the owner's OK before a
+  // customer self-booking lands. The slot is held + pending; the owner decides in Branch 3.
+  // Tell the customer their request is in and pending the business's confirmation — never that
+  // it is booked. No second YES; the session is done from the customer's side until the owner
+  // approves/declines (which fires its own outbound message).
+  if (result.pendingApproval) {
+    // Deferred-cancel reschedule into an approval-gated service: the new slot is only HELD-pending,
+    // not yet secured, so the customer KEEPS their original booking for now (we don't release it).
+    // Persist the supersede link onto the held booking so that, IF the owner approves, the resolver
+    // releases the old slot — and if the owner declines or it expires, the original simply stays.
+    if (ctx.rescheduledFrom) {
+      await db.update(bookings).set({ rescheduledFrom: ctx.rescheduledFrom }).where(eq(bookings.id, result.bookingId)).catch(() => { /* non-fatal */ })
+    }
+    await completeSession(db, session.id)
+    const requestedDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
+    const requestedTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
+    const reply = await genReply({
+      businessTimezone,
+      businessName,
+      language: lang,
+      situation: `The customer's request for ${pendingSlot.serviceName} on ${requestedDate} at ${requestedTime} has been received and is now waiting for the business to confirm. Warmly let them know the request is in and the business will confirm shortly — do NOT say it is booked, reserved, or confirmed yet.`,
+      transcript,
+      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+      customerMemory: extractMemory(ctx),
+    })
+    return { reply, sessionComplete: true }
+  }
+
   // Group class — booking already confirmed, no second YES needed
   if (result.directlyConfirmed) {
     await completeSession(db, session.id)

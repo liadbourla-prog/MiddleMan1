@@ -141,7 +141,7 @@ const availabilityChangeSchema = z.object({
   timezone: z.string().optional(),
 })
 
-const serviceChangeSchema = z.object({
+export const serviceChangeSchema = z.object({
   action: z.enum(['create', 'update', 'deactivate']),
   name: z.string(),
   durationMinutes: z.coerce.number().int().positive().optional(),
@@ -154,6 +154,9 @@ const serviceChangeSchema = z.object({
   schedulingMode: z.enum(['class', 'appointment']).nullable().optional(),
   // Raw owner color word ("blue", "כחול") → mapped to a Google colorId by color-vocab.
   color: z.string().nullable().optional(),
+  // Per-service owner approval of customer self-bookings (design 2026-06-25). true = hold customer
+  // self-bookings for this service for the owner's OK; false = stop asking (today's default).
+  requiresApproval: z.boolean().nullable().optional(),
   // Set by the LLM only when the owner confirms a previously-warned destructive switch.
   confirm: z.boolean().optional(),
 })
@@ -696,6 +699,9 @@ async function applyServiceChange(
   } else if (p.requiresPayment != null) {
     updates.requiresPayment = p.requiresPayment
   }
+  // Per-service owner approval of customer self-bookings (design 2026-06-25). Opt-in, never-default:
+  // only written when the owner explicitly toggles it for this service.
+  if (p.requiresApproval != null) updates.requiresOwnerApproval = p.requiresApproval
 
   // Calendar color: owner says a color word → nearest of Google's 11 colors. An
   // unrecognised word isn't applied — we ask which color instead. A real change
@@ -793,6 +799,10 @@ async function applyServiceChange(
     confirmationMessage = colorChanged ? `${modeMessage} ${i18n.apply_service_color_set[lang](p.name)}` : modeMessage
   } else if (p.color != null && p.color.trim().length > 0) {
     confirmationMessage = i18n.apply_service_color_set[lang](p.name)
+  } else if (p.requiresApproval != null) {
+    confirmationMessage = p.requiresApproval
+      ? i18n.apply_service_approval_on[lang](p.name)
+      : i18n.apply_service_approval_off[lang](p.name)
   } else {
     confirmationMessage = i18n.apply_service_updated[lang](p.name)
   }
@@ -977,8 +987,8 @@ async function applyRecurringClassChange(
 
 // ── Policy change ─────────────────────────────────────────────────────────────
 
-const policyChangeSchema = z.object({
-  subtype: z.enum(['cancellation_cutoff', 'booking_buffer', 'max_days_ahead', 'cancellation_fee', 'booking_authority', 'other']),
+export const policyChangeSchema = z.object({
+  subtype: z.enum(['cancellation_cutoff', 'booking_buffer', 'max_days_ahead', 'cancellation_fee', 'booking_authority', 'approval_window', 'other']),
   valueHours: z.coerce.number().nonnegative().nullable().optional(),
   valueDays: z.coerce.number().int().positive().nullable().optional(),
   valueAmount: z.coerce.number().nonnegative().nullable().optional(),
@@ -1054,6 +1064,19 @@ async function applyPolicyChange(
         .where(eq(businesses.id, businessId))
       await logAudit(db, { businessId, actorId, action: 'policy.booking_authority_updated', entityType: 'business', entityId: businessId, afterState: { bookingAuthority: mode } })
       return { ok: true, confirmationMessage: i18n.apply_policy_booking_authority[lang](mode) }
+    }
+
+    case 'approval_window': {
+      // How long a customer self-booking held for the owner's approval waits before it auto-expires
+      // and the slot is released (design 2026-06-25). Business-level; mirrors booking_buffer/cutoff.
+      // Default 24h when somehow missing. Clamp to a sane minimum of 1h so a hold can't be born expired.
+      const hours = Math.max(1, Math.round(p.valueHours ?? 24))
+      await db
+        .update(businesses)
+        .set({ bookingApprovalWindowHours: hours })
+        .where(eq(businesses.id, businessId))
+      await logAudit(db, { businessId, actorId, action: 'policy.approval_window_updated', entityType: 'business', entityId: businessId, afterState: { bookingApprovalWindowHours: hours } })
+      return { ok: true, confirmationMessage: i18n.apply_policy_approval_window[lang](hours) }
     }
 
     case 'other':

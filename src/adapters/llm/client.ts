@@ -201,13 +201,14 @@ availability_change:
   { "action": "set_hours"|"block"|"unblock", "dayOfWeek": 0-6|null, "specificDate": "YYYY-MM-DD"|null, "openTime": "HH:MM"|null, "closeTime": "HH:MM"|null, "reason": string|null }
 
 service_change:
-  { "action": "create"|"update"|"deactivate", "name": string, "durationMinutes": number|null, "bufferMinutes": number|null, "paymentAmount": number|null, "requiresPayment": boolean|null, "category": string|null, "maxParticipants": number|null, "schedulingMode": "class"|"appointment"|null, "color": string|null, "confirm": boolean|null }
+  { "action": "create"|"update"|"deactivate", "name": string, "durationMinutes": number|null, "bufferMinutes": number|null, "paymentAmount": number|null, "requiresPayment": boolean|null, "category": string|null, "maxParticipants": number|null, "schedulingMode": "class"|"appointment"|null, "color": string|null, "requiresApproval": boolean|null, "confirm": boolean|null }
   - category: logical grouping (e.g. "Yoga", "Pilates", "Haircut"). Infer from name if not stated.
   - maxParticipants: 1 for private/1-on-1 sessions (default), >1 for group classes (yoga class, pilates class, etc.)
   - paymentAmount: price in the business currency, or null if not mentioned
   - requiresPayment: true if a price is specified
   - schedulingMode: set "class" when the owner says a service is a group/class or schedule-driven session (e.g. "Pilates is a group class for 8", "make Yoga a class", "פילאטיס זה שיעור קבוצתי"); also fill maxParticipants when a group size is given. Set "appointment" when the owner makes a service private/1-on-1 (e.g. "switch physio to 1-on-1", "make X private / by appointment", "תהפוך את שיקום לפגישה אחת על אחד"). Leave null when the owner isn't changing the booking model. Use action "update" for an existing service.
   - color: the owner's raw color word for this service's calendar events (e.g. "make Yoga blue" → "blue"; "color X red" → "red"; "תצבע את היוגה בכחול" → "כחול"). Pass the word as-is in the owner's language; leave null if no color is mentioned. Use action "update".
+  - requiresApproval: whether the owner must personally approve each CUSTOMER self-booking for this service before it is confirmed. Set true when the owner wants to vet customer bookings for a service (e.g. "require my approval for physio bookings", "ask me before you book anyone for physio", "אני רוצה לאשר כל תור לפיזיותרפיה"); set false when they turn it off (e.g. "stop asking me to approve yoga", "you don't need my approval for yoga anymore", "תפסיק לבקש אישור ליוגה"). Leave null when approval isn't mentioned. This is about CUSTOMERS booking THEMSELVES for a specific service — NOT the PA booking on the owner's behalf (that is policy_change booking_authority). Use action "update".
   - confirm: set true ONLY when, earlier in this conversation, you warned the owner that switching a service to 1-on-1 would stop its recurring classes, and the owner has now answered yes/confirmed. Otherwise null.
 
 permission_change:
@@ -220,8 +221,8 @@ booking_cancellation:
 
 policy_change:
   {
-    "subtype": "cancellation_cutoff" | "booking_buffer" | "max_days_ahead" | "cancellation_fee" | "booking_authority" | "other",
-    "valueHours": number | null,    // for cancellation_cutoff (hours before appt) and booking_buffer (hours in advance)
+    "subtype": "cancellation_cutoff" | "booking_buffer" | "max_days_ahead" | "cancellation_fee" | "booking_authority" | "approval_window" | "other",
+    "valueHours": number | null,    // for cancellation_cutoff (hours before appt), booking_buffer (hours in advance), and approval_window (hours to wait for owner approval)
     "valueDays": number | null,     // for max_days_ahead
     "valueAmount": number | null,   // for cancellation_fee (monetary amount)
     "valueMode": "auto" | "owner_approval" | null,  // for booking_authority only
@@ -234,6 +235,7 @@ policy_change:
   - max_days_ahead: manager wants to cap how far into the future bookings can be made (e.g. "only 30 days ahead")
   - cancellation_fee: manager wants to charge a fee for late cancellations (e.g. "charge 50 for cancellations")
   - booking_authority: manager controls whether the PA may book on their behalf without asking. Set valueMode="owner_approval" when they want to approve bookings first (e.g. "don't book anything without asking me", "always check with me before you put something on the calendar", "אל תקבע כלום בלי לשאול אותי"); set valueMode="auto" when they want the PA to just book open slots itself (e.g. "just book open slots yourself", "you don't need to ask me, just schedule it", "תקבע לבד מה שפנוי"). This is about the PA/owner booking on the owner's behalf — NOT about customers booking themselves.
+  - approval_window: how long a customer self-booking that is HELD for the owner's approval waits before it auto-expires (only relevant when the owner approves customer bookings for some service). Set valueHours from the owner's wording (e.g. "give me 48 hours to approve bookings", "expire approval requests after 12 hours", "תן לי יומיים לאשר"). This sets the waiting window only — it does NOT turn approval on/off for a service (that is service_change requiresApproval).
   - other: anything else — policy cannot be enforced automatically; set ambiguous=true and clarificationNeeded explaining what IS enforceable
 
   For subtype "other", ALWAYS set ambiguous=true and clarificationNeeded to a message (in the manager's language) explaining:

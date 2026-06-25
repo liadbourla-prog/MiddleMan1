@@ -34,6 +34,7 @@ import {
   executeApproveReshuffle,
   executeRejectReshuffle,
   executeResolveProactiveProposal,
+  executeResolveBookingApproval,
   executeAmendReshuffle,
   executeConfigureReshuffle,
   executeConfigureNotifications,
@@ -505,6 +506,20 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'resolveBookingApproval',
+    description: "Approve or decline a CUSTOMER's self-booking that is waiting for the owner's OK (only for services where the owner turned on \"require my approval\"). Call this when the owner answers a pending approval request — 'yes, approve Dana's yoga' / 'go ahead' → decision 'approve'; 'no, decline that' / 'turn it down' → decision 'decline'. On approve the booking is confirmed (or, for a paid service, the customer gets a pay-link); on decline it's cancelled and the customer is invited to rebook. Pass customerHint and/or serviceHint (the customer name/phone and service the owner referred to) so the right request is picked when several are waiting — if it's still ambiguous the tool will ask which one. This is for customers booking THEMSELVES; it is NOT the PA-books-on-owner's-behalf approval (that is the createCalendarEvent ownerApproved flow).",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        decision: { type: Type.STRING, enum: ['approve', 'decline'], description: "Whether the owner approved (book it) or declined (turn it down) the customer's request" },
+        customerHint: { type: Type.STRING, description: "The customer's name or phone if the owner named one, to pick the right pending request" },
+        serviceHint: { type: Type.STRING, description: 'The service the owner referred to, to pick the right pending request' },
+        bookingId: { type: Type.STRING, description: 'The exact booking id, if known from a prior lookup (wins over the hints)' },
+      },
+      required: ['decision'],
+    },
+  },
+  {
     name: 'configureReshuffle',
     description: 'Change the proactive reschedule (swap) engine settings for this business. Use when the owner adjusts how it behaves — turn it on/off, batch size for outreach, whether to require approval, how many people to contact, the protect window, who to contact.',
     parameters: {
@@ -791,6 +806,8 @@ async function dispatchTool(
       return executeRejectReshuffle(args as unknown as Parameters<typeof executeRejectReshuffle>[0], ctx)
     case 'resolveProactiveProposal':
       return executeResolveProactiveProposal(args as unknown as Parameters<typeof executeResolveProactiveProposal>[0], ctx)
+    case 'resolveBookingApproval':
+      return executeResolveBookingApproval(args as unknown as Parameters<typeof executeResolveBookingApproval>[0], ctx)
     case 'amendReshuffle':
       return executeAmendReshuffle(args as unknown as Parameters<typeof executeAmendReshuffle>[0], ctx)
     case 'configureReshuffle':
@@ -841,6 +858,10 @@ function actionsFromToolResult(name: string, result: unknown): ActionClaim[] {
     case 'scheduleGroupSession':
     case 'scheduleRecurringClasses':
       return ['booking_made']
+    case 'resolveBookingApproval':
+      // Approving a customer request books it (immediate gate). A paid service goes to
+      // pending_payment — not booked yet — and a decline cancels it.
+      return r['outcome'] === 'confirmed' ? ['booking_made'] : r['outcome'] === 'declined' ? ['cancelled'] : []
     case 'deleteCalendarEvent':
     case 'manageBusinessSettings':
       return ['cancelled']

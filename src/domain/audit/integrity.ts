@@ -292,6 +292,11 @@ export function runIntegrityChecks(snap: IntegritySnapshot): IntegrityFinding[] 
   // A reschedule that left BOTH the new and the superseded booking active.
   const activeIds = new Set(active.map((b) => b.id))
   for (const b of active) {
+    // A still-tentative hold (incl. a customer self-booking held for owner approval, design
+    // 2026-06-25) hasn't superseded anything yet — its rescheduledFrom only takes effect if/when
+    // it commits, at which point the resolver releases the original. So it legitimately coexists
+    // with the booking it will replace; don't flag that window as residue.
+    if (b.state === 'held') continue
     if (b.rescheduledFrom && activeIds.has(b.rescheduledFrom)) {
       findings.push({
         kind: 'reschedule_residue',

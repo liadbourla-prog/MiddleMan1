@@ -43,6 +43,11 @@ export const businesses = pgTable('businesses', {
   //   'owner_approval' → a PA/owner-initiated booking is held until the owner's explicit chat "yes".
   // Default 'auto' preserves today's behavior. Set/changed in the Branch 3 owner chat.
   bookingAuthority: text('booking_authority', { enum: ['auto', 'owner_approval'] }).notNull().default('auto'),
+  // Per-service owner approval of CUSTOMER self-bookings (design 2026-06-25). When a service has
+  // requires_owner_approval on, a customer's Branch-4 self-booking is held until the owner decides;
+  // this is how long (hours) the request waits before it auto-expires and the slot is released.
+  // Owner-configurable in Branch 3 via policy_change 'approval_window'. Default 24h.
+  bookingApprovalWindowHours: integer('booking_approval_window_hours').notNull().default(24),
   // Availability policy
   available247: boolean('available_247').notNull().default(true),
   // Calendar backend
@@ -191,6 +196,11 @@ export const serviceTypes = pgTable('service_types', {
   // (calendar_blocks type='class'); a time with no class is refused and the real class
   // times are offered. Set by scheduleRecurringClasses. Default keeps existing services as-is.
   schedulingMode: text('scheduling_mode', { enum: ['appointment', 'class'] }).notNull().default('appointment'),
+  // Per-service owner approval of customer self-bookings (design 2026-06-25). OPT-IN, NEVER a
+  // default: when true, a Branch-4 customer self-booking for this service is held until the owner
+  // confirms in Branch 3. false = today's behavior (never gated). Set conversationally via
+  // service_change requiresApproval. PA/owner-initiated bookings are never gated by this (D1).
+  requiresOwnerApproval: boolean('requires_owner_approval').notNull().default(false),
   requiresPayment: boolean('requires_payment').notNull().default(false),
   paymentAmount: numeric('payment_amount', { precision: 10, scale: 2 }),
   // color_id maps to Google Calendar colorId (1-11) or null for default
@@ -349,6 +359,11 @@ export const bookings = pgTable(
       enum: ['inquiry', 'requested', 'held', 'pending_payment', 'confirmed', 'cancelled', 'expired', 'failed', 'attended', 'no_show'],
     }).notNull(),
     holdExpiresAt: timestamp('hold_expires_at', { withTimezone: true }),
+    // Owner-approval marker for customer self-bookings (design 2026-06-25). NULL = a normal booking
+    // (today's behavior). Non-null only ever set when the booking's service had requires_owner_approval
+    // on at request time: 'pending' while held awaiting the owner's Branch-3 decision, then 'approved'
+    // (→ confirmed/pending_payment) or 'declined' (→ cancelled). The held state reserves the slot.
+    approvalStatus: text('approval_status', { enum: ['pending', 'approved', 'declined'] }),
     calendarEventId: text('calendar_event_id'),
     // Last Google etag written by the outbound mirror — used by inbound sync for
     // loop prevention (incoming etag == last-written ⇒ our own echo, ignore).
