@@ -38,7 +38,7 @@ import { findProviderByName } from '../provider/lookup.js'
 import { sendMessage, sendTemplateMessage, canSendFreeForm } from '../../adapters/whatsapp/sender.js'
 import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
-import { resolveTargetForOwnerAction, setCustomerName, type CandidateView } from '../identity/customer-resolver.js'
+import { resolveTargetForOwnerAction, setCustomerName, deriveLastName, type CandidateView } from '../identity/customer-resolver.js'
 import { logAudit } from '../audit/logger.js'
 import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
 import { cancelClassSessionBookings, summarizeSessionCancellation } from '../scheduling/session-cancellation.js'
@@ -1052,6 +1052,7 @@ export async function executeLookupCustomer(
       .select({
         id: identities.id,
         displayName: identities.displayName,
+        lastName: identities.lastName,
         phoneNumber: identities.phoneNumber,
         preferredLanguage: identities.preferredLanguage,
       })
@@ -1241,6 +1242,40 @@ export async function executeSaveContactNote(
   }
 
   return { error: 'Unknown targetType' }
+}
+
+// ── setCustomerName ───────────────────────────────────────────────────────────
+
+// Owner sets/corrects a customer's name (e.g. after disambiguating two same-name customers, or
+// fixing a typo). Authorization-gated like other customer-management actions. Derives the last
+// name from displayName when the owner gives only a full name and no explicit lastName.
+interface SetCustomerNameArgs {
+  identityId?: string
+  displayName?: string
+  lastName?: string
+}
+
+export async function executeSetCustomerName(args: SetCustomerNameArgs, ctx: ToolContext): Promise<object> {
+  const auth = authorize(
+    { role: ctx.role ?? 'manager', ...(ctx.delegatedPermissions ? { delegatedPermissions: ctx.delegatedPermissions } : {}) },
+    'customer.manage',
+  )
+  if (!auth.allowed) {
+    return { ok: false, reason: 'not_authorized', guidance: 'This person is not allowed to edit customer details. Tell them only the owner (or granted staff) can do that.' }
+  }
+  if (!args.identityId) {
+    return { ok: false, reason: 'no_target', guidance: 'Look up the customer first (lookupCustomer) to get their id, then set the name.' }
+  }
+  const displayName = args.displayName?.trim()
+  const lastName = args.lastName?.trim() || deriveLastName(displayName ?? null) || undefined
+  if (!displayName && !lastName) {
+    return { ok: false, reason: 'nothing_to_set', guidance: 'Ask the owner what name to save (a first/display name and optionally a last name).' }
+  }
+  await setCustomerName(ctx.db, ctx.businessId, args.identityId, {
+    ...(displayName !== undefined ? { displayName } : {}),
+    ...(lastName !== undefined ? { lastName } : {}),
+  })
+  return { ok: true, guidance: 'Tell the owner the name is saved, in your own words.' }
 }
 
 // ── pauseConversation ─────────────────────────────────────────────────────────

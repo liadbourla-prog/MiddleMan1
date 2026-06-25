@@ -47,6 +47,7 @@ import {
   executeRefundPayment,
   executeMessageCustomer,
   executeBroadcastAnnouncement,
+  executeSetCustomerName,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
 import { executeCoordinateMeeting, executeResolveMeetingCoordination } from '../../domain/manager/coordination-tools.js'
@@ -328,6 +329,19 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         note: { type: Type.STRING },
       },
       required: ['targetType', 'identifier', 'note'],
+    },
+  },
+  {
+    name: 'setCustomerName',
+    description: "Save or correct a customer's name (first/display name and/or last name). Use after the owner tells you a customer's name — e.g. when they clarify WHICH of two same-name customers they meant, or fix a misspelling. Look the customer up first (lookupCustomer) to get their identityId. Pass the full name in displayName; pass lastName when the owner states it explicitly.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        identityId: { type: Type.STRING, description: "The customer's identityId, from lookupCustomer." },
+        displayName: { type: Type.STRING, description: "The customer's name as it should be displayed (e.g. \"Guy Cohen\")." },
+        lastName: { type: Type.STRING, description: "The customer's last name, when stated explicitly. If omitted, it is derived from displayName." },
+      },
+      required: ['identityId'],
     },
   },
   {
@@ -742,6 +756,8 @@ async function dispatchTool(
       return executeLookupCustomer(args as unknown as Parameters<typeof executeLookupCustomer>[0], ctx)
     case 'saveContactNote':
       return executeSaveContactNote(args as unknown as Parameters<typeof executeSaveContactNote>[0], ctx)
+    case 'setCustomerName':
+      return executeSetCustomerName(args as unknown as Parameters<typeof executeSetCustomerName>[0], ctx)
     case 'connectGoogleCalendar':
       return executeConnectGoogleCalendar(args as unknown as Parameters<typeof executeConnectGoogleCalendar>[0], ctx)
     case 'connectPayments':

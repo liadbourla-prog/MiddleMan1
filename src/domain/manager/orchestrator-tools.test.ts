@@ -8,6 +8,7 @@ import {
   executeRequestPayment,
   executeRefundPayment,
   executeMessageCustomer,
+  executeSetCustomerName,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
@@ -405,5 +406,31 @@ describe('requestPayment — disambiguation', () => {
     expect(res.ok).toBe(false)
     expect(res.reason).toBe('ambiguous_customer')
     expect(res.candidates).toHaveLength(2)
+  })
+})
+
+describe('setCustomerName', () => {
+  it('rejects a non-manager/non-granted caller', async () => {
+    const res = await executeSetCustomerName(
+      { identityId: 'c1', displayName: 'Guy Cohen', lastName: 'Cohen' },
+      payCtx('customer'),
+    ) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('writes the name for the owner and derives lastName when only displayName is given', async () => {
+    const captured: { patch?: Record<string, unknown> } = {}
+    const chain: Record<string, unknown> = {}
+    chain['set'] = (p: Record<string, unknown>) => { captured.patch = p; return chain }
+    chain['where'] = () => Promise.resolve(undefined)
+    const ctx: ToolContext = {
+      db: { update: () => chain } as unknown as ToolContext['db'],
+      calendar: {} as ToolContext['calendar'],
+      businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he', role: 'manager',
+    }
+    const res = await executeSetCustomerName({ identityId: 'c1', displayName: 'Guy Cohen' }, ctx) as { ok: boolean }
+    expect(res.ok).toBe(true)
+    expect(captured.patch).toEqual({ displayName: 'Guy Cohen', lastName: 'Cohen' })
   })
 })
