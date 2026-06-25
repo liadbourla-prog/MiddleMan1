@@ -24,6 +24,7 @@ import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
 import { listDayOptions } from '../availability/day-options.js'
+import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
 import { validateSlotTiming } from '../booking/engine.js'
@@ -288,6 +289,27 @@ async function buildDayOptionsText(
   return parts.length > 0 ? parts.join(' ') : null
 }
 
+/**
+ * Schedule-driven gate decision: is the requested slot off-schedule for a class service?
+ *
+ * A 'class' service (e.g. yoga, pilates) is bookable ONLY into a real materialized class
+ * instance — never an arbitrary in-hours time. Returns true when the service is class-mode
+ * AND no class block exists at `slotStart`, so the caller must re-offer real class times
+ * instead of confirming an invented slot. 'appointment'-mode services are never gated here
+ * (returns false without touching the DB). Mirrors the engine's no_class_at_time backstop,
+ * surfaced ahead of the confirmation step so the PA never asserts a class that isn't scheduled.
+ */
+export async function classInstanceMissing(
+  db: Db,
+  businessId: string,
+  svc: { id: string; schedulingMode: 'appointment' | 'class' },
+  slotStart: Date,
+): Promise<boolean> {
+  if (svc.schedulingMode !== 'class') return false
+  const block = await findClassBlockProviderForSlot(db, businessId, svc.id, slotStart)
+  return !block.found
+}
+
 // Safe clarification used when the LLM keeps asserting a booking that was never
 // made (cardinal "said done, didn't do" backstop — see reply-guard.ts).
 // How many slot/date clarification fumbles before the PA nudges toward a phone
@@ -416,6 +438,7 @@ export async function handleBookingFlow(
       durationMinutes: serviceTypes.durationMinutes,
       maxParticipants: serviceTypes.maxParticipants,
       category: serviceTypes.category,
+      schedulingMode: serviceTypes.schedulingMode,
     })
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
@@ -806,7 +829,7 @@ function slotDraftFromPending(
 // which-booking selection detour and then re-ask for it.
 function buildDraftFromIntent(
   intent: CustomerIntentOutput,
-  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null }>,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null; schedulingMode: 'appointment' | 'class' }>,
   tz: string,
   now: Date = new Date(),
 ): NonNullable<BookingFlowContext['slotDraft']> | null {
@@ -855,6 +878,7 @@ async function rebuildOnSlotPivot(
       durationMinutes: serviceTypes.durationMinutes,
       maxParticipants: serviceTypes.maxParticipants,
       category: serviceTypes.category,
+      schedulingMode: serviceTypes.schedulingMode,
     })
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
@@ -908,7 +932,7 @@ async function handleBookingIntent(
   session: ActiveSession,
   ctx: BookingFlowContext,
   intent: CustomerIntentOutput,
-  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null }>,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null; schedulingMode: 'appointment' | 'class' }>,
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
@@ -1084,6 +1108,31 @@ async function handleBookingIntent(
     return { reply, sessionComplete: false }
   }
 
+  // ── Schedule-driven class gate: a 'class' service is bookable ONLY into a real
+  // scheduled class instance. Verify a class block exists at the resolved slot BEFORE
+  // we ever ask the customer to confirm — otherwise the PA fabricates a class at an
+  // invented time ("yes, there's a yoga class at 17:00" when yoga only runs 10/12/16),
+  // and the customer is led to confirm a slot that does not exist on the calendar. This
+  // mirrors the engine's no_class_at_time backstop (Bug E) but moves it ahead of the
+  // confirmation step, so the PA never asserts a class that isn't on the schedule.
+  if (business && await classInstanceMissing(db, business.id, svc, slotStart)) {
+    const { time: _dropTime, ...draftKeep } = draft
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: 0 }, 'waiting_clarification')
+    const classTimesText = await buildDayOptionsText(db, business, localParts(slotStart, businessTimezone).dateStr, businessTimezone, svc.id)
+    const situation = [
+      `${svc.name} doesn't run at the time the customer asked — it only runs at set class times, so that exact time can't be booked.`,
+      classTimesText
+        ? `Offer these actual scheduled times and ask which they'd like: ${classTimesText}.`
+        : `There are no more ${svc.name} classes on that day. Don't invent a time — offer to check another day.`,
+    ].filter(Boolean).join(' ')
+    const reply = await genReply({
+      businessTimezone,
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation,
+    })
+    return { reply, sessionComplete: false }
+  }
+
   // ── Passed every gate: confirmation built from the RESOLVED slot (never the LLM's date) ─
   const displayDate = formatSlotDate(slotStart, businessTimezone)
   const displayTime = formatSlotTime(slotStart, businessTimezone)
@@ -1142,7 +1191,7 @@ async function handleReschedulingIntent(
   session: ActiveSession,
   ctx: BookingFlowContext,
   intent: CustomerIntentOutput,
-  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null }>,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null; schedulingMode: 'appointment' | 'class' }>,
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
@@ -1492,6 +1541,7 @@ async function handleClarification(
       durationMinutes: serviceTypes.durationMinutes,
       maxParticipants: serviceTypes.maxParticipants,
       category: serviceTypes.category,
+      schedulingMode: serviceTypes.schedulingMode,
     })
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
@@ -1769,6 +1819,7 @@ async function handleCancellationConfirmation(
           durationMinutes: serviceTypes.durationMinutes,
           maxParticipants: serviceTypes.maxParticipants,
           category: serviceTypes.category,
+          schedulingMode: serviceTypes.schedulingMode,
         })
         .from(serviceTypes)
         .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
@@ -2020,6 +2071,7 @@ async function handleRetentionResponse(
       durationMinutes: serviceTypes.durationMinutes,
       maxParticipants: serviceTypes.maxParticipants,
       category: serviceTypes.category,
+      schedulingMode: serviceTypes.schedulingMode,
     })
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
