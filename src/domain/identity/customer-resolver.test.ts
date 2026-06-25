@@ -40,3 +40,92 @@ describe('deriveLastName', () => {
     expect(deriveLastName(undefined)).toBeNull()
   })
 })
+
+import { resolveTargetForOwnerAction } from './customer-resolver.js'
+
+const TZ = 'Asia/Jerusalem'
+const row = (id: string, displayName: string, lastName: string | null, phone: string) =>
+  ({ id, displayName, lastName, phoneNumber: phone })
+
+describe('resolveTargetForOwnerAction', () => {
+  it('phone given + found → resolved (no ambiguity ever for a phone)', async () => {
+    const db = fakeDb([
+      [row('c1', 'Guy', null, '+972500000001')],   // identity lookup by phone
+      [],                                            // latestBookingFor → no bookings
+    ])
+    const r = await resolveTargetForOwnerAction(db, 'biz1', {
+      role: 'customer', phoneNumber: '+972500000001', timezone: TZ, lang: 'en',
+    })
+    expect(r.status).toBe('resolved')
+  })
+
+  it('phone given + not on file → phone_unknown', async () => {
+    const db = fakeDb([[]])
+    const r = await resolveTargetForOwnerAction(db, 'biz1', {
+      role: 'customer', phoneNumber: '+972500000009', timezone: TZ, lang: 'en',
+    })
+    expect(r).toEqual({ status: 'phone_unknown', phoneNumber: '+972500000009' })
+  })
+
+  it('name with one match → resolved', async () => {
+    const db = fakeDb([
+      [row('c1', 'Guy Cohen', 'Cohen', '+972500000001')],
+      [{ slotStart: new Date('2026-03-03T12:00:00Z'), service: 'Haircut' }],
+    ])
+    const r = await resolveTargetForOwnerAction(db, 'biz1', {
+      role: 'customer', name: 'Guy', timezone: TZ, lang: 'en',
+    })
+    expect(r.status).toBe('resolved')
+    if (r.status === 'resolved') {
+      expect(r.target.lastName).toBe('Cohen')
+      expect(r.target.lastBooking?.service).toBe('Haircut')
+    }
+  })
+
+  it('name with two matches → ambiguous with full candidate views', async () => {
+    const db = fakeDb([
+      [row('c1', 'Guy Cohen', 'Cohen', '+972500000001'), row('c2', 'Guy Levi', 'Levi', '+972500000002')],
+      [{ slotStart: new Date('2026-03-03T12:00:00Z'), service: 'Haircut' }], // booking for c1
+      [],                                                                     // booking for c2
+    ])
+    const r = await resolveTargetForOwnerAction(db, 'biz1', {
+      role: 'customer', name: 'Guy', timezone: TZ, lang: 'en',
+    })
+    expect(r.status).toBe('ambiguous')
+    if (r.status === 'ambiguous') {
+      expect(r.candidates).toHaveLength(2)
+      expect(r.candidates[0]).toMatchObject({ lastName: 'Cohen', phoneNumber: '+972500000001' })
+      expect(r.candidates[1]).toMatchObject({ lastName: 'Levi', lastBooking: null })
+    }
+  })
+
+  it('name with zero matches → not_found', async () => {
+    const db = fakeDb([[]])
+    const r = await resolveTargetForOwnerAction(db, 'biz1', {
+      role: 'customer', name: 'Nobody', timezone: TZ, lang: 'en',
+    })
+    expect(r).toEqual({ status: 'not_found', query: 'Nobody' })
+  })
+
+  it('contact role never queries bookings (lastBooking always null)', async () => {
+    const db = fakeDb([
+      [row('k1', 'Guy Supplier', 'Supplier', '+972500000003')],
+    ])
+    const r = await resolveTargetForOwnerAction(db, 'biz1', {
+      role: 'contact', name: 'Guy', timezone: TZ, lang: 'en',
+    })
+    expect(r.status).toBe('resolved')
+    if (r.status === 'resolved') expect(r.target.lastBooking).toBeNull()
+  })
+
+  it('lastName narrows two matches down to one (re-entry after owner clarifies)', async () => {
+    const db = fakeDb([
+      [row('c1', 'Guy Cohen', 'Cohen', '+972500000001')], // DB already filtered by lastName
+      [],
+    ])
+    const r = await resolveTargetForOwnerAction(db, 'biz1', {
+      role: 'customer', name: 'Guy', lastName: 'Cohen', timezone: TZ, lang: 'en',
+    })
+    expect(r.status).toBe('resolved')
+  })
+})

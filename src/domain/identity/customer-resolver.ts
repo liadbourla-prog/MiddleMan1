@@ -35,6 +35,73 @@ export function deriveLastName(name: string | null | undefined): string | null {
   return parts.length >= 2 ? parts[parts.length - 1]! : null
 }
 
+/**
+ * The single deterministic gate every owner-initiated action that targets a customer/contact
+ * MUST pass through before acting. Classifies a name/phone into resolved | ambiguous |
+ * not_found | phone_unknown. Performs NO writes, NO sends, NO authorization (callers are
+ * already gated). On a name collision it returns every candidate with the data the owner needs
+ * to verify: last name, full phone number, and (for customers) their most recent booking.
+ */
+export async function resolveTargetForOwnerAction(
+  db: Db,
+  businessId: string,
+  input: ResolveInput,
+): Promise<CustomerResolution> {
+  const phone = input.phoneNumber?.replace(/[\s-]/g, '')
+
+  // Phone path — unambiguous by construction (phone is unique per business).
+  if (phone && isValidE164(phone)) {
+    const [hit] = await db
+      .select({ id: identities.id, displayName: identities.displayName, lastName: identities.lastName, phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), eq(identities.phoneNumber, phone)))
+      .limit(1)
+    if (!hit) return { status: 'phone_unknown', phoneNumber: phone }
+    return { status: 'resolved', target: await toCandidate(db, businessId, hit, input) }
+  }
+
+  // Name path.
+  if (input.name && input.name.trim()) {
+    const name = input.name.trim()
+    const conds = [
+      eq(identities.businessId, businessId),
+      eq(identities.role, input.role),
+      ilike(identities.displayName, `%${name}%`),
+    ]
+    if (input.lastName && input.lastName.trim()) {
+      conds.push(ilike(identities.lastName, `%${input.lastName.trim()}%`))
+    }
+    const rows = await db
+      .select({ id: identities.id, displayName: identities.displayName, lastName: identities.lastName, phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(...conds))
+      .limit(5)
+
+    if (rows.length === 0) return { status: 'not_found', query: name }
+    if (rows.length === 1) {
+      return { status: 'resolved', target: await toCandidate(db, businessId, rows[0]!, input) }
+    }
+    const candidates: CandidateView[] = []
+    for (const row of rows) candidates.push(await toCandidate(db, businessId, row, input))
+    return { status: 'ambiguous', query: name, candidates }
+  }
+
+  // Neither phone nor name — caller must ask who to target.
+  return { status: 'not_found', query: input.name ?? '' }
+}
+
+async function toCandidate(
+  db: Db,
+  businessId: string,
+  row: { id: string; displayName: string | null; lastName: string | null; phoneNumber: string },
+  input: ResolveInput,
+): Promise<CandidateView> {
+  const lastBooking = input.role === 'customer'
+    ? await latestBookingFor(db, businessId, row.id, input.timezone, input.lang)
+    : null
+  return { id: row.id, displayName: row.displayName, lastName: row.lastName, phoneNumber: row.phoneNumber, lastBooking }
+}
+
 /** Most recent booking (date + service name) for an identity, or null if none. */
 export async function latestBookingFor(
   db: Db,
