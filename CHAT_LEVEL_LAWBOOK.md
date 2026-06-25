@@ -16,6 +16,8 @@ These constraints are imposed by the WhatsApp Cloud API and the WhatsApp client 
 - `\`monospace\`` — single backtick on each side
 - Line breaks: actual newline `\n` characters only — never `<br>`, never `\\n`
 
+> **Bold restraint (strictly enforced).** In conversational replies (Branches 3 & 4), `*bold*` is for the single fact the eye should catch in a message — at most one bolded item, and usually none. Do **not** bold every service name, time, date, price, or number: bolding routine words reads as cluttered and bot-like. Default to plain text. Never bold whole sentences. (This supersedes any older guidance that suggested bolding service names/times by default.) The one exception is a deliberately *structured reference list* — e.g. the operator admin business list (§5.1) — where bolding each entry's name aids scanning.
+
 ### 1.2 Unsupported (Never Use)
 - HTML tags: `<b>`, `<em>`, `<p>`, `<ul>`, `<li>`, or any other HTML
 - Markdown headers (`#`, `##`, `###`)
