@@ -96,6 +96,45 @@ describe('refundTransaction — authorization gate (no state touched on refusal)
   })
 })
 
+describe('createCalendarEvent — owner-approval gate (no write until owner confirms)', () => {
+  // A valid, resolvable future event: tomorrow 11:00–12:00. Date resolution succeeds, so the
+  // ONLY thing standing between this call and a calendar write is the owner-approval gate.
+  const validEvent = {
+    title: 'Meeting with Yoni',
+    date: { relativeDay: 'tomorrow' as const },
+    startTime: { hour: 11, minute: 0 },
+    endTime: { hour: 12, minute: 0 },
+  }
+
+  function approvalCtx(bookingAuthority: 'auto' | 'owner_approval'): ToolContext {
+    return { ...noWriteCtx(), bookingAuthority }
+  }
+
+  it('owner_approval mode, first call (no ownerApproved) → awaiting_owner_approval, NO state touched', async () => {
+    const res = await executeCreateCalendarEvent(validEvent, approvalCtx('owner_approval')) as {
+      success: boolean; status?: string; proposed?: { title: string }
+    }
+    expect(res.success).toBe(false)
+    expect(res.status).toBe('awaiting_owner_approval')
+    expect(res.proposed?.title).toBe('Meeting with Yoni')
+    // noWriteCtx throws on ANY db/calendar access → reaching this line proves no write happened.
+  })
+
+  it('owner_approval mode but ownerApproved:true → passes the gate (then hits db, proving no early return)', async () => {
+    // With approval granted, the gate is cleared and execution proceeds to the conflict query,
+    // which trips the no-write trap. The thrown error proves the gate did NOT short-circuit.
+    await expect(
+      executeCreateCalendarEvent({ ...validEvent, ownerApproved: true }, approvalCtx('owner_approval')),
+    ).rejects.toThrow(/must NOT be touched|DB\/calendar/)
+  })
+
+  it('auto mode → no approval needed, proceeds straight to the write path (trips the trap)', async () => {
+    await expect(
+      executeCreateCalendarEvent(validEvent, approvalCtx('auto')),
+    ).rejects.toThrow(/must NOT be touched|DB\/calendar/)
+  })
+})
+
 describe('manager calendar writes — deterministic date guard (no write on bad date)', () => {
   it('createCalendarEvent: explicit past year → needsClarification, no DB write', async () => {
     const res = await executeCreateCalendarEvent(

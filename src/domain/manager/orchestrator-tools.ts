@@ -89,6 +89,10 @@ export interface ToolContext {
   // google mode a freshly-created event is saved internally and syncing OUT to Google
   // asynchronously, so the reply must not claim it is already in Google Calendar.
   calendarMode?: 'google' | 'internal'
+  // Per-business booking authority (design 2026-06-25). 'owner_approval' holds a PA/owner-
+  // initiated calendar write until the owner explicitly confirms; 'auto' (default) commits
+  // straight away. Optional so existing contexts default to 'auto'.
+  bookingAuthority?: 'auto' | 'owner_approval'
   // Caller role + granted actions — used to gate config changes for delegated
   // staff at the apply seam. Optional so existing test contexts default to manager.
   role?: IdentityRole
@@ -228,6 +232,9 @@ interface CreateCalendarEventArgs {
   startTime: TimePieces
   endTime: TimePieces
   notes?: string
+  // Set true ONLY after the owner has explicitly confirmed, in a business whose
+  // bookingAuthority is 'owner_approval'. Ignored in 'auto' mode.
+  ownerApproved?: boolean
 }
 
 export async function executeCreateCalendarEvent(
@@ -244,6 +251,21 @@ export async function executeCreateCalendarEvent(
   )
   if (!resolved.ok) return clarifyDate(resolved.reason)
   const { start, end } = resolved
+
+  // Owner-approval gate (design 2026-06-25, §4.2). In a business whose bookingAuthority is
+  // 'owner_approval', a PA/owner-initiated calendar write is held until the owner explicitly
+  // confirms. First call (no ownerApproved) returns a proposal and writes NOTHING — the gap
+  // forces a turn where the owner says yes; only then is the tool re-called with ownerApproved.
+  // 'auto' (the default, and unset) commits straight away as before. Customer self-bookings
+  // never reach this tool, so they are unaffected (decision D1).
+  if (ctx.bookingAuthority === 'owner_approval' && args.ownerApproved !== true) {
+    return {
+      success: false,
+      status: 'awaiting_owner_approval',
+      proposed: { title: args.title, start: start.toISOString(), end: end.toISOString() },
+      guidance: 'This business requires the owner\'s explicit OK before you write anything to the calendar. Tell the owner what you\'re about to book and ask whether to go ahead. Do NOT say it is booked. Only call createCalendarEvent again — this time with ownerApproved:true — after the owner clearly approves.',
+    }
+  }
 
   // Guard: refuse to create if it overlaps an active customer booking. Precise
   // overlap predicate: existing.start < new.end AND existing.end > new.start.

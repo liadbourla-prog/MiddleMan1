@@ -37,6 +37,12 @@ export const businesses = pgTable('businesses', {
   // Booking policy
   confirmationGate: text('confirmation_gate', { enum: ['immediate', 'post_payment'] }).notNull().default('immediate'),
   paymentMethod: text('payment_method'),
+  // Booking authority — who may commit a PA/owner-initiated booking to the calendar (the
+  // customer self-booking path is NEVER gated by this; design decision D1, 2026-06-25).
+  //   'auto'           → the PA books any open slot on the owner's behalf; the owner is notified.
+  //   'owner_approval' → a PA/owner-initiated booking is held until the owner's explicit chat "yes".
+  // Default 'auto' preserves today's behavior. Set/changed in the Branch 3 owner chat.
+  bookingAuthority: text('booking_authority', { enum: ['auto', 'owner_approval'] }).notNull().default('auto'),
   // Availability policy
   available247: boolean('available_247').notNull().default(true),
   // Calendar backend

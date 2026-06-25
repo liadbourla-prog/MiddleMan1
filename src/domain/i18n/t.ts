@@ -516,6 +516,14 @@ const strings = {
     he: (amount: number, currency: string) => `עדכנתי את עמלת הביטול ל-${amount} ${currency}.`,
     en: (amount: number, currency: string) => `Set the cancellation fee to ${amount} ${currency}.`,
   },
+  apply_policy_booking_authority: {
+    he: (mode: 'auto' | 'owner_approval') => mode === 'owner_approval'
+      ? `עדכנתי — מעכשיו אבדוק איתך לפני שאני קובע משהו ביומן.`
+      : `עדכנתי — מעכשיו אקבע לבד מה שפנוי בלי לשאול כל פעם.`,
+    en: (mode: 'auto' | 'owner_approval') => mode === 'owner_approval'
+      ? `Done — from now on I'll check with you before I put anything on the calendar.`
+      : `Done — from now on I'll just book open slots myself without asking each time.`,
+  },
   apply_policy_unsupported: {
     he: `הנחיה זו אינה ניתנת לביצוע אוטומטי. ניתן לעדכן: זמן ביטול, זמן הזמנה מינימלי, טווח הזמנות, עמלת ביטול.`,
     en: `This policy cannot be applied automatically. Supported: cancellation cutoff, minimum booking buffer, booking window (days ahead), cancellation fee.`,

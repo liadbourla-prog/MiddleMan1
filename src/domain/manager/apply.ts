@@ -870,10 +870,11 @@ async function applyRecurringClassChange(
 // ── Policy change ─────────────────────────────────────────────────────────────
 
 const policyChangeSchema = z.object({
-  subtype: z.enum(['cancellation_cutoff', 'booking_buffer', 'max_days_ahead', 'cancellation_fee', 'other']),
+  subtype: z.enum(['cancellation_cutoff', 'booking_buffer', 'max_days_ahead', 'cancellation_fee', 'booking_authority', 'other']),
   valueHours: z.coerce.number().nonnegative().nullable().optional(),
   valueDays: z.coerce.number().int().positive().nullable().optional(),
   valueAmount: z.coerce.number().nonnegative().nullable().optional(),
+  valueMode: z.enum(['auto', 'owner_approval']).nullable().optional(),
   description: z.string(),
 })
 
@@ -932,6 +933,19 @@ async function applyPolicyChange(
         .where(eq(businesses.id, businessId))
       await logAudit(db, { businessId, actorId, action: 'policy.cancellation_fee_updated', entityType: 'business', entityId: businessId, afterState: { cancellationFeeAmount: amount, cancellationFeeCurrency: currency } })
       return { ok: true, confirmationMessage: i18n.apply_policy_cancellation_fee[lang](amount, currency) }
+    }
+
+    case 'booking_authority': {
+      // Per-business booking authority (design 2026-06-25). Governs only PA/owner-initiated
+      // bookings; customer self-bookings are never gated. Default to owner_approval when the
+      // mode is somehow missing — the safe side is "ask the owner first".
+      const mode = p.valueMode ?? 'owner_approval'
+      await db
+        .update(businesses)
+        .set({ bookingAuthority: mode })
+        .where(eq(businesses.id, businessId))
+      await logAudit(db, { businessId, actorId, action: 'policy.booking_authority_updated', entityType: 'business', entityId: businessId, afterState: { bookingAuthority: mode } })
+      return { ok: true, confirmationMessage: i18n.apply_policy_booking_authority[lang](mode) }
     }
 
     case 'other':

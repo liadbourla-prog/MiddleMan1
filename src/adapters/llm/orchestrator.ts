@@ -155,7 +155,7 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'createCalendarEvent',
-    description: 'Create a personal or business event on the calendar (team meetings, blocks, personal appointments). This is for non-customer events. To block time from customer bookings, use manageBusinessSettings instead. Report the date/time the manager said as structured pieces — NEVER compute an absolute or ISO date yourself; a deterministic system resolves them.',
+    description: 'Create a personal or business event on the calendar (team meetings, blocks, personal appointments). This is for non-customer events. To block time from customer bookings, use manageBusinessSettings instead. Report the date/time the manager said as structured pieces — NEVER compute an absolute or ISO date yourself; a deterministic system resolves them. If this business requires owner approval before bookings, the tool returns status "awaiting_owner_approval" on the first call — relay the proposal to the owner, and only re-call with ownerApproved:true once they say yes.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -164,6 +164,7 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         startTime: timeSchema('Start clock time the manager said, 24-hour'),
         endTime: timeSchema('End clock time the manager said, 24-hour'),
         notes: { type: Type.STRING },
+        ownerApproved: { type: Type.BOOLEAN, description: 'Set true ONLY after the owner has explicitly approved this specific event in an owner-approval business. Never set it pre-emptively.' },
       },
       required: ['title', 'date', 'startTime', 'endTime'],
     },
@@ -603,9 +604,10 @@ function buildSystemPrompt(params: {
   actionLedger: string
   activeCoordinations: string
   outreachIdentity: string
+  bookingAuthority: 'auto' | 'owner_approval'
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, outreachIdentity, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, outreachIdentity, bookingAuthority, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -680,6 +682,11 @@ ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 ${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
 ${activeCoordinations ? `\n## Active meeting coordinations\n${activeCoordinations}` : ''}
 ${outreachIdentity ? `\n## Outreach identity\n${outreachIdentity}` : ''}
+
+## Booking authority
+${bookingAuthority === 'owner_approval'
+  ? 'This business requires the OWNER\'S EXPLICIT OK before anything is written to the calendar. When you would create an event, the tool returns status "awaiting_owner_approval" instead of booking — tell the owner what you propose to book and ask whether to go ahead, and do NOT say it is booked. Only after the owner clearly approves, call the tool again with ownerApproved:true. (This applies to PA/owner-initiated bookings — customers booking themselves are unaffected.)'
+  : 'This business is in auto-book mode: when the owner asks you to put something on the calendar and the slot is open, just book it and confirm — you do not need a second approval step.'}
 
 ## After completing actions
 If the action you just completed has downstream effects on customers (cancellations, schedule changes), end your reply with a brief offer to notify them — phrased naturally, never the same way twice. Do not notify customers automatically — ask first.
@@ -946,11 +953,12 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     .limit(1)
     .catch(() => [undefined as { name: string | null } | undefined])
   const [bizRow] = await db
-    .select({ mode: businessesTable.outreachIdentityMode })
+    .select({ mode: businessesTable.outreachIdentityMode, bookingAuthority: businessesTable.bookingAuthority })
     .from(businessesTable)
     .where(eq(businessesTable.id, businessId))
     .limit(1)
-    .catch(() => [undefined as { mode: 'business' | 'owner_name' | null } | undefined])
+    .catch(() => [undefined as { mode: 'business' | 'owner_name' | null; bookingAuthority: 'auto' | 'owner_approval' } | undefined])
+  const bookingAuthority: 'auto' | 'owner_approval' = bizRow?.bookingAuthority ?? 'auto'
   const ownerNameOnFile = mgrName?.name && mgrName.name.trim().toLowerCase() !== 'owner' ? mgrName.name.trim() : null
   const outreachIdentity = bizRow?.mode === 'business'
     ? `When reaching out on the owner's behalf, introduce yourself as "${businessName}".`
@@ -969,11 +977,13 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     actionLedger,
     activeCoordinations,
     outreachIdentity,
+    bookingAuthority,
     conversationHistory: transcript.slice(-20),
   })
 
   const ctx: ToolContext = {
     db, businessId, identityId, timezone, lang, calendar,
+    bookingAuthority,
     ...(params.calendarMode ? { calendarMode: params.calendarMode } : {}),
     ...(params.role ? { role: params.role } : {}),
     ...(params.delegatedPermissions ? { delegatedPermissions: params.delegatedPermissions } : {}),

@@ -214,10 +214,11 @@ booking_cancellation:
 
 policy_change:
   {
-    "subtype": "cancellation_cutoff" | "booking_buffer" | "max_days_ahead" | "cancellation_fee" | "other",
+    "subtype": "cancellation_cutoff" | "booking_buffer" | "max_days_ahead" | "cancellation_fee" | "booking_authority" | "other",
     "valueHours": number | null,    // for cancellation_cutoff (hours before appt) and booking_buffer (hours in advance)
     "valueDays": number | null,     // for max_days_ahead
     "valueAmount": number | null,   // for cancellation_fee (monetary amount)
+    "valueMode": "auto" | "owner_approval" | null,  // for booking_authority only
     "description": string           // always fill — human-readable summary of what was requested
   }
 
@@ -226,10 +227,11 @@ policy_change:
   - booking_buffer: manager wants a minimum notice period before a booking (e.g. "don't accept same-day bookings", "require 2h notice")
   - max_days_ahead: manager wants to cap how far into the future bookings can be made (e.g. "only 30 days ahead")
   - cancellation_fee: manager wants to charge a fee for late cancellations (e.g. "charge 50 for cancellations")
+  - booking_authority: manager controls whether the PA may book on their behalf without asking. Set valueMode="owner_approval" when they want to approve bookings first (e.g. "don't book anything without asking me", "always check with me before you put something on the calendar", "אל תקבע כלום בלי לשאול אותי"); set valueMode="auto" when they want the PA to just book open slots itself (e.g. "just book open slots yourself", "you don't need to ask me, just schedule it", "תקבע לבד מה שפנוי"). This is about the PA/owner booking on the owner's behalf — NOT about customers booking themselves.
   - other: anything else — policy cannot be enforced automatically; set ambiguous=true and clarificationNeeded explaining what IS enforceable
 
   For subtype "other", ALWAYS set ambiguous=true and clarificationNeeded to a message (in the manager's language) explaining:
-  "I can automatically enforce: cancellation notice periods, advance booking windows, booking buffer times, and cancellation fees. This request needs to be handled manually. What specifically would you like to change?"
+  "I can automatically enforce: cancellation notice periods, advance booking windows, booking buffer times, cancellation fees, and whether I book on your behalf automatically or check with you first. This request needs to be handled manually. What specifically would you like to change?"
 
 recurring_class_change:
   { "action": "create"|"stop"|"cancel_occurrence", "serviceName": string|null, "dayOfWeek": 0-6|null, "startTime": "HH:MM"|null, "durationMinutes": number|null, "maxParticipants": number|null, "startDate": "YYYY-MM-DD"|null, "endDate": "YYYY-MM-DD"|null, "occurrenceDate": "YYYY-MM-DD"|null, "providerHint": string|null, "reason": string|null }
