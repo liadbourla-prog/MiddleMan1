@@ -124,6 +124,15 @@ export async function requestBooking(
     const classBlock = await findClassBlockProviderForSlot(db, actor.businessId, request.serviceTypeId, request.slotStart)
     effectiveProviderId = request.providerId ?? (classBlock.found ? classBlock.providerId : null)
     if (classBlock.found) instanceCapacity = classBlock.maxParticipants
+    // Bug E: a schedule-driven ('class') service is bookable ONLY into a real
+    // scheduled class instance. If there's no class block at this slot, refuse here
+    // instead of falling through to materialize-on-first-booking (which would create
+    // a class at an arbitrary time the owner never scheduled — e.g. a 17:00 Pilates
+    // when Pilates only runs 09/11/14/18). 'appointment'-mode group services keep the
+    // legacy fallback.
+    if (!classBlock.found && service.schedulingMode === 'class') {
+      return { ok: false, reason: 'no_class_at_time' }
+    }
   } else {
     // Private (1-on-1) booking: resolve provider by assignment + availability.
     const resolvedProvider = request.providerId

@@ -786,6 +786,12 @@ const MAX_SERIES_PER_BATCH = 200
 // rolls each series forward to the full horizon afterwards.
 const BATCH_HORIZON_DAYS = 28
 
+// Google Calendar event colorIds (1–11) handed out to class services so different
+// class types render in distinct colors. Ordered for visual contrast; '2' (the
+// default green used for confirmed one-off bookings) is intentionally excluded so
+// classes stay visually distinct from regular appointments.
+const CLASS_COLOR_PALETTE = [11, 9, 5, 7, 3, 10, 6, 8, 1, 4] as const
+
 function fmtTime(t: TimePieces): string {
   return `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`
 }
@@ -820,6 +826,23 @@ export async function executeScheduleRecurringClasses(args: ScheduleRecurringCla
   const skipped: Array<{ what: string; reason: string }> = []
   const createdByService: Record<string, number> = {}
 
+  // Per-type colors (owner request: "פילאטיס בצבע אחד ושיעורי יוגה בצבע אחר"). The
+  // block→Google mirror already paints each event with serviceTypes.colorId, but
+  // class setup never assigned one, so every class defaulted to the same green.
+  // Seed the "used" set from colors already on this business's services, then hand
+  // out a distinct Google colorId (1–11) to each class service that lacks one.
+  const usedColorRows = await ctx.db
+    .select({ colorId: serviceTypes.colorId })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.businessId, ctx.businessId), eq(serviceTypes.isActive, true)))
+  const usedColors = new Set<number>(usedColorRows.map((r) => r.colorId).filter((c): c is number => c != null))
+  const nextColorId = (): number | null => {
+    const next = CLASS_COLOR_PALETTE.find((c) => !usedColors.has(c))
+    if (next == null) return null
+    usedColors.add(next)
+    return next
+  }
+
   for (const spec of specs) {
     const name = (spec.serviceName ?? '').trim()
     const days = Array.isArray(spec.daysOfWeek) ? spec.daysOfWeek.filter((d) => Number.isInteger(d) && d >= 0 && d <= 6) : []
@@ -830,7 +853,7 @@ export async function executeScheduleRecurringClasses(args: ScheduleRecurringCla
     }
 
     const [svc] = await ctx.db
-      .select({ id: serviceTypes.id, name: serviceTypes.name, durationMinutes: serviceTypes.durationMinutes, maxParticipants: serviceTypes.maxParticipants })
+      .select({ id: serviceTypes.id, name: serviceTypes.name, durationMinutes: serviceTypes.durationMinutes, maxParticipants: serviceTypes.maxParticipants, colorId: serviceTypes.colorId, schedulingMode: serviceTypes.schedulingMode })
       .from(serviceTypes)
       .where(and(eq(serviceTypes.businessId, ctx.businessId), eq(serviceTypes.isActive, true), ilike(serviceTypes.name, `%${name}%`)))
       .limit(1)
@@ -839,6 +862,28 @@ export async function executeScheduleRecurringClasses(args: ScheduleRecurringCla
     // WS-C invariant: a class needs a real group capacity (>1).
     const cap = spec.maxParticipants ?? svc.maxParticipants ?? 1
     if (cap <= 1) { skipped.push({ what: svc.name, reason: 'needs_capacity' }); continue }
+
+    // Bug E: make this service schedule-driven so customers can only book INTO the
+    // scheduled class instances (not arbitrary open times), and lift its default
+    // capacity to the class size so the whole booking stack routes it as a group
+    // class. Without this the service stayed cap-1/'appointment' and customers were
+    // booked private appointments at times with no class. Idempotent.
+    if ((svc.maxParticipants ?? 1) < cap || svc.schedulingMode !== 'class') {
+      await ctx.db
+        .update(serviceTypes)
+        .set({ maxParticipants: Math.max(svc.maxParticipants ?? 1, cap), schedulingMode: 'class' })
+        .where(eq(serviceTypes.id, svc.id))
+    }
+
+    // Give this class service a distinct Google Calendar color if it has none yet,
+    // so different class types render in different colors (owner request). Best-effort.
+    if (svc.colorId == null) {
+      const color = nextColorId()
+      if (color != null) {
+        await ctx.db.update(serviceTypes).set({ colorId: color }).where(eq(serviceTypes.id, svc.id))
+        usedColors.add(color)
+      }
+    }
 
     let providerId: string | null = null
     if (spec.instructor && spec.instructor.trim().length > 0) {
@@ -907,7 +952,7 @@ export async function executeScheduleRecurringClasses(args: ScheduleRecurringCla
     success: true,
     created: { series: seriesCreated, instances: instancesCreated, byService: createdByService },
     skipped,
-    guidance: 'Recurring weekly classes are set up and the first weeks are already on the calendar (the rest roll out automatically). Summarize for the manager in your own words — how many of which class, plus anything skipped and why. Offer to adjust or notify customers.',
+    guidance: 'Recurring weekly classes are set up and the first weeks are on the internal calendar (the rest roll out automatically). They are syncing to the connected Google Calendar now and will appear there within a moment — do NOT claim they are already fully synced/visible in Google. Summarize for the manager in your own words — how many of which class, plus anything skipped and why. Offer to adjust or notify customers.',
   }
 }
 

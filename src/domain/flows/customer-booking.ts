@@ -1323,14 +1323,34 @@ async function handleHoldConfirmation(
       }
     }
 
-    await completeSession(db, session.id)
-    const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
+    // Slot taken — keep the session OPEN so the customer's pick of an offered
+    // alternative continues THIS booking instead of starting over. Completing the
+    // session here was dropping all in-flight context: the next message ("let's do
+    // 5") spawned a fresh session that re-asked and forgot the booking. Keep the
+    // service + date, drop the taken time, and re-enter clarification.
+    const reofferDraft = slotDraftFromPending(pendingSlot, businessTimezone)
+    const { time: _takenTime, ...keptReofferDraft } = reofferDraft
+    const { pendingSlot: _clearedSlot, awaitingConfirmationFor: _clearedAwait, ...ctxWithoutPending } = ctx
+    await updateSessionContext(
+      db,
+      session.id,
+      { ...ctxWithoutPending, slotDraft: keptReofferDraft, clarificationAttempts: 0 },
+      'waiting_clarification',
+    )
+    // Bug E: a schedule-driven ('class') service asked for at a time with no class.
+    // Offer the ACTUAL scheduled class times for that service/day — never arbitrary
+    // open slots (this is exactly how a customer got booked into a 17:00 with no class).
+    const classModeMiss = result.reason === 'no_class_at_time'
+    const hoursSummary = !classModeMiss && business ? await loadHoursSummary(db, business.id) : null
     // Proactive suggestion: enumerate real bookable openings near the request so
     // we can offer concrete alternatives ("I have 3pm or 4:30 free") instead of a
     // bare "that time doesn't work". Canonical spine — honours hours + blocks +
     // existing bookings. (CALENDAR_UX_DESIGN.md decision D.)
-    const openSlotsText = business
+    const openSlotsText = !classModeMiss && business
       ? await suggestOpenSlotsText(db, business, pendingSlot.serviceTypeId, new Date(pendingSlot.start), new Date(pendingSlot.end), businessTimezone)
+      : null
+    const classTimesText = classModeMiss && business
+      ? await buildDayOptionsText(db, business, localParts(new Date(pendingSlot.start), businessTimezone).dateStr, businessTimezone, pendingSlot.serviceTypeId)
       : null
     // Reactive instructor case: the customer named an instructor who teaches this
     // service but isn't free for the chosen slot. Surface that instructor's hours
@@ -1339,6 +1359,13 @@ async function handleHoldConfirmation(
     const providerUnavail = parseProviderUnavailable(result.reason, lang)
     const unavailSituation = providerUnavail
       ? `The customer asked to book with ${providerUnavail.name}, but ${providerUnavail.name} does not teach at the time they chose. ${providerUnavail.name}'s teaching times are: ${providerUnavail.hoursPhrase}. Reactively offer one of those times OR another instructor — do not invent times, and do not volunteer other staff names unprompted. Keep it warm and brief.`
+      : classModeMiss
+        ? [
+            `${pendingSlot.serviceName} doesn't run at the time the customer asked — it only runs at set class times, so that time can't be booked.`,
+            classTimesText
+              ? `Offer these actual scheduled times and ask which they'd like: ${classTimesText}.`
+              : `There are no more ${pendingSlot.serviceName} classes on that day. Don't invent a time — offer to check another day.`,
+          ].filter(Boolean).join(' ')
       : [
           `The requested slot is unavailable because ${sanitiseReason(result.reason)}.`,
           hoursSummary ?? '',
@@ -1355,7 +1382,7 @@ async function handleHoldConfirmation(
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     })
-    return { reply, sessionComplete: true }
+    return { reply, sessionComplete: false }
   }
 
   // Group class — booking already confirmed, no second YES needed

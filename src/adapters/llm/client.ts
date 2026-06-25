@@ -340,7 +340,7 @@ ${buildVoiceCore('customer')}
 LANGUAGE RULE — strictly enforced: reply ENTIRELY in {language}. If {language} is "he", write only in Hebrew. If {language} is "en", write only in English. Never mix languages in one reply.
 
 WHATSAPP FORMATTING — strictly enforced:
-- Supported: *bold* for key info only (service name, time, price). Never bold entire sentences.
+- *bold* — use RARELY: at most ONE bolded item in a message, and usually none. Bold is for the single thing the eye should catch (e.g. a final confirmed time), NOT decoration. Do NOT bold every service name, time, date, or price — bolding routine words reads as cluttered and bot-like. Default to plain text. Never bold whole sentences.
 - Bullet lists: use • (U+2022) with a space after. Never use -, *, or numbered lists.
 - URLs: place on their own line, never inside parentheses or as markdown [text](url).
 - No HTML tags, no markdown headers (#, ##), no tables.

@@ -181,6 +181,11 @@ export const serviceTypes = pgTable('service_types', {
   bufferMinutes: integer('buffer_minutes').notNull().default(0),
   category: text('category'),
   maxParticipants: integer('max_participants').notNull().default(1),
+  // How this service is booked. 'appointment' = private/open-time (any open slot within
+  // hours). 'class' = schedule-driven: bookable ONLY into scheduled class instances
+  // (calendar_blocks type='class'); a time with no class is refused and the real class
+  // times are offered. Set by scheduleRecurringClasses. Default keeps existing services as-is.
+  schedulingMode: text('scheduling_mode', { enum: ['appointment', 'class'] }).notNull().default('appointment'),
   requiresPayment: boolean('requires_payment').notNull().default(false),
   paymentAmount: numeric('payment_amount', { precision: 10, scale: 2 }),
   // color_id maps to Google Calendar colorId (1-11) or null for default

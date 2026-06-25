@@ -164,20 +164,39 @@ export async function materializeSeries(
 
   if (occurrences.length === 0) return { created: 0, seriesId }
 
-  await db.insert(calendarBlocks).values(
-    occurrences.map((o) => ({
-      businessId: series.businessId,
-      type: 'class' as const,
-      startTs: o.startTs,
-      endTs: o.endTs,
-      title: series.title,
-      serviceTypeId: series.serviceTypeId,
-      maxParticipants: series.maxParticipants,
-      seriesId: series.id,
-      providerId: series.providerId,
-      source: 'internal' as const,
-    })),
-  )
+  const inserted = await db
+    .insert(calendarBlocks)
+    .values(
+      occurrences.map((o) => ({
+        businessId: series.businessId,
+        type: 'class' as const,
+        startTs: o.startTs,
+        endTs: o.endTs,
+        title: series.title,
+        serviceTypeId: series.serviceTypeId,
+        maxParticipants: series.maxParticipants,
+        seriesId: series.id,
+        providerId: series.providerId,
+        source: 'internal' as const,
+      })),
+    )
+    .returning({ id: calendarBlocks.id })
+
+  // Write-through each new class instance to Google immediately (internal-as-hub
+  // mirror, CLAUDE.md principle 3). Previously series instances were left for the
+  // integrity sentinel to reconcile up to 2h later, so a freshly created class
+  // schedule did NOT appear in the owner's Google Calendar — and the PA could
+  // wrongly claim it had "synced". Enqueue is best-effort; the sentinel stays the
+  // backstop. Dynamic import keeps Redis/BullMQ out of this module's static graph
+  // (series.ts is imported by pure unit tests).
+  if (inserted.length > 0) {
+    try {
+      const { enqueueBlockMirror } = await import('../../workers/calendar-mirror.js')
+      await Promise.all(inserted.map((b) => enqueueBlockMirror(series.businessId, b.id)))
+    } catch {
+      /* mirror enqueue unavailable — integrity sentinel reconciles later */
+    }
+  }
 
   return { created: occurrences.length, seriesId }
 }
