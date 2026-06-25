@@ -77,6 +77,8 @@ If a skill needs data not currently in `SkillContext`, the correct path is to ex
 
 Every inbound WhatsApp message routes into exactly one of four branches. **Any work on LLM behaviour, reply quality, or conversational experience must identify which branch it targets.** See ARCHITECTURE.md Part 16 for the full specification.
 
+**Web & app surfaces** mirror these branches off WhatsApp (MiddleMan website ≈ B2, owner application ≈ B3, customer websites ≈ B4) — all UX mirrors over the one internal brain. See [WEB_SURFACES_DESIGN.md](WEB_SURFACES_DESIGN.md).
+
 | # | Name | Number | Sender | Entry point |
 |---|---|---|---|---|
 | 1 | **Operator Channel** | `PROVIDER_WA_NUMBER` | `OPERATOR_PHONE` | `flows/operator.ts` |
