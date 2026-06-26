@@ -40,6 +40,7 @@ import {
   executeAmendReshuffle,
   executeConfigureReshuffle,
   executeConfigureNotifications,
+  executeManageAllowedContacts,
   executeConfigurePaymentTiming,
   executeSetInitiationAutonomy,
   executeDecideFreedSlotOffer,
@@ -575,6 +576,19 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'manageAllowedContacts',
+    description: "Control which phone numbers the PA is allowed to talk to. Use when the owner says things like 'only respond to numbers I approve', 'just talk to these clients', 'add +972501234567 to the allowed list', 'allow 0501234567', 'stop the restriction', or 'who's on the allowed list?'. When restriction is ON, only allowed numbers (and you, your staff, and coordination contacts) reach the PA — everyone else is silently ignored and you get a heads-up. Adding a number turns the restriction ON automatically if it was off. One operation per call. Convert any local number the owner gives into full international (E.164) format yourself before calling.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        op: { type: Type.STRING, enum: ['enable', 'disable', 'add', 'remove', 'list'], description: 'enable/disable the restriction mode, add/remove a number, or list the current list' },
+        phone: { type: Type.STRING, description: 'Required for add/remove. Full international format, e.g. +972501234567' },
+        label: { type: Type.STRING, description: 'Optional name for the number when adding (e.g. the client name)' },
+      },
+      required: ['op'],
+    },
+  },
+  {
     name: 'configurePaymentTiming',
     description: "Set WHEN the PA sends the pay-link for a booking that needs payment, relative to the appointment. Use when the owner says things like 'send pay-links 24 hours before the appointment', 'send the payment request at booking', or 'charge them an hour after the session'. Pass policy 'at_booking' to send as soon as the booking is made (the default), or policy 'offset' with offsetMinutes = how far from the appointment start to send: NEGATIVE for before (24h before = -1440, 1h before = -60), POSITIVE for after (1h after = 60). Convert the owner's wording into minutes yourself.",
     parameters: {
@@ -845,6 +859,8 @@ async function dispatchTool(
       return executeConfigureReshuffle(args as unknown as Parameters<typeof executeConfigureReshuffle>[0], ctx)
     case 'configureNotifications':
       return executeConfigureNotifications(args as unknown as Parameters<typeof executeConfigureNotifications>[0], ctx)
+    case 'manageAllowedContacts':
+      return executeManageAllowedContacts(args as unknown as Parameters<typeof executeManageAllowedContacts>[0], ctx)
     case 'configurePaymentTiming':
       return executeConfigurePaymentTiming(args as unknown as Parameters<typeof executeConfigurePaymentTiming>[0], ctx)
     case 'setInitiationAutonomy':
