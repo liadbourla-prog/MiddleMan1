@@ -25,6 +25,14 @@ export interface CustomerIntentOutput {
   summary: string | null
   rawEntities: Record<string, string>
   detectedLanguage: 'he' | 'en'
+  // Categorical time windows the customer RULES OUT ("no mornings", "not Thursdays") —
+  // distinct from slotRequest (what they want). Folded into per-session negotiation
+  // constraints so suggestions honour the exclusion. See negotiation-constraints.ts.
+  avoidConstraints?: {
+    beforeHour: number | null // exclude slots starting before this business-local hour
+    afterHour: number | null // exclude slots starting at/after this business-local hour
+    weekdays: number[] | null // exclude these business-local weekdays (0=Sun … 6=Sat)
+  } | null
 }
 
 export interface ManagerInstructionOutput {

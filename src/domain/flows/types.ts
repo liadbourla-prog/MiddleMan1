@@ -1,3 +1,5 @@
+import type { NegotiationConstraints } from './negotiation-constraints.js'
+
 export interface FlowResult {
   reply: string
   sessionComplete: boolean
@@ -116,6 +118,15 @@ export interface BookingFlowContext {
   // Language: override locks the language for the session; offerPending means the inline offer was appended last turn
   languageOverride?: 'he' | 'en'
   languageSwitchOfferPending?: boolean
+  // Negotiation memory: times the customer has ruled out this session (concrete
+  // rejected instances + categorical avoid rules), so the PA never re-offers a slot
+  // already refused. Deterministically subtracted from suggestions; see
+  // negotiation-constraints.ts and NEGOTIATION_MEMORY_PLAN.md.
+  negotiationConstraints?: NegotiationConstraints
+  // The concrete slots offered in the LAST suggestion list. If the next turn doesn't
+  // book one of them, they're promoted to rejectedSlots (batch rejection — "none of
+  // those work"). Transient: consumed/cleared at the start of each turn.
+  lastOfferedSlots?: import('./negotiation-constraints.js').RejectedSlot[]
   [key: string]: unknown
 }
 
@@ -128,5 +139,7 @@ export interface ManagerFlowContext {
   languageOverride?: 'he' | 'en'
   // True when the previous reply appended an inline switch offer awaiting a yes/no.
   languageSwitchOfferPending?: boolean
+  // Negotiation memory (Phase 3 — read-side filter only for Branch 3; capture deferred).
+  negotiationConstraints?: NegotiationConstraints
   [key: string]: unknown
 }

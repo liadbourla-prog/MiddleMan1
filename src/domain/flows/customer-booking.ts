@@ -28,6 +28,24 @@ import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
 import { validateSlotTiming } from '../booking/engine.js'
+import {
+  pruneConstraints,
+  addRejectedSlots,
+  removeRejectedSlot,
+  filterOpenSlots,
+  isSlotSuppressed,
+  mergeAvoid,
+  type NegotiationConstraints,
+  type AvoidConstraint,
+  type RejectedSlot,
+} from './negotiation-constraints.js'
+
+/** Set or remove negotiationConstraints on a context — omits the key when empty so the
+ *  stored jsonb stays minimal (and satisfies exactOptionalPropertyTypes). */
+function withConstraints(ctx: BookingFlowContext, c: NegotiationConstraints): BookingFlowContext {
+  const { negotiationConstraints: _drop, ...rest } = ctx
+  return Object.keys(c).length > 0 ? { ...rest, negotiationConstraints: c } : rest
+}
 
 /** Persist a customer's self-stated name the first time we learn it. Only writes when we have no
  *  name on file yet (never clobbers an existing displayName). Best-effort: never throws into the
@@ -168,10 +186,19 @@ async function loadHoursSummary(db: Db, businessId: string): Promise<string | nu
   return parts.length > 0 ? `Business hours: ${parts.join(', ')}.` : null
 }
 
+// A suggestion's human text plus the concrete slots it offered. `offered` feeds
+// `lastOfferedSlots` so a subsequent batch rejection ("none of those") can mark exactly
+// those instants as rejected. `text` is null when nothing fits.
+interface SuggestionResult {
+  text: string | null
+  offered: RejectedSlot[]
+}
+const NO_SUGGESTION: SuggestionResult = { text: null, offered: [] }
+
 // Enumerate up to 4 real bookable openings for a service, starting from the
-// requested time, over the next 14 days. Returns a compact human string for the
-// LLM to phrase, or null when nothing is open. Uses the canonical availability
-// spine so suggestions never collide with hours, blocks, or existing bookings.
+// requested time, over the next 14 days. Returns compact human text for the LLM to
+// phrase plus the concrete slots offered. Uses the canonical availability spine so
+// suggestions never collide with hours, blocks, or existing bookings.
 async function suggestOpenSlotsText(
   db: Db,
   business: Business,
@@ -179,19 +206,25 @@ async function suggestOpenSlotsText(
   requestedStart: Date,
   requestedEnd: Date,
   tz: string,
-): Promise<string | null> {
+  constraints?: NegotiationConstraints,
+): Promise<SuggestionResult> {
   const durationMinutes = Math.max(15, Math.round((requestedEnd.getTime() - requestedStart.getTime()) / 60_000))
   const now = new Date()
   const from = requestedStart.getTime() > now.getTime() ? requestedStart : now
   const to = new Date(from.getTime() + 14 * 24 * 60 * 60_000)
   try {
-    const slots = await getOpenSlots(db, business, { start: from, end: to }, durationMinutes, { maxSlots: 4 })
-    if (slots.length === 0) return null
-    return slots
-      .map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`)
-      .join(', ')
+    // Over-fetch then subtract rejected/avoided times so we still surface up to 4 FRESH
+    // openings the customer hasn't already ruled out this session. The generous fetch
+    // guards against a broad avoid rule (e.g. "no mornings") emptying a small page.
+    const raw = await getOpenSlots(db, business, { start: from, end: to }, durationMinutes, { maxSlots: 40 })
+    const slots = filterOpenSlots(raw, constraints, tz).slice(0, 4)
+    if (slots.length === 0) return NO_SUGGESTION
+    return {
+      text: slots.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join(', '),
+      offered: slots.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString(), serviceTypeId })),
+    }
   } catch {
-    return null
+    return NO_SUGGESTION
   }
 }
 
@@ -205,7 +238,8 @@ async function buildInquiryAvailabilityText(
   slot: CustomerIntentOutput['slotRequest'],
   activeServices: Array<{ durationMinutes: number }>,
   tz: string,
-): Promise<string | null> {
+  constraints?: NegotiationConstraints,
+): Promise<SuggestionResult> {
   const now = new Date()
   const duration = activeServices.length > 0
     ? Math.min(...activeServices.map((s) => s.durationMinutes))
@@ -239,19 +273,23 @@ async function buildInquiryAvailabilityText(
   }
 
   try {
-    const slots = await getOpenSlots(db, business, { start: from, end: to }, duration, { maxSlots: 6 })
+    const offeredOf = (ss: { start: Date; end: Date }[]): RejectedSlot[] =>
+      ss.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString() }))
+    const rawSlots = await getOpenSlots(db, business, { start: from, end: to }, duration, { maxSlots: 40 })
+    const slots = filterOpenSlots(rawSlots, constraints, tz).slice(0, 6)
     if (slots.length > 0) {
       const list = slots.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
-      return `Actual open times in the window the customer asked about: ${list}.`
+      return { text: `Actual open times in the window the customer asked about: ${list}.`, offered: offeredOf(slots) }
     }
-    if (!scoped) return 'No open times in the next two weeks.'
+    if (!scoped) return { text: 'No open times in the next two weeks.', offered: [] }
     // Specific day/week had nothing — offer the next real opening overall, honestly.
-    const fallback = await getOpenSlots(db, business, { start: now, end: new Date(now.getTime() + 14 * 86_400_000) }, duration, { maxSlots: 3 })
-    if (fallback.length === 0) return 'Nothing open in the window they asked about, and nothing in the next two weeks.'
+    const rawFallback = await getOpenSlots(db, business, { start: now, end: new Date(now.getTime() + 14 * 86_400_000) }, duration, { maxSlots: 30 })
+    const fallback = filterOpenSlots(rawFallback, constraints, tz).slice(0, 3)
+    if (fallback.length === 0) return { text: 'Nothing open in the window they asked about, and nothing in the next two weeks.', offered: [] }
     const list = fallback.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
-    return `Nothing open in the window they asked about. The next real openings are: ${list}.`
+    return { text: `Nothing open in the window they asked about. The next real openings are: ${list}.`, offered: offeredOf(fallback) }
   } catch {
-    return null
+    return NO_SUGGESTION
   }
 }
 
@@ -265,28 +303,39 @@ async function buildDayOptionsText(
   dateStr: string,
   tz: string,
   serviceTypeId: string | undefined,
-): Promise<string | null> {
+  constraints?: NegotiationConstraints,
+): Promise<SuggestionResult> {
   const day = await listDayOptions(db, business, dateStr, tz, serviceTypeId ? { serviceTypeId } : {})
   const dayLabel = formatLocalDate(dateStr, tz)
   const parts: string[] = []
+  const offered: RejectedSlot[] = []
 
-  if (day.classes.length > 0) {
-    const items = day.classes.slice(0, 10).map((c) => {
+  // Drop class instances and private openings the customer already ruled out this session.
+  const classes = filterOpenSlots(day.classes, constraints, tz)
+  if (classes.length > 0) {
+    const items = classes.slice(0, 10).map((c) => {
+      offered.push({ start: c.start.toISOString(), end: c.end.toISOString(), serviceTypeId: c.serviceTypeId })
       const cap = c.spotsLeft <= 0 ? 'full' : `${c.spotsLeft} spot${c.spotsLeft === 1 ? '' : 's'} left`
       return `${c.serviceName} at ${formatSlotTime(c.start, tz)} (${cap})`
     })
     parts.push(`Classes on ${dayLabel}: ${items.join('; ')}.`)
   }
 
-  if (day.privateOpenings.length > 0) {
-    const items = day.privateOpenings.slice(0, 6).map((p) => {
-      const times = p.slots.slice(0, 4).map((s) => formatSlotTime(s, tz)).join(', ')
-      return `${p.serviceName} at ${times}`
+  const privateOpenings = day.privateOpenings
+    .map((p) => ({ ...p, slots: p.slots.filter((s) => !isSlotSuppressed(s, constraints, tz)) }))
+    .filter((p) => p.slots.length > 0)
+  if (privateOpenings.length > 0) {
+    const items = privateOpenings.slice(0, 6).map((p) => {
+      const shown = p.slots.slice(0, 4)
+      for (const s of shown) {
+        offered.push({ start: s.toISOString(), end: new Date(s.getTime() + p.durationMinutes * 60_000).toISOString(), serviceTypeId: p.serviceTypeId })
+      }
+      return `${p.serviceName} at ${shown.map((s) => formatSlotTime(s, tz)).join(', ')}`
     })
     parts.push(`Open private times on ${dayLabel}: ${items.join('; ')}.`)
   }
 
-  return parts.length > 0 ? parts.join(' ') : null
+  return parts.length > 0 ? { text: parts.join(' '), offered } : NO_SUGGESTION
 }
 
 /**
@@ -431,6 +480,21 @@ export async function handleBookingFlow(
     ...(session.context as BookingFlowContext),
     ...(botPersona ? { botPersona } : {}),
   } as BookingFlowContext
+  // Negotiation memory: drop rejected slots whose time has passed and cap the list
+  // before this turn reads (filters suggestions) or writes it. Pruned in-memory; the
+  // compacted set persists on the next updateSessionContext call.
+  if (ctx.negotiationConstraints) {
+    ctx = withConstraints(ctx, pruneConstraints(ctx.negotiationConstraints, new Date()))
+  }
+  // Batch rejection: a list of times was offered last turn. Whatever the customer does
+  // now, those exact slots are off the table — fold them into the rejected set so a
+  // re-suggest won't surface them again. If the customer is actually pursuing one, the
+  // explicit-pursuit un-suppress (booking/inquiry paths below) pulls it back out.
+  if (ctx.lastOfferedSlots && ctx.lastOfferedSlots.length > 0) {
+    const promoted = addRejectedSlots(ctx.negotiationConstraints, ctx.lastOfferedSlots)
+    const { lastOfferedSlots: _consumed, ...rest } = ctx
+    ctx = withConstraints(rest, promoted)
+  }
   const defaultLang: 'he' | 'en' = businessDefaultLanguage ?? 'he'
   const lang: 'he' | 'en' = (ctx.languageOverride ?? ctx.detectedLanguage) ?? defaultLang
 
@@ -628,6 +692,20 @@ export async function handleBookingFlow(
   await persistCapturedName(db, identity.businessId, identity.id, identity.displayName ?? null, intent.customerNameHint ?? null)
   const detectedLanguage = intent.detectedLanguage
 
+  // Negotiation memory: fold any newly-stated categorical exclusion ("no mornings",
+  // "not Thursdays") into the session constraints, so every suggestion from this turn
+  // onward honours it deterministically. Merged into ctx before handlers/inquiry run.
+  if (intent.avoidConstraints) {
+    const a = intent.avoidConstraints
+    const avoid: AvoidConstraint = {}
+    if (a.beforeHour != null) avoid.beforeHour = a.beforeHour
+    if (a.afterHour != null) avoid.afterHour = a.afterHour
+    if (a.weekdays && a.weekdays.length > 0) avoid.weekdays = a.weekdays
+    if (Object.keys(avoid).length > 0) {
+      ctx = withConstraints(ctx, mergeAvoid(ctx.negotiationConstraints, avoid))
+    }
+  }
+
   // Determine whether to append an inline language switch offer after this reply.
   // Offer when: detected language differs from default, no override locked yet.
   const shouldOfferSwitch = !ctx.languageOverride && detectedLanguage !== defaultLang
@@ -703,6 +781,7 @@ export async function handleBookingFlow(
         // they concretely asked for one. Otherwise fall back to the general
         // next-openings answer. Never a single parroted slot. (G2: all human-rendered.)
         let availabilityText: string | null = null
+        const inquiryOffered: RejectedSlot[] = []
         if (business) {
           const inquiryService = resolveService(intent.serviceTypeHint, activeServices)
           const dayParts: RequestedDateParts | null =
@@ -714,12 +793,28 @@ export async function handleBookingFlow(
                 }
               : null
           const resolvedDay = dayParts ? resolveRequestedDate(dayParts, businessTimezone, new Date()) : null
+          // Explicit re-ask about a specific time un-suppresses it: the customer is
+          // proactively asking about a slot they earlier ruled out, so surface it again.
+          if (resolvedDay && resolvedDay.ok && intent.slotRequest?.time) {
+            const askedStart = resolveSlotStart(resolvedDay.dateStr, intent.slotRequest.time, businessTimezone)
+            ctx = withConstraints(ctx, removeRejectedSlot(ctx.negotiationConstraints, askedStart.toISOString()))
+          }
           if (resolvedDay && resolvedDay.ok) {
-            availabilityText = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id)
+            const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints)
+            availabilityText = r.text
+            inquiryOffered.push(...r.offered)
           }
           if (!availabilityText) {
-            availabilityText = await buildInquiryAvailabilityText(db, business, intent.slotRequest, activeServices, businessTimezone)
+            const r = await buildInquiryAvailabilityText(db, business, intent.slotRequest, activeServices, businessTimezone, ctx.negotiationConstraints)
+            availabilityText = r.text
+            inquiryOffered.push(...r.offered)
           }
+          // Persist the offered times (and any avoid/un-suppress folded into ctx this
+          // turn) so a follow-up "none of those work" can batch-reject them — the
+          // inquiry path is otherwise read-only and wouldn't carry this forward.
+          let inquiryCtx = withConstraints(updatedCtx, ctx.negotiationConstraints ?? {})
+          if (inquiryOffered.length > 0) inquiryCtx = { ...inquiryCtx, lastOfferedSlots: inquiryOffered }
+          await updateSessionContext(db, session.id, inquiryCtx, 'active')
         }
         const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
 
@@ -950,9 +1045,17 @@ async function rebuildOnSlotPivot(
   const ps = ctx.pendingSlot
   const seededDraft = ps ? slotDraftFromPending(ps, businessTimezone) : ctx.slotDraft
   const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, ...rest } = ctx
+  // Negotiation memory: the customer just moved OFF the slot that was awaiting
+  // confirmation — record it as rejected so we never re-offer that exact instant later
+  // this session. (The new slot they pivoted to is pursued explicitly below, which
+  // un-suppresses it if it happened to be on the rejected list.)
+  const constraintsAfterReject = ps
+    ? addRejectedSlots(rest.negotiationConstraints, [{ start: ps.start, end: ps.end, serviceTypeId: ps.serviceTypeId }])
+    : rest.negotiationConstraints
   const rebuildCtx: BookingFlowContext = {
     ...rest,
     ...(seededDraft ? { slotDraft: seededDraft } : {}),
+    ...(constraintsAfterReject && Object.keys(constraintsAfterReject).length > 0 ? { negotiationConstraints: constraintsAfterReject } : {}),
     clarificationAttempts: 0,
   }
   await updateSessionContext(db, session.id, rebuildCtx, 'active')
@@ -1133,10 +1236,14 @@ async function handleBookingIntent(
   if (timingError || outsideHours) {
     // Drop the bad time, keep date + service, and offer real openings immediately.
     const { time: _dropTime, ...draftKeep } = draft
-    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: 0 }, 'waiting_clarification')
-    const openSlotsText = business
-      ? await suggestOpenSlotsText(db, business, svc.id, slotStart, slotEnd, businessTimezone)
-      : null
+    const suggestion = business
+      ? await suggestOpenSlotsText(db, business, svc.id, slotStart, slotEnd, businessTimezone, ctx.negotiationConstraints)
+      : NO_SUGGESTION
+    await updateSessionContext(db, session.id, {
+      ...ctx, slotDraft: draftKeep, clarificationAttempts: 0,
+      ...(suggestion.offered.length > 0 ? { lastOfferedSlots: suggestion.offered } : {}),
+    }, 'waiting_clarification')
+    const openSlotsText = suggestion.text
     const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
     const problemReason = timingError ? sanitiseReason(timingError) : sanitiseReason('outside_hours')
     const situation = [
@@ -1163,8 +1270,12 @@ async function handleBookingIntent(
   // confirmation step, so the PA never asserts a class that isn't on the schedule.
   if (business && await classInstanceMissing(db, business.id, svc, slotStart)) {
     const { time: _dropTime, ...draftKeep } = draft
-    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: 0 }, 'waiting_clarification')
-    const classTimesText = await buildDayOptionsText(db, business, localParts(slotStart, businessTimezone).dateStr, businessTimezone, svc.id)
+    const suggestion = await buildDayOptionsText(db, business, localParts(slotStart, businessTimezone).dateStr, businessTimezone, svc.id, ctx.negotiationConstraints)
+    await updateSessionContext(db, session.id, {
+      ...ctx, slotDraft: draftKeep, clarificationAttempts: 0,
+      ...(suggestion.offered.length > 0 ? { lastOfferedSlots: suggestion.offered } : {}),
+    }, 'waiting_clarification')
+    const classTimesText = suggestion.text
     const situation = [
       `${svc.name} doesn't run at the time the customer asked — it only runs at set class times, so that exact time can't be booked.`,
       classTimesText
@@ -1183,9 +1294,13 @@ async function handleBookingIntent(
   const displayDate = formatSlotDate(slotStart, businessTimezone)
   const displayTime = formatSlotTime(slotStart, businessTimezone)
 
-  const { slotDraft: _clearDraft, ...ctxWithoutDraft } = ctx
+  const { slotDraft: _clearDraft, negotiationConstraints: _ncDrop, lastOfferedSlots: _loDrop, ...ctxBase } = ctx
+  // Explicit pursuit of this exact slot overrides any earlier rejection of it
+  // (mind-change): clear it from the rejected list so it isn't shadow-suppressed later.
+  const constraintsForConfirm = removeRejectedSlot(ctx.negotiationConstraints, slotStart.toISOString())
   const newCtx: BookingFlowContext = {
-    ...ctxWithoutDraft,
+    ...ctxBase,
+    ...(Object.keys(constraintsForConfirm).length > 0 ? { negotiationConstraints: constraintsForConfirm } : {}),
     clarificationAttempts: 0,
     pendingSlot: {
       start: slotStart.toISOString(),
@@ -1446,13 +1561,7 @@ async function handleHoldConfirmation(
     // service + date, drop the taken time, and re-enter clarification.
     const reofferDraft = slotDraftFromPending(pendingSlot, businessTimezone)
     const { time: _takenTime, ...keptReofferDraft } = reofferDraft
-    const { pendingSlot: _clearedSlot, awaitingConfirmationFor: _clearedAwait, ...ctxWithoutPending } = ctx
-    await updateSessionContext(
-      db,
-      session.id,
-      { ...ctxWithoutPending, slotDraft: keptReofferDraft, clarificationAttempts: 0 },
-      'waiting_clarification',
-    )
+    const { pendingSlot: _clearedSlot, awaitingConfirmationFor: _clearedAwait, lastOfferedSlots: _loClear, ...ctxWithoutPending } = ctx
     // Bug E: a schedule-driven ('class') service asked for at a time with no class.
     // Offer the ACTUAL scheduled class times for that service/day — never arbitrary
     // open slots (this is exactly how a customer got booked into a 17:00 with no class).
@@ -1466,12 +1575,24 @@ async function handleHoldConfirmation(
     // we can offer concrete alternatives ("I have 3pm or 4:30 free") instead of a
     // bare "that time doesn't work". Canonical spine — honours hours + blocks +
     // existing bookings. (CALENDAR_UX_DESIGN.md decision D.)
-    const openSlotsText = !classModeMiss && business
-      ? await suggestOpenSlotsText(db, business, pendingSlot.serviceTypeId, new Date(pendingSlot.start), new Date(pendingSlot.end), businessTimezone)
-      : null
-    const classTimesText = classModeMiss && business
-      ? await buildDayOptionsText(db, business, localParts(new Date(pendingSlot.start), businessTimezone).dateStr, businessTimezone, pendingSlot.serviceTypeId)
-      : null
+    const openSuggestion = !classModeMiss && business
+      ? await suggestOpenSlotsText(db, business, pendingSlot.serviceTypeId, new Date(pendingSlot.start), new Date(pendingSlot.end), businessTimezone, ctx.negotiationConstraints)
+      : NO_SUGGESTION
+    const classSuggestion = classModeMiss && business
+      ? await buildDayOptionsText(db, business, localParts(new Date(pendingSlot.start), businessTimezone).dateStr, businessTimezone, pendingSlot.serviceTypeId, ctx.negotiationConstraints)
+      : NO_SUGGESTION
+    const offeredAlternatives = classModeMiss ? classSuggestion.offered : openSuggestion.offered
+    await updateSessionContext(
+      db,
+      session.id,
+      {
+        ...ctxWithoutPending, slotDraft: keptReofferDraft, clarificationAttempts: 0,
+        ...(offeredAlternatives.length > 0 ? { lastOfferedSlots: offeredAlternatives } : {}),
+      },
+      'waiting_clarification',
+    )
+    const openSlotsText = openSuggestion.text
+    const classTimesText = classSuggestion.text
     // Reactive instructor case: the customer named an instructor who teaches this
     // service but isn't free for the chosen slot. Surface that instructor's hours
     // (we only volunteer this because the customer raised the instructor first —

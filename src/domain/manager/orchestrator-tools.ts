@@ -35,6 +35,7 @@ import { reconcileScheduleWindowOnRead } from '../calendar/inbound-sync.js'
 import type { ListedEvent } from '../../adapters/calendar/types.js'
 import type { CalendarBlock } from '../../db/schema.js'
 import { getOpenSlots } from '../availability/service.js'
+import { filterOpenSlots, type NegotiationConstraints } from '../flows/negotiation-constraints.js'
 import { blockOpenTimeAroundClasses, blockAroundClassesReplyGuidance } from '../availability/block-around-classes.js'
 import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
@@ -103,6 +104,12 @@ export interface ToolContext {
   // staff at the apply seam. Optional so existing test contexts default to manager.
   role?: IdentityRole
   delegatedPermissions?: Set<Action>
+  // Negotiation memory (Branch 3 read-side only): times the owner has ruled out this
+  // session are subtracted from proactive free-slot suggestions. Capture is deferred
+  // (managers don't reject slots through a deterministic transition), so this is
+  // currently inert — wired and ready for when a capture path lands (e.g. meeting
+  // coordination). See negotiation-constraints.ts and NEGOTIATION_MEMORY_PLAN.md.
+  negotiationConstraints?: NegotiationConstraints
 }
 
 // Builds the guidance string the orchestrator LLM relays when a name is ambiguous. Lists each
@@ -251,7 +258,10 @@ export async function executeListCalendarEvents(
         .limit(1)
       const duration = svc?.durationMinutes ?? 30
 
-      const slots = await getOpenSlots(ctx.db, business, { start: from, end: to }, duration, { maxSlots: 12 })
+      // Over-fetch then subtract any session-rejected/avoided times so re-suggestions
+      // never resurface a slot the owner already ruled out. Inert until capture exists.
+      const rawSlots = await getOpenSlots(ctx.db, business, { start: from, end: to }, duration, { maxSlots: 40 })
+      const slots = filterOpenSlots(rawSlots, ctx.negotiationConstraints, ctx.timezone).slice(0, 12)
       if (slots.length === 0) {
         return { freeSlots: [], count: 0 }
       }

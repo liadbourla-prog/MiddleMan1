@@ -15,6 +15,7 @@ import type { CalendarClient } from '../calendar/client.js'
 import type { TranscriptTurn } from './types.js'
 import type { Lang } from '../../domain/i18n/t.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
+import type { NegotiationConstraints } from '../../domain/flows/negotiation-constraints.js'
 import { buildVoiceCore } from './voice.js'
 import { MODELS } from './models.js'
 import {
@@ -983,6 +984,10 @@ export interface OrchestratorParams {
   // are gated to the actions the owner declared. Defaults to manager when omitted.
   role?: IdentityRole
   delegatedPermissions?: Set<Action>
+  // Negotiation memory (Branch 3 read-side filter): the manager session's ruled-out
+  // times, subtracted from proactive free-slot suggestions. Capture is deferred, so this
+  // is currently always empty — threaded so it's live the moment a capture path exists.
+  negotiationConstraints?: NegotiationConstraints
   // ── Test seams (optional; production never sets these) ─────────────────────
   // Let the quality harness grade the real Gemini function-calling loop + the
   // real system prompt against FIXED tool results, with no DB or calendar. When
@@ -1062,6 +1067,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     ...(params.calendarMode ? { calendarMode: params.calendarMode } : {}),
     ...(params.role ? { role: params.role } : {}),
     ...(params.delegatedPermissions ? { delegatedPermissions: params.delegatedPermissions } : {}),
+    ...(params.negotiationConstraints ? { negotiationConstraints: params.negotiationConstraints } : {}),
   }
 
   const tools = [{ functionDeclarations: MANAGER_TOOLS }]

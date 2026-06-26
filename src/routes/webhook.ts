@@ -1103,6 +1103,7 @@ async function routeManagerMessage(
       teachingSchedule: mgTeachingSchedule,
       role: identity.role,
       ...(delegatedPermissions ? { delegatedPermissions } : {}),
+      ...(mgCtx.negotiationConstraints ? { negotiationConstraints: mgCtx.negotiationConstraints } : {}),
     }).catch((err) => {
       app.log.error({ err, businessId: business.id }, 'Orchestrator loop threw')
       return i18n.manager_classify_error[turnLang]

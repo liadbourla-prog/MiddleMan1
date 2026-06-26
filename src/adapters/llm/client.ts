@@ -89,6 +89,14 @@ const customerIntentSchema = z.object({
     Object.fromEntries(Object.entries(v).map(([k, val]) => [k, String(val)])),
   ).catch({}),
   detectedLanguage: z.enum(['he', 'en']).catch('he'),
+  avoidConstraints: z
+    .object({
+      beforeHour: z.number().int().min(0).max(23).nullable().catch(null),
+      afterHour: z.number().int().min(0).max(23).nullable().catch(null),
+      weekdays: z.array(z.number().int().min(0).max(6)).nullable().catch(null),
+    })
+    .nullable()
+    .catch(null),
 })
 
 // Defensive normalization: gemini-2.5-flash sometimes emits snake_case top-level
@@ -127,7 +135,7 @@ export async function extractCustomerIntent(
   sessionContext: Record<string, unknown>,
   businessTimezone: string,
   availableServices: string[],
-  botPersona?: 'female' | 'male' | 'neutral',
+  _botPersona?: 'female' | 'male' | 'neutral',
 ): Promise<LlmResult<CustomerIntentOutput>> {
   const safeMessage = sanitizeUserInput(message)
 
@@ -157,7 +165,8 @@ Return a JSON object with EXACTLY this structure (all fields required):
   "participantsHint": number | null,
   "summary": "one sentence summary" | null,
   "rawEntities": {},
-  "detectedLanguage": "he" | "en"
+  "detectedLanguage": "he" | "en",
+  "avoidConstraints": { "beforeHour": 0-23|null, "afterHour": 0-23|null, "weekdays": [0-6]|null } | null
 }
 
 Rules:
@@ -173,6 +182,9 @@ Rules:
   - hasSpecificDate: true if any concrete day is identifiable (relativeDay other than this_week/next_week, a weekday, or an explicitDate with day+month). false for vague ("sometime next week").
   - hasSpecificTime: true only when "time" is filled. false for vague ("morning").
   - dateAmbiguous: true ONLY for "this_week"/"next_week" with no weekday. Explicit day+month dates and named weekdays are NEVER ambiguous — set false.
+- avoidConstraints: capture time windows or days the customer RULES OUT — what they do NOT want, not what they want. Set to null unless the customer states an exclusion.
+  - "no mornings"/"בלי בוקר"/"לא בבוקר" → beforeHour 12. "nothing before 4"/"לא לפני 16:00" → beforeHour 16. "no evenings"/"בלי ערב" → afterHour 17. "nothing after 6pm"/"לא אחרי 18:00" → afterHour 18. "not Thursdays"/"לא בימי חמישי" → weekdays [4]; combine multiple days. Null fields that aren't stated; combine fields when several exclusions appear in one message.
+  - This is ONLY for excluded windows used to FIND a slot. The specific time the customer is asking to book goes in slotRequest.time, NEVER here.
 - serviceTypeHint: extract the service name the customer mentions (e.g. "תספורת" → "תספורת", "haircut" → "Haircut"). null if none.
 - customerNameHint: the customer's OWN name when they introduce themselves ("I'm Guy Cohen", "this is Dana", "שמי גיא"). null if they don't state their own name. Never put a staff or third-party name here.
 - participantsHint: number of people if the customer states a party size ("for 3 people"/"לשלושה אנשים"→3). null if not stated.
@@ -362,7 +374,7 @@ NEVER INVENT BUSINESS FACTS — strictly enforced: do not state or imply any ser
 
 BOOKING CONFIRMATIONS: when confirming a booking, restate the service name, day, date, and time clearly, then ask for a yes/no IN PLAIN WORDS — never append a menu. NEVER write "(כן / לא)", "(YES / NO)", "השב כן/לא", or any option list; just ask naturally ("מתאים?" / "סוגר?" / "sound good?" / "shall I lock it in?"). Vary the wording — don't template the whole message.
 
-GREETING — at most ONCE per conversation. Only the very first message of a session may open with a greeting/﻿hello or a self-introduction. On every later turn, do NOT open with "שלום"/"היי"/"hi"/"hello", do NOT re-introduce yourself ("אני העוזרת…"), and do NOT open with an offer to help ("אשמח לעזור"/"בטח"). Continue the conversation directly.
+GREETING — at most ONCE per conversation. Only the very first message of a session may open with a greeting/hello or a self-introduction. On every later turn, do NOT open with "שלום"/"היי"/"hi"/"hello", do NOT re-introduce yourself ("אני העוזרת…"), and do NOT open with an offer to help ("אשמח לעזור"/"בטח"). Continue the conversation directly.
 
 PLATFORM EXCEPTION: never reference AI or the underlying technology. The ONLY exception: when the situation explicitly authorizes a platform explanation, give the single one-line platform fact it provides — nothing more — then return to helping.
 
