@@ -142,6 +142,25 @@ export const businesses = pgTable('businesses', {
   // by the payment-request worker. Mirrors how reminder timing is owner-controlled.
   paymentLinkSendPolicy: text('payment_link_send_policy', { enum: ['at_booking', 'offset'] }).notNull().default('at_booking'),
   paymentLinkOffsetMinutes: integer('payment_link_offset_minutes'),
+  // Contact restriction (allowlist). Default OFF — behavior is identical to today until the owner
+  // opts in via the manageAllowedContacts Branch-3 tool. When ON, only numbers in allowedContacts
+  // (plus manager/delegated/contact identities) reach the PA; everyone else is silently dropped and
+  // the owner is forwarded the attempt. Strict list — existing customers are NOT grandfathered.
+  contactRestrictionEnabled: boolean('contact_restriction_enabled').notNull().default(false),
+  // jsonb array of { phone: E164, label?: string, addedAt: ISO8601 }. null/[] = empty list.
+  allowedContacts: jsonb('allowed_contacts'),
+})
+
+// Per-event owner-notification digest buffer (calendar-notifications feature). When a notification
+// rule routes an event to action 'digest', the owner emitter enqueues a row here instead of sending
+// immediately; the daily-briefing worker flushes unflushed rows into the briefing and stamps flushedAt.
+export const notificationDigestQueue = pgTable('notification_digest_queue', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  businessId: uuid('business_id').notNull().references(() => businesses.id),
+  event: text('event').notNull(), // NotificationEvent value
+  payload: jsonb('payload').notNull(), // { summary: string } — pre-rendered, lang-resolved at flush
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  flushedAt: timestamp('flushed_at', { withTimezone: true }),
 })
 
 export const identities = pgTable(
