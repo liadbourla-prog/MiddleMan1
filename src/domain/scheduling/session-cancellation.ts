@@ -6,7 +6,7 @@ import { enqueueMessage } from '../../workers/message-retry.js'
 import { enqueueBookingDeletion } from '../../workers/calendar-mirror.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { logAudit } from '../audit/logger.js'
-import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
+import { notifyBusinessBookingChange, notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { i18n, type Lang } from '../i18n/t.js'
 
 // Cancelling a class session is a state change that touches three parties: the booked
@@ -85,6 +85,18 @@ export async function cancelClassSessionBookings(
         serviceTypeId: block.serviceTypeId,
         slotStart: block.startTs,
       })
+
+      // Owner-facing: a session cancellation is a PA-initiated movement the owner has no other
+      // notice of. Rules-gated, so an owner who muted 'cancellation' won't be pinged. Best-effort.
+      notifyOwnerBookingChange(db, businessId, {
+        kind: 'cancelled',
+        origin: 'pa',
+        actorIsManager: false,
+        bookingId: b.id,
+        customerId: b.customerId,
+        serviceTypeId: block.serviceTypeId,
+        slotStart: block.startTs,
+      }).catch(() => { /* non-fatal */ })
 
       await logAudit(db, {
         businessId,

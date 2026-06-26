@@ -7,6 +7,7 @@ import type { ActiveSession } from '../session/types.js'
 import { buildActionLedgerBlock } from '../audit/ledger-block.js'
 import { updateSessionContext, completeSession, failSession } from '../session/manager.js'
 import { requestBooking, confirmBooking, cancelBooking } from '../booking/engine.js'
+import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
@@ -1338,10 +1339,45 @@ async function releaseSupersededBooking(
   ctx: BookingFlowContext,
 ): Promise<void> {
   if (!ctx.rescheduledFrom) return
+  let oldSlot: Date | null = null
+  let newSlot: Date | null = null
+  let serviceTypeId: string | null = null
   try {
+    const [oldB] = await db
+      .select({ slotStart: bookings.slotStart, serviceTypeId: bookings.serviceTypeId })
+      .from(bookings)
+      .where(eq(bookings.id, ctx.rescheduledFrom))
+      .limit(1)
+    oldSlot = oldB?.slotStart ?? null
+    serviceTypeId = oldB?.serviceTypeId ?? null
+    const newBookingId = ctx.pendingBookingId
+    if (newBookingId) {
+      const [newB] = await db
+        .select({ slotStart: bookings.slotStart })
+        .from(bookings)
+        .where(eq(bookings.id, newBookingId))
+        .limit(1)
+      newSlot = newB?.slotStart ?? null
+    }
     await cancelBooking(db, calendar, identity, ctx.rescheduledFrom, 'Superseded by reschedule')
   } catch {
     /* old slot lingers; surfaced via the customer's upcoming-appointments view + reminders */
+  }
+
+  // A reschedule is a single owner-facing 'moved' notice (customer-originated), not a cancel +
+  // a new booking. The engine suppresses the supersede-cancel ('Superseded by reschedule') and
+  // skips notifyOwnerNewBooking is irrelevant here — we surface the move once, with both slots.
+  if (oldSlot && newSlot && ctx.pendingBookingId) {
+    notifyOwnerBookingChange(db, identity.businessId, {
+      kind: 'moved',
+      origin: 'customer',
+      actorIsManager: false,
+      bookingId: ctx.pendingBookingId,
+      customerId: identity.id,
+      serviceTypeId,
+      fromSlotStart: oldSlot,
+      slotStart: newSlot,
+    }).catch(() => { /* non-fatal */ })
   }
 }
 

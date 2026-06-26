@@ -12,7 +12,7 @@ import {
 import { createCalendarClient } from '../../adapters/calendar/client.js'
 import type { RawCalendarEvent } from '../../adapters/calendar/types.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
-import { notifyBusinessBookingChange } from '../initiations/booking-notify.js'
+import { notifyBusinessBookingChange, notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { logAudit } from '../audit/logger.js'
 import { i18n, type Lang } from '../i18n/t.js'
 
@@ -389,6 +389,19 @@ async function applyOwnerCancellations(ctx: SyncContext, affected: AffectedBooki
       serviceTypeId: a.serviceTypeId,
       slotStart: a.slotStart,
     })
+
+    // Owner-facing: surface the Google-originated cancellation per-booking. Rules-gated (so an
+    // owner who muted 'cancellation' won't get both this and the digest), and the existing
+    // blast-radius confirm-gate above + the summary below are unchanged. Best-effort.
+    notifyOwnerBookingChange(db, businessId, {
+      kind: 'cancelled',
+      origin: 'google',
+      actorIsManager: false,
+      bookingId: a.bookingId,
+      customerId: a.customerId,
+      serviceTypeId: a.serviceTypeId,
+      slotStart: a.slotStart,
+    }).catch(() => { /* non-fatal */ })
 
     await logAudit(db, {
       businessId,

@@ -14,7 +14,7 @@ import { buildBookingAuditMeta, initiatorFromActor } from './audit-meta.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
-import { notifyBusinessBookingChange, notifyOwnerNewBooking, notifyOwnerApprovalRequest } from '../initiations/booking-notify.js'
+import { notifyBusinessBookingChange, notifyOwnerNewBooking, notifyOwnerApprovalRequest, notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { shouldHoldForApproval } from './approval.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
@@ -867,6 +867,20 @@ export async function cancelBooking(
   if (cancelledByRole === 'manager' && booking.customerId !== actor.id) {
     notifyBusinessBookingChange(db, actor.businessId, {
       kind: 'cancelled',
+      bookingId,
+      customerId: booking.customerId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+    }).catch(() => { /* non-fatal */ })
+  }
+
+  // Owner-facing: notify the owner of customer/PA-originated cancellations (NOT the manager's own
+  // action, and NOT a reschedule-supersede — that surfaces as a single 'moved' notice elsewhere).
+  if (cancelledByRole !== 'manager' && reason !== 'Superseded by reschedule') {
+    notifyOwnerBookingChange(db, actor.businessId, {
+      kind: 'cancelled',
+      origin: cancelledByRole === 'customer' ? 'customer' : 'pa',
+      actorIsManager: false,
       bookingId,
       customerId: booking.customerId,
       serviceTypeId: booking.serviceTypeId,
