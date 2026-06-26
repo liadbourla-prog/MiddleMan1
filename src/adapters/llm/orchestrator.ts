@@ -22,6 +22,7 @@ import {
   executeCreateCalendarEvent,
   executeSelectCalendar,
   executeScheduleGroupSession,
+  executeBlockOpenTimeAroundClasses,
   executeDeleteCalendarEvent,
   executeEditClassSession,
   executeScheduleRecurringClasses,
@@ -262,6 +263,28 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         },
       },
       required: ['classes'],
+    },
+  },
+  {
+    name: 'blockOpenTimeAroundClasses',
+    description: 'Block all the OPEN in-hours time AROUND the existing scheduled classes for a date range, in ONE step — use this for "this week customers may only book the existing classes, block everything else", "keep the group classes but block all the other hours Sun–Thu", "don\'t let anyone book outside the classes next week". It reads the real class schedule and the business hours and blocks every gap between classes, NEVER touching a class slot (the classes stay fully bookable). It is atomic and finishes immediately — do NOT block hours one-by-one or promise to "go through the rest later". VISIBILITY: ask the owner ONCE whether these should show up as real "blocked time" in their Google calendar (visibility:"google") or just be kept off-limits internally without cluttering their calendar (visibility:"internal"). Default to "internal" when they simply want customers not to book outside the classes (the common case). Either way customers can no longer book those hours. Report date ranges as structured pieces — NEVER compute an ISO date yourself.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        fromDate: DATE_PIECES_SCHEMA,
+        toDate: DATE_PIECES_SCHEMA,
+        weekdays: {
+          type: Type.ARRAY,
+          items: { type: Type.NUMBER },
+          description: 'Restrict to these weekdays: 0=Sunday … 6=Saturday. E.g. Sun–Thu = [0,1,2,3,4]. Omit to block every day in the range.',
+        },
+        visibility: {
+          type: Type.STRING,
+          enum: ['internal', 'google'],
+          description: '"internal" = off-limits hours kept inside the system, invisible in the owner\'s Google calendar (default; use for "just don\'t let customers book outside the classes"). "google" = real blocked-time events the owner sees in their Google calendar. Ask the owner once if unclear; default to "internal".',
+        },
+      },
+      required: ['fromDate', 'toDate'],
     },
   },
   {
@@ -708,6 +731,9 @@ Only state something happened — a message sent, a calendar connected, a bookin
 A tool result with success:false, an error, or a clarificationNeeded/needsClarification field means the action did NOT happen and nothing is queued. In that case relay that exact clarification or problem to the owner in your own words and ask for what's needed — NEVER respond as if it succeeded or is in progress. Specifically, never say a change is "done", "updated", "being applied", "saved", or "will show up in a few minutes / shortly" off a failed or clarification result — there is no background job; if you did not get success, it is not happening.
 Never say you "checked", "verified", "confirmed", or "made sure" of anything unless you actually called a tool to read it in THIS turn. If you have not verified, do not claim you did — say what you'll do, then do it.
 
+## Never promise to keep working after this turn — there is no background job
+You act ONLY within the current turn. You cannot work in the background, continue after you reply, or pick a task back up "in a few moments". After you have done PART of a multi-step request, NEVER say you will "go through the rest", "keep working on it", "finish it shortly", "continue blocking the other days", "update you when I'm done", or "it'll take a few moments" — these are forbidden because nothing runs after your reply, so the promise is always false. Instead: do as much as the turn's tools allow, then state EXACTLY what was done and what still remains, and ask the owner to tell you to continue (each owner message is what lets you do the next part). When a single tool can do the whole job in one call — e.g. blockOpenTimeAroundClasses blocks the open time around the classes for an entire date range at once — use THAT instead of doing it piece by piece, and report the real total it returned. If you genuinely cannot finish in this turn, say so plainly; do not paper over it with a promise to continue.
+
 ## Outbound: attempt the tool — never refuse from your own assumption
 When the owner asks you to contact, message, notify, or coordinate with a specific person, you MUST actually call the tool (messageCustomer for a one-off message to a customer or a number the owner gives you; coordinateMeeting to negotiate an unset meeting time). The tool — not you — decides deliverability and enforces the real WhatsApp rules. You do NOT know the messaging window or whether someone wrote recently unless a tool tells you. NEVER decline or stall by inventing a rule such as "they have to message us first", "the 24-hour window is closed", or "I can't text a new number" — those are for the tool to determine and report back; if a send truly can't go out, the tool says so (and often falls back to an approved template), and only then do you relay that honestly. Refusing an outbound request without having called the tool is a hard violation. The owner giving a phone number is explicit permission to reach that person.
 
@@ -766,6 +792,8 @@ async function dispatchTool(
       return executeSelectCalendar(args as unknown as Parameters<typeof executeSelectCalendar>[0], ctx)
     case 'scheduleGroupSession':
       return executeScheduleGroupSession(args as unknown as Parameters<typeof executeScheduleGroupSession>[0], ctx)
+    case 'blockOpenTimeAroundClasses':
+      return executeBlockOpenTimeAroundClasses(args as unknown as Parameters<typeof executeBlockOpenTimeAroundClasses>[0], ctx)
     case 'deleteCalendarEvent':
       return executeDeleteCalendarEvent(args as unknown as Parameters<typeof executeDeleteCalendarEvent>[0], ctx)
     case 'editClassSession':

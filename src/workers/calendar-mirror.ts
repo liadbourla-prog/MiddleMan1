@@ -103,6 +103,9 @@ async function processBlockUpsert(ctx: MirrorContext, businessId: string, blockI
   if (!block) return
   // Owner-imported blocks originate in Google — never mirror them back out.
   if (block.source === 'google_import') return
+  // Internal-only off-limits time (Issue 3): enforced for customers but deliberately
+  // invisible in the owner's Google calendar — never push it out.
+  if (!block.mirrorToGoogle) return
 
   let colorId: number | null = null
   if (block.type === 'class' && block.serviceTypeId) {

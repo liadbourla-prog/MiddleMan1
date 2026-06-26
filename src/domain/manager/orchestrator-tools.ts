@@ -35,6 +35,7 @@ import { reconcileScheduleWindowOnRead } from '../calendar/inbound-sync.js'
 import type { ListedEvent } from '../../adapters/calendar/types.js'
 import type { CalendarBlock } from '../../db/schema.js'
 import { getOpenSlots } from '../availability/service.js'
+import { blockOpenTimeAroundClasses, blockAroundClassesReplyGuidance } from '../availability/block-around-classes.js'
 import { localParts } from '../availability/compute.js'
 import { resolveSlotRange, resolveRequestedDate, addDaysToDateStr, resolveSlotStart, type RequestedDateParts, type RelativeDay, type SlotRangeReason } from '../availability/resolve-slot.js'
 import { findProviderByName } from '../provider/lookup.js'
@@ -628,6 +629,88 @@ export async function executeScheduleGroupSession(
     success: true,
     eventId: `${BLOCK_ID_PREFIX}${block.id}`,
     scheduled: { title, when, maxParticipants: maxParticipants ?? null, instructor: args.instructor?.trim() ?? null },
+  }
+}
+
+// ── blockOpenTimeAroundClasses ────────────────────────────────────────────────
+// Issue 3: the owner wants "this week, customers may only book the existing classes
+// — block everything else." A single atomic, idempotent call that materializes the
+// complementary in-hours gaps around existing class instances as `block` rows. Two
+// visibility modes (see CALENDAR_UX_DESIGN.md): 'google' = real blocked time the owner
+// sees in their calendar; 'internal' (default) = off-limits hours the customer engine
+// still refuses but that never clutter Google. Both still hard-stop customer bookings.
+
+interface BlockAroundClassesArgs {
+  fromDate: DatePieces
+  toDate: DatePieces
+  weekdays?: number[]
+  visibility?: 'internal' | 'google'
+}
+
+export async function executeBlockOpenTimeAroundClasses(
+  args: BlockAroundClassesArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const now = new Date()
+  const fromRes = resolveRequestedDate(toDateParts(args.fromDate), ctx.timezone, now)
+  if (!fromRes.ok) return clarifyDate(fromRes.reason)
+  const toRes = resolveRequestedDate(toDateParts(args.toDate), ctx.timezone, now)
+  if (!toRes.ok) return clarifyDate(toRes.reason)
+  if (toRes.dateStr < fromRes.dateStr) {
+    return {
+      success: false,
+      needsClarification: true,
+      guidance: 'The end date is before the start date. Ask the owner for a valid date range — do not guess.',
+    }
+  }
+
+  const [biz] = await ctx.db.select().from(businesses).where(eq(businesses.id, ctx.businessId)).limit(1)
+  if (!biz) return { success: false, message: 'Business not found.' }
+
+  // Default to internal/off-limits (this case's intent). Only mirror to Google when
+  // the owner explicitly wants visible blocked time. The tool description tells the
+  // model to ASK once when the owner's intent is ambiguous.
+  const mirror = args.visibility === 'google'
+
+  const summary = await blockOpenTimeAroundClasses(ctx.db, biz, {
+    from: fromRes.dateStr,
+    to: toRes.dateStr,
+    ...(args.weekdays && args.weekdays.length > 0 ? { weekdays: args.weekdays } : {}),
+    mirror,
+  })
+
+  // Enqueue an outbound mirror for each created block. The worker skips internal-only
+  // rows, so this is a no-op for soft blocks and a real push for visible ones.
+  for (const id of summary.createdBlockIds) await enqueueBlockMirror(ctx.businessId, id)
+
+  await logAudit(ctx.db, {
+    businessId: ctx.businessId,
+    actorId: ctx.identityId,
+    action: 'calendar.block_around_classes',
+    entityType: 'business',
+    entityId: ctx.businessId,
+    metadata: {
+      from: fromRes.dateStr,
+      to: toRes.dateStr,
+      weekdays: args.weekdays ?? null,
+      mirror,
+      daysProcessed: summary.daysProcessed,
+      blocksCreated: summary.blocksCreated,
+      classesPreserved: summary.classesPreserved,
+    },
+  })
+
+  return {
+    success: true,
+    visibility: mirror ? 'google' : 'internal',
+    result: {
+      daysProcessed: summary.daysProcessed,
+      blocksCreated: summary.blocksCreated,
+      classesPreserved: summary.classesPreserved,
+      from: fromRes.dateStr,
+      to: toRes.dateStr,
+    },
+    guidance: blockAroundClassesReplyGuidance(summary, mirror),
   }
 }
 

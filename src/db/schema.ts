@@ -432,6 +432,11 @@ export const calendarBlocks = pgTable(
     googleEtag: text('google_etag'),
     // Provenance: 'internal' = created via PA/Branch 3; 'google_import' = ingested from owner's Google edit
     source: text('source', { enum: ['internal', 'google_import'] }).notNull().default('internal'),
+    // Visibility: true = mirror out as a real "blocked time" event the owner sees in
+    // Google; false = internal-only off-limits hours (Branch 4 still refuses them to
+    // customers — only the Google mirror differs). Lets the owner block hours around
+    // classes WITHOUT cluttering their calendar. See CALENDAR_UX_DESIGN.md / Issue 3.
+    mirrorToGoogle: boolean('mirror_to_google').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

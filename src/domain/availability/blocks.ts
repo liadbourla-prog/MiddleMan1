@@ -31,6 +31,8 @@ export interface CreateBlockInput {
   googleEventId?: string | null
   googleEtag?: string | null
   source?: 'internal' | 'google_import'
+  /** false = internal-only off-limits time (never mirrored to Google). Default true. */
+  mirrorToGoogle?: boolean
 }
 
 /** Insert a calendar block and return the created row. */
@@ -50,6 +52,7 @@ export async function createBlock(db: Db, input: CreateBlockInput): Promise<Cale
       googleEventId: input.googleEventId ?? null,
       googleEtag: input.googleEtag ?? null,
       source: input.source ?? 'internal',
+      mirrorToGoogle: input.mirrorToGoogle ?? true,
     })
     .returning()
   if (!row) throw new Error('Failed to insert calendar block')
