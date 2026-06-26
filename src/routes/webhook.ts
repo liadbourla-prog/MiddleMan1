@@ -56,6 +56,12 @@ import { bufferInbound, flushBurst, combineInbound, shouldBypassCoalescing, debo
 import { findActiveByContact } from '../domain/coordination/repository.js'
 import { advanceFromContact, type BusinessCtx } from '../domain/coordination/handler.js'
 import { resolveOutreachIntroducer } from '../domain/coordination/introducer.js'
+import { isInboundBlocked } from './contact-gate.js'
+import type { AllowedContact } from '../domain/manager/allowed-contacts.js'
+import { notifyOwnerUnlistedContact } from '../domain/initiations/booking-notify.js'
+
+// Re-export so callers/tests importing the gate from the webhook surface still resolve it.
+export { isInboundBlocked } from './contact-gate.js'
 
 export async function webhookRoutes(app: FastifyInstance) {
   // Webhook verification handshake (GET)
@@ -284,12 +290,25 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
       await sendMessage({ toNumber: msg.fromNumber, body: revokedReply }, revokedCreds)
       return
     }
+    // Contact restriction: an unknown number is blocked unless on the allowlist. Silent to the
+    // sender; forward the attempt to the owner. Evaluated before auto-registration so a blocked
+    // number never becomes a customer identity.
+    if (isInboundBlocked(business.contactRestrictionEnabled, business.allowedContacts as AllowedContact[] | null, msg.fromNumber, null)) {
+      void notifyOwnerUnlistedContact(db, business.id, { fromNumber: msg.fromNumber, messageText: msg.body ?? '' })
+      return
+    }
     await registerCustomer(db, business.id, msg.fromNumber)
     identityResult = await resolveIdentity(db, business.id, msg.fromNumber)
   }
 
   if (!identityResult.found) return
   const identity = identityResult.identity
+
+  // Contact restriction for an EXISTING identity (strict list — customers are not grandfathered).
+  if (isInboundBlocked(business.contactRestrictionEnabled, business.allowedContacts as AllowedContact[] | null, msg.fromNumber, identity.role)) {
+    void notifyOwnerUnlistedContact(db, business.id, { fromNumber: msg.fromNumber, messageText: msg.body ?? '' })
+    return
+  }
 
   // Record the inbound timestamp NOW — before any early return below (opt-out, coordination,
   // paused business) and before burst buffering. identities.lastInboundAt is the source of truth
