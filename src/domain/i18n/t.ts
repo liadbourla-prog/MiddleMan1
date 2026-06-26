@@ -799,6 +799,15 @@ const strings = {
     he: (numTail: string, snippet: string) => `📵 מספר שאינו ברשימת המורשים (…${numTail}) ניסה לכתוב ל-PA: "${snippet}". לא עניתי לו. כדי לאשר אותו, השב/י "אשר ${numTail}".`,
     en: (numTail: string, snippet: string) => `📵 A number that isn't on your allowed list (…${numTail}) tried to message the PA: "${snippet}". I didn't reply. To allow them, reply "allow …${numTail}".`,
   },
+  // Owner-facing calendar movement notices (per-movement notifications feature).
+  owner_change_cancelled: {
+    he: (who: string, svc: string, when: string) => `🔴 ${who} ביטל/ה ${svc} (${when}).`,
+    en: (who: string, svc: string, when: string) => `🔴 ${who} cancelled ${svc} (${when}).`,
+  },
+  owner_change_moved: {
+    he: (who: string, svc: string, from: string, to: string) => `🔄 ${who} העביר/ה ${svc} מ-${from} ל-${to}.`,
+    en: (who: string, svc: string, from: string, to: string) => `🔄 ${who} moved ${svc} from ${from} to ${to}.`,
+  },
 
   // ── Per-conversation pause (manager ops) ─────────────────────────────────────
   pause_conv_confirm: {

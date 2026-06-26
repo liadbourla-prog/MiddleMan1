@@ -18,8 +18,9 @@ import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { dispatchInitiation } from './dispatch.js'
 import { getInitiator } from './registry.js'
-import { resolveNotificationAction, type NotificationRule } from './notification-rules.js'
+import { resolveNotificationAction, type NotificationRule, type NotificationEvent } from './notification-rules.js'
 import type { NotificationPreferences } from '../../shared/skill-types.js'
+import { enqueueDigest } from './digest-queue.js'
 
 export type BusinessBookingChange =
   | { kind: 'cancelled'; bookingId: string; customerId: string; serviceTypeId: string | null; slotStart: Date }
@@ -415,5 +416,96 @@ export async function notifyOwnerApprovalExpired(
     await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] owner approval-expired notify failed', { businessId, err: (err as Error).message })
+  }
+}
+
+// ── Owner-facing per-movement booking-change notifications ───────────────────────
+
+export type OwnerBookingChange =
+  | { kind: 'cancelled'; origin: 'customer' | 'pa' | 'google'; actorIsManager: boolean; bookingId: string; customerId: string; serviceTypeId: string | null; slotStart: Date }
+  | { kind: 'moved'; origin: 'customer' | 'pa' | 'google'; actorIsManager: boolean; bookingId: string; customerId: string; serviceTypeId: string | null; fromSlotStart: Date; slotStart: Date }
+  | { kind: 'confirmed'; origin: 'customer' | 'pa' | 'google'; actorIsManager: boolean; bookingId: string; customerId: string; serviceTypeId: string | null; slotStart: Date }
+
+const EVENT_FOR_OWNER_KIND: Record<OwnerBookingChange['kind'], NotificationEvent> = {
+  cancelled: 'cancellation',
+  moved: 'reschedule',
+  confirmed: 'new_booking',
+}
+
+/**
+ * Notify the OWNER that a booking moved (per-movement notifications feature). The owner-facing twin
+ * of notifyBusinessBookingChange. Gated by resolveNotificationAction: notify → send now; digest →
+ * buffer; handle_silently → nothing. Manager-originated changes are suppressed (the owner did it).
+ * Best-effort: never throws.
+ */
+export async function notifyOwnerBookingChange(db: Db, businessId: string, change: OwnerBookingChange): Promise<void> {
+  try {
+    if (change.actorIsManager) return // never ping the owner for their own action
+
+    const [biz] = await db
+      .select({
+        timezone: businesses.timezone,
+        defaultLanguage: businesses.defaultLanguage,
+        notificationRules: businesses.notificationRules,
+        notificationPreferences: businesses.notificationPreferences,
+      })
+      .from(businesses).where(eq(businesses.id, businessId)).limit(1)
+    if (!biz) return
+
+    const event = EVENT_FOR_OWNER_KIND[change.kind]
+    const action = resolveNotificationAction(
+      (biz.notificationRules as NotificationRule[] | null) ?? null,
+      (biz.notificationPreferences as NotificationPreferences | null) ?? null,
+      event,
+    )
+    if (action === 'handle_silently') return
+
+    const [manager] = await db
+      .select({ id: identities.id, phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+      .limit(1)
+    if (!manager) return
+
+    const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+    const locale = lang === 'he' ? 'he-IL' : 'en-GB'
+
+    const [cust] = await db
+      .select({ displayName: identities.displayName, phone: identities.phoneNumber })
+      .from(identities).where(eq(identities.id, change.customerId)).limit(1)
+    const who = cust?.displayName ?? (cust?.phone ? cust.phone.slice(-4) : (lang === 'he' ? 'לקוח' : 'a customer'))
+
+    let serviceName: string | null = null
+    if (change.serviceTypeId) {
+      const [svc] = await db.select({ name: serviceTypes.name }).from(serviceTypes).where(eq(serviceTypes.id, change.serviceTypeId)).limit(1)
+      serviceName = svc?.name ?? null
+    }
+    const svc = serviceName ?? (lang === 'he' ? 'תור' : 'an appointment')
+
+    const fmt = (d: Date) => new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(d)
+
+    let body: string
+    if (change.kind === 'moved') {
+      body = i18n.owner_change_moved[lang](who, svc, fmt(change.fromSlotStart), fmt(change.slotStart))
+    } else if (change.kind === 'cancelled') {
+      body = i18n.owner_change_cancelled[lang](who, svc, fmt(change.slotStart))
+    } else {
+      body = lang === 'he' ? `🟢 ${who} — ${svc} נקבע ל-${fmt(change.slotStart)}.` : `🟢 ${who} — ${svc} booked for ${fmt(change.slotStart)}.`
+    }
+
+    if (action === 'digest') {
+      await enqueueDigest(db, businessId, event, { summary: body }).catch(() => { /* non-fatal */ })
+      return
+    }
+
+    await dispatchInitiation(db, getInitiator('booking.new_for_owner'), {
+      businessId,
+      recipientId: manager.id,
+      dedupKey: `owner_change:${change.kind}:${change.bookingId}:${change.slotStart.getTime()}`,
+    }, {
+      sendFreeForm: async () => { await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
+    }).catch(() => { /* non-fatal */ })
+  } catch (err) {
+    console.error('[booking-notify] owner booking-change notify failed', { businessId, kind: change.kind, err: (err as Error).message })
   }
 }
