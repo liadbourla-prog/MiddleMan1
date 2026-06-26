@@ -48,6 +48,7 @@ import { logAudit } from '../audit/logger.js'
 import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
 import { cancelClassSessionBookings, summarizeSessionCancellation } from '../scheduling/session-cancellation.js'
 import { resolveBookingApproval, selectPendingApproval, type PendingApprovalCandidate } from '../booking/approval.js'
+import { addAllowedContact, removeAllowedContact, type AllowedContact } from './allowed-contacts.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -1901,6 +1902,79 @@ export async function executeConfigureNotifications(args: ConfigureNotifications
   await logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action: 'notification_rules.updated', entityType: 'business', entityId: ctx.businessId, metadata: { event: args.event, removed: args.remove === true } })
 
   return { success: true, fact: JSON.stringify(next), guidance: 'Notification rule saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
+}
+
+interface ManageAllowedContactsArgs {
+  op: 'enable' | 'disable' | 'add' | 'remove' | 'list'
+  phone?: string
+  label?: string
+}
+
+// Branch-3 control surface for the contact allowlist. enable/disable flips the mode; add/remove
+// edit the list (add auto-enables the mode if it was off so "only talk to +972..." works in one
+// step); list reads it back. Deterministic write — the LLM only supplies the parsed intent.
+export async function executeManageAllowedContacts(args: ManageAllowedContactsArgs, ctx: ToolContext): Promise<object> {
+  const [biz] = await ctx.db
+    .select({ enabled: businesses.contactRestrictionEnabled, list: businesses.allowedContacts })
+    .from(businesses)
+    .where(eq(businesses.id, ctx.businessId))
+    .limit(1)
+  if (!biz) return { success: false, reason: 'business_not_found' }
+
+  const current = (biz.list as AllowedContact[] | null) ?? null
+  const patch: Record<string, unknown> = {}
+  let autoEnabled = false
+
+  switch (args.op) {
+    case 'enable':
+      patch['contactRestrictionEnabled'] = true
+      break
+    case 'disable':
+      patch['contactRestrictionEnabled'] = false
+      break
+    case 'list': {
+      const phones = (current ?? []).map((c) => c.label ? `${c.phone} (${c.label})` : c.phone)
+      return {
+        success: true,
+        fact: JSON.stringify({ enabled: biz.enabled, contacts: phones }),
+        guidance: `Restriction is ${biz.enabled ? 'ON' : 'OFF'}. Read the owner the list of allowed numbers in plain words; if empty, say the list is empty.`,
+      }
+    }
+    case 'add': {
+      if (!args.phone) return { success: false, reason: 'missing_phone', guidance: 'Ask the owner which number to allow.' }
+      let next: AllowedContact[]
+      try {
+        next = addAllowedContact(current, args.phone, args.label, new Date().toISOString())
+      } catch {
+        return { success: false, reason: 'invalid_phone', guidance: 'Tell the owner the number must be in full international format, e.g. +972501234567.' }
+      }
+      patch['allowedContacts'] = next
+      if (!biz.enabled) { patch['contactRestrictionEnabled'] = true; autoEnabled = true }
+      break
+    }
+    case 'remove': {
+      if (!args.phone) return { success: false, reason: 'missing_phone', guidance: 'Ask the owner which number to remove.' }
+      patch['allowedContacts'] = removeAllowedContact(current, args.phone)
+      break
+    }
+    default:
+      return { success: false, reason: 'unknown_op' }
+  }
+
+  await ctx.db.update(businesses).set(patch).where(eq(businesses.id, ctx.businessId))
+  await logAudit(ctx.db, {
+    businessId: ctx.businessId, actorId: ctx.identityId, action: 'allowed_contacts.updated',
+    entityType: 'business', entityId: ctx.businessId, metadata: { op: args.op, autoEnabled },
+  })
+
+  return {
+    success: true,
+    autoEnabled,
+    fact: JSON.stringify(patch),
+    guidance: autoEnabled
+      ? 'Saved, and I turned the restriction ON because it was off. Confirm to the owner in plain words that the PA will now only talk to allowed numbers, and that this one is allowed.'
+      : 'Saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).',
+  }
 }
 
 interface ConfigurePaymentTimingArgs {
