@@ -563,12 +563,12 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'configureNotifications',
-    description: "Set how the owner wants to be notified about a business event. Use when the owner says things like 'only tell me about cancellations within 24 hours', 'stop pinging me on every new booking', 'handle no-shows silently', or 'let me know when someone pays'. One event per call. Note: payment_received is SILENT by default (the PA handles payments end to end) — use it when the owner wants to start (or stop) being told about incoming payments.",
+    description: "Set how the owner wants to be notified about a business event. Use when the owner says things like 'only tell me about cancellations within 24 hours', 'stop pinging me on every new booking', 'handle no-shows silently', or 'let me know when someone pays'. One event per call. Note: payment_received is SILENT by default (the PA handles payments end to end) — use it when the owner wants to start (or stop) being told about incoming payments. Use action 'digest' when the owner says things like 'don't ping me every time, just put cancellations in my daily summary' or 'batch the reschedules'.",
     parameters: {
       type: Type.OBJECT,
       properties: {
         event: { type: Type.STRING, enum: ['new_booking', 'first_time_customer', 'cancellation', 'reschedule', 'no_show', 'refund_request', 'vip_return', 'payment_received'], description: 'Which business event this rule is about' },
-        action: { type: Type.STRING, enum: ['notify', 'notify_with_actions', 'handle_silently'], description: 'notify = tell me; notify_with_actions = tell me with quick action buttons; handle_silently = do not tell me' },
+        action: { type: Type.STRING, enum: ['notify', 'notify_with_actions', 'handle_silently', 'digest'], description: 'notify = tell me right away; notify_with_actions = tell me with quick action buttons; handle_silently = do not tell me; digest = do not ping me live, collect these and include them in my daily briefing' },
         withinHours: { type: Type.NUMBER, description: 'Optional: only apply when the affected booking is within this many hours (e.g. 24 for "cancellations inside 24h")' },
         remove: { type: Type.BOOLEAN, description: 'Remove the existing rule for this event instead of setting one' },
       },
