@@ -1337,8 +1337,13 @@ async function releaseSupersededBooking(
   calendar: CalendarClient,
   identity: ResolvedIdentity,
   ctx: BookingFlowContext,
+  // The id of the replacement booking. Defaults to ctx.pendingBookingId (appointment path, where
+  // the hold is confirmed). The group-class direct-confirm path has no pendingBookingId — it passes
+  // result.bookingId explicitly so the 'moved' notice still fires (Defect 2).
+  newBookingIdOverride?: string,
 ): Promise<void> {
   if (!ctx.rescheduledFrom) return
+  const newBookingId = newBookingIdOverride ?? ctx.pendingBookingId
   let oldSlot: Date | null = null
   let newSlot: Date | null = null
   let serviceTypeId: string | null = null
@@ -1350,7 +1355,6 @@ async function releaseSupersededBooking(
       .limit(1)
     oldSlot = oldB?.slotStart ?? null
     serviceTypeId = oldB?.serviceTypeId ?? null
-    const newBookingId = ctx.pendingBookingId
     if (newBookingId) {
       const [newB] = await db
         .select({ slotStart: bookings.slotStart })
@@ -1365,14 +1369,15 @@ async function releaseSupersededBooking(
   }
 
   // A reschedule is a single owner-facing 'moved' notice (customer-originated), not a cancel +
-  // a new booking. The engine suppresses the supersede-cancel ('Superseded by reschedule') and
-  // skips notifyOwnerNewBooking is irrelevant here — we surface the move once, with both slots.
-  if (oldSlot && newSlot && ctx.pendingBookingId) {
+  // a new booking. The customer-self new-booking notice is suppressed at the engine (the confirm/
+  // request callers pass suppressOwnerNewBookingNotice on the reschedule path), so this is the only
+  // owner notice for the move — we surface it once, with both slots.
+  if (oldSlot && newSlot && newBookingId) {
     notifyOwnerBookingChange(db, identity.businessId, {
       kind: 'moved',
       origin: 'customer',
       actorIsManager: false,
-      bookingId: ctx.pendingBookingId,
+      bookingId: newBookingId,
       customerId: identity.id,
       serviceTypeId,
       fromSlotStart: oldSlot,
@@ -1502,6 +1507,9 @@ async function handleHoldConfirmation(
     const confirmResult = await confirmBooking(
       db, calendar, identity, ctx.pendingBookingId,
       (ctx as unknown as Record<string, string>)['displayName'] ?? 'Customer',
+      // On a reschedule the move surfaces as a single owner 'moved' notice (releaseSupersededBooking
+      // below); suppress the engine's new-booking notice so the owner isn't double-notified.
+      { suppressOwnerNewBookingNotice: Boolean(ctx.rescheduledFrom) },
     )
     await completeSession(db, session.id)
 
@@ -1557,6 +1565,11 @@ async function handleHoldConfirmation(
     slotStart: new Date(pendingSlot.start),
     slotEnd: new Date(pendingSlot.end),
     providerHint: (pendingSlot as unknown as { providerHint?: string }).providerHint ?? null,
+  }, {
+    // On a reschedule, a directly-confirmed booking (group class) emits a single owner 'moved'
+    // notice via releaseSupersededBooking below — suppress the engine's new-booking notice so the
+    // owner isn't double-notified. No-op for the non-reschedule and hold-then-confirm paths.
+    suppressOwnerNewBookingNotice: Boolean(ctx.rescheduledFrom),
   })
 
   if (!result.ok) {
@@ -1693,8 +1706,10 @@ async function handleHoldConfirmation(
   // Group class — booking already confirmed, no second YES needed
   if (result.directlyConfirmed) {
     await completeSession(db, session.id)
-    // New booking is committed — release the slot it replaces (reschedule into a class).
-    await releaseSupersededBooking(db, calendar, identity, ctx)
+    // New booking is committed — release the slot it replaces (reschedule into a class). The
+    // group-class booking id lives in result.bookingId (ctx.pendingBookingId is unset on this
+    // direct-confirm path), so pass it explicitly or the 'moved' notice would never fire (Defect 2).
+    await releaseSupersededBooking(db, calendar, identity, ctx, result.bookingId)
     const confirmedDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
     const confirmedTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
     const reply = await genReply({
