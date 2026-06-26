@@ -221,6 +221,48 @@ export async function notifyOwnerNewBooking(
   }
 }
 
+/**
+ * Forward an unlisted-contact attempt to the OWNER (contact-restriction feature). The sender got
+ * silence; the owner is told a number tried and how to allow it. Deduped through the spine so a
+ * blocked number cannot spam the owner. Best-effort: never throws.
+ */
+export async function notifyOwnerUnlistedContact(
+  db: Db,
+  businessId: string,
+  attempt: { fromNumber: string; messageText: string },
+): Promise<void> {
+  try {
+    const [biz] = await db
+      .select({ defaultLanguage: businesses.defaultLanguage })
+      .from(businesses)
+      .where(eq(businesses.id, businessId))
+      .limit(1)
+    if (!biz) return
+
+    const [manager] = await db
+      .select({ id: identities.id, phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+      .limit(1)
+    if (!manager) return
+
+    const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+    const numTail = attempt.fromNumber.slice(-4)
+    const snippet = attempt.messageText.trim().slice(0, 80)
+    const body = i18n.unlisted_contact_forward[lang](numTail, snippet)
+
+    await dispatchInitiation(db, getInitiator('booking.new_for_owner'), {
+      businessId,
+      recipientId: manager.id,
+      dedupKey: `unlisted_contact:${businessId}:${attempt.fromNumber}`,
+    }, {
+      sendFreeForm: async () => { await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
+    }).catch(() => { /* non-fatal */ })
+  } catch (err) {
+    console.error('[booking-notify] unlisted-contact forward failed', { businessId, err: (err as Error).message })
+  }
+}
+
 // ── Per-service owner approval of customer self-bookings (design 2026-06-25) ─────
 
 /**

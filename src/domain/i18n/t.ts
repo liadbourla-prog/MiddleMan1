@@ -794,6 +794,11 @@ const strings = {
     he: (n: number) => `שמתי לב שמחקת מ-Google Calendar אירוע שמשפיע על ${n} הזמנות לקוחות. כדי לא לבטל בטעות הזמנות, לא ביטלתי כלום אוטומטית. רוצה שאבטל את כל ${n} ההזמנות? השב/י "כן לבטל" כדי לאשר.`,
     en: (n: number) => `I noticed you removed a Google Calendar event that affects ${n} customer bookings. To avoid mass-cancelling by mistake, I didn't cancel anything automatically. Want me to cancel all ${n} bookings? Reply "yes cancel" to confirm.`,
   },
+  // Contact restriction: an unlisted number tried to reach the PA while restriction is ON.
+  unlisted_contact_forward: {
+    he: (numTail: string, snippet: string) => `📵 מספר שאינו ברשימת המורשים (…${numTail}) ניסה לכתוב ל-PA: "${snippet}". לא עניתי לו. כדי לאשר אותו, השב/י "אשר ${numTail}".`,
+    en: (numTail: string, snippet: string) => `📵 A number that isn't on your allowed list (…${numTail}) tried to message the PA: "${snippet}". I didn't reply. To allow them, reply "allow …${numTail}".`,
+  },
 
   // ── Per-conversation pause (manager ops) ─────────────────────────────────────
   pause_conv_confirm: {
