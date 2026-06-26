@@ -14,15 +14,61 @@ export interface FlowResult {
 export type ConfirmationParse = 'yes' | 'no' | 'unclear'
 
 const YES_PATTERNS =
-  /^\s*(yes|confirm|ok|okay|sure|yep|yeah|do it|book it|go ahead|כן|אוקיי|אישור|בסדר|בוא נעשה|קדימה|אשר|טוב|בהחלט|יאללה|נשמע טוב|כל הכבוד)\s*[.!]?\s*$/i
+  /^\s*(yes|confirm|ok|okay|sure|yep|yeah|do it|book it|go ahead|כן|כו|אוקיי|אישור|בסדר|בוא נעשה|קדימה|אשר|טוב|בהחלט|יאללה|נשמע טוב|כל הכבוד)\s*[.!]?\s*$/i
 
 const NO_PATTERNS =
   /^\s*(no|nope|cancel|stop|don't|dont|nevermind|never mind|לא|בטל|עצור|בטלו|אל תזמין|לבטל|סגור|אל כן|סליחה לא)\s*[.!]?\s*$/i
 
+// Negation token appearing ANYWHERE — guards the lenient-yes path below so a hedged
+// reply ("yes but no", "כן אבל לא") is never auto-upgraded to a confirmation.
+const NEG_TOKEN =
+  /\b(no|not|don'?t|cancel|stop|nope|never)\b|(^|\s)(לא|אל|בטל|עצור|ביטול)(\s|$)/i
+
+// A reply that OPENS with one of these is an affirmative even when followed by extra
+// words. Single-token forms only (multi-word affirmatives like "go ahead" / "בוא נעשה"
+// are already covered by the strict whole-message YES_PATTERNS above). Includes the
+// frequent one-char כן typo "כו".
+const AFFIRM_WORDS = new Set([
+  'yes', 'yeah', 'yep', 'yup', 'sure', 'okay', 'ok', 'confirm', 'confirmed',
+  'כן', 'כו', 'אוקיי', 'אישור', 'בסדר', 'סבבה', 'בהחלט', 'יאללה', 'קדימה', 'אשר', 'טוב',
+])
+
+// Confirm-intent filler that may TRAIL a leading affirmative without turning the reply
+// into a revision. If, after the opening affirmative, every remaining word is filler,
+// the reply is a plain yes ("yes book me please" / "כן תקבע לי בבקשה"). Any other
+// content (a day, a time, a different service) leaves it 'unclear' so the revision /
+// re-ask path handles it instead of a wrong auto-confirm.
+const CONFIRM_FILLER = new Set([
+  // en
+  'please', 'book', 'it', 'me', 'that', 'this', 'now', 'go', 'ahead', 'lock', 'in',
+  'sounds', 'good', 'great', 'perfect', 'do', 'lets', "let's", 'the', 'my', 'a', 'for',
+  // he
+  'בבקשה', 'תקבע', 'תזמין', 'תסגור', 'לי', 'את', 'זה', 'המקום', 'מעולה', 'נשמע', 'יופי',
+  'בוא', 'נסגור', 'נקבע', 'אפשר', 'רוצה', 'לסגור', 'לקבוע', 'בטוח', 'מצוין', 'תודה',
+])
+
+function confirmationWords(text: string): string[] {
+  return text
+    .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '')
+    .replace(/['’]/g, "'")
+    .replace(/[!?.,;:"()\-–—]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .split(' ')
+    .filter(Boolean)
+}
+
 export function parseConfirmation(text: string): ConfirmationParse {
-  if (YES_PATTERNS.test(text)) return 'yes'
+  // Order: strict no/yes first (canonical single-word replies), then the lenient
+  // leading-affirmative pass that fixes the live confirmation loop where a clear
+  // "yes, book me please" or a "כו" typo was re-asked forever as 'unclear'.
   if (NO_PATTERNS.test(text)) return 'no'
-  return 'unclear'
+  if (YES_PATTERNS.test(text)) return 'yes'
+  if (NEG_TOKEN.test(text)) return 'unclear'
+  const words = confirmationWords(text)
+  if (words.length === 0 || !AFFIRM_WORDS.has(words[0]!)) return 'unclear'
+  return words.slice(1).every((w) => CONFIRM_FILLER.has(w)) ? 'yes' : 'unclear'
 }
 
 export type RetentionReply =

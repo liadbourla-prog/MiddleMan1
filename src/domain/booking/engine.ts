@@ -570,6 +570,10 @@ async function requestGroupClassBooking(
       txResult.bookingId,
       groupEventTitle,
       new Date(Date.now() + 60 * 60 * 1000), // dummy expiry; we confirm immediately
+      // Skip the freebusy probe: the class instance is its own mirrored Google event,
+      // so the probe would report this slot busy and falsely reject the first booking
+      // into the class. Per-instance capacity is enforced above (advisory-lock + count).
+      { skipConflictCheck: true },
     )
 
     if (holdResult.status !== 'held') {

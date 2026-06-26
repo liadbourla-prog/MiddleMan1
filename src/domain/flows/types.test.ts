@@ -37,3 +37,40 @@ describe('parseConfirmation (shared dependency)', () => {
     expect(parseConfirmation('maybe')).toBe('unclear')
   })
 })
+
+// Regression for the live Branch-4 confirmation loop (סטודיוגה, 2026-06-26): a clear
+// affirmative with trailing words, and the one-char כן typo, were classified 'unclear'
+// and re-asked repeatedly. They must now resolve to 'yes' — while genuine revisions and
+// hedged replies must stay 'unclear' so the revision / re-ask path still handles them.
+describe('parseConfirmation — lenient affirmatives', () => {
+  const yes = [
+    'כן',
+    'כו', // one-char כן typo from the live transcript
+    'כן תקבע לי בבקשה', // "yes, book me please"
+    'כן בבקשה',
+    'yes book me please',
+    'ok do it',
+    'סבבה',
+    'אישור.',
+  ]
+  for (const t of yes) {
+    it(`'${t}' → yes`, () => expect(parseConfirmation(t)).toBe('yes'))
+  }
+
+  const unclear = [
+    'כן אבל יום שלישי', // affirmative-led but a revised DAY → must not auto-confirm
+    'כן אבל לא בא לי', // hedged with a negation
+    'yes but actually tuesday',
+    'אולי', // maybe
+    'תקבע לי יוגה ברביעי', // a fresh request, no leading affirmative
+    'מה לגבי 5?', // a question
+  ]
+  for (const t of unclear) {
+    it(`'${t}' → unclear`, () => expect(parseConfirmation(t)).toBe('unclear'))
+  }
+
+  const no = ['לא', 'no', 'בטל', 'cancel']
+  for (const t of no) {
+    it(`'${t}' → no`, () => expect(parseConfirmation(t)).toBe('no'))
+  }
+})

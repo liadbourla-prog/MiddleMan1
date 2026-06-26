@@ -13,6 +13,15 @@ export type HoldResult =
   | { status: 'conflict' }
   | { status: 'error'; reason: string }
 
+export interface PlaceHoldOptions {
+  // When true, placeHold creates the hold WITHOUT a prior availability/freebusy probe.
+  // Used for group-class bookings: a class instance is its own (mirrored) calendar
+  // event, so a freebusy probe reports the slot busy and would falsely reject the first
+  // booking into the class. Per-instance capacity is enforced authoritatively by the
+  // booking engine (advisory-lock + count), so the probe is both wrong and redundant here.
+  skipConflictCheck?: boolean
+}
+
 export type ConfirmResult =
   | { status: 'confirmed'; eventId: string; etag?: string | null }
   | { status: 'error'; reason: string }

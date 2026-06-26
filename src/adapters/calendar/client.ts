@@ -5,6 +5,7 @@ import type {
   CalendarSlot,
   AvailabilityResult,
   HoldResult,
+  PlaceHoldOptions,
   ConfirmResult,
   DeleteResult,
   ListedEvent,
@@ -83,10 +84,16 @@ function createInternalCalendarClient(options: CalendarClientOptions) {
     bookingId: string,
     _serviceName: string,
     _expiresAt: Date,
+    opts?: PlaceHoldOptions,
   ): Promise<HoldResult> {
-    const availability = await checkAvailability(slot)
-    if (availability.status === 'occupied') return { status: 'conflict' }
-    if (availability.status === 'error') return { status: 'error', reason: availability.reason }
+    // Group-class bookings skip the conflict probe: capacity for the instance is the
+    // authority (enforced by the engine's advisory-lock + count), and many bookings
+    // legitimately share one class slot. See PlaceHoldOptions for the rationale.
+    if (!opts?.skipConflictCheck) {
+      const availability = await checkAvailability(slot)
+      if (availability.status === 'occupied') return { status: 'conflict' }
+      if (availability.status === 'error') return { status: 'error', reason: availability.reason }
+    }
     // For internal mode the booking row IS the hold — use bookingId as the event id
     return { status: 'held', eventId: `internal:${bookingId}` }
   }
@@ -242,10 +249,18 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
     bookingId: string,
     serviceName: string,
     expiresAt: Date,
+    opts?: PlaceHoldOptions,
   ): Promise<HoldResult> {
-    const availability = await checkAvailability(slot)
-    if (availability.status === 'occupied') return { status: 'conflict' }
-    if (availability.status === 'error') return { status: 'error', reason: availability.reason }
+    // Group-class bookings skip the freebusy probe. A class instance is itself a
+    // mirrored Google event, so freebusy.query reports its own hour as busy and would
+    // mark the FIRST booking into every class a false 'conflict' (the live "session
+    // fully booked" bug). Capacity is enforced authoritatively by the engine's
+    // advisory-lock + count, not here. See PlaceHoldOptions.
+    if (!opts?.skipConflictCheck) {
+      const availability = await checkAvailability(slot)
+      if (availability.status === 'occupied') return { status: 'conflict' }
+      if (availability.status === 'error') return { status: 'error', reason: availability.reason }
+    }
 
     try {
       const response = await withTokenRefresh(() =>
