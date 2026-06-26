@@ -85,6 +85,11 @@ describe('resolveNotificationAction', () => {
     const rules: NotificationRule[] = [{ event: 'payment_received', action: 'notify' }]
     expect(resolveNotificationAction(rules, null, 'payment_received')).toBe('notify')
   })
+
+  it('resolves a digest rule to digest', () => {
+    const rules = upsertNotificationRule(null, { event: 'cancellation', action: 'digest' })
+    expect(resolveNotificationAction(rules, null, 'cancellation')).toBe('digest')
+  })
 })
 
 describe('upsertNotificationRule', () => {

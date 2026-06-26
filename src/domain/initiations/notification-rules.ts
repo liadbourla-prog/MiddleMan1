@@ -10,7 +10,7 @@ export type NotificationEvent =
   | 'new_booking' | 'first_time_customer' | 'cancellation' | 'reschedule'
   | 'no_show' | 'refund_request' | 'vip_return' | 'payment_received'
 
-export type NotificationAction = 'notify' | 'notify_with_actions' | 'handle_silently'
+export type NotificationAction = 'notify' | 'notify_with_actions' | 'handle_silently' | 'digest'
 
 export interface NotificationRule {
   event: NotificationEvent
