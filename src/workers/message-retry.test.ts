@@ -1,24 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-vi.mock('../adapters/whatsapp/sender.js', () => ({
-  sendMessage: vi.fn(async () => ({ ok: true as const })),
-}))
+// Mutable slot — individual tests can swap the resolved rows.
+let dbLimitResult: unknown[] = [
+  { phoneNumberId: 'PNID_199346', accessToken: 'TOKEN_BIZ' },
+]
 
 vi.mock('../db/client.js', () => ({
   db: {
-    select: () => ({ from: () => ({ where: () => ({ limit: async () => [
-      { phoneNumberId: 'PNID_199346', accessToken: 'TOKEN_BIZ' },
-    ] }) }) }),
+    select: () => ({ from: () => ({ where: () => ({ limit: async () => dbLimitResult }) }) }),
   },
 }))
 
 import { buildSendArgs } from './message-retry.js'
-import { sendMessage } from '../adapters/whatsapp/sender.js'
-
-const sendMessageMock = sendMessage as ReturnType<typeof vi.fn>
 
 describe('message-retry worker credential resolution', () => {
-  beforeEach(() => sendMessageMock.mockClear())
+  beforeEach(() => {
+    // Reset to the happy-path row before each test.
+    dbLimitResult = [{ phoneNumberId: 'PNID_199346', accessToken: 'TOKEN_BIZ' }]
+  })
 
   it('resolves per-business WA credentials from businessId', async () => {
     const { credentials } = await buildSendArgs({ businessId: 'biz-1', toNumber: '+972500000000', body: 'hi' })
@@ -32,19 +31,21 @@ describe('message-retry worker credential resolution', () => {
   })
 
   it('returns credentials: undefined and skips db when useGlobalCredentials is true', async () => {
-    // Make the db mock's limit throw so any db access would surface as a failure
-    const { db } = await import('../db/client.js')
-    const dbMock = db as unknown as { select: ReturnType<typeof vi.fn> }
-    const originalSelect = dbMock.select
-    dbMock.select = vi.fn(() => { throw new Error('db must not be called for global-credential sends') })
+    const args = await buildSendArgs({ businessId: 'biz-1', toNumber: '+1', body: 'x', useGlobalCredentials: true })
+    expect(args.credentials).toBeUndefined()
+    expect(args.toNumber).toBe('+1')
+    expect(args.body).toBe('x')
+  })
 
-    try {
-      const args = await buildSendArgs({ businessId: 'biz-1', toNumber: '+1', body: 'x', useGlobalCredentials: true })
-      expect(args.credentials).toBeUndefined()
-      expect(args.toNumber).toBe('+1')
-      expect(args.body).toBe('x')
-    } finally {
-      dbMock.select = originalSelect
-    }
+  it('returns credentials: undefined when db has no matching business row', async () => {
+    dbLimitResult = []
+    const args = await buildSendArgs({ businessId: 'biz-x', toNumber: '+1', body: 'x' })
+    expect(args.credentials).toBeUndefined()
+  })
+
+  it('returns credentials: undefined when db row has null credentials', async () => {
+    dbLimitResult = [{ phoneNumberId: null, accessToken: null }]
+    const args = await buildSendArgs({ businessId: 'biz-x', toNumber: '+1', body: 'x' })
+    expect(args.credentials).toBeUndefined()
   })
 })
