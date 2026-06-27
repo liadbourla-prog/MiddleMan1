@@ -10,6 +10,7 @@ import {
   executeMessageCustomer,
   executeSetCustomerName,
   executeManageAllowedContacts,
+  executeConfigureDailyBriefing,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
@@ -513,5 +514,67 @@ describe('manageAllowedContacts', () => {
     expect(res.success).toBe(true)
     expect(res.autoEnabled).toBe(true)
     expect(row.contactRestrictionEnabled).toBe(true)
+  })
+})
+
+// A stateful business-row stub that records the last update patch, so we can assert
+// the persisted dailyBriefingEnabled / dailyBriefingTime columns. configureDailyBriefing
+// only writes (no select), so we just need update + insert (logAudit) to be no-throw.
+function dailyBriefingCtx(): {
+  ctx: ToolContext
+  row: { dailyBriefingEnabled?: boolean; dailyBriefingTime?: string }
+} {
+  const row: { dailyBriefingEnabled?: boolean; dailyBriefingTime?: string } = {}
+  const db = {
+    update: () => ({
+      set: (patch: Record<string, unknown>) => ({
+        where: async () => {
+          if ('dailyBriefingEnabled' in patch) row.dailyBriefingEnabled = patch['dailyBriefingEnabled'] as boolean
+          if ('dailyBriefingTime' in patch) row.dailyBriefingTime = patch['dailyBriefingTime'] as string
+        },
+      }),
+    }),
+    insert: () => ({ values: async () => { /* logAudit */ } }),
+  }
+  const ctx: ToolContext = {
+    db: db as unknown as ToolContext['db'],
+    calendar: {} as ToolContext['calendar'],
+    businessId: 'biz-1',
+    identityId: 'mgr-1',
+    timezone: 'Asia/Jerusalem',
+    lang: 'en',
+    role: 'manager',
+  }
+  return { ctx, row }
+}
+
+describe('configureDailyBriefing', () => {
+  it('enabled=true persists dailyBriefingEnabled=true', async () => {
+    const { ctx, row } = dailyBriefingCtx()
+    const res = await executeConfigureDailyBriefing({ enabled: true }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(row.dailyBriefingEnabled).toBe(true)
+  })
+
+  it("time='08:00' persists dailyBriefingTime='08:00'", async () => {
+    const { ctx, row } = dailyBriefingCtx()
+    const res = await executeConfigureDailyBriefing({ time: '08:00' }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(row.dailyBriefingTime).toBe('08:00')
+  })
+
+  it("invalid time '8am' returns invalid_time (no write)", async () => {
+    const { ctx, row } = dailyBriefingCtx()
+    const res = await executeConfigureDailyBriefing({ time: '8am' }, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('invalid_time')
+    expect(row.dailyBriefingTime).toBeUndefined()
+  })
+
+  it('no args returns nothing_to_change', async () => {
+    const { ctx } = dailyBriefingCtx()
+    const res = await executeConfigureDailyBriefing({}, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('nothing_to_change')
   })
 })

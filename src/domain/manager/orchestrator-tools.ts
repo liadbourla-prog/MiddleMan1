@@ -1904,6 +1904,31 @@ export async function executeConfigureNotifications(args: ConfigureNotifications
   return { success: true, fact: JSON.stringify(next), guidance: 'Notification rule saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
 }
 
+interface ConfigureDailyBriefingArgs {
+  enabled?: boolean
+  time?: string // 'HH:MM' 24h business-local
+}
+
+// Branch-3 control for the daily owner briefing (also the cadence at which notification digests are
+// flushed). The owner says "send my briefing at 8am" / "turn off the morning summary"; the LLM maps
+// it to enabled/time. Deterministic write — at least one of enabled/time must be provided.
+export async function executeConfigureDailyBriefing(args: ConfigureDailyBriefingArgs, ctx: ToolContext): Promise<object> {
+  const patch: Record<string, unknown> = {}
+  if (typeof args.enabled === 'boolean') patch['dailyBriefingEnabled'] = args.enabled
+  if (args.time !== undefined) {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(args.time)) {
+      return { success: false, reason: 'invalid_time', guidance: 'Ask the owner for a time of day in 24-hour HH:MM form, e.g. 08:00 or 18:30.' }
+    }
+    patch['dailyBriefingTime'] = args.time
+  }
+  if (Object.keys(patch).length === 0) {
+    return { success: false, reason: 'nothing_to_change', guidance: 'Ask the owner whether to turn the daily briefing on/off and/or what time to send it.' }
+  }
+  await ctx.db.update(businesses).set(patch).where(eq(businesses.id, ctx.businessId))
+  await logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action: 'daily_briefing.updated', entityType: 'business', entityId: ctx.businessId, metadata: patch })
+  return { success: true, fact: JSON.stringify(patch), guidance: 'Saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
+}
+
 interface ManageAllowedContactsArgs {
   op: 'enable' | 'disable' | 'add' | 'remove' | 'list'
   phone?: string
