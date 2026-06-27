@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft } from './customer-booking.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
   setCustomerName: vi.fn().mockResolvedValue(undefined),
@@ -52,6 +52,28 @@ describe('classInstanceMissing — Branch 4 anti-invented-time gate', () => {
     vi.mocked(findClassBlockProviderForSlot).mockResolvedValue({ found: true, providerId: null, maxParticipants: 8 })
     const svc = { id: 'svc-yoga', schedulingMode: 'class' as const }
     expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(false)
+  })
+})
+
+describe('anchorRescheduleDraft — Branch 4 same-day time-only reschedule', () => {
+  const services = [
+    { id: 'svc-yoga', name: 'יוגה', durationMinutes: 60, maxParticipants: 8, category: null, schedulingMode: 'class' as const },
+  ]
+
+  it('reschedule: keeps the existing booking day when the customer gives only a time', () => {
+    const existing = { slotStart: new Date('2026-06-29T07:00:00.000Z'), serviceTypeId: 'svc-yoga' }
+    const intent = { intent: 'rescheduling', slotRequest: { time: { hour: 12, minute: 0 } } } as any
+    const draft = anchorRescheduleDraft(existing, intent, services, 'Asia/Jerusalem')
+    expect(draft.dateStr).toBe('2026-06-29')
+    expect(draft.time).toEqual({ hour: 12, minute: 0 })
+    expect(draft.serviceTypeId).toBe('svc-yoga')
+  })
+
+  it('reschedule: lets the customer override the day when they state one', () => {
+    const existing = { slotStart: new Date('2026-06-29T07:00:00.000Z'), serviceTypeId: 'svc-yoga' }
+    const intent = { intent: 'rescheduling', slotRequest: { weekday: 2, time: { hour: 12, minute: 0 } } } as any
+    const draft = anchorRescheduleDraft(existing, intent, services, 'Asia/Jerusalem')
+    expect(draft.dateStr).not.toBe('2026-06-29')
   })
 })
 

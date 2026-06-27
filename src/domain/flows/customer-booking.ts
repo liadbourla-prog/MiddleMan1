@@ -978,6 +978,28 @@ function buildDraftFromIntent(
   return Object.keys(draft).length > 0 ? draft : null
 }
 
+// On a single-booking reschedule, anchor the new slot on the EXISTING booking: keep its
+// day and service unless the customer explicitly states a new one. Fixes "move 10:00->12:00"
+// (a time-only change) being treated as a fresh booking that asks "which day?".
+export function anchorRescheduleDraft(
+  existing: { slotStart: Date; serviceTypeId: string },
+  intent: CustomerIntentOutput,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null; schedulingMode: 'appointment' | 'class' }>,
+  tz: string,
+  now: Date = new Date(),
+): NonNullable<BookingFlowContext['slotDraft']> {
+  const captured = buildDraftFromIntent(intent, activeServices, tz, now) ?? {}
+  const svc = activeServices.find((s) => s.id === existing.serviceTypeId)
+  const anchor: NonNullable<BookingFlowContext['slotDraft']> = {
+    serviceTypeId: existing.serviceTypeId,
+    ...(svc ? { serviceName: svc.name } : {}),
+    dateStr: localParts(existing.slotStart, tz).dateStr,
+  }
+  // captured (what the customer actually said) overrides the anchor; buildDraftFromIntent only
+  // sets dateStr when the customer named a day, so a time-only change keeps the anchor's date.
+  return { ...anchor, ...captured }
+}
+
 // Root B — while a slot is awaiting confirmation, a non-"yes" reply may be the
 // customer REVISING the request ("no, breathing instead", "make it Tuesday 7pm"),
 // not answering yes/no. Re-extract intent; if they named a different
@@ -1437,7 +1459,12 @@ async function handleReschedulingIntent(
   // new one is actually secured (see releaseSupersededBooking, called at the
   // confirmation success points in handleHoldConfirmation). Until then — including if
   // the customer declines the proposed slot — they keep their original appointment.
-  const newCtx: BookingFlowContext = { ...ctx, rescheduledFrom: existing.id }
+  const anchored = anchorRescheduleDraft(existing, intent, activeServices, businessTimezone)
+  const newCtx: BookingFlowContext = {
+    ...ctx,
+    rescheduledFrom: existing.id,
+    slotDraft: { ...(ctx.slotDraft ?? {}), ...anchored },
+  }
   return handleBookingIntent(db, calendar, identity, session, newCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply, '', business)
 }
 
