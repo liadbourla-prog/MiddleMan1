@@ -4,7 +4,7 @@ import type { Db } from '../../db/client.js'
 // Record every enqueueMessage call (the WhatsApp send the emitter ultimately fires).
 const enqueued: Array<{ toNumber: string; body: string }> = []
 vi.mock('../../workers/message-retry.js', () => ({
-  enqueueMessage: vi.fn(async (toNumber: string, body: string) => {
+  enqueueMessage: vi.fn(async (_businessId: string, toNumber: string, body: string) => {
     enqueued.push({ toNumber, body })
   }),
 }))

@@ -147,7 +147,7 @@ export async function reconcilePayment(
   db: Db,
   webhookToken: string,
   fields: GrowWebhookFields,
-  deps?: { growClient?: GrowClient; calendar?: CalendarClient; enqueue?: (phone: string, body: string) => Promise<void> },
+  deps?: { growClient?: GrowClient; calendar?: CalendarClient; enqueue?: (businessId: string, phone: string, body: string) => Promise<void> },
 ): Promise<ReconcileResult> {
   if (!fields.transactionCode) return { ok: false, reason: 'missing_transaction' }
 
@@ -253,7 +253,7 @@ export async function reconcilePayment(
       const msg = lang === 'he'
         ? `🧾 הנה החשבונית שלך: ${fields.invoiceUrl}`
         : `🧾 Here's your invoice: ${fields.invoiceUrl}`
-      await enqueue(phone, msg).catch(() => { /* non-fatal */ })
+      await enqueue(businessId, phone, msg).catch(() => { /* non-fatal */ })
     }
   }
 
@@ -276,7 +276,7 @@ async function notifyOwnerPaymentReceived(
   db: Db,
   businessId: string,
   charge: { id: string; amount: string | null; description: string | null; source: string },
-  enqueue?: (phone: string, body: string) => Promise<void>,
+  enqueue?: (businessId: string, phone: string, body: string) => Promise<void>,
 ): Promise<void> {
   const [biz] = await db
     .select({
@@ -317,7 +317,7 @@ async function notifyOwnerPaymentReceived(
     recipientId: manager.id,
     dedupKey: `payment.received:${charge.id}`,
   }, {
-    sendFreeForm: async () => { await send(manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
+    sendFreeForm: async () => { await send(businessId, manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
   }).catch(() => { /* non-fatal */ })
 }
 

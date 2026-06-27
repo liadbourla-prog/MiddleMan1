@@ -121,7 +121,7 @@ async function sendPaymentLink(
       let body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
       // Guard: the link MUST be present — never send a pay request without the actual link.
       if (!body.includes(paymentUrl)) body = `${body}\n${paymentUrl}`
-      await enqueueMessage(b.customerPhone, body)
+      await enqueueMessage(biz.id, b.customerPhone, body)
     },
   })
 }

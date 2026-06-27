@@ -122,7 +122,7 @@ async function sendDunning(
       // Guard: when we have a link it MUST appear — never send a dunning nudge that promises a
       // link the LLM dropped.
       if (payUrl && !body.includes(payUrl)) body = `${body}\n${payUrl}`
-      await enqueueMessage(b.customerPhone, body)
+      await enqueueMessage(biz.id, b.customerPhone, body)
     },
     sendTemplate: async () => {
       await sendTemplateMessage({

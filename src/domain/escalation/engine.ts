@@ -81,7 +81,7 @@ export async function checkOwnerEscalationRules(
       recipientId: managerIdentity.id,
       dedupKey: `escalation.owner_rule:${business.id}:${customerPhone}:${Date.now()}`,
     }, {
-      sendFreeForm: async () => { await enqueueMessage(managerIdentity.phoneNumber, managerMessage).catch(() => {}) },
+      sendFreeForm: async () => { await enqueueMessage(business.id, managerIdentity.phoneNumber, managerMessage).catch(() => {}) },
     }).catch(() => { /* non-fatal: a ledger/notify hiccup must not break the inbound escalation flow */ })
   }
 
@@ -123,7 +123,7 @@ export async function escalateToPlatform(
     recipientId: null,
     dedupKey: `escalation.platform:${business.id}:${customerPhone}:${Date.now()}`,
   }, {
-    sendFreeForm: async () => { await enqueueMessage(operatorPhone, message).catch(() => {}) },
+    sendFreeForm: async () => { await enqueueMessage(business.id, operatorPhone, message).catch(() => {}) },
   }).catch(() => { /* non-fatal: a ledger/notify hiccup must not break platform escalation recording */ })
 
   await db.insert(escalatedTasks).values({

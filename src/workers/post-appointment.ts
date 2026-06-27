@@ -69,7 +69,7 @@ async function sendPostAppointment(
   }, {
     sendFreeForm: async () => {
       const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
-      await enqueueMessage(b.customerPhone, body)
+      await enqueueMessage(biz.id, b.customerPhone, body)
     },
     sendTemplate: async () => {
       await sendTemplateMessage({
@@ -108,7 +108,7 @@ async function sendThankYou(
   }, {
     sendFreeForm: async () => {
       const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
-      await enqueueMessage(b.customerPhone, body)
+      await enqueueMessage(biz.id, b.customerPhone, body)
     },
     sendTemplate: async (templateName) => {
       await sendTemplateMessage({

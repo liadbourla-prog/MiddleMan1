@@ -117,7 +117,7 @@ export async function proposeInitiation(db: Db, proposal: InitiationProposal): P
     .where(and(eq(identities.businessId, proposal.businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
     .limit(1)
   if (manager) {
-    await enqueueMessage(manager.phoneNumber, proposal.ownerSummary).catch(() => {})
+    await enqueueMessage(proposal.businessId, manager.phoneNumber, proposal.ownerSummary).catch(() => {})
   }
 
   await logAudit(db, {

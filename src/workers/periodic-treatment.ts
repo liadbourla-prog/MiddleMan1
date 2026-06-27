@@ -129,7 +129,7 @@ export async function runPeriodicTreatmentTick(now: Date = new Date()): Promise<
             }, {
               sendFreeForm: async () => {
                 const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
-                await enqueueMessage(c.phoneNumber, body)
+                await enqueueMessage(biz.id, c.phoneNumber, body)
               },
               sendTemplate: async (templateName) => {
                 await sendTemplateMessage({

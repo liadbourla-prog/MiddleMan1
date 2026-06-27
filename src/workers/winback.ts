@@ -76,7 +76,7 @@ export async function runWinbackTick(): Promise<number> {
             }, {
               sendFreeForm: async () => {
                 const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: biz.defaultLanguage, situation: proposal.situation, fallback: proposal.fallback, timeoutMs: 2500 })
-                await enqueueMessage(summary.phoneNumber, body)
+                await enqueueMessage(biz.id, summary.phoneNumber, body)
               },
               sendTemplate: async () => {
                 // Out-of-window: winback_reengage template — [business].

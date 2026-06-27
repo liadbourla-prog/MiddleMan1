@@ -354,7 +354,7 @@ async function applyOwnerCancellations(ctx: SyncContext, affected: AffectedBooki
 
   if (affected.length > BLAST_RADIUS_THRESHOLD) {
     if (ctx.managerPhone) {
-      await enqueueMessage(ctx.managerPhone, i18n.calendar_owner_reconcile_gate[ctx.lang](affected.length))
+      await enqueueMessage(businessId, ctx.managerPhone, i18n.calendar_owner_reconcile_gate[ctx.lang](affected.length))
         .catch(() => { /* non-fatal */ })
     }
     await logAudit(db, {
@@ -415,7 +415,7 @@ async function applyOwnerCancellations(ctx: SyncContext, affected: AffectedBooki
   }
 
   if (ctx.managerPhone) {
-    await enqueueMessage(ctx.managerPhone, i18n.calendar_owner_reconcile_applied[ctx.lang](affected.length))
+    await enqueueMessage(businessId, ctx.managerPhone, i18n.calendar_owner_reconcile_applied[ctx.lang](affected.length))
       .catch(() => { /* non-fatal */ })
   }
 }

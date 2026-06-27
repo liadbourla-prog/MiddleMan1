@@ -96,7 +96,7 @@ export async function runRatchet(db: Db, businessId: string, category: string): 
         : (he
             ? `שמתי לב לכמה ביטולי הסכמה בפניות "${category}", אז חזרתי לשאול אותך לפני כל אחת — ליתר ביטחון.`
             : `I noticed a few opt-outs on "${category}" outreach, so I've gone back to asking you before each one — just to be safe.`)
-      await enqueueMessage(manager.phoneNumber, msg).catch(() => {})
+      await enqueueMessage(businessId, manager.phoneNumber, msg).catch(() => {})
     }
   } catch { /* notify is best-effort */ }
 
