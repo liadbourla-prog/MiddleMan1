@@ -1,6 +1,6 @@
 import { eq, and, or, gt, gte, isNull, count } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { serviceTypes, bookings, identities, availability } from '../../db/schema.js'
+import { serviceTypes, bookings, identities, availability, conversationSessions } from '../../db/schema.js'
 import type { Business, CalendarBlockType } from '../../db/schema.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import type { ActiveSession } from '../session/types.js'
@@ -61,6 +61,22 @@ export async function persistCapturedName(
   const name = capturedName?.trim()
   if (!name || storedDisplayName) return
   await setCustomerName(db, businessId, identityId, { displayName: name, lastName: deriveLastName(name) }).catch(() => {})
+}
+
+/** WS-D — softly append a one-line name request to a booking/rescheduling reply when the
+ *  customer has no name on file, at most once per session. Pure + unit-testable: it does NOT
+ *  touch the DB. The caller persists the returned `nameAsked` flag so it isn't re-asked next
+ *  turn. Skipped for read-only intents (inquiry/list_bookings), when a name is already stored,
+ *  when already asked, and when the reply is empty (a paused/escalation suppressed reply). */
+export function appendNameRequest(
+  reply: string,
+  opts: { intent: CustomerIntentOutput['intent']; displayName: string | null; nameAsked: boolean; lang: 'he' | 'en' },
+): { reply: string; nameAsked: boolean } {
+  const isBookingPath = opts.intent === 'booking' || opts.intent === 'rescheduling'
+  if (!isBookingPath || opts.displayName || opts.nameAsked || !reply.trim()) {
+    return { reply, nameAsked: opts.nameAsked }
+  }
+  return { reply: `${reply}\n\n${t('ask_customer_name', opts.lang)}`, nameAsked: true }
 }
 
 type CustomerMemoryInput = {
@@ -922,16 +938,46 @@ export async function handleBookingFlow(
     }
   })()
 
+  let result = intentResult2
+
+  // ── Soft name request (WS-D) ─────────────────────────────────────────────
+  // Single chokepoint: every booking/rescheduling reply funnels through here. When the
+  // customer has no name on file, append one soft one-line ask (at most once per session)
+  // so the owner's calendar isn't left with a bare phone number. Skipped for terminal
+  // hard replies (escalation/pause/failure) and for the successful-booking case where the
+  // handler already completed the session (asking on a closed session can't be guarded).
+  const isHardReply = result.escalated || result.paused || result.sessionFailed
+  if (!isHardReply && !result.sessionComplete) {
+    const named = appendNameRequest(result.reply, {
+      intent: intent.intent,
+      displayName: identity.displayName ?? null,
+      nameAsked: updatedCtx.nameAsked ?? false,
+      lang,
+    })
+    if (named.nameAsked && !(updatedCtx.nameAsked ?? false)) {
+      // The handler already persisted its own (richer) context this turn. Merge the
+      // nameAsked flag onto the just-written row so it isn't clobbered, then carry the
+      // appended reply forward.
+      result = { ...result, reply: named.reply }
+      const [row] = await db
+        .select({ context: conversationSessions.context })
+        .from(conversationSessions)
+        .where(eq(conversationSessions.id, session.id))
+      const persisted = (row?.context as BookingFlowContext | undefined) ?? updatedCtx
+      await updateSessionContext(db, session.id, { ...persisted, nameAsked: true }).catch(() => {})
+    }
+  }
+
   // ── Inline language switch offer ─────────────────────────────────────────
   // Append once per turn when we detected a different language and no override is set yet.
-  if (shouldOfferSwitch && intentResult2.reply && !intentResult2.sessionComplete) {
+  if (shouldOfferSwitch && result.reply && !result.sessionComplete) {
     const offerSuffix = detectedLanguage === 'en'
       ? '\n\nWant me to keep going in English? Just say the word.'
       : '\n\nרוצה שאמשיך בעברית? פשוט תכתוב לי כן.'
-    return { ...intentResult2, reply: intentResult2.reply + offerSuffix }
+    return { ...result, reply: result.reply + offerSuffix }
   }
 
-  return intentResult2
+  return result
 }
 
 // Reconstruct an incremental slot draft from a slot that was about to be confirmed,

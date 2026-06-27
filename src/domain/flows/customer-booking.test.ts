@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest } from './customer-booking.js'
+import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
   setCustomerName: vi.fn().mockResolvedValue(undefined),
@@ -27,6 +28,56 @@ describe('persistCapturedName', () => {
     vi.mocked(setCustomerName).mockClear()
     await persistCapturedName(db, 'biz1', 'c1', null, null)
     expect(setCustomerName).not.toHaveBeenCalled()
+  })
+})
+
+describe('appendNameRequest — Branch 4 soft name capture (WS-D)', () => {
+  it('appends the name request and flips nameAsked for a nameless customer mid-booking', () => {
+    const r = appendNameRequest('Booked you for Monday at 10:00.', {
+      intent: 'booking', displayName: null, nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe(`Booked you for Monday at 10:00.\n\n${t('ask_customer_name', 'en')}`)
+    expect(r.nameAsked).toBe(true)
+  })
+
+  it('uses the Hebrew copy when lang is he', () => {
+    const r = appendNameRequest('קבעתי לך ליום שני ב-10:00.', {
+      intent: 'rescheduling', displayName: null, nameAsked: false, lang: 'he',
+    })
+    expect(r.reply.endsWith(t('ask_customer_name', 'he'))).toBe(true)
+    expect(r.nameAsked).toBe(true)
+  })
+
+  it('leaves the reply untouched when the customer already has a displayName', () => {
+    const r = appendNameRequest('Booked you for Monday at 10:00.', {
+      intent: 'booking', displayName: 'Guy Cohen', nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe('Booked you for Monday at 10:00.')
+    expect(r.nameAsked).toBe(false)
+  })
+
+  it('does not re-ask once nameAsked is already true', () => {
+    const r = appendNameRequest('Booked you for Monday at 10:00.', {
+      intent: 'booking', displayName: null, nameAsked: true, lang: 'en',
+    })
+    expect(r.reply).toBe('Booked you for Monday at 10:00.')
+    expect(r.nameAsked).toBe(true)
+  })
+
+  it('does not append for a read-only inquiry intent', () => {
+    const r = appendNameRequest('We are open Mon–Fri 9–5.', {
+      intent: 'inquiry', displayName: null, nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe('We are open Mon–Fri 9–5.')
+    expect(r.nameAsked).toBe(false)
+  })
+
+  it('does not append onto an empty reply', () => {
+    const r = appendNameRequest('', {
+      intent: 'booking', displayName: null, nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe('')
+    expect(r.nameAsked).toBe(false)
   })
 })
 

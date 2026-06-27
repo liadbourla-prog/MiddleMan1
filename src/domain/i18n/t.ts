@@ -288,6 +288,13 @@ const strings = {
   status_unknown: { he: `לא ידוע`, en: `Unknown` },
 
   // ── Customer-facing system messages ─────────────────────────────────────────
+  // Soft, single one-line name request appended to a booking/rescheduling reply when
+  // the customer has no name on file (Branch 4, WS-D). No emoji — it's a question, and
+  // the lawbook bars emoji in questions/clarifications. Asked at most once per session.
+  ask_customer_name: {
+    he: `ודרך אגב, מה השם שלך לרישום?`,
+    en: `By the way, what's your name for the booking?`,
+  },
   paused_msg: {
     he: (name: string) => `${name} מנהל תורים ישירות כרגע. צרו קשר איתנו לבדיקת זמינות.`,
     en: (name: string) => `${name} is currently handling appointments directly. Please contact us for availability.`,
