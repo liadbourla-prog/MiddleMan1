@@ -25,7 +25,7 @@ import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/eng
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
-import { listDayOptions } from '../availability/day-options.js'
+import { listDayOptions, type ClassSession } from '../availability/day-options.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
@@ -418,6 +418,42 @@ async function buildDayOptionsText(
   // the caller does NOT fall back to an all-day answer (which reopens the fabrication).
   if (timeOfDay) return { text: `No ${timeOfDay} classes or open times on ${dayLabel}.`, offered: [] }
   return NO_SUGGESTION
+}
+
+// The class analogue of suggestOpenSlotsText: enumerate the next real CLASS
+// instances (with spots left) over the next 14 days. Class-mode services are NOT
+// bookable into arbitrary gaps, so their availability is the scheduled classes —
+// NOT getOpenSlots, which reports zero on a fully-tiled week (classes+blocks) and
+// makes the PA wrongly claim "fully booked" when classes with open seats exist.
+// `serviceTypeId` undefined → all class services. Scans day-by-day and early-exits
+// once enough are collected (a daily-class business fills the first day).
+export async function suggestNextClassesText(
+  db: Db,
+  business: Business,
+  serviceTypeId: string | undefined,
+  tz: string,
+  constraints?: NegotiationConstraints,
+  timeOfDay?: TimeOfDay | null,
+  now: Date = new Date(),
+  maxClasses = 6,
+): Promise<SuggestionResult> {
+  const collected: ClassSession[] = []
+  let dateStr = localParts(now, tz).dateStr
+  for (let i = 0; i < 14 && collected.length < maxClasses; i++) {
+    const day = await listDayOptions(db, business, dateStr, tz, { ...(serviceTypeId ? { serviceTypeId } : {}), now })
+    let dayClasses = filterOpenSlots(day.classes, constraints, tz).filter((c) => c.spotsLeft > 0)
+    if (timeOfDay) dayClasses = dayClasses.filter((c) => startInBucket(c.start, tz, timeOfDay))
+    collected.push(...dayClasses)
+    dateStr = addDaysToDateStr(dateStr, 1)
+  }
+  const shown = collected.slice(0, maxClasses)
+  if (shown.length === 0) return NO_SUGGESTION
+  const offered: RejectedSlot[] = shown.map((c) => ({ start: c.start.toISOString(), end: c.end.toISOString(), serviceTypeId: c.serviceTypeId }))
+  const items = shown.map((c) => {
+    const cap = c.spotsLeft === 1 ? '1 spot left' : `${c.spotsLeft} spots left`
+    return `${c.serviceName} on ${formatSlotDate(c.start, tz)} at ${formatSlotTime(c.start, tz)} (${cap})`
+  })
+  return { text: `Upcoming scheduled classes (these are the real options — there are no others): ${items.join('; ')}.`, offered }
 }
 
 /**
@@ -953,6 +989,21 @@ export async function handleBookingFlow(
             availabilityText = r.text
             inquiryOffered.push(...r.offered)
           }
+          // No specific day resolved (or that day had nothing): answer from the right
+          // availability MODEL. For a class-mode focus — or a class business with no
+          // appointment focus — that is the scheduled CLASSES, never getOpenSlots gaps
+          // (which read empty on a fully-tiled week and make the PA cry "fully booked"
+          // while classes with open seats exist). Appointment focus still uses gaps.
+          if (!availabilityText) {
+            const focalIsAppointment = inquiryService?.schedulingMode === 'appointment'
+            const hasClassService = activeServices.some((s) => s.schedulingMode === 'class')
+            if (!focalIsAppointment && hasClassService) {
+              const classSvcId = inquiryService?.schedulingMode === 'class' ? inquiryService.id : undefined
+              const r = await suggestNextClassesText(db, business, classSvcId, businessTimezone, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null)
+              availabilityText = r.text
+              inquiryOffered.push(...r.offered)
+            }
+          }
           if (!availabilityText) {
             const r = await buildInquiryAvailabilityText(db, business, intent.slotRequest, activeServices, businessTimezone, ctx.negotiationConstraints)
             availabilityText = r.text
@@ -1364,17 +1415,32 @@ async function handleBookingIntent(
   if (!draft.serviceTypeId || !draft.dateStr || !draft.time) {
     const newAttempts = attempts + 1
     if (newAttempts >= MAX_CLARIFICATION_ATTEMPTS) return nudgeAfterRepeatedTries()
-    await updateSessionContext(db, session.id, { ...ctx, slotDraft: draft, clarificationAttempts: newAttempts }, 'waiting_clarification')
 
     let ask: string
+    let offeredSlots: RejectedSlot[] = []
     if (!draft.serviceTypeId) {
       const list = activeServices.map((s) => s.name).join(', ')
       ask = `The customer wants to book but hasn't said which service. Available: ${list}. Ask which one — one question, naturally.`
     } else if (!draft.dateStr) {
       ask = `Booking ${draft.serviceName}. Still need the day — ask which day works. Do NOT re-ask the service.`
     } else {
-      ask = `Booking ${draft.serviceName} on ${formatLocalDate(draft.dateStr, businessTimezone)}. Still need the time — ask what time. Do NOT re-ask the day or service.`
+      // Day known, time missing: surface THAT day's real options into the situation
+      // so the PA offers true times (which the fabrication guard accepts) instead of
+      // recalling them from the transcript (which the guard strips → unhelpful "which
+      // day?" fallback) or, worse, asserting the day is full.
+      const dayOpts = business
+        ? await buildDayOptionsText(db, business, draft.dateStr, businessTimezone, draft.serviceTypeId, ctx.negotiationConstraints)
+        : NO_SUGGESTION
+      offeredSlots = dayOpts.offered
+      const dayLabel = formatLocalDate(draft.dateStr, businessTimezone)
+      ask = dayOpts.text
+        ? `Booking ${draft.serviceName} on ${dayLabel}. These are the only real times that day: ${dayOpts.text} Offer ONLY these and ask which they'd like — do NOT re-ask the day or service, and do NOT invent any other time.`
+        : `Booking ${draft.serviceName} on ${dayLabel}, but there is nothing available that day. Say so plainly and offer to check another day — do NOT invent a time.`
     }
+    await updateSessionContext(db, session.id, {
+      ...ctx, slotDraft: draft, clarificationAttempts: newAttempts,
+      ...(offeredSlots.length > 0 ? { lastOfferedSlots: offeredSlots } : {}),
+    }, 'waiting_clarification')
     const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
@@ -2578,10 +2644,10 @@ async function handleListBookings(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function resolveService(
+function resolveService<T extends { id: string; name: string }>(
   hint: string | null,
-  services: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null }>,
-) {
+  services: T[],
+): T | null {
   if (services.length === 0) return null
   if (services.length === 1) return services[0]!
   if (!hint) return null
