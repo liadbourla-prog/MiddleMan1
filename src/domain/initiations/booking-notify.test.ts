@@ -124,8 +124,9 @@ describe('notifyOwnerBookingChange', () => {
   })
 
   it('routes to the digest queue when the cancellation rule is set to digest', async () => {
-    // Only the business select runs before action resolves to 'digest' and the emitter
-    // diverts to enqueueDigest (no manager/customer/service selects needed).
+    // The emitter resolves the action AND builds the full body (running the business, manager,
+    // customer and service selects) before diverting to enqueueDigest — so all four rows are still
+    // queued here; the divert only changes the delivery (buffer vs live send), not the work before it.
     const db = fakeDb([
       [{
         timezone: 'Asia/Jerusalem',

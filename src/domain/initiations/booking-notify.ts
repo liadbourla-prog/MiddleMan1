@@ -421,15 +421,15 @@ export async function notifyOwnerApprovalExpired(
 
 // ── Owner-facing per-movement booking-change notifications ───────────────────────
 
+// Owner-facing calendar movements that currently fire a notice. New bookings are intentionally NOT
+// here — they are covered by notifyOwnerNewBooking; adding a 'confirmed' kind would double-notify.
 export type OwnerBookingChange =
   | { kind: 'cancelled'; origin: 'customer' | 'pa' | 'google'; actorIsManager: boolean; bookingId: string; customerId: string; serviceTypeId: string | null; slotStart: Date }
   | { kind: 'moved'; origin: 'customer' | 'pa' | 'google'; actorIsManager: boolean; bookingId: string; customerId: string; serviceTypeId: string | null; fromSlotStart: Date; slotStart: Date }
-  | { kind: 'confirmed'; origin: 'customer' | 'pa' | 'google'; actorIsManager: boolean; bookingId: string; customerId: string; serviceTypeId: string | null; slotStart: Date }
 
 const EVENT_FOR_OWNER_KIND: Record<OwnerBookingChange['kind'], NotificationEvent> = {
   cancelled: 'cancellation',
   moved: 'reschedule',
-  confirmed: 'new_booking',
 }
 
 /**
@@ -484,14 +484,9 @@ export async function notifyOwnerBookingChange(db: Db, businessId: string, chang
 
     const fmt = (d: Date) => new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(d)
 
-    let body: string
-    if (change.kind === 'moved') {
-      body = i18n.owner_change_moved[lang](who, svc, fmt(change.fromSlotStart), fmt(change.slotStart))
-    } else if (change.kind === 'cancelled') {
-      body = i18n.owner_change_cancelled[lang](who, svc, fmt(change.slotStart))
-    } else {
-      body = lang === 'he' ? `🟢 ${who} — ${svc} נקבע ל-${fmt(change.slotStart)}.` : `🟢 ${who} — ${svc} booked for ${fmt(change.slotStart)}.`
-    }
+    const body = change.kind === 'moved'
+      ? i18n.owner_change_moved[lang](who, svc, fmt(change.fromSlotStart), fmt(change.slotStart))
+      : i18n.owner_change_cancelled[lang](who, svc, fmt(change.slotStart))
 
     if (action === 'digest') {
       await enqueueDigest(db, businessId, event, { summary: body }).catch(() => { /* non-fatal */ })
