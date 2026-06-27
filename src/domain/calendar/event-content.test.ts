@@ -34,13 +34,26 @@ describe('renderBookingEvent — 1-on-1', () => {
     expect(description).not.toContain('Phone')
   })
 
-  it('falls back to phone in the title when no name is known', () => {
+  it('uses the no-name placeholder (not the phone) when no name is known — phone once', () => {
     const { title, description } = renderBookingEvent(
       { ...base, customer: { name: null, phone: '+972501234567' } },
       'en',
     )
-    expect(title).toBe('Haircut — +972501234567')
-    expect(description).toContain('Client: +972501234567')
+    expect(title).toBe('Haircut — No name')
+    expect(description).toContain('Client: No name')
+    expect(description).toContain('Phone: +972501234567')
+    expect(description.match(/\+972501234567/g)?.length).toBe(1)
+  })
+
+  it('uses the no-name placeholder (not the phone) when a 1-on-1 customer has no name — phone once (Hebrew)', () => {
+    const { title, description } = renderBookingEvent({
+      kind: 'one_on_one', serviceName: 'יוגה', durationMinutes: 60,
+      customer: { name: null, phone: '+972522858870' }, instructorName: null,
+    }, 'he')
+    expect(title).toBe('יוגה — ללא שם')
+    expect(description).toContain('לקוח: ללא שם')
+    expect(description).toContain('טלפון: +972522858870')
+    expect(description.match(/\+972522858870/g)?.length).toBe(1)
   })
 
   it('renders Hebrew with the right labels and digits', () => {
@@ -89,6 +102,15 @@ describe('renderBookingEvent — group', () => {
     const { title, description } = renderBookingEvent({ ...base, attendees: [] }, 'en')
     expect(title).toBe('Vinyasa Flow — 0/12')
     expect(description).toBe('Group session: Vinyasa Flow\nInstructor: Maya\nBooked: 0 of 12')
+  })
+
+  it('group attendee with no name renders "placeholder — phone", phone once', () => {
+    const { description } = renderBookingEvent({
+      kind: 'group', serviceName: 'יוגה', instructorName: null, maxParticipants: 8,
+      attendees: [{ name: null, phone: '+972522858870' }],
+    }, 'he')
+    expect(description).toContain('1. ללא שם — +972522858870')
+    expect(description.match(/\+972522858870/g)?.length).toBe(1)
   })
 
   it('drops a missing phone but keeps the attendee', () => {

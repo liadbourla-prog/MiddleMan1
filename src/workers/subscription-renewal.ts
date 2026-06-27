@@ -84,7 +84,7 @@ async function sendRenewal(
   }, {
     sendFreeForm: async () => {
       const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
-      await enqueueMessage(s.customerPhone, body)
+      await enqueueMessage(biz.id, s.customerPhone, body)
     },
     sendTemplate: async (templateName) => {
       await sendTemplateMessage({

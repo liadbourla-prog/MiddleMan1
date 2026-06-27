@@ -207,7 +207,7 @@ async function alertDivergence(jobData: CalendarMirrorJob, errMsg: string): Prom
     const ctx = await loadMirrorContext(jobData.businessId)
     if (!ctx?.managerPhone) return
     const body = i18n.calendar_mirror_divergence[ctx.lang]
-    await enqueueMessage(ctx.managerPhone, body).catch(() => { /* non-fatal */ })
+    await enqueueMessage(jobData.businessId, ctx.managerPhone, body).catch(() => { /* non-fatal */ })
     await logAudit(db, {
       businessId: jobData.businessId,
       actorId: null,

@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest'
+import { getTableName } from 'drizzle-orm'
 import {
   executeCreateCalendarEvent,
   executeSelectCalendar,
   executeScheduleGroupSession,
   executeEditClassSession,
   executeScheduleRecurringClasses,
+  executeGetSessionRoster,
   executeRequestPayment,
   executeRefundPayment,
   executeMessageCustomer,
@@ -15,6 +17,7 @@ import {
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
 import type { Action } from '../authorization/check.js'
+import type { BookingState } from '../../db/schema.js'
 
 // A ctx whose db/calendar throw on ANY access. If an executor returns a
 // clarification BEFORE touching either, we've proven the deterministic date
@@ -547,6 +550,157 @@ function dailyBriefingCtx(): {
   }
   return { ctx, row }
 }
+
+// ── getSessionRoster (Branch-3 occupancy grounding) ──────────────────────────
+// Fidelity note: this repo has no real-Postgres / pglite harness for domain code
+// (see digest-queue.test.ts). So this is a STATEFUL FAKE-DB routed BY TABLE. The
+// load-bearing part — that cancelled bookings are excluded from the count — is NOT
+// faked: the bookings store holds ALL rows (a confirmed seat AND a cancelled one),
+// and the stub interprets the REAL inArray(state, SEAT_STATES) filter that
+// loadSessionRoster builds, so the genuine production exclusion logic runs.
+
+interface SeatRow {
+  customerId: string
+  displayName: string | null
+  state: BookingState
+  paymentStatus: string
+  providerId: string | null
+  slotEnd: Date | null
+}
+
+// Walk the drizzle SQL filter tree for the bookings query and pull out the
+// inArray(state, [...]) allow-list, so we apply the REAL state filter to our rows.
+function extractStateAllowList(filter: any): string[] | null {
+  if (filter == null || typeof filter !== 'object') return null
+  const chunks: any[] = Array.isArray(filter.queryChunks) ? filter.queryChunks : []
+  // Recurse into nested SQL (the and(...) wrapper holds the leaf operators).
+  for (const c of chunks) {
+    if (c && Array.isArray(c.queryChunks)) {
+      const nested = extractStateAllowList(c)
+      if (nested) return nested
+    }
+  }
+  // Leaf: an "in" operator whose column is bookings.state and whose list is an
+  // array chunk of param objects ({ value }).
+  const col = chunks.find((c) => c && typeof c === 'object' && typeof c.name === 'string')
+  const opText = chunks
+    .filter((c) => c && typeof c === 'object' && Array.isArray(c.value))
+    .map((c: any) => c.value.join(''))
+    .join('')
+  if (col?.name === 'state' && opText.includes(' in ')) {
+    const listChunk = chunks.find((c) => Array.isArray(c))
+    if (Array.isArray(listChunk)) return listChunk.map((p: any) => p.value as string)
+  }
+  return null
+}
+
+// A class session with `seats` bookings (some possibly cancelled). Routes each
+// select() by the table named in .from(); the bookings read applies the real
+// SEAT_STATES filter, every other read returns a fixed single-row result.
+function rosterCtx(opts: {
+  serviceId?: string
+  serviceName?: string
+  capacity?: number | null
+  instructorName?: string | null
+  seats: SeatRow[]
+}): ToolContext {
+  const serviceId = opts.serviceId ?? 'svc-yoga'
+  const serviceName = opts.serviceName ?? 'Yoga'
+  const capacity = opts.capacity ?? 4
+
+  const db = {
+    select: (_cols?: unknown) => {
+      const builder: any = {
+        _table: null as string | null,
+        _filter: null as any,
+        from: (table: unknown) => { builder._table = getTableName(table as any); return builder },
+        innerJoin: () => builder,
+        where: (f: any) => { builder._filter = f; return builder },
+        // The bookings⋈identities read has NO .limit() — it is awaited directly.
+        then: (resolve: (rows: unknown[]) => void) => {
+          if (builder._table === 'bookings') {
+            const allow = extractStateAllowList(builder._filter)
+            const rows = (allow ? opts.seats.filter((s) => allow.includes(s.state)) : opts.seats)
+              .map((s) => ({
+                customerId: s.customerId,
+                displayName: s.displayName,
+                state: s.state,
+                paymentStatus: s.paymentStatus,
+                providerId: s.providerId,
+                slotEnd: s.slotEnd,
+              }))
+            return resolve(rows)
+          }
+          return resolve([])
+        },
+        limit: async () => {
+          switch (builder._table) {
+            case 'calendar_blocks':
+              return [{ providerId: 'inst-1', maxParticipants: capacity }]
+            case 'service_types':
+              return [{ id: serviceId, name: serviceName }]
+            case 'identities':
+              return [{ name: opts.instructorName ?? 'Dana' }]
+            default:
+              return []
+          }
+        },
+      }
+      return builder
+    },
+  }
+
+  return {
+    db: db as unknown as ToolContext['db'],
+    calendar: {} as ToolContext['calendar'],
+    businessId: 'biz-1',
+    identityId: 'mgr-1',
+    timezone: 'Asia/Jerusalem',
+    lang: 'en',
+    role: 'manager',
+  }
+}
+
+describe('getSessionRoster — live, cancelled-excluded occupancy (no memory fabrication)', () => {
+  const args = {
+    serviceName: 'Yoga',
+    date: { explicitDate: { year: 2099, month: 1, day: 15 } },
+    time: { hour: 10, minute: 0 },
+  }
+
+  it('after one of two bookings is cancelled, count is 1 and only the remaining participant is returned', async () => {
+    const ctx = rosterCtx({
+      seats: [
+        { customerId: 'c1', displayName: 'Harel', state: 'confirmed', paymentStatus: 'paid', providerId: 'inst-1', slotEnd: null },
+        // The customer who rescheduled OUT of this slot — cancelled. Must NOT count.
+        { customerId: 'c2', displayName: 'Noa', state: 'cancelled', paymentStatus: 'paid', providerId: 'inst-1', slotEnd: null },
+      ],
+    })
+
+    const res = await executeGetSessionRoster(args, ctx) as {
+      found: boolean; count: number; capacity: number | null; spotsLeft: number | null
+      participants: { name: string | null }[]; guidance?: string
+    }
+
+    expect(res.found).toBe(true)
+    expect(res.count).toBe(1)
+    const names = res.participants.map((p) => p.name)
+    expect(names).toContain('Harel')
+    expect(names).not.toContain('Noa') // the cancelled/rescheduled-out customer is gone
+    expect(res.capacity).toBe(4)
+    expect(res.spotsLeft).toBe(3)
+    expect(res.guidance).toMatch(/cancelled bookings excluded/i)
+  })
+
+  it('fails closed with a clarify on an unresolvable date — no DB access', async () => {
+    const res = await executeGetSessionRoster(
+      { serviceName: 'Yoga', date: { explicitDate: { year: 2016, month: 1, day: 1 } }, time: { hour: 10, minute: 0 } },
+      noWriteCtx(),
+    ) as { success?: boolean; needsClarification?: boolean; reason?: string }
+    expect(res.needsClarification).toBe(true)
+    expect(res.reason).toBe('past_year')
+  })
+})
 
 describe('configureDailyBriefing', () => {
   it('enabled=true persists dailyBriefingEnabled=true', async () => {

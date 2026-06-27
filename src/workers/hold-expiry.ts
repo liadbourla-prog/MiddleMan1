@@ -116,7 +116,7 @@ export async function expireHeldBookings() {
           fallback,
           timeoutMs: 2500,
         })
-        await enqueueMessage(customer.phoneNumber, msg)
+        await enqueueMessage(booking.businessId, customer.phoneNumber, msg)
 
         if (isApproval) {
           await notifyOwnerApprovalExpired(db, booking.businessId, {

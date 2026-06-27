@@ -140,5 +140,5 @@ export async function handleFreedSlot(db: Db, slot: FreedSlot): Promise<void> {
     ? i18n.freed_slot_ask_first_time[lang](serviceName, dateStr, waiting.length)
     : i18n.freed_slot_ask[lang](serviceName, dateStr, waiting.length)
 
-  await enqueueMessage(manager.phoneNumber, body).catch(() => { /* retry queue handles failures */ })
+  await enqueueMessage(slot.businessId, manager.phoneNumber, body).catch(() => { /* retry queue handles failures */ })
 }

@@ -742,7 +742,7 @@ async function routeCustomerMessage(
         .catch((err) => app.log.error({ err }, 'Failed to mark opt-out'))
     } else {
       app.log.error({ error: sendResult.error, toNumber: msg.fromNumber }, 'Failed to send reply — enqueued for retry')
-      await enqueueMessage(msg.fromNumber, result.reply).catch((err) => {
+      await enqueueMessage(business.id, msg.fromNumber, result.reply).catch((err) => {
         app.log.error({ err }, 'Failed to enqueue message retry')
       })
     }

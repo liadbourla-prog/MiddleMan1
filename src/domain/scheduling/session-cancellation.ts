@@ -122,7 +122,7 @@ export async function cancelClassSessionBookings(
     if (instructor?.phoneNumber) {
       const insLang: Lang = (instructor.preferredLanguage as Lang | null | undefined) ?? lang
       const className = block.title ?? (insLang === 'he' ? 'השיעור' : 'the class')
-      await enqueueMessage(instructor.phoneNumber, i18n.class_cancelled_instructor[insLang](className, slotDateStr(block.startTs, insLang)))
+      await enqueueMessage(businessId, instructor.phoneNumber, i18n.class_cancelled_instructor[insLang](className, slotDateStr(block.startTs, insLang)))
         .catch(() => { /* non-fatal — queued send */ })
       await logAudit(db, {
         businessId,
@@ -214,7 +214,7 @@ export async function notifyInstructorsOfCancelledBookings(
 
     const insLang: Lang = (instructor.preferredLanguage as Lang | null | undefined) ?? lang
     const className = name ?? (insLang === 'he' ? 'השיעור' : 'the class')
-    await enqueueMessage(instructor.phoneNumber, i18n.class_cancelled_instructor[insLang](className, slotDateStr(s.slotStart, insLang)))
+    await enqueueMessage(businessId, instructor.phoneNumber, i18n.class_cancelled_instructor[insLang](className, slotDateStr(s.slotStart, insLang)))
       .catch(() => { /* non-fatal — queued send */ })
     await logAudit(db, {
       businessId,

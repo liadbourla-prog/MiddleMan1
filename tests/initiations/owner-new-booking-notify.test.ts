@@ -10,7 +10,7 @@ const { dispatchSpy, enqueueSpy } = vi.hoisted(() => ({
     // Run the executor so we can observe the message body via the enqueue mock.
     if (exec.sendFreeForm) await exec.sendFreeForm()
   }),
-  enqueueSpy: vi.fn(async (_phone: string, _body: string) => {}),
+  enqueueSpy: vi.fn(async (_businessId: string, _phone: string, _body: string) => {}),
 }))
 
 vi.mock('../../src/domain/initiations/dispatch.js', () => ({ dispatchInitiation: dispatchSpy }))
@@ -60,7 +60,7 @@ describe('notifyOwnerNewBooking — owner reflection of a customer self-booking'
     expect(dispatchSpy).toHaveBeenCalledTimes(1)
     expect(dispatchSpy.mock.calls[0]![2].recipientId).toBe('mgr-1')
     expect(enqueueSpy).toHaveBeenCalledTimes(1)
-    const [phone, body] = enqueueSpy.mock.calls[0]!
+    const [_bizId, phone, body] = enqueueSpy.mock.calls[0]!
     expect(phone).toBe(MANAGER_PHONE)
     expect(body).toContain('Yoni')
     expect(body).toContain('Pilates')

@@ -403,7 +403,7 @@ async function alertFinding(business: Business, f: IntegrityFinding): Promise<vo
     .where(and(eq(identities.businessId, business.id), eq(identities.role, 'manager')))
     .limit(1)
   if (manager) {
-    await enqueueMessage(manager.phoneNumber, describeFinding(f, lang, business.name)).catch(() => { /* non-fatal */ })
+    await enqueueMessage(business.id, manager.phoneNumber, describeFinding(f, lang, business.name)).catch(() => { /* non-fatal */ })
   }
 
   // Operator (platform), in English with the technical detail.
@@ -415,7 +415,7 @@ async function alertFinding(business: Business, f: IntegrityFinding): Promise<vo
       `Kind: ${f.kind}`,
       `Detail: ${JSON.stringify(f.detail)}`,
     ].join('\n')
-    await enqueueMessage(operatorPhone, body).catch(() => { /* non-fatal */ })
+    await enqueueMessage(business.id, operatorPhone, body, { useGlobalCredentials: true }).catch(() => { /* non-fatal */ })
   }
 }
 

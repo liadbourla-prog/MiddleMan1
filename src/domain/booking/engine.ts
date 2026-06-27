@@ -1065,7 +1065,7 @@ export async function finalizePaidBooking(
       fallback: paymentFallback,
       timeoutMs: 2500,
     }).catch(() => paymentFallback)
-    await enqueueMessage(customerPhone, paymentMsg).catch(() => { /* non-fatal */ })
+    await enqueueMessage(businessId, customerPhone, paymentMsg).catch(() => { /* non-fatal */ })
   }
 
   return { ok: true, bookingId: booking.id, message: `Booking confirmed for ${customerPhone}.` }

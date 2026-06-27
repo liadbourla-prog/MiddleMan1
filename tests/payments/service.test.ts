@@ -205,7 +205,7 @@ describe('PaymentService', () => {
     const enqueued: { phone: string; body: string }[] = []
     const res = await reconcilePayment(db, 'wh-tok-123',
       { transactionCode: 'TX1', processId: 'PR1', paymentSum: 300, invoiceUrl: 'https://grow/inv.pdf', invoiceNumber: 'INV-9' },
-      { growClient: grow.client, enqueue: async (phone, body) => { enqueued.push({ phone, body }) } },
+      { growClient: grow.client, enqueue: async (_bizId, phone, body) => { enqueued.push({ phone, body }) } },
     )
     expect(res.ok).toBe(true)
     if (res.ok) expect(res.outcome).toBe('recorded') // no booking attached
@@ -223,7 +223,7 @@ describe('PaymentService', () => {
     queueSelect(businesses, [{ name: 'Biz', defaultLanguage: 'en', notificationRules: null, notificationPreferences: null }])
     const grow = growStub()
     const enqueued: { phone: string; body: string }[] = []
-    const res = await reconcilePayment(db, 'wh-tok-123', { transactionCode: 'TX1', processId: 'PR1' }, { growClient: grow.client, enqueue: async (phone, body) => { enqueued.push({ phone, body }) } })
+    const res = await reconcilePayment(db, 'wh-tok-123', { transactionCode: 'TX1', processId: 'PR1' }, { growClient: grow.client, enqueue: async (_bizId, phone, body) => { enqueued.push({ phone, body }) } })
     expect(res.ok).toBe(true)
     expect(enqueued).toHaveLength(0) // no invoice (none on this webhook) and silent owner notify
   })
@@ -236,7 +236,7 @@ describe('PaymentService', () => {
     queueSelect(identities, [{ id: 'mgr-1', phoneNumber: '+972511111111' }]) // manager lookup
     const grow = growStub()
     const enqueued: { phone: string; body: string }[] = []
-    const res = await reconcilePayment(db, 'wh-tok-123', { transactionCode: 'TX1', processId: 'PR1' }, { growClient: grow.client, enqueue: async (phone, body) => { enqueued.push({ phone, body }) } })
+    const res = await reconcilePayment(db, 'wh-tok-123', { transactionCode: 'TX1', processId: 'PR1' }, { growClient: grow.client, enqueue: async (_bizId, phone, body) => { enqueued.push({ phone, body }) } })
     expect(res.ok).toBe(true)
     expect(enqueued).toHaveLength(1)
     expect(enqueued[0]!.phone).toBe('+972511111111')

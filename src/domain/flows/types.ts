@@ -103,6 +103,9 @@ export interface BookingFlowContext {
   }
   // Set once a session greeting/intro has been delivered, so we never re-introduce.
   greeted?: boolean
+  // Set once the PA has softly asked a nameless customer for their name (WS-D). Guards
+  // against re-asking every booking turn — the request is appended at most once per session.
+  nameAsked?: boolean
   awaitingConfirmationFor?: 'hold' | 'cancellation' | 'cancellation_selection' | 'retention_offer'
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'

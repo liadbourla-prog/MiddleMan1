@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest } from './customer-booking.js'
+import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
   setCustomerName: vi.fn().mockResolvedValue(undefined),
@@ -30,6 +31,56 @@ describe('persistCapturedName', () => {
   })
 })
 
+describe('appendNameRequest — Branch 4 soft name capture (WS-D)', () => {
+  it('appends the name request and flips nameAsked for a nameless customer mid-booking', () => {
+    const r = appendNameRequest('Booked you for Monday at 10:00.', {
+      intent: 'booking', displayName: null, nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe(`Booked you for Monday at 10:00.\n\n${t('ask_customer_name', 'en')}`)
+    expect(r.nameAsked).toBe(true)
+  })
+
+  it('uses the Hebrew copy when lang is he', () => {
+    const r = appendNameRequest('קבעתי לך ליום שני ב-10:00.', {
+      intent: 'rescheduling', displayName: null, nameAsked: false, lang: 'he',
+    })
+    expect(r.reply.endsWith(t('ask_customer_name', 'he'))).toBe(true)
+    expect(r.nameAsked).toBe(true)
+  })
+
+  it('leaves the reply untouched when the customer already has a displayName', () => {
+    const r = appendNameRequest('Booked you for Monday at 10:00.', {
+      intent: 'booking', displayName: 'Guy Cohen', nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe('Booked you for Monday at 10:00.')
+    expect(r.nameAsked).toBe(false)
+  })
+
+  it('does not re-ask once nameAsked is already true', () => {
+    const r = appendNameRequest('Booked you for Monday at 10:00.', {
+      intent: 'booking', displayName: null, nameAsked: true, lang: 'en',
+    })
+    expect(r.reply).toBe('Booked you for Monday at 10:00.')
+    expect(r.nameAsked).toBe(true)
+  })
+
+  it('does not append for a read-only inquiry intent', () => {
+    const r = appendNameRequest('We are open Mon–Fri 9–5.', {
+      intent: 'inquiry', displayName: null, nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe('We are open Mon–Fri 9–5.')
+    expect(r.nameAsked).toBe(false)
+  })
+
+  it('does not append onto an empty reply', () => {
+    const r = appendNameRequest('', {
+      intent: 'booking', displayName: null, nameAsked: false, lang: 'en',
+    })
+    expect(r.reply).toBe('')
+    expect(r.nameAsked).toBe(false)
+  })
+})
+
 describe('classInstanceMissing — Branch 4 anti-invented-time gate', () => {
   const db = {} as never
   const slot = new Date('2026-06-29T14:00:00.000Z') // 17:00 Asia/Jerusalem — no class there
@@ -52,6 +103,28 @@ describe('classInstanceMissing — Branch 4 anti-invented-time gate', () => {
     vi.mocked(findClassBlockProviderForSlot).mockResolvedValue({ found: true, providerId: null, maxParticipants: 8 })
     const svc = { id: 'svc-yoga', schedulingMode: 'class' as const }
     expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(false)
+  })
+})
+
+describe('anchorRescheduleDraft — Branch 4 same-day time-only reschedule', () => {
+  const services = [
+    { id: 'svc-yoga', name: 'יוגה', durationMinutes: 60, maxParticipants: 8, category: null, schedulingMode: 'class' as const },
+  ]
+
+  it('reschedule: keeps the existing booking day when the customer gives only a time', () => {
+    const existing = { slotStart: new Date('2026-06-29T07:00:00.000Z'), serviceTypeId: 'svc-yoga' }
+    const intent = { intent: 'rescheduling', slotRequest: { time: { hour: 12, minute: 0 } } } as any
+    const draft = anchorRescheduleDraft(existing, intent, services, 'Asia/Jerusalem')
+    expect(draft.dateStr).toBe('2026-06-29')
+    expect(draft.time).toEqual({ hour: 12, minute: 0 })
+    expect(draft.serviceTypeId).toBe('svc-yoga')
+  })
+
+  it('reschedule: lets the customer override the day when they state one', () => {
+    const existing = { slotStart: new Date('2026-06-29T07:00:00.000Z'), serviceTypeId: 'svc-yoga' }
+    const intent = { intent: 'rescheduling', slotRequest: { weekday: 2, time: { hour: 12, minute: 0 } } } as any
+    const draft = anchorRescheduleDraft(existing, intent, services, 'Asia/Jerusalem')
+    expect(draft.dateStr).not.toBe('2026-06-29')
   })
 })
 

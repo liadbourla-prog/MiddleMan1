@@ -17,7 +17,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 // Capture the engine's customer-confirmation enqueue (it goes through the real message-retry
 // module, NOT deps.enqueue) so we can prove it targets the customer and never the owner.
 const { enqueueMessageMock } = vi.hoisted(() => ({
-  enqueueMessageMock: vi.fn(async (_phone: string, _body: string) => {}),
+  enqueueMessageMock: vi.fn(async (_businessId: string, _phone: string, _body: string) => {}),
 }))
 
 vi.mock('../../src/workers/message-retry.js', () => ({
@@ -189,7 +189,7 @@ describe('§10 — autonomous payment loop with zero owner involvement', () => {
       db,
       'wh-tok-123',
       { transactionCode: 'TX1', processId: 'PR1', paymentSum: 300, invoiceUrl: 'https://grow/inv.pdf', invoiceNumber: 'INV-9' },
-      { growClient: grow.client, calendar: calendarStub(), enqueue: async (phone, body) => { enqueued.push({ phone, body }) } },
+      { growClient: grow.client, calendar: calendarStub(), enqueue: async (_bizId, phone, body) => { enqueued.push({ phone, body }) } },
     )
 
     // The booking transition happened end to end.
@@ -205,10 +205,10 @@ describe('§10 — autonomous payment loop with zero owner involvement', () => {
 
     // The engine's booking confirmation went to the CUSTOMER too — never the owner.
     expect(enqueueMessageMock).toHaveBeenCalled()
-    for (const call of enqueueMessageMock.mock.calls) expect(call[0]).toBe(CUSTOMER_PHONE)
+    for (const call of enqueueMessageMock.mock.calls) expect(call[1]).toBe(CUSTOMER_PHONE)
 
     // The single critical assertion: NO enqueue on ANY channel targeted the manager/owner phone.
-    const allPhones = [...enqueued.map((e) => e.phone), ...enqueueMessageMock.mock.calls.map((c) => c[0])]
+    const allPhones = [...enqueued.map((e) => e.phone), ...enqueueMessageMock.mock.calls.map((c) => c[1])]
     expect(allPhones).not.toContain(MANAGER_PHONE)
   })
 
@@ -247,6 +247,6 @@ describe('§10 — autonomous payment loop with zero owner involvement', () => {
     expect(confirmed).toBeDefined()
     expect((confirmed!.vals['metadata'] as { triggeredBy?: string }).triggeredBy).toBe('manager_paid_command')
     // The confirmation message reaches the customer (via the engine's enqueue), proving the edge fired.
-    expect(enqueueMessageMock).toHaveBeenCalledWith(CUSTOMER_PHONE, expect.any(String))
+    expect(enqueueMessageMock).toHaveBeenCalledWith('biz-1', CUSTOMER_PHONE, expect.any(String))
   })
 })

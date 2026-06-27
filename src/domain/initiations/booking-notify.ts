@@ -123,7 +123,7 @@ export async function notifyBusinessBookingChange(db: Db, businessId: string, ch
     }, {
       sendFreeForm: async () => {
         const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
-        await enqueueMessage(customer.phoneNumber, body)
+        await enqueueMessage(businessId, customer.phoneNumber, body)
       },
       sendTemplate: async (templateName) => {
         await sendTemplateMessage({
@@ -215,7 +215,7 @@ export async function notifyOwnerNewBooking(
       recipientId: manager.id,
       dedupKey: `booking.new_for_owner:${booking.bookingId}`,
     }, {
-      sendFreeForm: async () => { await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
+      sendFreeForm: async () => { await enqueueMessage(businessId, manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
     }).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] owner new-booking notify failed', { businessId, bookingId: booking.bookingId, err: (err as Error).message })
@@ -257,7 +257,7 @@ export async function notifyOwnerUnlistedContact(
       recipientId: manager.id,
       dedupKey: `unlisted_contact:${businessId}:${attempt.fromNumber}`,
     }, {
-      sendFreeForm: async () => { await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
+      sendFreeForm: async () => { await enqueueMessage(businessId, manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
     }).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] unlisted-contact forward failed', { businessId, err: (err as Error).message })
@@ -314,7 +314,7 @@ export async function notifyOwnerApprovalRequest(
     const timeStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, hour: '2-digit', minute: '2-digit', hour12: false }).format(booking.slotStart)
 
     const body = i18n.approval_request_owner[lang](who, svc, dateStr, timeStr)
-    await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ })
+    await enqueueMessage(businessId, manager.phoneNumber, body).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] owner approval-request notify failed', { businessId, err: (err as Error).message })
   }
@@ -364,7 +364,7 @@ export async function notifyCustomerApprovalDeclined(
       fallback,
       timeoutMs: 2500,
     }).catch(() => fallback)
-    await enqueueMessage(customer.phoneNumber, body).catch(() => { /* non-fatal */ })
+    await enqueueMessage(businessId, customer.phoneNumber, body).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] customer approval-declined notify failed', { businessId, err: (err as Error).message })
   }
@@ -413,7 +413,7 @@ export async function notifyOwnerApprovalExpired(
     const dateStr = new Intl.DateTimeFormat(locale, { timeZone: biz.timezone, weekday: 'long', day: 'numeric', month: 'long' }).format(booking.slotStart)
 
     const body = i18n.approval_expired_owner[lang](who, svc, dateStr)
-    await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ })
+    await enqueueMessage(businessId, manager.phoneNumber, body).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] owner approval-expired notify failed', { businessId, err: (err as Error).message })
   }
@@ -498,7 +498,7 @@ export async function notifyOwnerBookingChange(db: Db, businessId: string, chang
       recipientId: manager.id,
       dedupKey: `owner_change:${change.kind}:${change.bookingId}:${change.slotStart.getTime()}`,
     }, {
-      sendFreeForm: async () => { await enqueueMessage(manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
+      sendFreeForm: async () => { await enqueueMessage(businessId, manager.phoneNumber, body).catch(() => { /* non-fatal */ }) },
     }).catch(() => { /* non-fatal */ })
   } catch (err) {
     console.error('[booking-notify] owner booking-change notify failed', { businessId, kind: change.kind, err: (err as Error).message })

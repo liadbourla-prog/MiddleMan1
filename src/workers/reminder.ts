@@ -191,7 +191,7 @@ async function processReminder(job: { data: ReminderJob }) {
     {
       sendFreeForm: async () => {
         const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: body, timeoutMs: 2500 })
-        await enqueueMessage(customer.phoneNumber, llmBody)
+        await enqueueMessage(businessId, customer.phoneNumber, llmBody)
       },
       sendTemplate: async (templateName) => {
         await sendTemplateMessage({

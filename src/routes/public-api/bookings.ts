@@ -128,5 +128,5 @@ async function sendBookingConfirmation(biz: Business, lang: 'he' | 'en', phone: 
   const body = d.state === 'pending_payment'
     ? i18n.booking_pending_payment[lang](d.serviceName, biz.name, dateStr, timeStr)
     : i18n.booking_confirmed[lang](d.serviceName, biz.name, dateStr, timeStr)
-  await enqueueMessage(phone, body, d.id)
+  await enqueueMessage(biz.id, phone, body, { bookingId: d.id })
 }

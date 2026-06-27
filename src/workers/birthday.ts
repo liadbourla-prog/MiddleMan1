@@ -79,7 +79,7 @@ export async function runBirthdayTick(now: Date = new Date()): Promise<void> {
           }, {
             sendFreeForm: async () => {
               const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
-              await enqueueMessage(c.phoneNumber, body)
+              await enqueueMessage(biz.id, c.phoneNumber, body)
             },
             sendTemplate: async (templateName) => {
               await sendTemplateMessage({
