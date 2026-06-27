@@ -1,4 +1,4 @@
-import { eq, and, or, gt, gte, isNull, count } from 'drizzle-orm'
+import { eq, and, or, gt, gte, isNull, count, inArray } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { serviceTypes, bookings, identities, availability, conversationSessions } from '../../db/schema.js'
 import type { Business, CalendarBlockType, SessionState } from '../../db/schema.js'
@@ -11,6 +11,7 @@ import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
+import { extractClockTimes, extractMentionedTimes, findUnbackedTimes } from './slot-fabrication-guard.js'
 import { inferFocusService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
@@ -171,6 +172,21 @@ function formatLocalDate(dateStr: string, tz: string): string {
   return formatSlotDate(resolveSlotStart(dateStr, { hour: 12, minute: 0 }, tz), tz)
 }
 
+type TimeOfDay = 'morning' | 'afternoon' | 'evening'
+
+// Business definition of the day's parts, by a slot's LOCAL start time:
+//   morning   = opening …  < 12:00   (a session STARTING at 12:00 is NOT morning)
+//   afternoon = 12:00 … < 18:00
+//   evening   = 18:00 … closing      (a session STARTING at 18:00 IS evening)
+// Used to honour "what's in the morning/evening?" from real class/slot starts
+// instead of letting the model interpolate a part-of-day window.
+export function startInBucket(start: Date, tz: string, bucket: TimeOfDay): boolean {
+  const m = localParts(start, tz).minutes
+  if (bucket === 'morning') return m < 12 * 60
+  if (bucket === 'afternoon') return m >= 12 * 60 && m < 18 * 60
+  return m >= 18 * 60
+}
+
 function extractMemory(ctx: BookingFlowContext): CustomerMemoryInput {
   const hydrated = ctx as unknown as Partial<HydratedContext>
   const recentBookings = hydrated.recentBookings ?? []
@@ -201,6 +217,35 @@ async function loadHoursSummary(db: Db, businessId: string): Promise<string | nu
     .map((r) => `${DAY_NAMES[r.dayOfWeek!] ?? r.dayOfWeek}: ${r.openTime}–${r.closeTime}`)
 
   return parts.length > 0 ? `Business hours: ${parts.join(', ')}.` : null
+}
+
+// Distinct open/close boundary times (HH:MM) across the week — legit for a reply to
+// state ("we're open 09:00–20:00") so the fabrication guard must not flag them.
+async function loadBoundaryTimes(db: Db, businessId: string): Promise<string[]> {
+  const rows = await db
+    .select({ open: availability.openTime, close: availability.closeTime })
+    .from(availability)
+    .where(and(eq(availability.businessId, businessId), eq(availability.isBlocked, false)))
+  const out = new Set<string>()
+  for (const r of rows) {
+    if (r.open) out.add(r.open.slice(0, 5))
+    if (r.close) out.add(r.close.slice(0, 5))
+  }
+  return [...out]
+}
+
+// HH:MM of this customer's own upcoming occupying bookings — so a reply restating
+// "your class is at 14:00" (cancellation/list/reschedule) is never flagged.
+async function loadCustomerBookingTimes(db: Db, customerId: string, tz: string): Promise<string[]> {
+  const rows = await db
+    .select({ start: bookings.slotStart })
+    .from(bookings)
+    .where(and(
+      eq(bookings.customerId, customerId),
+      inArray(bookings.state, ['held', 'pending_payment', 'confirmed']),
+      gte(bookings.slotStart, new Date()),
+    ))
+  return [...new Set(rows.map((r) => formatSlotTime(r.start, tz)))]
 }
 
 // A suggestion's human text plus the concrete slots it offered. `offered` feeds
@@ -289,22 +334,30 @@ async function buildInquiryAvailabilityText(
     }
   }
 
+  // Honour an explicit part-of-day ("evening?") by keeping only slots whose LOCAL
+  // start falls in that bucket — never widen back to all-day, which is what tempts
+  // the model to fabricate (e.g. "evening" → inventing 17:00/19:00).
+  const bucket: TimeOfDay | null = slot?.timeOfDay ?? null
+  const byBucket = <T extends { start: Date }>(ss: T[]): T[] =>
+    bucket ? ss.filter((s) => startInBucket(s.start, tz, bucket)) : ss
+  const ofDay = bucket ? ` ${bucket}` : ''
+
   try {
     const offeredOf = (ss: { start: Date; end: Date }[]): RejectedSlot[] =>
       ss.map((s) => ({ start: s.start.toISOString(), end: s.end.toISOString() }))
     const rawSlots = await getOpenSlots(db, business, { start: from, end: to }, duration, { maxSlots: 40 })
-    const slots = filterOpenSlots(rawSlots, constraints, tz).slice(0, 6)
+    const slots = byBucket(filterOpenSlots(rawSlots, constraints, tz)).slice(0, 6)
     if (slots.length > 0) {
       const list = slots.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
       return { text: `Actual open times in the window the customer asked about: ${list}.`, offered: offeredOf(slots) }
     }
-    if (!scoped) return { text: 'No open times in the next two weeks.', offered: [] }
+    if (!scoped) return { text: `No open${ofDay} times in the next two weeks.`, offered: [] }
     // Specific day/week had nothing — offer the next real opening overall, honestly.
     const rawFallback = await getOpenSlots(db, business, { start: now, end: new Date(now.getTime() + 14 * 86_400_000) }, duration, { maxSlots: 30 })
-    const fallback = filterOpenSlots(rawFallback, constraints, tz).slice(0, 3)
-    if (fallback.length === 0) return { text: 'Nothing open in the window they asked about, and nothing in the next two weeks.', offered: [] }
+    const fallback = byBucket(filterOpenSlots(rawFallback, constraints, tz)).slice(0, 3)
+    if (fallback.length === 0) return { text: `Nothing open${ofDay} in the window they asked about, and nothing in the next two weeks.`, offered: [] }
     const list = fallback.map((s) => `${formatSlotDate(s.start, tz)} at ${formatSlotTime(s.start, tz)}`).join('; ')
-    return { text: `Nothing open in the window they asked about. The next real openings are: ${list}.`, offered: offeredOf(fallback) }
+    return { text: `Nothing open${ofDay} in the window they asked about. The next real openings are: ${list}.`, offered: offeredOf(fallback) }
   } catch {
     return NO_SUGGESTION
   }
@@ -321,14 +374,22 @@ async function buildDayOptionsText(
   tz: string,
   serviceTypeId: string | undefined,
   constraints?: NegotiationConstraints,
+  timeOfDay?: TimeOfDay | null,
 ): Promise<SuggestionResult> {
   const day = await listDayOptions(db, business, dateStr, tz, serviceTypeId ? { serviceTypeId } : {})
   const dayLabel = formatLocalDate(dateStr, tz)
   const parts: string[] = []
   const offered: RejectedSlot[] = []
 
+  // Narrow to the requested part-of-day (real class/slot starts only) so an
+  // "evening?" inquiry can never widen back into invented full-day times.
+  const byBucket = <T extends { start: Date }>(ss: T[]): T[] =>
+    timeOfDay ? ss.filter((s) => startInBucket(s.start, tz, timeOfDay)) : ss
+  const datesByBucket = (ds: Date[]): Date[] =>
+    timeOfDay ? ds.filter((d) => startInBucket(d, tz, timeOfDay)) : ds
+
   // Drop class instances and private openings the customer already ruled out this session.
-  const classes = filterOpenSlots(day.classes, constraints, tz)
+  const classes = byBucket(filterOpenSlots(day.classes, constraints, tz))
   if (classes.length > 0) {
     const items = classes.slice(0, 10).map((c) => {
       offered.push({ start: c.start.toISOString(), end: c.end.toISOString(), serviceTypeId: c.serviceTypeId })
@@ -339,7 +400,7 @@ async function buildDayOptionsText(
   }
 
   const privateOpenings = day.privateOpenings
-    .map((p) => ({ ...p, slots: p.slots.filter((s) => !isSlotSuppressed(s, constraints, tz)) }))
+    .map((p) => ({ ...p, slots: datesByBucket(p.slots.filter((s) => !isSlotSuppressed(s, constraints, tz))) }))
     .filter((p) => p.slots.length > 0)
   if (privateOpenings.length > 0) {
     const items = privateOpenings.slice(0, 6).map((p) => {
@@ -352,7 +413,11 @@ async function buildDayOptionsText(
     parts.push(`Open private times on ${dayLabel}: ${items.join('; ')}.`)
   }
 
-  return parts.length > 0 ? { text: parts.join(' '), offered } : NO_SUGGESTION
+  if (parts.length > 0) return { text: parts.join(' '), offered }
+  // A part-of-day was asked but nothing real falls in it — state that explicitly so
+  // the caller does NOT fall back to an all-day answer (which reopens the fabrication).
+  if (timeOfDay) return { text: `No ${timeOfDay} classes or open times on ${dayLabel}.`, offered: [] }
+  return NO_SUGGESTION
 }
 
 /**
@@ -411,6 +476,19 @@ const BOOKING_NOT_CONFIRMED_FALLBACK: Record<'he' | 'en', string> = {
   en: "Hang on — that's not booked yet. What day and time works for you?",
 }
 
+// Safe reply when the model keeps stating times the spine never offered (a
+// fabricated-availability claim that survived one regeneration). States no time at
+// all — better to ask than to offer a slot that does not exist / is blocked.
+const FABRICATED_TIME_FALLBACK: Record<'he' | 'en', string> = {
+  he: 'בוא נמצא לך זמן אמיתי — לאיזה יום שאבדוק עבורך?',
+  en: "Let me get you a real time — which day should I check for you?",
+}
+
+// Appended to the situation when the first draft offered an unbacked time. Forces
+// the model back onto the deterministic, block-aware times already in the situation.
+const TIME_GUARD_INSTRUCTION =
+  'CRITICAL: Your draft offered a time that is NOT available. The ONLY bookable times are those explicitly listed as open times / classes in the context above. Business hours describe when the studio is open, NOT bookable slots — never present a time as available just because it falls within opening hours or between classes. If nothing listed fits what the customer asked, say plainly there is nothing available for that and invite them to pick from the listed options or choose another day. Do NOT state any other clock time as available.'
+
 // Bound reply function: built once per request with the business's authoritative
 // facts so every customer reply is grounded in real config (no invented services,
 // instructors, prices, or policies — C3/C4). Callers never pass businessFacts.
@@ -427,24 +505,71 @@ type GenReply = (
 //
 // `businessFacts` is closed over here and merged into every reply so the LLM is
 // grounded in the real, exhaustive config on EVERY path — not just inquiries.
-function makeGenReply(businessFacts: string, actionLedger: string): GenReply {
+// Assemble the set of clock times a reply is allowed to state, WITHOUT any per-path
+// wiring: the situation string is system-authored and already block-aware, so every
+// time the spine legitimately surfaced this turn is in it. Union that with the times
+// the customer raised (a reply may echo/refuse them), the business-hour boundaries,
+// and the customer's own booking times. Anything else in the reply is a fabrication.
+function buildAllowedTimes(
+  input: Parameters<typeof generateCustomerReply>[0],
+  timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
+): Set<string> {
+  const allowed = new Set<string>([...timeGuard.boundaryTimes, ...timeGuard.bookingTimes])
+  for (const t of extractClockTimes(input.situation ?? '')) allowed.add(t)
+  for (const turn of input.transcript ?? []) {
+    if (turn.role === 'customer') for (const t of extractMentionedTimes(turn.text)) allowed.add(t)
+  }
+  return allowed
+}
+
+// Reply-vs-state binding guard. Every customer reply goes through here. Two output
+// gates run unless the caller asserted a real persisted booking (bookingConfirmed):
+//   1. phantom "booking confirmed" claim (assertsBookingConfirmed) — said-done/didn't,
+//   2. fabricated availability — a clock time the deterministic spine never offered
+//      (the recurring Branch-4 bug: the model interpolating bookable times from open
+//      hours / the class cadence). Each gate regenerates once, then falls back to a
+//      deterministic, time-free reply. This is the single intent-path-agnostic seam.
+//
+// `businessFacts` is closed over here and merged into every reply so the LLM is
+// grounded in the real, exhaustive config on EVERY path — not just inquiries.
+function makeGenReply(
+  businessFacts: string,
+  actionLedger: string,
+  timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
+): GenReply {
   return async (input, opts = {}) => {
     const grounded = {
       ...input,
       ...(businessFacts ? { businessFacts } : {}),
       ...(actionLedger ? { actionLedger } : {}),
     }
-    const reply = await generateCustomerReply(grounded)
+    let reply = await generateCustomerReply(grounded)
     if (opts.bookingConfirmed) return reply
-    if (!assertsBookingConfirmed(reply, input.language)) return reply
 
-    const correctedInput = {
-      ...grounded,
-      situation: `${input.situation}\n\nCRITICAL: No booking has been made or confirmed. Do NOT state or imply the appointment is booked, reserved, registered, or done. If a decision is needed, ask for it plainly.`,
+    // Gate 1 — phantom booking-confirmed claim.
+    if (assertsBookingConfirmed(reply, input.language)) {
+      const corrected = await generateCustomerReply({
+        ...grounded,
+        situation: `${input.situation}\n\nCRITICAL: No booking has been made or confirmed. Do NOT state or imply the appointment is booked, reserved, registered, or done. If a decision is needed, ask for it plainly.`,
+      })
+      reply = assertsBookingConfirmed(corrected, input.language)
+        ? BOOKING_NOT_CONFIRMED_FALLBACK[input.language]
+        : corrected
     }
-    const corrected = await generateCustomerReply(correctedInput)
-    if (!assertsBookingConfirmed(corrected, input.language)) return corrected
-    return BOOKING_NOT_CONFIRMED_FALLBACK[input.language]
+
+    // Gate 2 — fabricated availability (a clock time the spine never offered).
+    const allowed = buildAllowedTimes(input, timeGuard)
+    if (findUnbackedTimes(reply, allowed).length > 0) {
+      const corrected = await generateCustomerReply({
+        ...grounded,
+        situation: `${input.situation}\n\n${TIME_GUARD_INSTRUCTION}`,
+      })
+      reply = findUnbackedTimes(corrected, allowed).length > 0
+        ? FABRICATED_TIME_FALLBACK[input.language]
+        : corrected
+    }
+
+    return reply
   }
 }
 
@@ -558,7 +683,14 @@ export async function handleBookingFlow(
     scope: 'customer',
     identityId: identity.id,
   }).catch(() => '')
-  const genReply = makeGenReply(businessFacts, actionLedger)
+  // Fabrication-guard context: loaded once so the output gate in genReply can tell a
+  // real time (offered/hours/own-booking) from an invented one. Best-effort — a load
+  // failure just narrows the allowlist (the regenerate→fallback path stays safe).
+  const [boundaryTimes, bookingTimes] = await Promise.all([
+    loadBoundaryTimes(db, identity.businessId).catch(() => [] as string[]),
+    loadCustomerBookingTimes(db, identity.id, businessTimezone).catch(() => [] as string[]),
+  ])
+  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes })
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
@@ -817,7 +949,7 @@ export async function handleBookingFlow(
             ctx = withConstraints(ctx, removeRejectedSlot(ctx.negotiationConstraints, askedStart.toISOString()))
           }
           if (resolvedDay && resolvedDay.ok) {
-            const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints)
+            const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null)
             availabilityText = r.text
             inquiryOffered.push(...r.offered)
           }
@@ -842,7 +974,7 @@ export async function handleBookingFlow(
         const hoursCtx = hoursSummary ? ` ${hoursSummary}` : ''
 
         const situation = activeServices.length > 0
-          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the hours, real open times, FAQs, and service info above. If they asked which times/days are open, give the actual open times above as a short bullet list and invite them to pick one — never invent times. If the customer asks to book with a specific instructor by name, that is supported — bookings go through here. Do NOT proactively bring up, list, or advertise individual instructors or who teaches what; only engage with instructor specifics if the customer raises them first.`
+          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above. CRITICAL on times: the ONLY bookable times are those explicitly listed above as open times / classes. Business hours describe when the studio is OPEN — they are NOT a list of bookable slots; never present a time as available just because it falls within opening hours or between classes. If they asked which times/days are open, give the listed open times as a short bullet list and invite them to pick one. If nothing is listed for what they asked, say plainly there is nothing available and offer the listed alternatives or another day — never invent or infer a time. If the customer asks to book with a specific instructor by name, that is supported — bookings go through here. Do NOT proactively bring up, list, or advertise individual instructors or who teaches what; only engage with instructor specifics if the customer raises them first.`
           : `${firstMsgPrefix}Customer asked about the business. ${customerCtx} No services are configured yet. Direct them to contact the business directly.`
         const knowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
