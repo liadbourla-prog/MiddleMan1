@@ -1,7 +1,7 @@
 import { eq, and, or, gt, gte, isNull, count } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { serviceTypes, bookings, identities, availability, conversationSessions } from '../../db/schema.js'
-import type { Business, CalendarBlockType } from '../../db/schema.js'
+import type { Business, CalendarBlockType, SessionState } from '../../db/schema.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import type { ActiveSession } from '../session/types.js'
 import { buildActionLedgerBlock } from '../audit/ledger-block.js'
@@ -960,11 +960,11 @@ export async function handleBookingFlow(
       // appended reply forward.
       result = { ...result, reply: named.reply }
       const [row] = await db
-        .select({ context: conversationSessions.context })
+        .select({ context: conversationSessions.context, state: conversationSessions.state })
         .from(conversationSessions)
         .where(eq(conversationSessions.id, session.id))
       const persisted = (row?.context as BookingFlowContext | undefined) ?? updatedCtx
-      await updateSessionContext(db, session.id, { ...persisted, nameAsked: true }).catch(() => {})
+      await updateSessionContext(db, session.id, { ...persisted, nameAsked: true }, row?.state as SessionState | undefined).catch(() => {})
     }
   }
 
