@@ -10,6 +10,12 @@ import { countManagedOutcomes } from '../domain/initiations/resolution-autonomy.
 import { resolveSlotStart, addDaysToDateStr } from '../domain/availability/resolve-slot.js'
 import { localParts } from '../domain/availability/compute.js'
 import { queryCustomerSegment } from '../domain/crm/segment-repository.js'
+import { fetchUnflushedDigests, markDigestsFlushed, businessesWithPendingDigests } from '../domain/initiations/digest-queue.js'
+import { buildDigestSection } from './digest-section.js'
+
+// buildDigestSection lives in a side-effect-free module (this worker instantiates a BullMQ Queue at
+// import time, which would connect to Redis in unit tests). Re-export so callers/tests can reach it here.
+export { buildDigestSection } from './digest-section.js'
 
 const QUEUE_NAME = 'daily-briefing'
 const REPEAT_EVERY_MS = 15 * 60_000 // check every 15 minutes
@@ -59,7 +65,11 @@ async function processTick(): Promise<void> {
         ?? (biz.defaultLanguage as Lang | null | undefined)
         ?? 'he'
 
+      // Fold any buffered digest items into the briefing so the owner gets one combined message.
+      const digestRows = await fetchUnflushedDigests(db, biz.id)
+      const { section: digestSection, ids: digestIds } = buildDigestSection(digestRows, lang)
       const body = await buildBriefing(biz.id, biz.name, biz.timezone, lang)
+        + (digestSection ? `\n\n${digestSection}` : '')
 
       const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
         ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
@@ -68,9 +78,48 @@ async function processTick(): Promise<void> {
       await sendMessage({ toNumber: manager.phoneNumber, body }, waCredentials)
         .catch((err) => console.warn('[daily-briefing] Send failed', { businessId: biz.id, err }))
 
+      // Mark flushed only after the send is attempted; if this fails the rows retry next tick.
+      if (digestIds.length > 0) await markDigestsFlushed(db, digestIds).catch(() => { /* retry next tick */ })
+
       console.info(JSON.stringify({ event: 'daily_briefing.sent', businessId: biz.id }))
     } catch (err) {
       console.error('[daily-briefing] Business briefing failed', { businessId: biz.id, err: err instanceof Error ? err.message : String(err) })
+    }
+  }
+
+  // Digest-only sweep: businesses with buffered changes but daily briefing OFF still get their
+  // digest once a day, so opting an event into 'digest' never silently swallows it.
+  const enabledIds = new Set(enabledBizList.map((b) => b.id))
+  const pendingIds = (await businessesWithPendingDigests(db)).filter((id) => !enabledIds.has(id))
+  for (const businessId of pendingIds) {
+    try {
+      const [biz] = await db.select({
+        name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage,
+        dailyBriefingTime: businesses.dailyBriefingTime, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken,
+      }).from(businesses).where(eq(businesses.id, businessId)).limit(1)
+      if (!biz) continue
+
+      const briefingTime = biz.dailyBriefingTime ?? '09:00'
+      const todayLocal = new Intl.DateTimeFormat('en-CA', { timeZone: biz.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now)
+      const briefingLocal = new Date(`${todayLocal}T${briefingTime}:00`)
+      const briefingUtc = new Date(briefingLocal.toLocaleString('en-US', { timeZone: 'UTC' }))
+      const diffMs = now.getTime() - briefingUtc.getTime()
+      if (diffMs < 0 || diffMs > REPEAT_EVERY_MS) continue
+
+      const [manager] = await db.select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
+        .from(identities).where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'))).limit(1)
+      if (!manager) continue
+      const lang: Lang = (manager.preferredLanguage as Lang | null | undefined) ?? (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+
+      const rows = await fetchUnflushedDigests(db, businessId)
+      const { section, ids } = buildDigestSection(rows, lang)
+      if (ids.length === 0) continue
+      const waCredentials = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+        ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId } : undefined
+      await sendMessage({ toNumber: manager.phoneNumber, body: section }, waCredentials).catch((err) => console.warn('[daily-briefing] digest-only send failed', { businessId, err }))
+      await markDigestsFlushed(db, ids).catch(() => { /* retry next tick */ })
+    } catch (err) {
+      console.error('[daily-briefing] digest-only sweep failed', { businessId, err: err instanceof Error ? err.message : String(err) })
     }
   }
 }

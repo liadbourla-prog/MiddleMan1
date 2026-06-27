@@ -14,7 +14,7 @@ import { buildBookingAuditMeta, initiatorFromActor } from './audit-meta.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { recordCompletedBooking } from '../customer/profile.js'
 import { scheduleReminders, cancelReminders } from '../../workers/reminder.js'
-import { notifyBusinessBookingChange, notifyOwnerNewBooking, notifyOwnerApprovalRequest } from '../initiations/booking-notify.js'
+import { notifyBusinessBookingChange, notifyOwnerNewBooking, notifyOwnerApprovalRequest, notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { shouldHoldForApproval } from './approval.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
@@ -79,6 +79,7 @@ export async function requestBooking(
   calendar: CalendarClient,
   actor: ResolvedIdentity,
   request: BookingSlotRequest,
+  opts?: { suppressOwnerNewBookingNotice?: boolean },
 ): Promise<BookingEngineResult> {
   const auth = authorize({ role: actor.role, ...(actor.delegatedPermissions ? { delegatedPermissions: actor.delegatedPermissions } : {}) }, 'booking.request')
   if (!auth.allowed) return { ok: false, reason: auth.reason }
@@ -211,7 +212,7 @@ export async function requestBooking(
     // mechanics don't compose with the held-for-approval reservation, so a class service keeps
     // today's direct-confirm path even if requires_owner_approval is on (documented limitation;
     // never gated → no behavior change, only "approval not yet honored for classes").
-    return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, instanceCapacity)
+    return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, instanceCapacity, opts?.suppressOwnerNewBookingNotice ?? false)
   }
 
   // Per-service owner-approval gate (design 2026-06-25, §2). Fires ONLY when the service opted in
@@ -461,6 +462,7 @@ async function requestGroupClassBooking(
   paymentMethod: string | null,
   providerDisplayName: string | null = null,
   instanceCapacity: number | null = null,
+  suppressOwnerNewBookingNotice = false,
 ): Promise<BookingEngineResult> {
   // Per-instance capacity wins over the service-type default (CRM_STANDARD.md
   // invariant #2): the scheduled class block decides how many fit in THIS slot.
@@ -629,8 +631,9 @@ async function requestGroupClassBooking(
   await scheduleReminders(actor.businessId, actor.id, txResult.bookingId, request.serviceTypeId, request.slotStart).catch(() => { /* non-fatal */ })
 
   // Reflect a customer self-booking to the owner (INV-3 proactive). Owner-/PA-initiated bookings
-  // don't reach this customer-booking engine, so this is always a customer self-commit.
-  if (initiatorFromActor(actor) === 'customer_self') {
+  // don't reach this customer-booking engine, so this is always a customer self-commit. Suppressed
+  // on a reschedule replacement: the move surfaces as a single 'moved' owner notice instead.
+  if (initiatorFromActor(actor) === 'customer_self' && !suppressOwnerNewBookingNotice) {
     await notifyOwnerNewBooking(db, actor.businessId, {
       bookingId: txResult.bookingId,
       customerId: actor.id,
@@ -655,6 +658,7 @@ export async function confirmBooking(
   actor: ResolvedIdentity,
   bookingId: string,
   customerName: string,
+  opts?: { suppressOwnerNewBookingNotice?: boolean },
 ): Promise<BookingEngineResult> {
   const [booking] = await db
     .select()
@@ -727,7 +731,9 @@ export async function confirmBooking(
     .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (confirm):', err))
   await scheduleReminders(actor.businessId, actor.id, bookingId, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
 
-  if (initiatorFromActor(actor) === 'customer_self') {
+  // Suppressed on a reschedule replacement: the move surfaces as a single 'moved' owner notice
+  // (fired by the flow's releaseSupersededBooking) instead of a 'new booking' + 'moved' pair.
+  if (initiatorFromActor(actor) === 'customer_self' && !(opts?.suppressOwnerNewBookingNotice ?? false)) {
     await notifyOwnerNewBooking(db, actor.businessId, {
       bookingId,
       customerId: booking.customerId,
@@ -867,6 +873,20 @@ export async function cancelBooking(
   if (cancelledByRole === 'manager' && booking.customerId !== actor.id) {
     notifyBusinessBookingChange(db, actor.businessId, {
       kind: 'cancelled',
+      bookingId,
+      customerId: booking.customerId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+    }).catch(() => { /* non-fatal */ })
+  }
+
+  // Owner-facing: notify the owner of customer/PA-originated cancellations (NOT the manager's own
+  // action, and NOT a reschedule-supersede — that surfaces as a single 'moved' notice elsewhere).
+  if (cancelledByRole !== 'manager' && reason !== 'Superseded by reschedule') {
+    notifyOwnerBookingChange(db, actor.businessId, {
+      kind: 'cancelled',
+      origin: cancelledByRole === 'customer' ? 'customer' : 'pa',
+      actorIsManager: false,
       bookingId,
       customerId: booking.customerId,
       serviceTypeId: booking.serviceTypeId,

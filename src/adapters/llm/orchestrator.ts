@@ -40,6 +40,8 @@ import {
   executeAmendReshuffle,
   executeConfigureReshuffle,
   executeConfigureNotifications,
+  executeConfigureDailyBriefing,
+  executeManageAllowedContacts,
   executeConfigurePaymentTiming,
   executeSetInitiationAutonomy,
   executeDecideFreedSlotOffer,
@@ -562,16 +564,40 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'configureNotifications',
-    description: "Set how the owner wants to be notified about a business event. Use when the owner says things like 'only tell me about cancellations within 24 hours', 'stop pinging me on every new booking', 'handle no-shows silently', or 'let me know when someone pays'. One event per call. Note: payment_received is SILENT by default (the PA handles payments end to end) — use it when the owner wants to start (or stop) being told about incoming payments.",
+    description: "Set how the owner wants to be notified about a business event. Use when the owner says things like 'only tell me about cancellations within 24 hours', 'stop pinging me on every new booking', 'handle no-shows silently', or 'let me know when someone pays'. One event per call. Note: payment_received is SILENT by default (the PA handles payments end to end) — use it when the owner wants to start (or stop) being told about incoming payments. Use action 'digest' when the owner says things like 'don't ping me every time, just put cancellations in my daily summary' or 'batch the reschedules'.",
     parameters: {
       type: Type.OBJECT,
       properties: {
         event: { type: Type.STRING, enum: ['new_booking', 'first_time_customer', 'cancellation', 'reschedule', 'no_show', 'refund_request', 'vip_return', 'payment_received'], description: 'Which business event this rule is about' },
-        action: { type: Type.STRING, enum: ['notify', 'notify_with_actions', 'handle_silently'], description: 'notify = tell me; notify_with_actions = tell me with quick action buttons; handle_silently = do not tell me' },
+        action: { type: Type.STRING, enum: ['notify', 'notify_with_actions', 'handle_silently', 'digest'], description: 'notify = tell me right away; notify_with_actions = tell me with quick action buttons; handle_silently = do not tell me; digest = do not ping me live, collect these and include them in my daily briefing' },
         withinHours: { type: Type.NUMBER, description: 'Optional: only apply when the affected booking is within this many hours (e.g. 24 for "cancellations inside 24h")' },
         remove: { type: Type.BOOLEAN, description: 'Remove the existing rule for this event instead of setting one' },
       },
       required: ['event'],
+    },
+  },
+  {
+    name: 'configureDailyBriefing',
+    description: "Turn the owner's daily briefing on or off and set the time it's sent. Use when the owner says things like 'send me a daily summary at 8am', 'turn on the morning briefing', 'stop the daily summary', or 'move my briefing to 18:00'. The daily briefing is also when batched ('digest') notifications are delivered. Provide enabled and/or time (24-hour HH:MM, business-local). Convert the owner's wording (e.g. '8am') into HH:MM yourself.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        enabled: { type: Type.BOOLEAN, description: 'Turn the daily briefing on (true) or off (false)' },
+        time: { type: Type.STRING, description: "Time of day to send it, 24-hour HH:MM business-local, e.g. '08:00' or '18:30'" },
+      },
+    },
+  },
+  {
+    name: 'manageAllowedContacts',
+    description: "Control which phone numbers the PA is allowed to talk to. Use when the owner says things like 'only respond to numbers I approve', 'just talk to these clients', 'add +972501234567 to the allowed list', 'allow 0501234567', 'stop the restriction', or 'who's on the allowed list?'. When restriction is ON, only allowed numbers (and you, your staff, and coordination contacts) reach the PA — everyone else is silently ignored and you get a heads-up. Adding a number turns the restriction ON automatically if it was off. One operation per call. Convert any local number the owner gives into full international (E.164) format yourself before calling.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        op: { type: Type.STRING, enum: ['enable', 'disable', 'add', 'remove', 'list'], description: 'enable/disable the restriction mode, add/remove a number, or list the current list' },
+        phone: { type: Type.STRING, description: 'Required for add/remove. Full international format, e.g. +972501234567' },
+        label: { type: Type.STRING, description: 'Optional name for the number when adding (e.g. the client name)' },
+      },
+      required: ['op'],
     },
   },
   {
@@ -845,6 +871,10 @@ async function dispatchTool(
       return executeConfigureReshuffle(args as unknown as Parameters<typeof executeConfigureReshuffle>[0], ctx)
     case 'configureNotifications':
       return executeConfigureNotifications(args as unknown as Parameters<typeof executeConfigureNotifications>[0], ctx)
+    case 'configureDailyBriefing':
+      return executeConfigureDailyBriefing(args as unknown as Parameters<typeof executeConfigureDailyBriefing>[0], ctx)
+    case 'manageAllowedContacts':
+      return executeManageAllowedContacts(args as unknown as Parameters<typeof executeManageAllowedContacts>[0], ctx)
     case 'configurePaymentTiming':
       return executeConfigurePaymentTiming(args as unknown as Parameters<typeof executeConfigurePaymentTiming>[0], ctx)
     case 'setInitiationAutonomy':
