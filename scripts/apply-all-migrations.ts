@@ -48,6 +48,7 @@ const EXPECTED_TABLES = [
   'business_payment_credentials',
   'payment_connect_tokens',
   'payment_requests',
+  'notification_digest_queue',
 ]
 const EXPECTED_INDEXES = [
   'initiation_log_dedup_idx',
