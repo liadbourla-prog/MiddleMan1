@@ -49,6 +49,7 @@ import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type Cale
 import { cancelClassSessionBookings, summarizeSessionCancellation } from '../scheduling/session-cancellation.js'
 import { resolveBookingApproval, selectPendingApproval, type PendingApprovalCandidate } from '../booking/approval.js'
 import { addAllowedContact, removeAllowedContact, type AllowedContact } from './allowed-contacts.js'
+import { loadSessionRoster } from '../booking/roster.js'
 
 // ── Structured date/time pieces from the orchestrator (classify-only) ────────
 // The LLM supplies these; the deterministic core (resolveSlotRange) computes the
@@ -300,6 +301,75 @@ export async function executeListCalendarEvents(
     return { events: formatted, count: formatted.length }
   } catch (err) {
     return { error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+// ── getSessionRoster ──────────────────────────────────────────────────────────
+// The authoritative "how many / who is booked for this session" read for Branch 3.
+// loadSessionRoster (booking/roster.ts) is the single source of truth — it excludes
+// cancelled bookings (SEAT_STATES) — but until now it was wired ONLY to the web API,
+// so the orchestrator had no roster tool and the LLM fabricated occupancy/participant
+// counts from conversation memory (live bug: a rescheduled-out customer reported as
+// still present, count "back to two"). This tool grounds those answers in real state.
+
+interface GetSessionRosterArgs {
+  serviceName?: string
+  date: DatePieces
+  time: TimePieces
+}
+
+export async function executeGetSessionRoster(
+  args: GetSessionRosterArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  // Deterministic slot-start resolution — the LLM only classified the pieces, the
+  // core computes the absolute instant (mirrors executeCreateCalendarEvent). On an
+  // unresolvable date we fail closed with a clarify, never guessing a slot.
+  const resolved = resolveSlotRange(
+    { date: toDateParts(args.date), startTime: args.time, durationMinutes: 1 },
+    ctx.timezone,
+    new Date(),
+  )
+  if (!resolved.ok) return clarifyDate(resolved.reason)
+  const slotStart = resolved.start
+
+  // Resolve the named service to a serviceTypeId the SAME way the rest of this file
+  // does — a fuzzy ilike name match (cf. scheduleGroupSession). When no name is
+  // given, fall back to the single active service if there is exactly one; if the
+  // name can't be matched and the business has more than one service, ask which.
+  let serviceTypeId: string | null = null
+  if (args.serviceName && args.serviceName.trim().length > 0) {
+    const [svc] = await ctx.db
+      .select({ id: serviceTypes.id })
+      .from(serviceTypes)
+      .where(and(eq(serviceTypes.businessId, ctx.businessId), ilike(serviceTypes.name, `%${args.serviceName.trim()}%`)))
+      .limit(1)
+    serviceTypeId = svc?.id ?? null
+  } else {
+    const active = await ctx.db
+      .select({ id: serviceTypes.id })
+      .from(serviceTypes)
+      .where(and(eq(serviceTypes.businessId, ctx.businessId), eq(serviceTypes.isActive, true)))
+      .limit(2)
+    if (active.length === 1) serviceTypeId = active[0]!.id
+  }
+
+  if (!serviceTypeId) {
+    return { error: 'unknown_service', guidance: 'Ask the owner which class/service they mean.' }
+  }
+
+  const roster = await loadSessionRoster(ctx.db, ctx.businessId, { serviceTypeId, slotStart })
+  if (!roster) {
+    return { found: false, participants: [], count: 0 }
+  }
+
+  return {
+    found: true,
+    count: roster.participants.length,
+    spotsLeft: roster.spotsLeft,
+    capacity: roster.instance.capacity,
+    participants: roster.participants.map((p) => ({ name: p.displayName, hasName: p.displayName != null })),
+    guidance: 'This is the live, authoritative roster (cancelled bookings excluded). Report these exact names/count — do NOT add or infer participants from earlier in the conversation.',
   }
 }
 

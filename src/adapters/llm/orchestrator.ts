@@ -28,6 +28,7 @@ import {
   executeEditClassSession,
   executeScheduleRecurringClasses,
   executeManageBusinessSettings,
+  executeGetSessionRoster,
   executeSearchWeb,
   executeLookupCustomer,
   executeSaveContactNote,
@@ -157,6 +158,19 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         dateTo: { ...DATE_PIECES_SCHEMA, description: 'Range end, as structured date pieces (for list_range). NEVER an ISO/absolute date.' },
       },
       required: ['intent'],
+    },
+  },
+  {
+    name: 'getSessionRoster',
+    description: 'Get the LIVE, authoritative roster for ONE specific class/group session — how many people are booked, how many spots are left, the capacity, and the participants\' names. Use this WHENEVER the owner asks how many are booked for a session, who is booked, whether a session is full, or whether a session\'s roster/headcount changed (e.g. "how many in tomorrow\'s 10:00 yoga?", "who\'s in the Tuesday pilates?", "did anyone drop the morning class?"). It excludes cancelled and rescheduled-out bookings, so it reflects the true current count. Identify the session by service name + date + start time. Report the date/time as structured pieces — NEVER compute an absolute or ISO date yourself.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        serviceName: { type: Type.STRING, description: 'Name of the class/service for the session (matched fuzzily). Optional only when the business has a single service; otherwise required so the right session is found.' },
+        date: DATE_PIECES_SCHEMA,
+        time: timeSchema('Start clock time of the session, 24-hour, as the owner said it'),
+      },
+      required: ['date', 'time'],
     },
   },
   {
@@ -736,6 +750,7 @@ For createCalendarEvent, scheduleGroupSession, and listCalendarEvents(list_range
 - manageBusinessSettings: ALWAYS use this for any change to recurring weekly hours, services, pricing, policies, staff access, or booking cancellations. Also use it to set a service's calendar color (e.g. "make Yoga blue", "color Pilates red", "תצבע את היוגה בכחול") and to set whether a service is a group class or a private 1-on-1 appointment (e.g. "Pilates is a group class for 8", "make Yoga a class", "switch physio to 1-on-1"). Also use it to block time from customer bookings (e.g. "block 2–4pm Tuesday"). Use it to STOP or SKIP one date of a recurring weekly class (e.g. "stop the weekly pilates class", "no spin class this coming Tuesday") — but to CREATE/SET UP recurring classes use scheduleRecurringClasses, not this. Also use it to add or manage instructors / teaching staff and their weekly hours (e.g. "add Dana as a yoga instructor Mon/Wed 9–13", "change Dana's hours", "Dana also teaches pilates", "remove Dana"). Never handle these as conversational replies. One manageBusinessSettings call handles exactly ONE service — when the owner changes MORE THAN ONE service in a single message (e.g. "make Pilates green and Yoga purple", "Pilates and Yoga are group classes for 8"), call manageBusinessSettings SEPARATELY for each service, once per named service, so every change actually applies. Never pack two services into one instruction — that gets only a clarification back and applies nothing.
 - scheduleRecurringClasses: use to CREATE recurring weekly classes — one or many at once (e.g. "yoga every Monday 10am", "yoga and pilates every hour 9–20 Sun–Thu", "breathing Mon & Wed at 10:00 and 16:00"). Expand ranges into explicit days and times yourself. The service must already exist and have a group capacity (>1) or you pass maxParticipants.
 - listCalendarEvents: use for schedule questions. Use intent check_free_slots when the manager asks what times are open/free — it returns real bookable openings. Do not call it unless the manager is asking about their calendar.
+- getSessionRoster: use for the live headcount/roster of ONE specific session — how many are booked, who is booked, whether a session is full, or whether its roster changed (e.g. "how many in tomorrow's 10:00 yoga?", "who's in the Tuesday class?", "did anyone drop?"). It excludes cancelled/rescheduled-out bookings, so it is the only correct source for participant counts and names.
 - createCalendarEvent: personal/business 1-on-1 events only (e.g. "dentist 3pm"). Do not use for blocking customer booking slots — that is manageBusinessSettings.
 - scheduleGroupSession: use when the manager wants to put a SINGLE class/group session on the calendar for one specific date ahead of bookings (e.g. "add a yoga class this Tuesday 11am with Dana, 10 spots"). Capture the instructor when named ("with Dana"). For a class that repeats every week ("every Monday", "weekly"), use scheduleRecurringClasses instead.
 - editClassSession: use to change an ALREADY-scheduled class on the calendar — its instructor, time, or capacity (e.g. "change tomorrow's 10:00 yoga to Dana", "move the Tuesday breathing to 17:00"). Get its eventId from listCalendarEvents first. Never delete+recreate a class to "edit" it — that drops its bookings.
@@ -766,6 +781,9 @@ When the owner asks you to contact, message, notify, or coordinate with a specif
 
 ## Never invent conversation history
 Do not claim you spoke to someone, that a person messaged you, when they messaged, or what they said, unless a tool result IN THIS TURN shows it. To check whether someone wrote — or to find a past exchange — call lookupCustomer with recent_messages and answer only from what it returns. Never substitute a real customer's name or number for the person the owner actually asked about, and never assert "I already messaged them / they replied on <day>" from memory. When you have not checked, say you'll check — then check.
+
+## Never report occupancy or a roster from memory
+When the owner asks how many people are booked for a session, who is booked, or whether a session's roster changed, you MUST call getSessionRoster (or listCalendarEvents for a whole-day view) and answer ONLY from the result — never from earlier messages in this conversation. A reschedule that moved someone OUT of a slot reduces that slot's count; never assume a count "returned to" a previous value.
 
 ## Reflect committed reality — never ask to approve what is already done
 The "What actually happened" block below is the single source of truth about what customers have done. If it shows a customer already booked, cancelled, or changed an appointment themselves, that is FINAL and committed — the customer was already told. REFLECT it to the owner as a done fact ("Yoni already booked Pilates himself for Sunday 17:00"). NEVER ask the owner to approve, confirm, or re-book something the ground truth shows is already done, and never tell the owner an action is "still pending" or "waiting" when the block shows it completed. The first committed action wins; your job is to report it truthfully, not to re-litigate it.
@@ -829,6 +847,8 @@ async function dispatchTool(
       return executeScheduleRecurringClasses(args as unknown as Parameters<typeof executeScheduleRecurringClasses>[0], ctx)
     case 'manageBusinessSettings':
       return executeManageBusinessSettings(args as unknown as Parameters<typeof executeManageBusinessSettings>[0], ctx)
+    case 'getSessionRoster':
+      return executeGetSessionRoster(args as unknown as Parameters<typeof executeGetSessionRoster>[0], ctx)
     case 'searchWeb':
       return executeSearchWeb(args as unknown as Parameters<typeof executeSearchWeb>[0], ctx)
     case 'lookupCustomer':
