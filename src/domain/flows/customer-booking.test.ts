@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
@@ -78,6 +79,22 @@ describe('appendNameRequest — Branch 4 soft name capture (WS-D)', () => {
     })
     expect(r.reply).toBe('')
     expect(r.nameAsked).toBe(false)
+  })
+})
+
+// Regression guard for the 2026-06-28 "name never persisted" root cause: persistCapturedName
+// ran ONLY on the default intent path, so a name stated on the clarification or hold-redispatch
+// path (where extractCustomerIntent also runs) was extracted but never written to display_name —
+// which in turn left the owner notification and calendar roster showing "no name". Invariant:
+// every intent-extraction site in this flow must be paired with a name-capture call. This reads
+// the source so a future extraction site that forgets capture fails loudly.
+describe('name-capture invariant — every extractCustomerIntent is paired with persistCapturedName', () => {
+  it('has a persistCapturedName call for each extractCustomerIntent call site', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    const extractions = (src.match(/await extractCustomerIntent\(/g) ?? []).length
+    const captures = (src.match(/await persistCapturedName\(/g) ?? []).length
+    expect(extractions).toBeGreaterThan(0)
+    expect(captures).toBeGreaterThanOrEqual(extractions)
   })
 })
 

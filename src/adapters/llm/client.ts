@@ -404,7 +404,7 @@ function buildKnowledgeAddendum(input: GenerateReplyInput): string {
       `Formality: ${cs.formality === 'formal' ? 'formal — use respectful titles and complete sentences' : 'casual — friendly, first names, relaxed'}.`,
       `Emoji: ${cs.emojiUse === 'none' ? 'never use emoji' : cs.emojiUse === 'frequent' ? 'use emoji freely' : 'use emoji sparingly (max 1 per message)'}.`,
     ]
-    if (cs.useCustomerName) rules.push("Use the customer's first name when known.")
+    if (cs.useCustomerName) rules.push("You may use the customer's first name for warmth when it's known — but sparingly (an occasional touch, never in every message).")
     if (!cs.humor) rules.push('Keep tone professional — no jokes or playful language.')
     if (cs.phrasesToUse.length > 0) rules.push(`Preferred phrases: ${cs.phrasesToUse.join(', ')}.`)
     if (cs.phrasesToAvoid.length > 0) rules.push(`Never say: ${cs.phrasesToAvoid.join(', ')}.`)

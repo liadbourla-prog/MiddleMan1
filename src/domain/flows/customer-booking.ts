@@ -1273,6 +1273,10 @@ async function rebuildOnSlotPivot(
   if (!re.ok) return null
 
   const intent = re.data
+  // Capture a self-stated name supplied while a hold was pending (e.g. "I'm Harel, actually make
+  // it Thursday"). This redispatch path extracts intent but otherwise bypasses the default
+  // capture at line ~877. Non-blocking, never clobbers an existing name.
+  await persistCapturedName(db, identity.businessId, identity.id, identity.displayName ?? null, intent.customerNameHint ?? null)
   const ns = intent.slotRequest
   const hasNewSlot =
     intent.serviceTypeHint != null ||
@@ -2067,6 +2071,14 @@ async function handleClarification(
     })
     return { reply, sessionComplete: false }
   }
+
+  // Capture a self-stated name on the clarification path too. This is the path the name
+  // almost always arrives on: when we softly ask "what's your name?" the session is in
+  // waiting_clarification, so the customer's answer routes here — NOT through the default
+  // intent path (line ~877) where capture also runs. Without this, asking for the name
+  // structurally guarantees the answer is never persisted (display_name stays null, and the
+  // owner notification + calendar roster fall back to "no name"). Non-blocking, never clobbers.
+  await persistCapturedName(db, identity.businessId, identity.id, identity.displayName ?? null, intentResult.data.customerNameHint ?? null)
 
   const detectedLanguage = intentResult.data.detectedLanguage
   const mergedCtx: BookingFlowContext = { ...updatedContext, detectedLanguage }
