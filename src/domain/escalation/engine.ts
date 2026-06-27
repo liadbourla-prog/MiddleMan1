@@ -123,7 +123,7 @@ export async function escalateToPlatform(
     recipientId: null,
     dedupKey: `escalation.platform:${business.id}:${customerPhone}:${Date.now()}`,
   }, {
-    sendFreeForm: async () => { await enqueueMessage(business.id, operatorPhone, message).catch(() => {}) },
+    sendFreeForm: async () => { await enqueueMessage(business.id, operatorPhone, message, { useGlobalCredentials: true }).catch(() => {}) },
   }).catch(() => { /* non-fatal: a ledger/notify hiccup must not break platform escalation recording */ })
 
   await db.insert(escalatedTasks).values({

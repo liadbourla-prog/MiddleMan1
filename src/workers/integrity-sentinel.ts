@@ -415,7 +415,7 @@ async function alertFinding(business: Business, f: IntegrityFinding): Promise<vo
       `Kind: ${f.kind}`,
       `Detail: ${JSON.stringify(f.detail)}`,
     ].join('\n')
-    await enqueueMessage(business.id, operatorPhone, body).catch(() => { /* non-fatal */ })
+    await enqueueMessage(business.id, operatorPhone, body, { useGlobalCredentials: true }).catch(() => { /* non-fatal */ })
   }
 }
 

@@ -13,6 +13,7 @@ interface MessageJob {
   toNumber: string
   body: string
   bookingId?: string
+  useGlobalCredentials?: boolean
 }
 
 export const messageRetryQueue = new Queue<MessageJob>(QUEUE_NAME, {
@@ -29,18 +30,27 @@ export async function enqueueMessage(
   businessId: string,
   toNumber: string,
   body: string,
-  opts?: { bookingId?: string },
+  opts?: { bookingId?: string; useGlobalCredentials?: boolean },
 ) {
   await messageRetryQueue.add('send', {
     businessId,
     toNumber,
     body,
     ...(opts?.bookingId ? { bookingId: opts.bookingId } : {}),
+    ...(opts?.useGlobalCredentials ? { useGlobalCredentials: true } : {}),
   })
 }
 
 // Exported for unit testing: resolve the recipient + per-business WhatsApp credentials.
-export async function buildSendArgs(data: Pick<MessageJob, 'businessId' | 'toNumber' | 'body'>) {
+export async function buildSendArgs(
+  data: Pick<MessageJob, 'businessId' | 'toNumber' | 'body'> & { useGlobalCredentials?: boolean },
+) {
+  if (data.useGlobalCredentials) {
+    // Operator-audience messages must use the global/provider WABA (env creds),
+    // not a per-business WABA — the operator's 24h window is with the platform number.
+    return { toNumber: data.toNumber, body: data.body, credentials: undefined }
+  }
+
   const [biz] = await db
     .select({ phoneNumberId: businesses.whatsappPhoneNumberId, accessToken: businesses.whatsappAccessToken })
     .from(businesses)

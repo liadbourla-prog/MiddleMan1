@@ -30,4 +30,21 @@ describe('message-retry worker credential resolution', () => {
     expect(args.toNumber).toBe('+972500000000')
     expect(args.body).toBe('hi')
   })
+
+  it('returns credentials: undefined and skips db when useGlobalCredentials is true', async () => {
+    // Make the db mock's limit throw so any db access would surface as a failure
+    const { db } = await import('../db/client.js')
+    const dbMock = db as unknown as { select: ReturnType<typeof vi.fn> }
+    const originalSelect = dbMock.select
+    dbMock.select = vi.fn(() => { throw new Error('db must not be called for global-credential sends') })
+
+    try {
+      const args = await buildSendArgs({ businessId: 'biz-1', toNumber: '+1', body: 'x', useGlobalCredentials: true })
+      expect(args.credentials).toBeUndefined()
+      expect(args.toNumber).toBe('+1')
+      expect(args.body).toBe('x')
+    } finally {
+      dbMock.select = originalSelect
+    }
+  })
 })
