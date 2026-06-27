@@ -87,7 +87,7 @@ function clean(value: string | null | undefined): string | null {
 }
 
 function personLabel(p: EventPerson, noName: string): string {
-  return clean(p.name) ?? clean(p.phone) ?? noName
+  return clean(p.name) ?? noName
 }
 
 export function renderBookingEvent(content: BookingEventContent, lang: Lang): RenderedEvent {
