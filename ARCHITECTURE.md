@@ -1351,6 +1351,10 @@ This branch uses a strict two-layer model:
 
 **What the LLM must NOT do in Layer A:** Make any claim about availability, booking state, or policy beyond what the `situation` string provides. **What the LLM must NOT do in Layer B:** Make any transactional claim (confirm, cancel, check availability) — if a conversational turn leads to a transactional intent, it re-enters the standard intent-extraction pipeline.
 
+**Owner escalation for unfulfillable requests (P3):** When a customer asks for an arrangement the catalog can't express — a *private* version of a group class, a *group* booking beyond a 1-on-1 service's capacity, or an explicitly *out-of-hours* session — the PA does not dead-end with a rejection. The extractor flags the request *shape* (`specialArrangementRequest`); the deterministic core confirms it's genuinely unfulfillable (party-size > capacity, or out-of-hours insistence); only then does `escalateUnfulfillableRequest` (`src/domain/escalation/engine.ts`) notify the business owner (via the `escalation.unfulfillable` initiator → `escalatedTasks`) and tell the customer it's been passed on. Fires at most **once per session** (`specialRequestEscalated` guard). LLM stays interpretive; the core decides.
+
+**Restore-after-cancel (P4):** A successful cancellation records a snapshot of the cancelled slot on `customer_profiles` (`lastCancelledBooking` + `lastCancelledAt`) — durable across the session boundary, since the cancel session is completed and a fresh session handles the follow-up. When the customer asks to undo it ("give me back the class we cancelled" → extractor `restorePrevious`), the dispatch re-offers the **exact** cancelled slot through the normal booking gate (re-validating availability and asking to confirm) within a freshness window (`LAST_CANCEL_RESTORE_WINDOW_MINUTES`, default 120). The pure `buildRestoreDraft` gates staleness / past-slot / removed-service.
+
 ---
 
 ### Locked design decisions (applicable across branches)

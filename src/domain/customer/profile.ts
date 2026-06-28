@@ -1,7 +1,6 @@
-import { eq, and, sql } from 'drizzle-orm'
+import { eq } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { customerProfiles, bookings, serviceTypes } from '../../db/schema.js'
-import type { CustomerProfile } from '../../db/schema.js'
+import { customerProfiles, serviceTypes } from '../../db/schema.js'
 
 export interface CustomerMemory {
   displayName: string | null
