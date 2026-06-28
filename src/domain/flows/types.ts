@@ -13,7 +13,7 @@ export interface FlowResult {
   redispatch?: boolean
 }
 
-export type ConfirmationParse = 'yes' | 'no' | 'unclear'
+export type ConfirmationParse = 'yes' | 'no' | 'unclear' | 'yes_with_question'
 
 const YES_PATTERNS =
   /^\s*(yes|confirm|ok|okay|sure|yep|yeah|do it|book it|go ahead|כן|כו|אוקיי|אישור|בסדר|בוא נעשה|קדימה|אשר|טוב|בהחלט|יאללה|נשמע טוב|כל הכבוד)\s*[.!]?\s*$/i
@@ -61,16 +61,31 @@ function confirmationWords(text: string): string[] {
     .filter(Boolean)
 }
 
+// A trailing question signal: an explicit question mark (he/ar/en) or a leading
+// interrogative word. Used to recognise "yes + a side question" without treating a
+// slot REVISION as a confirmation.
+const QUESTION_RE = /[?؟]/
+const INTERROGATIVE_WORDS = new Set([
+  'who', 'what', 'when', 'where', 'why', 'how', 'which',
+  'מי', 'מה', 'מתי', 'איפה', 'למה', 'איך', 'כמה', 'איזה', 'איזו',
+])
+
 export function parseConfirmation(text: string): ConfirmationParse {
-  // Order: strict no/yes first (canonical single-word replies), then the lenient
-  // leading-affirmative pass that fixes the live confirmation loop where a clear
-  // "yes, book me please" or a "כו" typo was re-asked forever as 'unclear'.
   if (NO_PATTERNS.test(text)) return 'no'
   if (YES_PATTERNS.test(text)) return 'yes'
   if (NEG_TOKEN.test(text)) return 'unclear'
   const words = confirmationWords(text)
   if (words.length === 0 || !AFFIRM_WORDS.has(words[0]!)) return 'unclear'
-  return words.slice(1).every((w) => CONFIRM_FILLER.has(w)) ? 'yes' : 'unclear'
+  const rest = words.slice(1)
+  if (rest.every((w) => CONFIRM_FILLER.has(w))) return 'yes'
+  // A leading affirmative followed by a SIDE QUESTION (not a slot revision): confirm,
+  // and let the caller answer the question. Reject if it carries a clock time (a likely
+  // revision) — weekday/service revisions are caught by the booking-path re-extraction,
+  // but a time is the strongest revision signal and must not auto-confirm.
+  const hasQuestion = QUESTION_RE.test(text) || rest.some((w) => INTERROGATIVE_WORDS.has(w))
+  const hasClockTime = /(?<![\d:])[\d]{1,2}:[\d]{2}(?![\d:])/.test(text)
+  if (hasQuestion && !hasClockTime) return 'yes_with_question'
+  return 'unclear'
 }
 
 export type RetentionReply =
