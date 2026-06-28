@@ -11,7 +11,7 @@ import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
-import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability } from './slot-fabrication-guard.js'
+import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability, extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
 import { matchCancelBookings } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
@@ -544,7 +544,7 @@ const TIME_GUARD_INSTRUCTION =
 // instructors, prices, or policies — C3/C4). Callers never pass businessFacts.
 type GenReply = (
   input: Parameters<typeof generateCustomerReply>[0],
-  opts?: { bookingConfirmed?: boolean },
+  opts?: { bookingConfirmed?: boolean; focusDay?: { dateStr: string; serviceTypeId?: string } },
 ) => Promise<string>
 
 // Reply-vs-state binding guard. Every customer reply goes through here. When the
@@ -586,6 +586,7 @@ function makeGenReply(
   businessFacts: string,
   actionLedger: string,
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
+  dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
 ): GenReply {
   return async (input, opts = {}) => {
     const grounded = {
@@ -594,6 +595,7 @@ function makeGenReply(
       ...(actionLedger ? { actionLedger } : {}),
     }
     let reply = await generateCustomerReply(grounded)
+    const replySurfacesAnyTime = (text: string): boolean => extractClockTimes(text).length > 0
     if (opts.bookingConfirmed) return reply
 
     // Gate 1 — phantom booking-confirmed claim.
@@ -619,30 +621,47 @@ function makeGenReply(
         : corrected
     }
 
-    // Gate 3 — fabricated unavailability (occupancy). Deterministic signal: the
-    // situation lists ≥1 OPEN interior time (not a business-hour boundary, the
-    // customer's own booking, or one marked full). If the reply nonetheless asserts
-    // blanket fullness AND restates none of those open times (i.e. hides them), it's
-    // the §6 "fully booked" fabrication (observed: PA listed Mon 11/14/18 then said
-    // "Monday is completely full"). The signal gates the phrase check, so a genuinely
-    // full day (no open signal) is never touched; the restates-an-option check spares
-    // a legitimate specific negative ("no 19:00, but 11/14/18 are open").
-    const openOffered = new Set(extractClockTimes(input.situation ?? ''))
-    for (const t of timeGuard.boundaryTimes) openOffered.delete(t)
-    for (const t of timeGuard.bookingTimes) openOffered.delete(t)
-    for (const t of extractFullTimes(input.situation ?? '')) openOffered.delete(t)
-    const replySurfacesOpen = (text: string): boolean => {
-      const times = new Set(extractClockTimes(text))
-      return [...openOffered].some((t) => times.has(t))
-    }
-    if (openOffered.size > 0 && !replySurfacesOpen(reply) && assertsNoAvailability(reply)) {
-      const corrected = await generateCustomerReply({
-        ...grounded,
-        situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}`,
-      })
-      reply = !replySurfacesOpen(corrected) && assertsNoAvailability(corrected)
-        ? OCCUPANCY_FALLBACK[input.language]
-        : corrected
+    // Gate 3 — fabricated unavailability (occupancy). Two signals, strongest first:
+    //  (a) Fresh-spine backstop: if a focusDay is in play and the reply asserts blanket
+    //      fullness, RE-READ that day from the spine. If it has open options, the claim
+    //      is a laundered lie regardless of what the situation text held — regenerate
+    //      with the real options, then OCCUPANCY_FALLBACK. (Kills cross-turn laundering.)
+    //  (b) Situation signal (back-compat): open interior times present in the situation
+    //      that the reply hides, now compared DAY-SCOPED so a cross-day HH:MM coincidence
+    //      no longer spares a specific-slot false-full.
+    if (assertsNoAvailability(reply)) {
+      // (a) spine backstop
+      if (opts.focusDay) {
+        const spine = await dayHasOpenOptions(opts.focusDay.dateStr, opts.focusDay.serviceTypeId)
+        if (spine.open) {
+          const corrected = await generateCustomerReply({
+            ...grounded,
+            situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}${spine.text ? ` Real open options: ${spine.text}` : ''}`,
+          })
+          return assertsNoAvailability(corrected) && !replySurfacesAnyTime(corrected)
+            ? OCCUPANCY_FALLBACK[input.language]
+            : corrected
+        }
+      }
+      // (b) situation signal, day-scoped
+      const situationOpen = extractDayScopedTimes(input.situation ?? '')
+      for (const set of situationOpen.values()) {
+        for (const t of timeGuard.boundaryTimes) set.delete(t)
+        for (const t of timeGuard.bookingTimes) set.delete(t)
+      }
+      for (const t of extractFullTimes(input.situation ?? '')) {
+        for (const set of situationOpen.values()) set.delete(t)
+      }
+      const anyOpen = [...situationOpen.values()].some((s) => s.size > 0)
+      if (anyOpen && !daysShareOpenTime(situationOpen, extractDayScopedTimes(reply))) {
+        const corrected = await generateCustomerReply({
+          ...grounded,
+          situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}`,
+        })
+        reply = assertsNoAvailability(corrected) && !daysShareOpenTime(situationOpen, extractDayScopedTimes(corrected))
+          ? OCCUPANCY_FALLBACK[input.language]
+          : corrected
+      }
     }
 
     return reply
@@ -766,7 +785,20 @@ export async function handleBookingFlow(
     loadBoundaryTimes(db, identity.businessId).catch(() => [] as string[]),
     loadCustomerBookingTimes(db, identity.id, businessTimezone).catch(() => [] as string[]),
   ])
-  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes })
+  // Fresh-spine occupancy reader for the output gate: re-reads a focused day's real
+  // class/slot availability so a "full" claim can never launder past makeGenReply
+  // without a current spine check. Best-effort: a failure reports "not open" (the gate
+  // simply doesn't fire — safe), never throws into the reply path.
+  const dayHasOpenOptions = async (dateStr: string, serviceTypeId?: string): Promise<{ open: boolean; text: string | null }> => {
+    if (!business) return { open: false, text: null }
+    try {
+      const r = await buildDayOptionsText(db, business, dateStr, businessTimezone, serviceTypeId, undefined)
+      return { open: r.offered.length > 0, text: r.text }
+    } catch {
+      return { open: false, text: null }
+    }
+  }
+  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
@@ -1007,8 +1039,11 @@ export async function handleBookingFlow(
         // next-openings answer. Never a single parroted slot. (G2: all human-rendered.)
         let availabilityText: string | null = null
         const inquiryOffered: RejectedSlot[] = []
+        // Hoisted to case scope so the inquiryReply genReply call below can pass focusDay.
+        let inquiryService: typeof activeServices[number] | null = null
+        let resolvedDay: ReturnType<typeof resolveRequestedDate> | null = null
         if (business) {
-          const inquiryService = resolveService(intent.serviceTypeHint, activeServices)
+          inquiryService = resolveService(intent.serviceTypeHint, activeServices)
           const dayParts: RequestedDateParts | null =
             intent.slotRequest && (intent.slotRequest.relativeDay || intent.slotRequest.weekday != null || intent.slotRequest.explicitDate)
               ? {
@@ -1017,7 +1052,7 @@ export async function handleBookingFlow(
                   explicitDate: intent.slotRequest.explicitDate ?? null,
                 }
               : null
-          const resolvedDay = dayParts ? resolveRequestedDate(dayParts, businessTimezone, new Date()) : null
+          resolvedDay = dayParts ? resolveRequestedDate(dayParts, businessTimezone, new Date()) : null
           // Explicit re-ask about a specific time un-suppresses it: the customer is
           // proactively asking about a slot they earlier ruled out, so surface it again.
           if (resolvedDay && resolvedDay.ok && intent.slotRequest?.time) {
@@ -1080,7 +1115,7 @@ export async function handleBookingFlow(
           transcript,
           customerMemory: extractMemory(updatedCtx),
           ...knowledgeFields,
-        })
+        }, (resolvedDay && resolvedDay.ok) ? { focusDay: { dateStr: resolvedDay.dateStr, ...(inquiryService ? { serviceTypeId: inquiryService.id } : {}) } } : undefined)
         return { reply: inquiryReply, sessionComplete: false }
       }
 
@@ -1133,6 +1168,23 @@ export async function handleBookingFlow(
         await updateSessionContext(db, session.id, ctxWithCount)
 
         const hasFaqs = (businessKnowledge?.faqs?.length ?? 0) > 0
+        // Re-ground: if this turn references a day (or continues an in-flight one), inject
+        // that day's REAL options so a challenge ("are you sure it's full?") or continuation
+        // ("I want to join") is answered from the spine, never from a stale transcript claim.
+        let unknownFocus: { dateStr: string; serviceTypeId?: string } | undefined
+        let unknownDayText: string | null = null
+        if (business) {
+          const dp = intent.slotRequest && (intent.slotRequest.relativeDay || intent.slotRequest.weekday != null || intent.slotRequest.explicitDate)
+            ? resolveRequestedDate({ relativeDay: intent.slotRequest.relativeDay ?? null, weekday: intent.slotRequest.weekday ?? null, explicitDate: intent.slotRequest.explicitDate ?? null }, businessTimezone, new Date())
+            : null
+          const focusDateStr = (dp?.ok ? dp.dateStr : undefined) ?? updatedCtx.slotDraft?.dateStr
+          const focusSvc = resolveService(intent.serviceTypeHint, activeServices)?.id ?? updatedCtx.slotDraft?.serviceTypeId
+          if (focusDateStr) {
+            const r = await buildDayOptionsText(db, business, focusDateStr, businessTimezone, focusSvc, updatedCtx.negotiationConstraints)
+            unknownDayText = r.text
+            unknownFocus = { dateStr: focusDateStr, ...(focusSvc ? { serviceTypeId: focusSvc } : {}) }
+          }
+        }
         // ONLY the genuine first message of a session may introduce the PA. Every
         // later turn continues the conversation — it must never re-greet or
         // re-announce identity (that was the verbatim-reintroduction bug).
@@ -1142,6 +1194,9 @@ export async function handleBookingFlow(
             ? `Mid-conversation: the customer said "${messageText}", which isn't a clear booking/cancel/reschedule. Do NOT greet or re-introduce yourself. If a FAQ above answers it, answer directly; otherwise reply like a person — briefly acknowledge, then nudge toward what you can help with (booking, changing, cancelling, checking appointments).`
             : `Mid-conversation: the customer said "${messageText}", which you couldn't map to a booking action. Do NOT greet or re-introduce yourself and do NOT repeat a canned capability list. Reply like a human employee — a short, warm acknowledgement that keeps things moving toward booking, changing, cancelling, or checking an appointment.`
 
+        const unknownSituationGrounded = unknownDayText
+          ? `${unknownSituation} Real options for the day in question: ${unknownDayText} Never tell the customer a day/class is full if options are listed here.`
+          : unknownSituation
         const unknownKnowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
           ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
@@ -1151,11 +1206,11 @@ export async function handleBookingFlow(
           businessTimezone,
           businessName,
           language: detectedLanguage,
-          situation: unknownSituation,
+          situation: unknownSituationGrounded,
           transcript,
           customerMemory: extractMemory(updatedCtx),
           ...unknownKnowledgeFields,
-        })
+        }, unknownFocus ? { focusDay: unknownFocus } : undefined)
         return { reply: unknownReply, sessionComplete: false }
       }
     }
@@ -1519,7 +1574,7 @@ async function handleBookingIntent(
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation: `${firstMsgPrefix}${ask}`,
-    })
+    }, { focusDay: { dateStr: draft.dateStr!, ...(draft.serviceTypeId ? { serviceTypeId: draft.serviceTypeId } : {}) } })
     return { reply, sessionComplete: false }
   }
 
@@ -1627,7 +1682,7 @@ async function handleBookingIntent(
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation,
-    })
+    }, { focusDay: { dateStr: localParts(slotStart, businessTimezone).dateStr, serviceTypeId: svc.id } })
     return { reply, sessionComplete: false }
   }
 
@@ -2019,7 +2074,7 @@ async function handleHoldConfirmation(
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
-    })
+    }, { focusDay: { dateStr: localParts(new Date(pendingSlot.start), businessTimezone).dateStr, serviceTypeId: pendingSlot.serviceTypeId } })
     return { reply, sessionComplete: false }
   }
 
