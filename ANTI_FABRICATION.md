@@ -46,7 +46,7 @@ The fix is to make **output gating** universal and **intent-path-agnostic** — 
 |---|---|---|---|
 | **Time fabrication** | offers `17:00`/`19:00` that are blocked / never offered | output gate + grounding | **solved** (§4–5) |
 | **Action-claim fabrication** | "I booked you ✅" when nothing was written; "I messaged him" / "calendar connected" / "cancelled" | output gate | **solved** (`reply-guard.ts`) |
-| **Occupancy fabrication** | "all Wednesday spots are taken" when ~55 are free | **source-truth** (grounding) | **solved at source** (§6); guard is future work |
+| **Occupancy fabrication** | "all Wednesday spots are taken" when ~55 are free; "Monday is completely full" right after listing Mon 11/14/18 | **source-truth** (grounding) **+ output gate** | **solved** — source (§6) + Gate 3 occupancy guard (§4.6) |
 | **Service / staff / price fabrication** | invents a service or instructor or quotes a price not on record | grounding (`buildBusinessFacts`) | solved (closed-world facts block) |
 | **Service-fidelity fabrication** (prior-assistant laundering) | locks the customer's remembered "usual" service (e.g. switches a pilates thread to *yoga*) on an underspecified booking the customer never affirmed | grounding (`customerReferencedService`) | **solved** (§4.2 rule extended to *service*) |
 
@@ -134,9 +134,9 @@ Reduce how often the gate must fire by never handing the model interpolatable ra
 
 **Lesson:** when the *core's data* is wrong, fix the core — an output guard cannot validate against a source that is itself lying.
 
-### Could an occupancy *output* guard exist? (future work)
+### The occupancy *output* guard — Gate 3 (built)
 
-Yes, but only if it keys off a **deterministic signal**, never phrase-parsing. The safe design: the handler passes `makeGenReply` a boolean "the spine offered ≥1 real bookable option this turn"; if the reply asserts blanket unavailability ("fully booked / no spots") while that signal is true → regenerate. A naive regex that flags "full" claims is unsafe because a genuinely full class is legitimately reported as full (`buildDayOptionsText` prints `(full)`), so the guard cannot tell truth from lie without the spine's signal. Not yet built; documented here so the next implementer starts from the signal, not the phrase.
+Keyed off a **deterministic signal**, never phrase-parsing alone. Implemented in `makeGenReply` as a third gate. The signal is computed centrally from the system-authored situation (no per-path wiring, matching Gate 2): **open offered times** = clock times in the situation, MINUS business-hour boundaries, MINUS the customer's own bookings, MINUS any time the situation marks `(full)` / `(מלא)` (`extractFullTimes` — this is what makes a genuinely-full day's `(full)` markers *not* count as availability, the exact failure §6 warned about). If that set is non-empty AND the reply asserts blanket unavailability (`assertsNoAvailability` — a conservative he/en fullness-phrase set) AND the reply restates **none** of the open times (so a legitimate specific negative like "no 19:00, but 11/14/18 are open" is spared) → regenerate once with `OCCUPANCY_GUARD_INSTRUCTION`, then fall back to `OCCUPANCY_FALLBACK` (asserts no fullness, invents no time). The deterministic signal gates the phrase check, so a truly full day (no open signal) is never touched — truth from lie is decided by the spine, not the regex. Fixes the live "Monday is completely full" right after the PA listed Mon 11/14/18.
 
 ---
 
@@ -183,7 +183,8 @@ Branch 3 (manager orchestrator) already generalizes the same idea: `detectAction
 |---|---|
 | Time detection (pure) | `src/domain/flows/slot-fabrication-guard.ts` · `extractClockTimes`, `extractMentionedTimes`, `findUnbackedTimes`, `canonicalTime` |
 | Output gate (chokepoint) | `src/domain/flows/customer-booking.ts` · `makeGenReply`, `buildAllowedTimes`, `loadBoundaryTimes`, `loadCustomerBookingTimes` |
-| Corrective + fallbacks | `customer-booking.ts` · `TIME_GUARD_INSTRUCTION`, `FABRICATED_TIME_FALLBACK`, `BOOKING_NOT_CONFIRMED_FALLBACK` |
+| Corrective + fallbacks | `customer-booking.ts` · `TIME_GUARD_INSTRUCTION`, `FABRICATED_TIME_FALLBACK`, `BOOKING_NOT_CONFIRMED_FALLBACK`, `OCCUPANCY_GUARD_INSTRUCTION`, `OCCUPANCY_FALLBACK` |
+| Occupancy guard (Gate 3) | `slot-fabrication-guard.ts` · `extractFullTimes`, `assertsNoAvailability`; `customer-booking.ts` · `makeGenReply` (Gate 3) |
 | Booking-claim / action guards | `src/domain/flows/reply-guard.ts` · `assertsBookingConfirmed`, `detectActionClaims` |
 | Branch-3 claim auditor | `src/adapters/llm/orchestrator.ts` (generalized guard) |
 | Grounding — closed-world facts | `customer-booking.ts` · `buildBusinessFacts`; inquiry-situation hardening (`inquiry` case) |
@@ -206,4 +207,5 @@ Branch 3 (manager orchestrator) already generalizes the same idea: `detectAction
 
 - **v1.0.96** — Time-fabrication gate (Gate 2) + allowlist + inquiry grounding + part-of-day buckets. Fixes the PA offering internally-blocked times on open-ended inquiries.
 - **(this change)** — `suggestNextClassesText` + class-aware inquiry fallback (Symptom A) + no-time booking injects day options (Symptom B). Fixes the false "fully booked" occupancy claim and the gate's false-positive fallback on under-specified class bookings.
+- **(this change)** — **Occupancy output guard (Gate 3).** Built the §4.6 "future work" guard: `makeGenReply` now regenerates (then safe-falls-back) when a reply asserts a day/class is full while the situation lists ≥1 *open* time it hides. Deterministic signal (`extractFullTimes` excludes `(full)` markers) gates a conservative he/en fullness-phrase check (`assertsNoAvailability`); a specific-time negative that surfaces the open times is spared. Fixes the recurring "Monday is completely full" said right after listing Mon 11/14/18.
 - **(this change)** — **Service-fidelity guard.** Extended §4.2's "never trust prior-assistant turns" rule from *time* to *service*: `inferFocusService` reads assistant turns, so on an underspecified booking it laundered the customer's remembered favourite (a memory-driven "yoga as usual?" the customer never affirmed) into a locked booking — observed live switching a pilates thread to yoga. `customerReferencedService` now refuses to lock the preferred favourite unless the customer raised it this conversation. Also reworded the `FABRICATED_TIME_FALLBACK` ("real time" → "a time that works").

@@ -4,6 +4,8 @@ import {
   extractClockTimes,
   extractMentionedTimes,
   findUnbackedTimes,
+  extractFullTimes,
+  assertsNoAvailability,
 } from './slot-fabrication-guard.js'
 
 describe('canonicalTime', () => {
@@ -70,5 +72,35 @@ describe('findUnbackedTimes — the production bug', () => {
   it('passes a reply that only states offered times', () => {
     const reply = 'יש לנו מקומות פנויים מחר ב-14:00 או ב-15:00.'
     expect(findUnbackedTimes(reply, new Set(['14:00', '15:00']))).toEqual([])
+  })
+})
+
+describe('extractFullTimes — occupancy signal (exclude full slots)', () => {
+  it('captures times marked (full) in en and (מלא) in he', () => {
+    const situation = 'Classes on Monday: Pilates at 11:00 (5 spots left); Pilates at 14:00 (full); יוגה at 18:00 (מלא).'
+    expect(extractFullTimes(situation).sort()).toEqual(['14:00', '18:00'])
+  })
+  it('returns nothing when no full markers', () => {
+    expect(extractFullTimes('Pilates at 11:00 (5 spots left); 14:00 (3 spots left)')).toEqual([])
+  })
+})
+
+describe('assertsNoAvailability — blanket fullness claim', () => {
+  it('flags the observed Hebrew "Monday is completely full"', () => {
+    expect(assertsNoAvailability('בעצם אני רואה שיום שני כבר התמלא לגמרי. יש יום אחר?')).toBe(true)
+  })
+  it('flags "no room for pilates on Sunday"', () => {
+    expect(assertsNoAvailability('אין מקום פנוי לפילאטיס ביום ראשון')).toBe(true)
+  })
+  it('flags English fully-booked phrasings', () => {
+    expect(assertsNoAvailability('That day is fully booked, sorry.')).toBe(true)
+    expect(assertsNoAvailability('No availability on Monday.')).toBe(true)
+  })
+  it('does NOT flag a reply that simply offers open times', () => {
+    expect(assertsNoAvailability('ביום שני יש פילאטיס ב-11:00, 14:00, ו-18:00. איזו שעה?')).toBe(false)
+    expect(assertsNoAvailability('We have spots at 14:00 and 15:00.')).toBe(false)
+  })
+  it('does NOT flag a specific-time negative', () => {
+    expect(assertsNoAvailability('ב-19:00 אין לנו שיעור, אבל יש ב-18:00.')).toBe(false)
   })
 })

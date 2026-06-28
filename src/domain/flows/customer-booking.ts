@@ -11,7 +11,7 @@ import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
-import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime } from './slot-fabrication-guard.js'
+import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability } from './slot-fabrication-guard.js'
 import { matchCancelBookings } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
@@ -521,6 +521,19 @@ const FABRICATED_TIME_FALLBACK: Record<'he' | 'en', string> = {
   en: "Let's find a time that works for you — which day should I check?",
 }
 
+// Safe reply when the model insists a day/class is full while the spine surfaced
+// real open options this turn (occupancy fabrication, survived one regeneration).
+// Asserts NO fullness and invents no time — invites the customer to pick a time.
+const OCCUPANCY_FALLBACK: Record<'he' | 'en', string> = {
+  he: 'יש עדיין מקומות פנויים באותו יום — איזו שעה מתאימה לך?',
+  en: 'There are still open spots that day — which time works for you?',
+}
+
+// Appended to the situation when the first draft falsely claimed the day/class is
+// full despite real open options being listed. Forces the model back onto them.
+const OCCUPANCY_GUARD_INSTRUCTION =
+  'CRITICAL: There ARE open, bookable options this turn — the times listed above as open / with spots left are real and available right now. Do NOT tell the customer the day, class, or slot is full, fully booked, or that nothing is available. Offer the real open times listed above and ask which one they would like.'
+
 // Appended to the situation when the first draft offered an unbacked time. Forces
 // the model back onto the deterministic, block-aware times already in the situation.
 const TIME_GUARD_INSTRUCTION =
@@ -603,6 +616,32 @@ function makeGenReply(
       })
       reply = findUnbackedTimes(corrected, allowed).length > 0
         ? FABRICATED_TIME_FALLBACK[input.language]
+        : corrected
+    }
+
+    // Gate 3 — fabricated unavailability (occupancy). Deterministic signal: the
+    // situation lists ≥1 OPEN interior time (not a business-hour boundary, the
+    // customer's own booking, or one marked full). If the reply nonetheless asserts
+    // blanket fullness AND restates none of those open times (i.e. hides them), it's
+    // the §6 "fully booked" fabrication (observed: PA listed Mon 11/14/18 then said
+    // "Monday is completely full"). The signal gates the phrase check, so a genuinely
+    // full day (no open signal) is never touched; the restates-an-option check spares
+    // a legitimate specific negative ("no 19:00, but 11/14/18 are open").
+    const openOffered = new Set(extractClockTimes(input.situation ?? ''))
+    for (const t of timeGuard.boundaryTimes) openOffered.delete(t)
+    for (const t of timeGuard.bookingTimes) openOffered.delete(t)
+    for (const t of extractFullTimes(input.situation ?? '')) openOffered.delete(t)
+    const replySurfacesOpen = (text: string): boolean => {
+      const times = new Set(extractClockTimes(text))
+      return [...openOffered].some((t) => times.has(t))
+    }
+    if (openOffered.size > 0 && !replySurfacesOpen(reply) && assertsNoAvailability(reply)) {
+      const corrected = await generateCustomerReply({
+        ...grounded,
+        situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}`,
+      })
+      reply = !replySurfacesOpen(corrected) && assertsNoAvailability(corrected)
+        ? OCCUPANCY_FALLBACK[input.language]
         : corrected
     }
 

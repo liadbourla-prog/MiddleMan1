@@ -78,6 +78,37 @@ export function extractMentionedTimes(text: string): string[] {
   return [...out]
 }
 
+// Clock times the SITUATION explicitly marks as full (no seats left) — rendered as
+// "HH:MM (full)" / "HH:MM (מלא)" by buildDayOptionsText. Excluded from the "open
+// options" signal so a day on which every class is full is never mistaken for one
+// that still has availability.
+export function extractFullTimes(text: string): string[] {
+  if (!text) return []
+  const out = new Set<string>()
+  for (const m of text.matchAll(/(\d{1,2}):(\d{2})\s*\((?:full|מלא)\)/gi)) {
+    const canon = canonicalTime(Number(m[1]), Number(m[2]))
+    if (canon) out.add(canon)
+  }
+  return [...out]
+}
+
+// Does the reply assert BLANKET unavailability — a whole day / class is full or
+// nothing is open? Conservative, phrase-based, and ALWAYS paired in the gate with a
+// deterministic "≥1 open option exists this turn" signal, so a genuinely-full day
+// (no open signal) is never touched. Targets sweeping claims, not a specific-time
+// negative ("no class at 19:00"), which the gate further protects via the
+// reply-restates-an-open-time check.
+const NO_AVAILABILITY_RE: RegExp[] = [
+  /fully\s*booked/i, /completely\s*full/i, /\ball\s*booked\b/i, /no\s*availability/i,
+  /no\s*(?:open\s*)?spots?\b/i, /no\s*openings?\b/i, /nothing\s*(?:is\s*)?available/i,
+  /sold\s*out/i, /no\s*slots?\s*(?:left|available)/i, /\ball\s*(?:full|taken|booked)\b/i,
+  /התמלא/, /מלא\s*לגמרי/, /מלא\s*לחלוטין/, /הכל\s*מלא/, /הכול\s*מלא/, /כבר\s*מלא/,
+  /אין\s*מקום/, /אין\s*מקומות/, /אין\s*זמינות/, /אין\s*שיעורים\s*פנויים/, /נתפסו\s*כל/, /הכל\s*תפוס/,
+]
+export function assertsNoAvailability(text: string): boolean {
+  return !!text && NO_AVAILABILITY_RE.some((re) => re.test(text))
+}
+
 /**
  * Clock times the reply states that are NOT in `allowed` — candidate fabrications.
  * `allowed` holds canonical 'HH:MM' strings the caller has assembled from the
