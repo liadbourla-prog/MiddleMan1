@@ -23,6 +23,7 @@ import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 import type { HydratedContext } from '../session/hydration.js'
 import { checkOwnerEscalationRules, escalateToPlatform, escalateUnfulfillableRequest } from '../escalation/engine.js'
+import { recordLastCancellation } from '../customer/profile.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
@@ -1471,6 +1472,28 @@ export async function maybeEscalateSpecial(
   return { reply: customerReply ?? '', sessionComplete: false, escalated: true }
 }
 
+// P4: after a successful cancel, snapshot the slot onto the customer profile so a
+// follow-up "give me back the class we cancelled" can re-offer the exact time — even in
+// a fresh session. The row still exists post-cancel (state='cancelled'), so we read it
+// here. Best-effort: restore memory must never break the cancellation reply.
+async function recordCancellationSnapshot(db: Db, identity: ResolvedIdentity, bookingId: string): Promise<void> {
+  try {
+    const [row] = await db
+      .select({ serviceTypeId: bookings.serviceTypeId, serviceName: serviceTypes.name, slotStart: bookings.slotStart })
+      .from(bookings)
+      .innerJoin(serviceTypes, eq(serviceTypes.id, bookings.serviceTypeId))
+      .where(eq(bookings.id, bookingId))
+      .limit(1)
+    if (!row) return
+    await recordLastCancellation(db, identity.businessId, identity.id, {
+      bookingId,
+      serviceTypeId: row.serviceTypeId,
+      serviceName: row.serviceName,
+      slotStartIso: row.slotStart.toISOString(),
+    })
+  } catch { /* non-fatal */ }
+}
+
 // ── Intent handlers ───────────────────────────────────────────────────────────
 
 async function handleBookingIntent(
@@ -2647,6 +2670,7 @@ async function handleCancellationConfirmation(
     return { reply, sessionComplete: true }
   }
 
+  await recordCancellationSnapshot(db, identity, bookingId)
   await completeSession(db, session.id)
   const reply = await genReply({
     businessTimezone,
@@ -2798,6 +2822,7 @@ async function handleRetentionResponse(
       return { reply, sessionComplete: true }
     }
 
+    await recordCancellationSnapshot(db, identity, ctx.targetBookingId!)
     await completeSession(db, session.id)
     await logAudit(db, {
       businessId: identity.businessId,

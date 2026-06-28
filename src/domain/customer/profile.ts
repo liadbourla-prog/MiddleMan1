@@ -53,6 +53,61 @@ export async function recordCompletedBooking(
     .where(eq(customerProfiles.identityId, identityId))
 }
 
+// P4: a snapshot of the most recently cancelled booking, kept on the profile so a
+// follow-up "give me back the class we cancelled" can re-offer the exact slot even when
+// the restore arrives in a fresh session.
+export interface LastCancellation {
+  bookingId: string
+  serviceTypeId: string
+  serviceName: string
+  slotStartIso: string
+}
+
+// Upsert the last-cancellation snapshot. Best-effort restore memory; callers swallow errors.
+export async function recordLastCancellation(
+  db: Db,
+  businessId: string,
+  identityId: string,
+  snap: LastCancellation,
+): Promise<void> {
+  const now = new Date()
+  const existing = await db
+    .select({ id: customerProfiles.id })
+    .from(customerProfiles)
+    .where(eq(customerProfiles.identityId, identityId))
+    .limit(1)
+
+  if (existing.length === 0) {
+    await db.insert(customerProfiles).values({
+      businessId,
+      identityId,
+      lastCancelledBooking: snap,
+      lastCancelledAt: now,
+      updatedAt: now,
+    })
+    return
+  }
+  await db
+    .update(customerProfiles)
+    .set({ lastCancelledBooking: snap, lastCancelledAt: now, updatedAt: now })
+    .where(eq(customerProfiles.identityId, identityId))
+}
+
+// Load the last-cancellation snapshot (+ when it happened), or null if none recorded.
+export async function loadLastCancellation(
+  db: Db,
+  identityId: string,
+): Promise<{ snap: LastCancellation; at: Date } | null> {
+  const rows = await db
+    .select({ snap: customerProfiles.lastCancelledBooking, at: customerProfiles.lastCancelledAt })
+    .from(customerProfiles)
+    .where(eq(customerProfiles.identityId, identityId))
+    .limit(1)
+  const row = rows[0]
+  if (!row || !row.snap || !row.at) return null
+  return { snap: row.snap, at: row.at }
+}
+
 // Loads a customer's memory for session hydration — returns null for first-time customers
 export async function loadCustomerMemory(
   db: Db,
