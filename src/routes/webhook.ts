@@ -51,7 +51,7 @@ import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
 import { loadInstructorRoster, loadTeachingSchedule } from '../domain/provider/roster.js'
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
-import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
+import { withBusinessLock, withIdentityLock } from '../domain/flows/concurrency-lock.js'
 import { bufferInbound, flushBurst, combineInbound, shouldBypassCoalescing, debounceMsForRole, coalescingEnabled } from '../domain/flows/message-coalescer.js'
 import { findActiveByContact } from '../domain/coordination/repository.js'
 import { advanceFromContact, type BusinessCtx } from '../domain/coordination/handler.js'
@@ -552,6 +552,11 @@ async function routeCustomerMessage(
     return
   }
 
+  // Serialize concurrent turns from the same customer. Two messages arriving close
+  // together (past the burst-coalescer's debounce) would otherwise process in parallel
+  // and race on the session row. The session load/create MUST be inside the lock so a
+  // queued (serialized) turn re-reads the prior turn's committed session state.
+  await withIdentityLock(identity.id, async () => {
   // Load or create session — hydrate new sessions with customer memory
   let session = await loadActiveSession(db, identity.id)
   let isFirstMessage = false
@@ -757,6 +762,7 @@ async function routeCustomerMessage(
       app.log.warn({ err }, 'Failed to enqueue customer summary'),
     )
   }
+  })
 }
 
 async function routeManagerMessage(

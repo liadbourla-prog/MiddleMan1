@@ -75,3 +75,37 @@ export async function withBusinessLock<T>(
     await releaseLock(businessId, token)
   }
 }
+
+function customerLockKey(identityId: string): string {
+  return `lock:customer:${identityId}`
+}
+
+async function acquireIdentityLock(identityId: string): Promise<string | null> {
+  const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const result = await redis.set(customerLockKey(identityId), token, 'PX', LOCK_TTL_MS, 'NX')
+  return result === 'OK' ? token : null
+}
+
+async function releaseIdentityLock(identityId: string, token: string): Promise<void> {
+  const script = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`
+  await redis.eval(script, 1, customerLockKey(identityId), token)
+}
+
+/**
+ * Run fn while holding a per-identity lock, SERIALIZING concurrent turns from the same
+ * customer (a customer turn must not be dropped — unlike Branch 3, which enqueues). On
+ * contention, poll for the lock up to ~8s; if still unavailable (a wedged holder), give
+ * up the lock-wait and run anyway so the customer is never left unanswered.
+ */
+export async function withIdentityLock<T>(identityId: string, fn: () => Promise<T>): Promise<T> {
+  let token: string | null = null
+  for (let i = 0; i < 40 && !token; i++) {
+    token = await acquireIdentityLock(identityId)
+    if (!token) await new Promise((r) => setTimeout(r, 200))
+  }
+  try {
+    return await fn()
+  } finally {
+    if (token) await releaseIdentityLock(identityId, token)
+  }
+}
