@@ -1329,8 +1329,14 @@ async function rebuildOnSlotPivot(
   // Without these, such a message parses as an 'unclear' confirmation and the PA re-asks
   // the SAME stale slot indefinitely (the live-test confirmation loop).
   const isRebuild = (intent.intent === 'booking' || intent.intent === 'rescheduling') && hasNewSlot
-  const isRedirect = !isRebuild &&
-    (intent.intent === 'inquiry' || intent.intent === 'cancellation' || intent.intent === 'list_bookings')
+  // A pure inquiry / list while a HOLD is awaiting confirmation is a SIDE QUESTION, not
+  // abandonment — do NOT redirect (which would clear the pending slot). Only a cancellation
+  // (genuinely leaving the booking) still redirects from the confirmation step.
+  const awaitingHold = session.state === 'waiting_confirmation' && ctx.awaitingConfirmationFor === 'hold'
+  const isRedirect = !isRebuild && (
+    intent.intent === 'cancellation' ||
+    (!awaitingHold && (intent.intent === 'inquiry' || intent.intent === 'list_bookings'))
+  )
   if (!isRebuild && !isRedirect) return null
 
   // Release any hold already placed for the stale slot so it isn't orphaned.
@@ -1794,7 +1800,10 @@ async function handleHoldConfirmation(
   business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
-  const confirmation = parseConfirmation(messageText)
+  const parsed = parseConfirmation(messageText)
+  // A leading yes bundled with a side question (e.g. "yes, who's the instructor?") is still
+  // a confirmation — the grounded reply answers the question (roster/facts are in businessFacts).
+  const confirmation: 'yes' | 'no' | 'unclear' = parsed === 'yes_with_question' ? 'yes' : parsed
 
   // Root B: a non-"yes" reply may be REVISING the slot, not answering. If so, rebuild
   // from the new request so the revised slot is what gets booked (not the stale one).
@@ -2391,7 +2400,8 @@ async function handleCancellationConfirmation(
   business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
-  const confirmation = parseConfirmation(messageText)
+  const parsedCancel = parseConfirmation(messageText)
+  const confirmation: 'yes' | 'no' | 'unclear' = parsedCancel === 'yes_with_question' ? 'yes' : parsedCancel
 
   if (confirmation === 'unclear') {
     const reply = await genReply({
