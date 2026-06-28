@@ -118,3 +118,63 @@ export function findUnbackedTimes(reply: string, allowed: Iterable<string>): str
   const allowSet = allowed instanceof Set ? allowed : new Set(allowed)
   return extractClockTimes(reply).filter((t) => !allowSet.has(t))
 }
+
+// Day tokens we section text on. Hebrew weekday cores (with/without "יום") + English
+// weekday names. The seven Hebrew cores are lexically disjoint, so list order does not
+// affect which token wins — dayKeyAt picks by highest match position, not list order.
+const DAY_TOKENS: Array<{ re: RegExp; key: string }> = [
+  { re: /\bsunday\b/i, key: 'sunday' }, { re: /\bmonday\b/i, key: 'monday' },
+  { re: /\btuesday\b/i, key: 'tuesday' }, { re: /\bwednesday\b/i, key: 'wednesday' },
+  { re: /\bthursday\b/i, key: 'thursday' }, { re: /\bfriday\b/i, key: 'friday' },
+  { re: /\bsaturday\b/i, key: 'saturday' },
+  { re: /ראשון/, key: 'ראשון' }, { re: /שני/, key: 'שני' }, { re: /שלישי/, key: 'שלישי' },
+  { re: /רביעי/, key: 'רביעי' }, { re: /חמישי/, key: 'חמישי' }, { re: /שישי/, key: 'שישי' },
+  { re: /שבת/, key: 'שבת' },
+]
+
+// Find the day key whose token appears latest at-or-before `idx` in `text`.
+function dayKeyAt(text: string, idx: number): string {
+  const head = text.slice(0, idx)
+  let best = ''
+  let bestPos = -1
+  for (const { re, key } of DAY_TOKENS) {
+    const matches = [...head.matchAll(new RegExp(re.source, 'gi'))]
+    const last = matches[matches.length - 1]
+    if (last && last.index != null && last.index > bestPos) { bestPos = last.index; best = key }
+  }
+  return best
+}
+
+/**
+ * Map of day key -> set of canonical HH:MM in that day's section. Each clock time is
+ * attributed to the nearest preceding day token (or '' when none precedes it). Pure.
+ */
+export function extractDayScopedTimes(text: string): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>()
+  if (!text) return out
+  for (const m of text.matchAll(CLOCK_RE)) {
+    const canon = canonicalTime(Number(m[1]), Number(m[2]))
+    if (!canon || m.index == null) continue
+    const key = dayKeyAt(text, m.index)
+    if (!out.has(key)) out.set(key, new Set())
+    out.get(key)!.add(canon)
+  }
+  return out
+}
+
+/**
+ * True when `reply` surfaces at least one open time on the SAME day it is open in
+ * `situationOpen`. Unscoped ('') situation times match any reply day (back-compat).
+ */
+export function daysShareOpenTime(
+  situationOpen: Map<string, Set<string>>,
+  replyTimes: Map<string, Set<string>>,
+): boolean {
+  for (const [day, times] of situationOpen) {
+    const replySet = day === ''
+      ? new Set([...replyTimes.values()].flatMap((s) => [...s]))
+      : replyTimes.get(day)
+    if (replySet && [...times].some((t) => replySet.has(t))) return true
+  }
+  return false
+}

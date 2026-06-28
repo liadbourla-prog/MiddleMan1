@@ -7,6 +7,7 @@ import {
   extractFullTimes,
   assertsNoAvailability,
 } from './slot-fabrication-guard.js'
+import { extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
 
 describe('canonicalTime', () => {
   it('zero-pads valid times', () => {
@@ -102,5 +103,32 @@ describe('assertsNoAvailability — blanket fullness claim', () => {
   })
   it('does NOT flag a specific-time negative', () => {
     expect(assertsNoAvailability('ב-19:00 אין לנו שיעור, אבל יש ב-18:00.')).toBe(false)
+  })
+})
+
+describe('extractDayScopedTimes', () => {
+  it('scopes Hebrew day sections', () => {
+    const m = extractDayScopedTimes('ביום רביעי יוגה ב-16:00 התמלא. יש יוגה ביום שני ב-16:00 או שלישי ב-10:00')
+    expect([...(m.get('רביעי') ?? [])]).toContain('16:00')
+    expect([...(m.get('שני') ?? [])]).toContain('16:00')
+    expect([...(m.get('שלישי') ?? [])]).toContain('10:00')
+  })
+  it('scopes English day sections', () => {
+    const m = extractDayScopedTimes('Classes on Monday: yoga at 16:00. Tuesday: yoga at 10:00.')
+    expect([...(m.get('monday') ?? [])]).toContain('16:00')
+    expect([...(m.get('tuesday') ?? [])]).toContain('10:00')
+  })
+})
+
+describe('daysShareOpenTime', () => {
+  it('returns true only when the SAME day shares the time', () => {
+    const situationOpen = new Map([['שני', new Set(['16:00'])]]) // Mon 16:00 open
+    expect(daysShareOpenTime(situationOpen, extractDayScopedTimes('ביום שני ב-16:00 פנוי'))).toBe(true)
+    expect(daysShareOpenTime(situationOpen, extractDayScopedTimes('ביום רביעי ב-16:00'))).toBe(false)
+  })
+  it('unscoped ("") situation times match any reply day (back-compat)', () => {
+    const situationUnscoped = new Map([['', new Set(['16:00'])]])
+    expect(daysShareOpenTime(situationUnscoped, extractDayScopedTimes('ביום שני ב-16:00'))).toBe(true)
+    expect(daysShareOpenTime(situationUnscoped, extractDayScopedTimes('ביום שני ב-18:00'))).toBe(false)
   })
 })
