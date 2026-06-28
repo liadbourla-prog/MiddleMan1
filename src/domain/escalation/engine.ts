@@ -100,6 +100,60 @@ export async function checkOwnerEscalationRules(
   return { escalated: true, customerReply, source: 'owner_rule' }
 }
 
+// ── Unfulfillable-request escalation (P3) ─────────────────────────────────────
+
+/**
+ * The customer asked for something the catalog can't express on its own — a private
+ * version of a group class, a group booking beyond a 1-on-1 service's capacity, or an
+ * explicitly out-of-hours session. Notify the business owner so they can follow up, and
+ * tell the customer it's been passed on (never a flat rejection). Best-effort: a missing
+ * manager or notify hiccup never throws into the reply path.
+ */
+export async function escalateUnfulfillableRequest(
+  db: Db,
+  business: Business,
+  customerPhone: string,
+  requestText: string,
+  customerLang: Lang = 'he',
+): Promise<{ customerReply: string | null }> {
+  const [managerIdentity] = await db
+    .select({ id: identities.id, phoneNumber: identities.phoneNumber })
+    .from(identities)
+    .where(and(eq(identities.businessId, business.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+
+  if (managerIdentity) {
+    const managerLang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+    const managerMessage = i18n.escalation_manager_notify_unfulfillable[managerLang](customerPhone, requestText.slice(0, 300))
+    await dispatchInitiation(db, getInitiator('escalation.unfulfillable'), {
+      businessId: business.id,
+      recipientId: managerIdentity.id,
+      dedupKey: `escalation.unfulfillable:${business.id}:${customerPhone}:${Date.now()}`,
+    }, {
+      sendFreeForm: async () => { await enqueueMessage(business.id, managerIdentity.phoneNumber, managerMessage).catch(() => {}) },
+    }).catch(() => { /* non-fatal */ })
+  }
+
+  await db.insert(escalatedTasks).values({
+    businessId: business.id,
+    customerPhone,
+    messageBody: requestText.slice(0, 300),
+    receivedAt: new Date(),
+    escalationType: 'unfulfillable',
+    forwardedAt: new Date(),
+  }).catch(() => { /* non-fatal */ })
+
+  // Customer-facing: "passed to the studio, someone will be in touch" — never a rejection.
+  const customerReply = await generateProactiveCustomerMessage({
+    businessName: business.name,
+    language: customerLang,
+    situation: `The customer asked for a special arrangement we can't book automatically. Tell them warmly it's been passed to ${business.name} and someone will be in touch shortly — do NOT reject them or say it's impossible.`,
+    fallback: i18n.escalation_customer_passed[customerLang](business.name),
+    timeoutMs: 2500,
+  })
+  return { customerReply }
+}
+
 // ── Platform escalation ───────────────────────────────────────────────────────
 
 export async function escalateToPlatform(

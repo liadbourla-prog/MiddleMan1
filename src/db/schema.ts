@@ -1049,8 +1049,10 @@ export const escalatedTasks = pgTable(
     customerPhone: text('customer_phone').notNull(),
     messageBody: text('message_body').notNull(),
     receivedAt: timestamp('received_at', { withTimezone: true }).notNull(),
-    // 'platform' = unknown intent after threshold; 'owner_rule' = matched owner-defined trigger
-    escalationType: text('escalation_type', { enum: ['platform', 'owner_rule'] }).notNull(),
+    // 'platform' = unknown intent after threshold; 'owner_rule' = matched owner-defined trigger;
+    // 'unfulfillable' = a customer asked for something the PA can't book on its own (private/
+    // group/out-of-hours/bespoke), forwarded to the owner. Plain text column — no SQL migration.
+    escalationType: text('escalation_type', { enum: ['platform', 'owner_rule', 'unfulfillable'] }).notNull(),
     triggerRule: text('trigger_rule'),
     forwardedAt: timestamp('forwarded_at', { withTimezone: true }),
     resolvedAt: timestamp('resolved_at', { withTimezone: true }),
