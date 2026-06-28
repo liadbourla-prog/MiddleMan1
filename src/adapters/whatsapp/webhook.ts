@@ -1,6 +1,5 @@
 import crypto from 'crypto'
 import type { InboundMessage, WhatsAppWebhookPayload } from './types.js'
-import { i18n } from '../../domain/i18n/t.js'
 
 const APP_SECRET = process.env['WHATSAPP_APP_SECRET'] ?? ''
 const VERIFY_TOKEN = process.env['WHATSAPP_WEBHOOK_VERIFY_TOKEN'] ?? ''
@@ -28,10 +27,10 @@ export function verifyWebhookChallenge(
 
 export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
   messages: InboundMessage[]
-  nonTextReplies: Array<{ toNumber: string; body: string }>
+  nonTextReplies: Array<{ recipientNumber: string; businessNumber: string }>
 } {
   const messages: InboundMessage[] = []
-  const nonTextReplies: Array<{ toNumber: string; body: string }> = []
+  const nonTextReplies: Array<{ recipientNumber: string; businessNumber: string }> = []
 
   for (const entry of payload.entry) {
     for (const change of entry.changes) {
@@ -41,7 +40,7 @@ export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
       for (const msg of value.messages) {
         const fromNumber = msg.from.startsWith('+') ? msg.from : `+${msg.from}`
         // display_phone_number can come formatted e.g. "+1 555-631-3430" — normalise to E.164
-        const rawDisplayNumber = value.metadata.display_phone_number.replace(/[\s\-\(\)]/g, '')
+        const rawDisplayNumber = value.metadata.display_phone_number.replace(/[\s()-]/g, '')
         const toNumber = rawDisplayNumber.startsWith('+') ? rawDisplayNumber : `+${rawDisplayNumber}`
 
         if (msg.type === 'image' && msg.image) {
@@ -59,10 +58,47 @@ export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
           continue
         }
 
+        // Interactive replies (quick-reply button tap or list selection) — extract the
+        // customer-selected title and route as normal text so the downstream sanitize+fence
+        // path (T4.3) covers it identically to a typed message.
+        if (msg.type === 'interactive' && msg.interactive) {
+          const title = msg.interactive.button_reply?.title ?? msg.interactive.list_reply?.title
+          if (title?.trim()) {
+            messages.push({
+              messageId: msg.id,
+              fromNumber,
+              toNumber,
+              body: title.trim(),
+              timestamp: new Date(parseInt(msg.timestamp, 10) * 1000),
+              rawPayload: payload,
+            })
+            continue
+          }
+          // Malformed / empty title — fall through to non-text dead-end below
+        }
+
+        // Template quick-reply button (msg.type === 'button') — extract the button text.
+        if (msg.type === 'button' && msg.button) {
+          const text = msg.button.text?.trim()
+          if (text) {
+            messages.push({
+              messageId: msg.id,
+              fromNumber,
+              toNumber,
+              body: text,
+              timestamp: new Date(parseInt(msg.timestamp, 10) * 1000),
+              rawPayload: payload,
+            })
+            continue
+          }
+          // Empty text — fall through to non-text dead-end below
+        }
+
         if (msg.type !== 'text' || !msg.text) {
-          // Sticker, voice note, video, etc. — reply with guidance
+          // Sticker, voice note, video, etc. — carry routing data only; body resolved in
+          // the route layer once the business language + credentials are known.
           if (fromNumber && toNumber) {
-            nonTextReplies.push({ toNumber: fromNumber, body: i18n.non_text_reply.he })
+            nonTextReplies.push({ recipientNumber: fromNumber, businessNumber: toNumber })
           }
           continue
         }

@@ -2,6 +2,7 @@ import { eq, desc } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { conversationMessages } from '../../db/schema.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
+import { sanitize } from '../flows/fence.js'
 
 export async function saveMessage(
   db: Db,
@@ -9,7 +10,14 @@ export async function saveMessage(
   role: 'customer' | 'assistant',
   text: string,
 ): Promise<void> {
-  await db.insert(conversationMessages).values({ sessionId, role, text })
+  // Gate-2(i): sanitize customer-authored text at the persistence boundary so the stored
+  // transcript (later fed to reply/extractor LLMs via loadTranscript) never carries raw
+  // injection text. Assistant replies are NEVER sanitized — they are our own output and
+  // sanitizing them could corrupt the stored transcript.
+  // NOTE: Part (ii) per-LLM fences at each interpolation site (client.ts, orchestrator.ts,
+  // customer-booking.ts) are deferred to those files' own task chains.
+  const storedText = role === 'customer' ? sanitize(text) : text
+  await db.insert(conversationMessages).values({ sessionId, role, text: storedText })
 }
 
 export async function loadTranscript(

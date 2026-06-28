@@ -6,6 +6,77 @@ import { eq } from 'drizzle-orm'
 // Used by the /simulate route and integration tests.
 export const replyCapture = new AsyncLocalStorage<string[]>()
 
+/**
+ * Splits a WhatsApp message body into parts that each fit within `limit` chars (default 4096).
+ *
+ * Algorithm:
+ *   1. If body.length <= limit, return [body] — no split needed.
+ *   2. Greedily build a part by scanning forward up to `limit` chars:
+ *      a. Look for the last paragraph boundary (\n\n) within the window.
+ *      b. If none, look for the last newline (\n) within the window.
+ *      c. If still none, hard-chunk at exactly `limit` chars.
+ *   3. Emit the part (trimEnd to discard trailing whitespace from the consumed boundary).
+ *   4. Advance past the boundary. Trim leading whitespace from what remains only when the
+ *      boundary was a paragraph/newline split (not a hard-chunk).
+ *   5. Repeat until nothing remains.
+ *   Empty parts are never emitted.
+ *
+ * Contract: every emitted part has length <= limit; joining all parts recovers
+ * all content (boundary whitespace consumed at split points is the only loss).
+ *
+ * T4.1 / F1 / P7 — prevents silent 4096-char API rejection.
+ */
+export function splitForWhatsApp(body: string, limit = 4096): string[] {
+  if (body.length <= limit) return [body]
+
+  const parts: string[] = []
+  let remaining = body
+
+  while (remaining.length > 0) {
+    if (remaining.length <= limit) {
+      parts.push(remaining)
+      break
+    }
+
+    // Window we can consume (chars 0..limit-1)
+    const window = remaining.slice(0, limit)
+
+    // Prefer paragraph boundary (\n\n) — find the LAST one inside the window
+    const paraIdx = window.lastIndexOf('\n\n')
+    if (paraIdx > 0) {
+      const part = window.slice(0, paraIdx).trimEnd()
+      if (part.length > 0) parts.push(part)
+      // Advance past the \n\n boundary and trim leading whitespace from remainder
+      remaining = remaining.slice(paraIdx + 2).trimStart()
+      continue
+    }
+
+    // Fall back to last single newline inside the window
+    const nlIdx = window.lastIndexOf('\n')
+    if (nlIdx > 0) {
+      const part = window.slice(0, nlIdx).trimEnd()
+      if (part.length > 0) parts.push(part)
+      // Advance past the \n boundary and trim leading whitespace from remainder
+      remaining = remaining.slice(nlIdx + 1).trimStart()
+      continue
+    }
+
+    // No boundary found — hard-chunk at `limit`. `.slice` cuts at a UTF-16 code unit,
+    // so if char `limit-1` is a HIGH surrogate (0xD800–0xDBFF) its low surrogate sits at
+    // `limit`; cutting there would sever an astral char (e.g. an emoji) into lone
+    // surrogates → a corrupt char on the WhatsApp wire. Back the cut off by one so the
+    // pair stays together. (The \n / \n\n branches above are BMP-safe — '\n' is never a
+    // surrogate, so a boundary index never lands mid-pair.)
+    let cut = limit
+    const lastCode = remaining.charCodeAt(cut - 1)
+    if (cut > 1 && lastCode >= 0xd800 && lastCode <= 0xdbff) cut--
+    parts.push(remaining.slice(0, cut))
+    remaining = remaining.slice(cut)
+  }
+
+  return parts.filter(p => p.length > 0)
+}
+
 const WA_USER_OPT_OUT_CODE = 131026
 // Meta rejects a free-form send when >24h have passed since the customer last messaged
 // this number ("re-engagement" error). This — not our local session table — is the
@@ -114,50 +185,69 @@ export async function sendMessage(
   message: OutboundMessage,
   credentials?: WaCredentials,
 ): Promise<SendResultWithOptOut> {
+  // Split into <=4096-char parts before any send. A single short body yields exactly
+  // one part (byte-identical), so existing callers are unaffected.
+  const parts = splitForWhatsApp(message.body)
+
   const capture = replyCapture.getStore()
   if (capture !== undefined) {
-    capture.push(message.body)
+    // Push each part to the capture store. Short bodies still yield one entry.
+    for (const part of parts) {
+      capture.push(part)
+    }
     return { ok: true, whatsappMessageId: 'sim-captured' }
   }
 
   const { accessToken, phoneNumberId } = resolveCredentials(credentials)
   const apiUrl = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`
 
-  try {
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to: message.toNumber,
-        type: 'text',
-        text: { preview_url: false, body: message.body },
-      }),
-    })
+  // Send each part sequentially. On the first failure, return that failure immediately.
+  // On full success, return the whatsappMessageId of the FIRST part.
+  // Partial-delivery tradeoff (intentional, per spec): if part N fails after parts 1..N-1
+  // already POSTed, those earlier parts are already delivered — there is no idempotency
+  // guard, so a whole-message retry by the caller would re-send them. Accepted: dropping a
+  // long reply silently (F1) is worse than a rare duplicated prefix on retry.
+  let firstMessageId: string | undefined
 
-    if (!response.ok) {
-      const text = await response.text()
-      let userOptedOut = false
-      let outsideWindow = false
-      try {
-        const parsed = JSON.parse(text) as { error?: { code?: number } }
-        if (parsed.error?.code === WA_USER_OPT_OUT_CODE) userOptedOut = true
-        if (parsed.error?.code === WA_REENGAGEMENT_CODE) outsideWindow = true
-      } catch { /* ignore */ }
+  for (const part of parts) {
+    try {
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: message.toNumber,
+          type: 'text',
+          text: { preview_url: false, body: part },
+        }),
+      })
 
-      return { ok: false, error: `WA API ${response.status}: ${text}`, userOptedOut, outsideWindow }
+      if (!response.ok) {
+        const text = await response.text()
+        let userOptedOut = false
+        let outsideWindow = false
+        try {
+          const parsed = JSON.parse(text) as { error?: { code?: number } }
+          if (parsed.error?.code === WA_USER_OPT_OUT_CODE) userOptedOut = true
+          if (parsed.error?.code === WA_REENGAGEMENT_CODE) outsideWindow = true
+        } catch { /* ignore */ }
+
+        return { ok: false, error: `WA API ${response.status}: ${text}`, userOptedOut, outsideWindow }
+      }
+
+      const data = (await response.json()) as { messages: Array<{ id: string }> }
+      const id = data.messages[0]?.id
+      if (!id) return { ok: false, error: 'WA API returned no message id' }
+
+      if (firstMessageId === undefined) firstMessageId = id
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
-
-    const data = (await response.json()) as { messages: Array<{ id: string }> }
-    const id = data.messages[0]?.id
-    if (!id) return { ok: false, error: 'WA API returned no message id' }
-
-    return { ok: true, whatsappMessageId: id }
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
+
+  return { ok: true, whatsappMessageId: firstMessageId! }
 }

@@ -2,6 +2,7 @@ import { and, eq, ilike, desc } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { identities, bookings, serviceTypes } from '../../db/schema.js'
 import { isValidE164 } from './resolver.js'
+import { sanitize } from '../flows/fence.js'
 
 export type TargetRole = 'customer' | 'contact'
 
@@ -104,7 +105,15 @@ async function toCandidate(
 
 /** Shared deterministic write for a target's name fields. Skips the DB entirely when no field
  *  is supplied. Used by booking capture, the owner setCustomerName tool, and opportunistic
- *  save at disambiguation. */
+ *  save at disambiguation.
+ *
+ *  Gate-2(i): customer-supplied names are sanitized before persisting (INJ2 vector — a name
+ *  like "ignore previous instructions…" is later interpolated into Branch-4 reply prompts).
+ *  - Non-null strings are sanitized and capped to 100 chars (names are short; 2000 would let
+ *    an absurd "name" slip through).
+ *  - null clears the field (preserves existing null-clear semantics).
+ *  - undefined means "don't touch this field" (preserves existing skip semantics).
+ */
 export async function setCustomerName(
   db: Db,
   businessId: string,
@@ -112,8 +121,12 @@ export async function setCustomerName(
   fields: { displayName?: string | null; lastName?: string | null },
 ): Promise<void> {
   const patch: Record<string, unknown> = {}
-  if (fields.displayName !== undefined) patch['displayName'] = fields.displayName
-  if (fields.lastName !== undefined) patch['lastName'] = fields.lastName
+  if (fields.displayName !== undefined) {
+    patch['displayName'] = fields.displayName !== null ? sanitize(fields.displayName, 100) : null
+  }
+  if (fields.lastName !== undefined) {
+    patch['lastName'] = fields.lastName !== null ? sanitize(fields.lastName, 100) : null
+  }
   if (Object.keys(patch).length === 0) return
   await db.update(identities).set(patch).where(and(eq(identities.businessId, businessId), eq(identities.id, identityId)))
 }

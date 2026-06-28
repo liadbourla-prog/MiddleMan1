@@ -103,9 +103,12 @@ export async function webhookRoutes(app: FastifyInstance) {
       // optimistic "sent" is corrected and the owner is told honestly. Best-effort, never blocks.
       await handleDeliveryStatuses(request.body, app).catch((err) => app.log.warn({ err }, 'Delivery-status handling failed'))
 
-      // Reply to non-text messages immediately (no DB work needed)
-      for (const { toNumber, body } of nonTextReplies) {
-        await sendMessage({ toNumber, body }).catch(() => { /* fire-and-forget */ })
+      // Reply to non-text messages immediately.
+      // Resolve the business by PA number so the reply goes FROM the correct per-business
+      // number in the business's single configured language (fix INJ5/F5).
+      for (const { recipientNumber, businessNumber } of nonTextReplies) {
+        const nonTextPayload = await resolveNonTextReply(recipientNumber, businessNumber)
+        await sendMessage(nonTextPayload.message, nonTextPayload.creds).catch(() => { /* fire-and-forget */ })
       }
 
       for (const msg of messages) {
@@ -353,7 +356,9 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
       try {
         const burst = await flushBurst(business.id, identity.id, seq)
         if (!burst) return // a newer message arrived during the window — it owns the flush
-        await dispatchToRole(combineInbound(burst), identity, business, app)
+        // Pass identity.role so combineInbound applies Gate-2 sanitize to customer bursts
+        // (T4.7/INJ6 — defeats split-across-burst injection).
+        await dispatchToRole(combineInbound(burst, identity.role), identity, business, app)
       } catch (err) {
         app.log.error({ err, messageId: msg.messageId }, 'Coalesced burst flush failed')
         await notifyManagerOfError(msg, err instanceof Error ? err.message : String(err), app).catch(() => { /* fire-and-forget */ })
@@ -379,10 +384,93 @@ async function dispatchToRole(
 }
 
 /**
+ * Pure helper (ID5 fix): decides which app secret to use for signature verification.
+ *
+ * An empty or whitespace-only stored secret is treated as ABSENT and falls back to the
+ * global secret. This prevents a misconfigured business row (whatsappAppSecret = '')
+ * from returning '' to verifySignature, which would silently fail verification for every
+ * inbound message from that business (HTTP 401/skip with no diagnostic).
+ *
+ * Returns `emptyStored: true` when the DB row has a non-null but blank secret so the
+ * caller (resolveAppSecret) can log a distinct, greppable warning about the misconfig.
+ *
+ * Trimming is safe: real WhatsApp App Secrets are hex strings with no surrounding
+ * whitespace. We trim defensively and return the trimmed value for legitimate secrets.
+ *
+ * @internal exported for unit testing only
+ */
+export function chooseAppSecret(
+  storedSecret: string | null | undefined,
+  globalSecret: string | undefined,
+): { secret: string | undefined; emptyStored: boolean } {
+  // null/undefined → straightforward absent, no warning needed
+  if (storedSecret == null) {
+    return { secret: globalSecret, emptyStored: false }
+  }
+
+  const trimmed = storedSecret.trim()
+  if (trimmed.length === 0) {
+    // non-null but blank: the business row exists but its secret is empty/whitespace (misconfig)
+    return { secret: globalSecret, emptyStored: true }
+  }
+
+  return { secret: trimmed, emptyStored: false }
+}
+
+/**
+ * T4.4 fix (INJ5/F5): Resolve the business-specific language, credentials, and reply body
+ * for a non-text reply so it goes FROM the correct per-business PA number in the
+ * business's single configured language (no bilingual leak).
+ *
+ * Exported for unit testing of the routing logic.
+ *
+ * Falls back safely when the business cannot be found (e.g. MiddleMan number) — uses
+ * the Hebrew string and no per-business credentials so the reply is still delivered
+ * rather than silently dropped, but the caller is not crashed.
+ */
+export async function resolveNonTextReply(
+  recipientNumber: string,
+  businessNumber: string,
+): Promise<{
+  message: { toNumber: string; body: string }
+  creds: { accessToken: string; phoneNumberId: string } | undefined
+}> {
+  try {
+    const [biz] = await db
+      .select({
+        defaultLanguage: businesses.defaultLanguage,
+        whatsappPhoneNumberId: businesses.whatsappPhoneNumberId,
+        whatsappAccessToken: businesses.whatsappAccessToken,
+      })
+      .from(businesses)
+      .where(eq(businesses.whatsappNumber, businessNumber))
+      .limit(1)
+
+    if (!biz) {
+      // Unknown business (e.g. MiddleMan number) — fall back to Hebrew with no per-biz creds
+      return { message: { toNumber: recipientNumber, body: i18n.non_text_reply.he }, creds: undefined }
+    }
+
+    const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+    const creds = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+      ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+      : undefined
+
+    return { message: { toNumber: recipientNumber, body: i18n.non_text_reply[lang] }, creds }
+  } catch {
+    // DB failure — fall back safely rather than crash
+    return { message: { toNumber: recipientNumber, body: i18n.non_text_reply.he }, creds: undefined }
+  }
+}
+
+/**
  * Resolves the correct App Secret for signature verification.
  * Different Meta apps (MiddleMan vs per-business PA numbers) have different App Secrets.
  * We extract the phone_number_id from the raw payload to look up the business's secret.
  * Falls back to the global WHATSAPP_APP_SECRET when no per-business secret is stored.
+ *
+ * ID5 fix: an empty/whitespace stored secret is treated as absent (falls back to global)
+ * and logs a distinct warning so the misconfiguration is visible in Cloud Logging.
  */
 async function resolveAppSecret(payload: WhatsAppWebhookPayload): Promise<string | undefined> {
   const globalSecret = process.env['WHATSAPP_APP_SECRET']
@@ -401,7 +489,15 @@ async function resolveAppSecret(payload: WhatsAppWebhookPayload): Promise<string
       .where(eq(businesses.whatsappPhoneNumberId, phoneNumberId))
       .limit(1)
 
-    return biz?.waAppSecret ?? globalSecret
+    const { secret, emptyStored } = chooseAppSecret(biz?.waAppSecret, globalSecret)
+
+    if (emptyStored) {
+      // Distinct, greppable warning — a business row exists but its app secret is blank (misconfig).
+      // resolveAppSecret does not have the Fastify logger in scope, so console.warn is intentional.
+      console.warn('[webhook] business has empty whatsappAppSecret; falling back to global', { phoneNumberId })
+    }
+
+    return secret
   } catch {
     return globalSecret
   }

@@ -423,6 +423,28 @@ async function applyOwnerCancellations(ctx: SyncContext, affected: AffectedBooki
 // ── Webhook entry point ──────────────────────────────────────────────────────
 
 /**
+ * P6 (SYNC6) authentication gate — pure decision helper so it can be unit-tested
+ * without a DB. Returns true only when BOTH the channelToken and resourceId are
+ * present in the stored channel record AND exactly match the incoming headers.
+ *
+ * Strict presence + match on both fields is intentional:
+ *   - A null/missing stored token means the channel was registered without one
+ *     (anomaly) — we must NOT fall through and accept arbitrary pushes.
+ *   - A null/missing stored resourceId is likewise an anomaly — reject.
+ *   - A forged or mismatched incoming value on either field is rejected.
+ */
+export function isAuthenticatedPush(
+  channel: { channelToken: string | null | undefined; resourceId: string | null | undefined },
+  headers: { channelToken: string | undefined; resourceId: string | undefined },
+): boolean {
+  if (!channel.channelToken) return false
+  if (!headers.channelToken || headers.channelToken !== channel.channelToken) return false
+  if (!channel.resourceId) return false
+  if (!headers.resourceId || headers.resourceId !== channel.resourceId) return false
+  return true
+}
+
+/**
  * Handle an inbound Google push. Google sends only headers (no useful body); the
  * channelId + token authenticate it and we then pull the actual changes. Returns
  * quickly regardless — Google needs a fast 2xx and retries on its own.
@@ -444,8 +466,25 @@ export async function handleWatchNotification(headers: {
     .where(eq(calendarSyncChannels.channelId, headers.channelId))
     .limit(1)
   if (!channel) return
-  // Authenticate via the shared token we registered the channel with.
-  if (channel.channelToken && channel.channelToken !== headers.channelToken) return
+
+  // ── P6 / SYNC6 authentication chokepoint ────────────────────────────────
+  // Require strict presence + exact match on BOTH channelToken and resourceId.
+  // A null stored token (anomaly) or any forged/mismatched header is rejected.
+  // The route always 200s to Google; rejection is silent from Google's perspective.
+  if (!isAuthenticatedPush(channel, headers)) {
+    const reason = !channel.channelToken
+      ? 'stored-token-null'
+      : !headers.channelToken || headers.channelToken !== channel.channelToken
+        ? 'token-mismatch'
+        : !channel.resourceId
+          ? 'stored-resourceId-null'
+          : 'resourceId-mismatch'
+    console.warn('[inbound-sync] rejected unauthenticated/mismatched calendar push', {
+      channelId: headers.channelId,
+      reason,
+    })
+    return
+  }
 
   await runInboundSync(channel.businessId).catch((err: unknown) => {
     console.error('[inbound-sync] webhook-triggered sync failed', err)

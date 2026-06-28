@@ -774,10 +774,11 @@ const strings = {
   },
 
   // ── System / adapter messages ─────────────────────────────────────────────────
-  // Bilingual single-line — used when no language context is available (non-text messages)
+  // Per-language, single-language — resolved in routes/webhook.ts after business language is known.
+  // Voice gate: warm + first-person, invites the next step, no bilingual leak, no dead-end.
   non_text_reply: {
-    he: `אני מבין רק הודעות טקסט. / I can only understand text messages.`,
-    en: `אני מבין רק הודעות טקסט. / I can only understand text messages.`,
+    he: `קיבלתי הודעה שאני לא יכול לקרוא. כתבו לי בטקסט ואשמח לעזור 😊`,
+    en: `I got your message but couldn't read it. Just type what you need and I'll be happy to help 😊`,
   },
   manager_process_error: {
     he: (phone: string, err: string) => `⚠️ הודעה מ-${phone} לא עובדה.\nשגיאה: ${err}\n\nאנא פנו ללקוח ישירות.`,
