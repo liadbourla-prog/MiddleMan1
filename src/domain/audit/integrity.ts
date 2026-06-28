@@ -20,6 +20,7 @@ export type IntegrityKind =
   | 'reschedule_residue' // INV-8 / F9
   | 'out_of_hours' // INV-4 / F6 — emitted by the worker (needs DB-backed hours), not this pure engine
   | 'unmirrored' // INV-9 / F-c — internal record not yet write-through to Google after the grace window
+  | 'stranded_requested' // INV-10 / CX1 — a `requested` row stranded past the reaper TTL (placeHold or the held-flip crashed; seat leaking)
 
 export type Severity = 'critical' | 'warning'
 
@@ -81,6 +82,14 @@ export interface IntegritySnapshot {
   /** INV-9 grace: a record older than this with no Google event id is "unmirrored".
    *  Omit to disable INV-9 entirely (e.g. fixtures that don't exercise it). */
   unmirrorGraceMs?: number
+  /** INV-10: a `requested` row older than this (measured from createdAt) is "stranded" — its
+   *  placeHold or the requested→held_for_approval flip crashed and the seat is leaking.
+   *  Keyed on createdAt, NOT holdExpiresAt (requested rows legitimately have null holdExpiresAt
+   *  mid-flip). Default ≥5 min so the sub-second transient requested→held_for_approval window
+   *  (the engine writes `requested` at ~line 289 and flips to the hold state at ~line 334) is
+   *  never reaped by the threshold — the age gap is the exclusion mechanism.
+   *  Omit to disable INV-10 entirely. */
+  requestedReaperMs?: number
 }
 
 export interface IntegrityFinding {
@@ -306,6 +315,35 @@ export function runIntegrityChecks(snap: IntegritySnapshot): IntegrityFinding[] 
         slotStart: b.slotStart,
         detail: { newBooking: b.id, supersededStillActive: b.rescheduledFrom },
         autoRemediable: false,
+      })
+    }
+  }
+
+  // ── INV-10 stranded_requested (CX1) ─────────────────────────────────────────
+  // A `requested` row that has aged past the reaper TTL means placeHold (or the
+  // requested→held_for_approval/held flip) crashed and the seat is leaking. Key on
+  // createdAt age — NOT holdExpiresAt (requested rows legitimately have null
+  // holdExpiresAt mid-flip). The reaper threshold (default ≥5 min) is precisely what
+  // excludes the sub-second transient requested→held_for_approval window that the engine
+  // passes through at ~line 289→334 during a normal placeHold — a fresh row at age <5 min
+  // is never flagged, giving the flip ample time to complete.
+  if (snap.requestedReaperMs != null) {
+    const requestedCutoff = new Date(snap.now.getTime() - snap.requestedReaperMs)
+    for (const b of snap.bookings) {
+      if (b.state !== 'requested') continue
+      if (!b.createdAt || b.createdAt >= requestedCutoff) continue
+      findings.push({
+        kind: 'stranded_requested',
+        severity: 'warning',
+        dedupKey: `stranded_requested:${b.id}`,
+        bookingId: b.id,
+        slotStart: b.slotStart,
+        detail: {
+          createdAt: b.createdAt.toISOString(),
+          reaperTtlMs: snap.requestedReaperMs,
+          reason: 'requested row stranded past reaper TTL — placeHold or held-flip crashed; seat is leaking',
+        },
+        autoRemediable: true,
       })
     }
   }

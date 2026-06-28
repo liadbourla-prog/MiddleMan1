@@ -33,6 +33,11 @@ const HOLD_GRACE_MS = parseInt(process.env['HOLD_GRACE_PERIOD_SECONDS'] ?? '60',
 // async mirror (seconds, with retries) is never flagged; tight enough to catch a silently
 // dropped/failed write well inside a 2h tick.
 const UNMIRROR_GRACE_MS = parseInt(process.env['UNMIRROR_GRACE_MINUTES'] ?? '15', 10) * 60_000
+// INV-10 reaper: a `requested` row older than this (by createdAt) is stranded — placeHold
+// or the requested→held_for_approval flip crashed and the seat is leaking. Must be ≥5 min
+// and > the slowest possible placeHold round-trip so the transient requested→held_for_approval
+// window (engine ~line 289→334, sub-second) is never reaped by the age threshold alone.
+const REQUESTED_REAPER_MS = parseInt(process.env['REQUESTED_REAPER_MINUTES'] ?? '5', 10) * 60_000
 const QUARANTINE_REASON = 'integrity_quarantine'
 
 export const integritySentinelQueue = new Queue(QUEUE_NAME, { connection: redisConnection })
@@ -153,6 +158,7 @@ function buildSnapshot(
       source: b.source,
     })),
     unmirrorGraceMs: UNMIRROR_GRACE_MS,
+    requestedReaperMs: REQUESTED_REAPER_MS,
     reminders: reminderRows,
     holdGraceMs: HOLD_GRACE_MS,
   }
@@ -340,8 +346,25 @@ async function onNewFinding(business: Business, f: IntegrityFinding, now: Date):
 async function autoRemediate(f: IntegrityFinding, now: Date): Promise<boolean> {
   try {
     if (f.kind === 'stuck_hold' && f.bookingId) {
+      // TODO(payments-hardening): on expiring a pending_payment booking here, void any
+      // issued pay-link / trigger a refund if the customer already paid. The state flip
+      // below is correct (expired releases the seat); the pay-link/refund side-effect is
+      // deferred until the payments-hardening workstream.
       await db.update(bookings).set({ state: 'expired', holdExpiresAt: null, updatedAt: now }).where(eq(bookings.id, f.bookingId))
       return true
+    }
+    if (f.kind === 'stranded_requested' && f.bookingId) {
+      // CAS-flip: the AND state='requested' guard prevents clobbering a row that advanced
+      // legitimately to held/confirmed between detection and remediation (T1.5/T1.7 CAS
+      // discipline). Returning true only when a row actually flipped ensures the finding
+      // is recorded as auto-remediated only on a real state change. Expiring the row
+      // removes it from the active-booking count → frees the class seat (CX1).
+      const result = await db
+        .update(bookings)
+        .set({ state: 'expired', updatedAt: now })
+        .where(and(eq(bookings.id, f.bookingId), eq(bookings.state, 'requested')))
+        .returning({ id: bookings.id })
+      return result.length > 0
     }
     if (f.kind === 'reminder_orphan') {
       const reminderId = f.detail['reminderId']
@@ -377,6 +400,7 @@ function describeFinding(f: IntegrityFinding, lang: Lang, businessName: string):
     reschedule_residue: 'a reschedule left two active bookings',
     out_of_hours: 'a booking sits inside a break / blocked time',
     unmirrored: 'an event saved here has not synced to Google Calendar yet',
+    stranded_requested: 'a booking request got stuck and its slot may be blocked',
   }
   const he: Record<string, string> = {
     double_book: 'שתי הזמנות חופפות באותו זמן',
@@ -386,6 +410,7 @@ function describeFinding(f: IntegrityFinding, lang: Lang, businessName: string):
     reschedule_residue: 'שינוי תור השאיר שתי הזמנות פעילות',
     out_of_hours: 'הזמנה נמצאת בתוך הפסקה / זמן חסום',
     unmirrored: 'אירוע שנשמר כאן עדיין לא סונכרן ל-Google Calendar',
+    stranded_requested: 'בקשת הזמנה נתקעה והחריץ עשוי להיות חסום',
   }
   const desc = (lang === 'he' ? he : en)[f.kind] ?? f.kind
   return lang === 'he'

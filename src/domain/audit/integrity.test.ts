@@ -34,6 +34,7 @@ function snapshot(over: Partial<IntegritySnapshot> = {}): IntegritySnapshot {
     holdGraceMs: over.holdGraceMs ?? 60_000,
     ...(over.blocks !== undefined ? { blocks: over.blocks } : {}),
     ...(over.unmirrorGraceMs !== undefined ? { unmirrorGraceMs: over.unmirrorGraceMs } : {}),
+    ...(over.requestedReaperMs !== undefined ? { requestedReaperMs: over.requestedReaperMs } : {}),
   }
 }
 
@@ -321,5 +322,69 @@ describe('runIntegrityChecks', () => {
       bookings: [booking({ id: 'b1', state: 'confirmed', calendarEventId: null, createdAt: old })],
     })
     expect(kinds(s)).not.toContain('unmirrored')
+  })
+
+  // ── INV-10 stranded_requested ──────────────────────────────────────────────
+  // A `requested` row that has aged past the reaper TTL means placeHold (or the
+  // requested→held_for_approval flip) crashed and the seat is leaking. Key on
+  // createdAt age (NOT holdExpiresAt — requested rows legitimately have null
+  // holdExpiresAt mid-flip). The threshold (≥5 min default) is precisely what
+  // excludes the sub-second transient requested→held_for_approval/held window.
+
+  it('INV-10 flags a requested row older than requestedReaperMs as stranded_requested (warning, autoRemediable)', () => {
+    const now = new Date(T0.getTime() + 100 * HOUR)
+    const reaperMs = 5 * 60_000 // 5 min
+    // createdAt is 10 min in the past — well past the reaper TTL
+    const strandedCreatedAt = new Date(now.getTime() - 10 * 60_000)
+    const s = snapshot({
+      now,
+      requestedReaperMs: reaperMs,
+      bookings: [booking({ id: 'b1', state: 'requested', createdAt: strandedCreatedAt })],
+    })
+    const findings = runIntegrityChecks(s)
+    const f = findings.find((x) => x.kind === 'stranded_requested')
+    expect(f).toBeDefined()
+    expect(f!.severity).toBe('warning')
+    expect(f!.autoRemediable).toBe(true)
+    expect(f!.bookingId).toBe('b1')
+    expect(f!.dedupKey).toBe('stranded_requested:b1')
+  })
+
+  it('INV-10 does NOT flag a requested row younger than the TTL (transient approval-flip window)', () => {
+    const now = new Date(T0.getTime() + 100 * HOUR)
+    const reaperMs = 5 * 60_000
+    // createdAt is only 30 seconds in the past — still inside the TTL
+    const freshCreatedAt = new Date(now.getTime() - 30_000)
+    const s = snapshot({
+      now,
+      requestedReaperMs: reaperMs,
+      bookings: [booking({ id: 'b1', state: 'requested', createdAt: freshCreatedAt })],
+    })
+    expect(kinds(s)).not.toContain('stranded_requested')
+  })
+
+  it('INV-10 does NOT flag confirmed or held rows as stranded_requested', () => {
+    const now = new Date(T0.getTime() + 100 * HOUR)
+    const reaperMs = 5 * 60_000
+    const oldCreatedAt = new Date(now.getTime() - 60 * 60_000) // 1h old
+    const s = snapshot({
+      now,
+      requestedReaperMs: reaperMs,
+      bookings: [
+        booking({ id: 'b1', state: 'confirmed', createdAt: oldCreatedAt }),
+        booking({ id: 'b2', state: 'held', createdAt: oldCreatedAt }),
+      ],
+    })
+    expect(kinds(s)).not.toContain('stranded_requested')
+  })
+
+  it('INV-10 is disabled when requestedReaperMs is omitted', () => {
+    const now = new Date(T0.getTime() + 100 * HOUR)
+    const oldCreatedAt = new Date(now.getTime() - 60 * 60_000)
+    const s = snapshot({
+      now,
+      bookings: [booking({ id: 'b1', state: 'requested', createdAt: oldCreatedAt })],
+    })
+    expect(kinds(s)).not.toContain('stranded_requested')
   })
 })
