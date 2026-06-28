@@ -14,6 +14,7 @@ import {
 } from '../db/schema.js'
 import { redisConnection } from '../redis.js'
 import { sendMessage, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { enqueueMessage } from './message-retry.js'
 import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
@@ -54,7 +55,18 @@ async function waCredentialsFor(businessId: string) {
   return biz
 }
 
-/** Send a warm, LLM-phrased probe to one customer asking if they'll take `slotStart`. */
+/**
+ * Send a warm, LLM-phrased probe to one customer asking if they'll take `slotStart`.
+ *
+ * Failure handling is intentionally asymmetric with waitlist.ts cold-fill: there, each
+ * dispatchInitiation is wrapped in a per-candidate try/catch so one enqueue failure is
+ * tallied for the blast-breaker and the batch continues. Here, sendProbe does NOT swallow
+ * — an enqueue failure propagates out of dispatchInitiation (after it compensates the
+ * ledger row), out of sendProbe, and aborts the whole campaign tick. That is correct for
+ * reshuffle: BullMQ re-drives the tick (it is a single re-runnable BullMQ job), and the
+ * dedup ledger was already compensated, so the re-driven tick re-probes cleanly. A failed
+ * probe aborting + re-driving the tick is preferable to silently dropping one occupant.
+ */
 async function sendProbe(
   businessId: string,
   businessName: string,
@@ -78,12 +90,17 @@ async function sendProbe(
     recipientId: customerId,
     dedupKey: `reshuffle.probe:${customerId}:${slotStart.toISOString()}`,
   }, {
+    // Executors MUST throw on failure so dispatch.ts compensation can delete the
+    // just-inserted ledger row and keep the dedup invariant: key only burns on
+    // successful hand-off to the durable queue (E2/P7 fix).
     sendFreeForm: async () => {
       const body = await generateProactiveCustomerMessage({ businessName, language: lang, situation, fallback, timeoutMs: 2500 })
-      await sendMessage({ toNumber: phoneNumber, body }, creds).catch(() => { /* retry queue handles transient failures */ })
+      await enqueueMessage(businessId, phoneNumber, body)
     },
     sendTemplate: async () => {
       // Out-of-window: reshuffle_probe template — [business, proposed_time].
+      // Template sends go through sendTemplateMessage directly; the throw propagates
+      // to dispatch compensation on failure.
       await sendTemplateMessage({
         toNumber: phoneNumber,
         templateName: 'reshuffle_probe',
@@ -91,7 +108,7 @@ async function sendProbe(
         components: bodyComponents([businessName, dateStr]),
         bodyText: fallback,
         ...(creds !== undefined && { credentials: creds }),
-      }).catch(() => { /* retry queue handles transient failures */ })
+      })
     },
   })
   return decision.kind === 'send_free_form' || decision.kind === 'send_template'

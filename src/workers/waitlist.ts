@@ -2,7 +2,8 @@ import { Worker, Queue } from 'bullmq'
 import { eq, and, asc } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { waitlist, identities, businesses, serviceTypes, bookings } from '../db/schema.js'
-import { sendMessage, canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { enqueueMessage } from './message-retry.js'
 import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
@@ -106,23 +107,25 @@ async function attemptColdFill(
     const fallback = lang === 'he'
       ? `שלום! התפנה מקום ל${serviceName} ב${biz.name} ב-${localDateStr}. נשמח לראות אותך שוב — רוצה לקחת אותו?`
       : `Hi! A spot just opened for ${serviceName} at ${biz.name} on ${localDateStr}. We'd love to welcome you back — want to take it?`
-    let sendFailed = false
-    const decision = await dispatchInitiation(database, getInitiator('coldfill.invite'), {
-      businessId,
-      recipientId: pick.identityId,
-      dedupKey: `coldfill.invite:${pick.identityId}:${bucket}`,
-    }, {
-      sendFreeForm: async () => {
-        const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
-        try {
-          await sendMessage({ toNumber: pick.phoneNumber, body }, creds)
-        } catch {
-          sendFailed = true // retry queue still handles transient failures; we only count for the breaker
-        }
-      },
-      sendTemplate: async () => {
-        // Out-of-window: coldfill_invite template — [business, service, date].
-        try {
+    let dispatchError = false
+    let decision
+    try {
+      decision = await dispatchInitiation(database, getInitiator('coldfill.invite'), {
+        businessId,
+        recipientId: pick.identityId,
+        dedupKey: `coldfill.invite:${pick.identityId}:${bucket}`,
+      }, {
+        // Executors MUST throw on failure so dispatch.ts compensation can delete the
+        // just-inserted ledger row and keep the dedup invariant: key only burns on
+        // successful hand-off to the durable queue (E2/P7 fix).
+        sendFreeForm: async () => {
+          const body = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback, timeoutMs: 2500 })
+          await enqueueMessage(businessId, pick.phoneNumber, body)
+        },
+        sendTemplate: async () => {
+          // Out-of-window: coldfill_invite template — [business, service, date].
+          // Template sends go through sendTemplateMessage directly; the throw propagates
+          // to dispatch compensation on failure.
           await sendTemplateMessage({
             toNumber: pick.phoneNumber,
             templateName: 'coldfill_invite',
@@ -131,15 +134,17 @@ async function attemptColdFill(
             bodyText: fallback,
             ...(creds !== undefined && { credentials: creds }),
           })
-        } catch {
-          sendFailed = true
-        }
-      },
-    })
+        },
+      })
+    } catch {
+      // Enqueue failed — dispatchInitiation already compensated the ledger row.
+      // Count as error for the blast-breaker tally and continue the batch.
+      dispatchError = true
+    }
     // Tally outcomes for the breaker.
-    if (decision.kind === 'skip' && decision.reason === 'opted_out') tally.optOuts++
-    else if (sendFailed) tally.errors++
-    else if (decision.kind !== 'skip') tally.sent++
+    if (decision?.kind === 'skip' && decision.reason === 'opted_out') tally.optOuts++
+    else if (dispatchError) tally.errors++
+    else if (decision?.kind !== 'skip') tally.sent++
   }
 
   await logAudit(database, {
@@ -302,11 +307,15 @@ export async function processJob(job: { data: WaitlistJob }) {
 
     const freeFormAllowed = await canSendFreeForm(next.customerId)
     if (freeFormAllowed) {
+      // Durable path: enqueueMessage hands off to the message-retry BullMQ queue so a
+      // transient WA send failure is re-driven rather than silently lost (E2/P7 fix).
       const situation = `A slot just opened up at ${biz.name}: "${serviceName}" on ${dateStr}. Share the good news warmly and invite them to just tell you if they want it — never say "reply YES/NO". Mention you're holding it for ${OFFER_TTL_MINUTES} minutes.`
       const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: offerBody, timeoutMs: 2500 })
-      await sendMessage({ toNumber: customer.phoneNumber, body: llmBody }, waCredentials)
-        .catch(() => { /* retry queue handles failures */ })
+      await enqueueMessage(businessId, customer.phoneNumber, llmBody)
     } else {
+      // Template path: sendTemplateMessage is NOT wrapped in catch — a failure propagates
+      // to BullMQ's job-level retry (processJob runs with attempts: 2) rather than being
+      // swallowed and lost (E2/P7 fix).
       await sendTemplateMessage({
         toNumber: customer.phoneNumber,
         templateName: 'waitlist_slot_offer',
@@ -322,7 +331,7 @@ export async function processJob(job: { data: WaitlistJob }) {
         }],
         bodyText: offerBody,
         ...(waCredentials !== undefined && { credentials: waCredentials }),
-      }).catch(() => { /* retry queue handles failures */ })
+      })
     }
   }
 
