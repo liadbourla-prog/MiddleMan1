@@ -191,7 +191,8 @@ export async function triggerWaitlistForSlot(
   )
 }
 
-async function processJob(job: { data: WaitlistJob }) {
+/** @internal Exported for integration-test white-box access only. */
+export async function processJob(job: { data: WaitlistJob }) {
   const { type, businessId, serviceTypeId, slotStart, slotEnd, waitlistId } = job.data
 
   if (type === 'expire_offer') {
@@ -249,10 +250,20 @@ async function processJob(job: { data: WaitlistJob }) {
 
   const offerExpiresAt = new Date(Date.now() + OFFER_TTL_MINUTES * 60_000)
 
-  await db
+  // CAS promotion (E1/P1): include `status = 'pending'` in the WHERE so that two
+  // concurrent offer_slot jobs racing on the same entry only ONE flips the row.
+  // The loser gets 0 rows back and must NOT send — return immediately without sending.
+  // CONTRACT: send the offer only when flippedRows.length === 1.
+  const flippedRows = await db
     .update(waitlist)
     .set({ status: 'offered', offeredAt: new Date(), offerExpiresAt })
-    .where(eq(waitlist.id, next.id))
+    .where(and(eq(waitlist.id, next.id), eq(waitlist.status, 'pending')))
+    .returning({ id: waitlist.id })
+
+  if (flippedRows.length === 0) {
+    // A concurrent job already promoted this entry — this job is the loser; do nothing.
+    return
+  }
 
   const [customer] = await db
     .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
