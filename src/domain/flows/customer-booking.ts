@@ -23,7 +23,7 @@ import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 import type { HydratedContext } from '../session/hydration.js'
 import { checkOwnerEscalationRules, escalateToPlatform, escalateUnfulfillableRequest } from '../escalation/engine.js'
-import { recordLastCancellation } from '../customer/profile.js'
+import { recordLastCancellation, loadLastCancellation } from '../customer/profile.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
@@ -1006,6 +1006,12 @@ export async function handleBookingFlow(
     : 'Do NOT greet or re-introduce yourself — continue the conversation directly. '
 
   const intentResult2 = await (async (): Promise<FlowResult> => {
+    // P4: "give me back the class we cancelled" → re-offer the exact cancelled slot from
+    // the snapshot. Falls through to normal handling when there's nothing fresh to restore.
+    if (intent.restorePrevious) {
+      const restored = await handleRestoreCancelled(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply, activeServices, business)
+      if (restored) return restored
+    }
     switch (intent.intent) {
       case 'booking':
         return handleBookingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply, firstMsgPrefix, business)
@@ -1492,6 +1498,76 @@ async function recordCancellationSnapshot(db: Db, identity: ResolvedIdentity, bo
       slotStartIso: row.slotStart.toISOString(),
     })
   } catch { /* non-fatal */ }
+}
+
+// P4: a customer asking to undo a cancellation gets the EXACT cancelled slot re-offered
+// from the per-identity snapshot, routed through the normal booking gate (which re-checks
+// availability and asks for a fresh confirmation). Returns null — falling through to
+// ordinary handling — when there's no usable snapshot (none recorded, older than the
+// freshness window, the slot is now in the past, or the service is no longer active).
+const LAST_CANCEL_RESTORE_WINDOW_MINUTES = parseInt(process.env['LAST_CANCEL_RESTORE_WINDOW_MINUTES'] ?? '120', 10)
+
+// Pure decision: given a cancellation snapshot, decide whether (and as what draft) it can
+// be restored. Returns null when there's nothing usable — stale (older than the window),
+// the slot is now in the past, malformed, or the service is no longer active.
+export function buildRestoreDraft(
+  snap: { serviceTypeId: string; serviceName: string; slotStartIso: string },
+  at: Date,
+  now: Date,
+  windowMinutes: number,
+  activeServiceIds: Set<string>,
+  tz: string,
+): NonNullable<BookingFlowContext['slotDraft']> | null {
+  const ageMinutes = (now.getTime() - at.getTime()) / 60_000
+  const slotStart = new Date(snap.slotStartIso)
+  if (ageMinutes > windowMinutes || isNaN(slotStart.getTime()) || slotStart.getTime() <= now.getTime()) return null
+  if (!activeServiceIds.has(snap.serviceTypeId)) return null
+  const lp = localParts(slotStart, tz)
+  return {
+    serviceTypeId: snap.serviceTypeId,
+    serviceName: snap.serviceName,
+    dateStr: lp.dateStr,
+    time: { hour: Math.floor(lp.minutes / 60), minute: lp.minutes % 60 },
+  }
+}
+
+async function handleRestoreCancelled(
+  db: Db,
+  calendar: CalendarClient,
+  identity: ResolvedIdentity,
+  session: ActiveSession,
+  ctx: BookingFlowContext,
+  businessTimezone: string,
+  businessName: string,
+  transcript: TranscriptTurn[],
+  genReply: GenReply,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; category: string | null; schedulingMode: 'appointment' | 'class' }>,
+  business?: Business,
+): Promise<FlowResult | null> {
+  const lang = ctx.detectedLanguage ?? 'en'
+  const last = await loadLastCancellation(db, identity.id).catch(() => null)
+  if (!last) return null
+
+  const slotDraft = buildRestoreDraft(
+    last.snap, last.at, new Date(), LAST_CANCEL_RESTORE_WINDOW_MINUTES,
+    new Set(activeServices.map((s) => s.id)), businessTimezone,
+  )
+  if (!slotDraft) return null
+  const newCtx: BookingFlowContext = { ...ctx, slotDraft }
+  await updateSessionContext(db, session.id, newCtx, 'active')
+
+  // Synthetic booking intent: the slot is fully in the draft, so the booking path runs
+  // the deterministic gate (re-validates the slot is still open) and asks to confirm —
+  // if someone took it meanwhile, the customer is told and offered alternatives.
+  const synthetic: CustomerIntentOutput = {
+    intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
+    customerNameHint: null, participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+  }
+  return handleBookingIntent(
+    db, calendar, identity,
+    { ...session, state: 'active', context: newCtx },
+    newCtx, synthetic, activeServices, businessTimezone, businessName, transcript, genReply, '', business,
+  )
 }
 
 // ── Intent handlers ───────────────────────────────────────────────────────────

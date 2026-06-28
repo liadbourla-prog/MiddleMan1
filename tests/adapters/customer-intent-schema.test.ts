@@ -22,3 +22,15 @@ describe('customerIntentSchema — specialArrangementRequest', () => {
     expect(r.specialArrangementRequest).toBe(false)
   })
 })
+
+describe('customerIntentSchema — restorePrevious', () => {
+  const base = { intent: 'booking', detectedLanguage: 'he' }
+
+  it('keeps restorePrevious=true when present', () => {
+    expect(customerIntentSchema.parse({ ...base, restorePrevious: true }).restorePrevious).toBe(true)
+  })
+
+  it('defaults restorePrevious to false when omitted', () => {
+    expect(customerIntentSchema.parse({ ...base }).restorePrevious).toBe(false)
+  })
+})

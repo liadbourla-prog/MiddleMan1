@@ -38,6 +38,9 @@ export interface CustomerIntentOutput {
   // capacity, an explicitly OUT-OF-HOURS session, or a bespoke event. Shape-only signal;
   // the deterministic core confirms unfulfillability before any owner escalation.
   specialArrangementRequest?: boolean
+  // True when the customer asks to UNDO a cancellation / bring back a just-cancelled
+  // booking. Drives the snapshot-based restore path (re-offers the exact cancelled slot).
+  restorePrevious?: boolean
 }
 
 export interface ManagerInstructionOutput {
