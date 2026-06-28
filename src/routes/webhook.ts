@@ -58,6 +58,7 @@ import { findActiveByContact } from '../domain/coordination/repository.js'
 import { advanceFromContact, type BusinessCtx } from '../domain/coordination/handler.js'
 import { resolveOutreachIntroducer } from '../domain/coordination/introducer.js'
 import { isInboundBlocked } from './contact-gate.js'
+import { classifyImageMessage } from './image-routing.js'
 import type { AllowedContact } from '../domain/manager/allowed-contacts.js'
 import { notifyOwnerUnlistedContact } from '../domain/initiations/booking-notify.js'
 
@@ -217,21 +218,32 @@ const PROVIDER_WA_NUMBER = process.env['PROVIDER_WA_NUMBER'] ?? ''
 export async function processInboundMessage(msg: InboundMessage, app: FastifyInstance) {
   // Step 0 — provider onboarding (central number, no business context)
   if (PROVIDER_WA_NUMBER && msg.toNumber === PROVIDER_WA_NUMBER) {
+    // There is no image-skill concept on the provider channel, so imageSkillUploadable is always
+    // false. If the image carries a caption, route it as the provider's text (INJ6); only bounce
+    // when there is genuinely no caption — and that bounce stays bilingual by design (Branch 2).
     if (msg.imageMediaId) {
-      const imgFallback = `${i18n.non_text_reply.he}\n\n${i18n.non_text_reply.en}`
-      const imgReply = await generateProviderOnboardingReply({
-        step: 'image_not_supported',
-        lang: 'bilingual',
-        fallback: imgFallback,
+      const disposition = classifyImageMessage({
+        hasCaption: !!msg.body?.trim(),
+        imageSkillUploadable: false,
       })
-      await sendMessage(
-        { toNumber: msg.fromNumber, body: imgReply },
-        {
-          accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
-          phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
-        },
-      )
-      return
+      if (disposition === 'bounce_non_text') {
+        const imgFallback = `${i18n.non_text_reply.he}\n\n${i18n.non_text_reply.en}`
+        const imgReply = await generateProviderOnboardingReply({
+          step: 'image_not_supported',
+          lang: 'bilingual',
+          fallback: imgFallback,
+        })
+        await sendMessage(
+          { toNumber: msg.fromNumber, body: imgReply },
+          {
+            accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
+            phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
+          },
+        )
+        return
+      }
+      // disposition === 'route_caption_as_text': fall through to the normal provider path below,
+      // processing the caption (msg.body) as the provider's text.
     }
     const result = await handleProviderOnboarding(db, msg.fromNumber, msg.body)
     const providerSendResult = await sendMessage(
@@ -624,7 +636,7 @@ export async function routeContactMessage(
   await advanceFromContact(db, calendar, row, msg.body, ctx)
 }
 
-async function routeCustomerMessage(
+export async function routeCustomerMessage(
   msg: InboundMessage,
   identity: ResolvedIdentity,
   business: Business,
@@ -730,16 +742,22 @@ async function routeCustomerMessage(
     loadInstructorRoster(db, business.id).catch((): InstructorRosterEntry[] => []),
   ])
 
-  // Image handling — download only for skills that support photos; others get non-text reply
+  // Image handling — download only for skills that support photos. Otherwise: if the image
+  // carries a text caption (a booking typed under the photo), route the caption as a normal
+  // text message; only bounce to the non-text fallback when there is genuinely no caption (INJ6).
   let uploadedImageUrl: string | null = null
   let uploadedImageMediaType: string | null = null
   if (msg.imageMediaId) {
     const imageSkills = new Set(['website-builder', 'google-business-setup'])
     const shouldUpload = workflowState?.skillName && imageSkills.has(workflowState.skillName)
-    if (shouldUpload && business.whatsappAccessToken) {
+    const imageSkillUploadable = !!(shouldUpload && business.whatsappAccessToken)
+    const hasCaption = !!msg.body?.trim()
+    const disposition = classifyImageMessage({ hasCaption, imageSkillUploadable })
+
+    if (disposition === 'upload_for_skill') {
       const mediaResult = await downloadAndUploadMedia({
         mediaId: msg.imageMediaId,
-        accessToken: business.whatsappAccessToken,
+        accessToken: business.whatsappAccessToken!,
         businessId: business.id,
         ...(msg.imageMediaType ? { mediaType: msg.imageMediaType } : {}),
       })
@@ -749,7 +767,9 @@ async function routeCustomerMessage(
       } else {
         app.log.warn({ error: mediaResult.error, mediaId: msg.imageMediaId }, 'Customer image upload failed — proceeding without image')
       }
-    } else {
+    } else if (disposition === 'bounce_non_text') {
+      // Captionless image with no skill to consume it — nothing to act on.
+      // Single-language fallback by design (F5): customer replies stay in one language.
       const nonTextFallback = i18n.non_text_reply[lang]
       const nonTextReply = await generateProactiveCustomerMessage({
         businessName: business.name,
@@ -761,6 +781,10 @@ async function routeCustomerMessage(
       await sendMessage({ toNumber: msg.fromNumber, body: nonTextReply }, waCredentials)
       return
     }
+    // disposition === 'route_caption_as_text': fall through with imageUrl/imageMediaType null.
+    // The caption (msg.body) is processed exactly like a typed message — it is already gate-2
+    // sanitized at saveMessage(...,'customer', msg.body) above (line ~707, T4.3i). We deliberately
+    // neither upload the image bytes nor bounce.
   }
 
   const skillCtx = await buildSkillContext({
