@@ -48,6 +48,7 @@ The fix is to make **output gating** universal and **intent-path-agnostic** — 
 | **Action-claim fabrication** | "I booked you ✅" when nothing was written; "I messaged him" / "calendar connected" / "cancelled" | output gate | **solved** (`reply-guard.ts`) |
 | **Occupancy fabrication** | "all Wednesday spots are taken" when ~55 are free | **source-truth** (grounding) | **solved at source** (§6); guard is future work |
 | **Service / staff / price fabrication** | invents a service or instructor or quotes a price not on record | grounding (`buildBusinessFacts`) | solved (closed-world facts block) |
+| **Service-fidelity fabrication** (prior-assistant laundering) | locks the customer's remembered "usual" service (e.g. switches a pilates thread to *yoga*) on an underspecified booking the customer never affirmed | grounding (`customerReferencedService`) | **solved** (§4.2 rule extended to *service*) |
 
 The same two levers address all of them; which lever leads depends on whether the core's *data* was wrong (→ grounding) or only the *phrasing* was wrong (→ gate). See the decision framework in §7.
 
@@ -205,3 +206,4 @@ Branch 3 (manager orchestrator) already generalizes the same idea: `detectAction
 
 - **v1.0.96** — Time-fabrication gate (Gate 2) + allowlist + inquiry grounding + part-of-day buckets. Fixes the PA offering internally-blocked times on open-ended inquiries.
 - **(this change)** — `suggestNextClassesText` + class-aware inquiry fallback (Symptom A) + no-time booking injects day options (Symptom B). Fixes the false "fully booked" occupancy claim and the gate's false-positive fallback on under-specified class bookings.
+- **(this change)** — **Service-fidelity guard.** Extended §4.2's "never trust prior-assistant turns" rule from *time* to *service*: `inferFocusService` reads assistant turns, so on an underspecified booking it laundered the customer's remembered favourite (a memory-driven "yoga as usual?" the customer never affirmed) into a locked booking — observed live switching a pilates thread to yoga. `customerReferencedService` now refuses to lock the preferred favourite unless the customer raised it this conversation. Also reworded the `FABRICATED_TIME_FALLBACK` ("real time" → "a time that works").

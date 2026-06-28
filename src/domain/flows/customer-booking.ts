@@ -11,8 +11,9 @@ import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
-import { extractClockTimes, extractMentionedTimes, findUnbackedTimes } from './slot-fabrication-guard.js'
-import { inferFocusService } from './service-resolution.js'
+import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime } from './slot-fabrication-guard.js'
+import { matchCancelBookings } from './cancellation-match.js'
+import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { parseConfirmation, parseRetentionReply } from './types.js'
@@ -516,8 +517,8 @@ const BOOKING_NOT_CONFIRMED_FALLBACK: Record<'he' | 'en', string> = {
 // fabricated-availability claim that survived one regeneration). States no time at
 // all — better to ask than to offer a slot that does not exist / is blocked.
 const FABRICATED_TIME_FALLBACK: Record<'he' | 'en', string> = {
-  he: 'בוא נמצא לך זמן אמיתי — לאיזה יום שאבדוק עבורך?',
-  en: "Let me get you a real time — which day should I check for you?",
+  he: 'בוא נמצא לך זמן שמתאים — לאיזה יום שאבדוק עבורך?',
+  en: "Let's find a time that works for you — which day should I check?",
 }
 
 // Appended to the situation when the first draft offered an unbacked time. Forces
@@ -933,7 +934,7 @@ export async function handleBookingFlow(
         return handleReschedulingIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply, business)
 
       case 'cancellation':
-        return handleCancellationIntent(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply)
+        return handleCancellationIntent(db, calendar, identity, session, updatedCtx, intent, activeServices, businessTimezone, businessName, transcript, genReply)
 
       case 'list_bookings':
         return handleListBookings(db, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply)
@@ -1369,13 +1370,37 @@ async function handleBookingIntent(
   }
   if (slot?.time) draft.time = { hour: slot.time.hour, minute: slot.time.minute }
 
-  const service =
+  let service =
     resolveService(intent.serviceTypeHint, activeServices) ??
     (draft.serviceTypeId ? activeServices.find((s) => s.id === draft.serviceTypeId) ?? null : null) ??
     // Referential fallback: the customer is continuing ("the one we discussed",
     // "sign me up", "yes") without re-naming the service. Adopt the single service
     // the conversation has clearly been about — never guess when it's ambiguous.
     inferFocusService(transcript, activeServices)
+
+  // Anti-fabrication, service-fidelity (ANTI_FABRICATION §4.2). Never LOCK the
+  // customer's remembered "usual" service when they did not raise it THIS
+  // conversation. The PA may have proposed it from cross-session preferred-service
+  // memory ("yoga as usual?"); inferFocusService would then launder that proposal
+  // back in from the PA's own turn and book a service the customer never affirmed
+  // (observed live: a pilates thread silently switched to yoga on an underspecified
+  // "sign me up for 12"). Require a real customer signal — an explicit hint this
+  // turn, an already-locked draft, or the customer naming it — before adopting the
+  // remembered favourite. Otherwise drop to null so the flow asks which service.
+  // `memoryForActiveService` covers the in-flight case; this covers fresh bookings.
+  const preferredFavourite = (ctx as unknown as Partial<HydratedContext>).preferredServiceName ?? null
+  if (
+    service &&
+    activeServices.length > 1 &&
+    !intent.serviceTypeHint &&
+    !draft.serviceTypeId &&
+    preferredFavourite != null &&
+    service.name === preferredFavourite &&
+    !customerReferencedService(transcript, service)
+  ) {
+    service = null
+  }
+
   if (service) {
     draft.serviceTypeId = service.id
     draft.serviceName = service.name
@@ -2090,12 +2115,52 @@ async function handleClarification(
   )
 }
 
+// Business-local 'YYYY-MM-DD' for a slot — matches the format resolveRequestedDate
+// returns, so a stated day can be compared against a booking's date deterministically.
+function localDateStr(d: Date, tz: string): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d)
+}
+
+// Narrow a customer's bookings to those consistent with the service / day / time
+// their cancellation request already stated. Any criterion that matches nothing is
+// dropped (return the full set) rather than filtering to empty — better to show the
+// menu than to wrongly claim they have no such booking.
+function narrowCancelCandidates<B extends { id: string; slotStart: Date; serviceTypeId: string }>(
+  candidates: B[],
+  intent: CustomerIntentOutput,
+  activeServices: Array<{ id: string; name: string }>,
+  tz: string,
+): B[] {
+  const svc = intent.serviceTypeHint ? resolveService(intent.serviceTypeHint, activeServices) : null
+  const slot = intent.slotRequest
+  let dateStr: string | null = null
+  if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
+    const r = resolveRequestedDate(
+      { relativeDay: slot.relativeDay ?? null, weekday: slot.weekday ?? null, explicitDate: slot.explicitDate ?? null },
+      tz, new Date(),
+    )
+    if (r.ok) dateStr = r.dateStr
+  }
+  const hhmm = slot?.time ? canonicalTime(slot.time.hour, slot.time.minute) : null
+  if (!svc && !dateStr && !hhmm) return candidates
+
+  const filtered = candidates.filter((b) => {
+    if (svc && b.serviceTypeId !== svc.id) return false
+    if (dateStr && localDateStr(b.slotStart, tz) !== dateStr) return false
+    if (hhmm && formatSlotTime(b.slotStart, tz) !== hhmm) return false
+    return true
+  })
+  return filtered.length > 0 ? filtered : candidates
+}
+
 async function handleCancellationIntent(
   db: Db,
   calendar: CalendarClient,
   identity: ResolvedIdentity,
   session: ActiveSession,
   ctx: BookingFlowContext,
+  intent: CustomerIntentOutput,
+  activeServices: Array<{ id: string; name: string }>,
   businessTimezone: string,
   businessName: string,
   transcript: TranscriptTurn[],
@@ -2103,7 +2168,7 @@ async function handleCancellationIntent(
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
 
-  const activeBookings = await db
+  const allBookings = await db
     .select({ id: bookings.id, slotStart: bookings.slotStart, serviceTypeId: bookings.serviceTypeId })
     .from(bookings)
     .where(
@@ -2114,7 +2179,7 @@ async function handleCancellationIntent(
       ),
     )
 
-  if (activeBookings.length === 0) {
+  if (allBookings.length === 0) {
     await completeSession(db, session.id)
     const reply = await genReply({
       businessTimezone,
@@ -2127,6 +2192,12 @@ async function handleCancellationIntent(
     })
     return { reply, sessionComplete: true }
   }
+
+  // Pre-filter by what the customer ALREADY stated ("cancel my yoga on Friday at
+  // 12"). When their request uniquely identifies one booking, skip the menu and go
+  // straight to a single confirmation; when it narrows to a few, show only those.
+  // A criterion that matches nothing is ignored (don't filter to empty and mislead).
+  const activeBookings = narrowCancelCandidates(allBookings, intent, activeServices, businessTimezone)
 
   if (activeBookings.length === 1) {
     const booking = activeBookings[0]!
@@ -2207,9 +2278,30 @@ async function handleCancellationSelection(
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
   const candidates = ctx.cancellationCandidates ?? []
-  const n = parseInt(messageText.trim(), 10)
 
-  if (isNaN(n) || n < 1 || n > candidates.length) {
+  // Candidate bookings with service names, so we can resolve a natural-language
+  // pick and name the chosen slot back in the confirmation.
+  const rows = candidates.length > 0
+    ? await db
+        .select({ id: bookings.id, slotStart: bookings.slotStart, serviceTypeId: bookings.serviceTypeId, serviceName: serviceTypes.name })
+        .from(bookings)
+        .innerJoin(serviceTypes, eq(serviceTypes.id, bookings.serviceTypeId))
+        .where(and(inArray(bookings.id, candidates), or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held'))))
+    : []
+
+  // A bare number picks by position; otherwise resolve the customer's words
+  // ("Friday at 12", "the yoga one") against the candidates deterministically. Only
+  // a UNIQUE match auto-selects — anything ambiguous falls through to a re-ask.
+  const n = parseInt(messageText.trim(), 10)
+  let selected: (typeof rows)[number] | null = null
+  if (!isNaN(n) && n >= 1 && n <= candidates.length) {
+    selected = rows.find((r) => r.id === candidates[n - 1]) ?? null
+  } else {
+    const matches = matchCancelBookings(messageText, rows, businessTimezone)
+    if (matches.length === 1) selected = matches[0]!
+  }
+
+  if (!selected) {
     const reply = await genReply({
       businessTimezone,
       businessName,
@@ -2222,18 +2314,19 @@ async function handleCancellationSelection(
     return { reply, sessionComplete: false }
   }
 
-  const selectedId = candidates[n - 1]!
   const newCtx: BookingFlowContext = {
     ...ctx,
-    targetBookingId: selectedId,
+    targetBookingId: selected.id,
     awaitingConfirmationFor: 'cancellation',
   }
   await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
 
-  // Ask for explicit confirmation before acting — do NOT auto-confirm
+  // Ask for explicit confirmation before acting — do NOT auto-confirm. Name the
+  // exact slot so the customer confirms the right one with a single yes.
+  const slotLabel = `${selected.serviceName} on ${formatSlotDate(selected.slotStart, businessTimezone)} at ${formatSlotTime(selected.slotStart, businessTimezone)}`
   const situation = ctx.isReschedulingFlow
-    ? `Customer selected booking #${n} as the one to move. Confirm that's the booking they want to reschedule — naturally, no menu. (It stays booked until the new time is set.)`
-    : `Customer selected booking #${n} to cancel. Ask them to confirm the cancellation — naturally, no menu.`
+    ? `Customer chose ${slotLabel} as the one to move. Confirm that's the booking they want to reschedule — naturally, no menu. (It stays booked until the new time is set.)`
+    : `Customer wants to cancel ${slotLabel}. Ask them to confirm the cancellation — naturally, no menu.`
   const reply = await genReply({
     businessTimezone,
     businessName,

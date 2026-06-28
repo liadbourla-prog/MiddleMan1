@@ -33,6 +33,32 @@ function serviceTokens(name: string): string[] {
     .filter((t) => t.length >= 3)
 }
 
+/**
+ * Did the CUSTOMER themselves reference this service anywhere in the recent
+ * transcript? Prior-ASSISTANT mentions don't count.
+ *
+ * Anti-fabrication, service-fidelity (ANTI_FABRICATION §4.2 — "never trust
+ * prior-assistant turns as ground truth"). A service the PA merely *proposed* —
+ * e.g. the customer's remembered favourite, surfaced from cross-session
+ * "preferred service" memory ("yoga as usual?") — must be AFFIRMED by the
+ * customer before it is locked into a booking. `inferFocusService` reads
+ * assistant turns (by design, for referential continuations), so on its own it
+ * would launder that proposal back in from the PA's own mouth and book a service
+ * the customer never engaged with. Callers use this to refuse to lock the
+ * remembered favourite unless the customer actually raised it this conversation.
+ */
+export function customerReferencedService<T extends ServiceLite>(
+  transcript: TranscriptTurnLite[],
+  service: T,
+  recentTurns = 8,
+): boolean {
+  const tokens = serviceTokens(service.name)
+  if (tokens.length === 0) return false
+  return transcript
+    .slice(-recentTurns)
+    .some((t) => t.role === 'customer' && tokens.some((tok) => t.text.toLowerCase().includes(tok)))
+}
+
 export function inferFocusService<T extends ServiceLite>(
   transcript: TranscriptTurnLite[],
   services: T[],
