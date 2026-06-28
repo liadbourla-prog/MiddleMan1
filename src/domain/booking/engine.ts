@@ -520,6 +520,18 @@ async function requestGroupClassBooking(
       // (business, service, slot) is the correct slot-level mutex: it forces
       // concurrent bookers of the same class to take turns through the count→insert
       // window, and Postgres releases it automatically at transaction end.
+      //
+      // A2 — canonical-key invariant (finding A2, T1.2):
+      //   `request.slotStart` is canonical by construction. Offered class slots come
+      //   directly from `calendarBlocks.startTs` (the DB-authoritative schedule) and
+      //   are stored as ISO strings in `pendingSlot.start`, round-tripped via
+      //   `new Date(pendingSlot.start)` — bit-identical to the original. For
+      //   `schedulingMode:'class'` services the `no_class_at_time` gate (engine.ts
+      //   line ~156) rejects any slotStart that doesn't exactly match a DB block, so
+      //   only canonical values reach this function. The advisory lock key and the
+      //   capacity COUNT below both key on this same `request.slotStart`, so they are
+      //   guaranteed consistent — no separate canonical-block lookup is needed.
+      //   NO DB construct added (gated per §A2 backfill requirement).
       const lockKey = `${actor.businessId}:${request.serviceTypeId}:${request.slotStart.toISOString()}`
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`)
 
@@ -545,7 +557,12 @@ async function requestGroupClassBooking(
         return { ok: false as const, reason: `Class is full (${currentCount}/${maxParticipants} spots taken)` }
       }
 
-      // Also prevent the same customer from double-booking the same class
+      // Also prevent the same customer from double-booking the same class.
+      // A5 fix (T1.2): include `pending_payment` in the state set so a customer
+      // with an unpaid-but-active seat cannot slip a second booking through while
+      // payment is outstanding. Mirrors the state set used by the capacity count
+      // above (requested | confirmed | pending_payment) — both guards must agree
+      // on what counts as an "occupying" booking.
       const [duplicate] = await tx
         .select({ id: bookings.id })
         .from(bookings)
@@ -555,7 +572,11 @@ async function requestGroupClassBooking(
             eq(bookings.serviceTypeId, request.serviceTypeId),
             eq(bookings.slotStart, request.slotStart),
             eq(bookings.customerId, actor.id),
-            or(eq(bookings.state, 'requested'), eq(bookings.state, 'confirmed')),
+            or(
+              eq(bookings.state, 'requested'),
+              eq(bookings.state, 'confirmed'),
+              eq(bookings.state, 'pending_payment'),
+            ),
           ),
         )
         .limit(1)
