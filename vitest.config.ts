@@ -6,6 +6,6 @@ export default defineConfig({
     environment: 'node',
     setupFiles: ['tests/setup-env.ts'],
     include: ['tests/**/*.test.ts', 'src/skills/**/*.test.ts', 'src/domain/**/*.test.ts', 'src/routes/**/*.test.ts', 'src/workers/**/*.test.ts'],
-    exclude: ['tests/integration/**', 'tests/quality/**'],
+    exclude: ['tests/integration/**', 'tests/quality/**', 'tests/concurrency/**'],
   },
 })
