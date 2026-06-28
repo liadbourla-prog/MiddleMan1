@@ -828,15 +828,71 @@ export async function cancelBooking(
     }
   }
 
+  // Serial-retry idempotency guard: if the booking is ALREADY cancelled at read
+  // time, return success with no side effects. The CAS alone cannot close this —
+  // transition('cancelled','cancelled') passes via its from===to idempotent branch,
+  // and the CAS predicate (state = booking.state = 'cancelled') would match the
+  // already-cancelled row → 1 row "flipped" → side effects would re-fire. This
+  // explicit guard is what makes a repeated cancel of a completed cancel a true
+  // no-op (no duplicate audit, no duplicate notifications, no second waitlist offer).
+  if (booking.state === 'cancelled') {
+    return { ok: true, bookingId, message: 'Booking cancelled.' }
+  }
+
   const t = transition(booking.state, 'cancelled')
   if (!t.ok) return { ok: false, reason: t.reason }
 
-  // When a group participant cancels but others remain, refresh the shared event's
-  // roster after the state flip (below) instead of deleting it.
-  let refreshGroupRosterAfter = false
+  // Computed before the CAS so the same value feeds both the CAS payload and the
+  // winner-side audit row below.
+  const cancelledByRole =
+    actor.role === 'manager' ? 'manager' : actor.role === 'customer' ? 'customer' : 'system'
 
+  // ── Conditional CAS: the state-flip is the atomic arbiter ─────────────────
+  //
+  // ORDER MATTERS: the CAS runs BEFORE any side effects (calendar delete,
+  // notifications, waitlist). This eliminates the TOCTOU race where two
+  // concurrent cancels both pass the transition() guard and both fire side
+  // effects.
+  //
+  // The WHERE predicate gates on the exact state observed at read time
+  // (AND state = <booking.state>), so exactly one concurrent winner can flip
+  // the row. The other sees 0 rows returned and takes the idempotent path.
+  //
+  // Idempotency contract:
+  //   - 0 rows returned  → a concurrent cancel already won; return ok:true
+  //     with NO side effects (no calendar delete, no audit, no notifications,
+  //     no waitlist offer).
+  //   - 1 row returned   → this call is the winner; run all side effects in
+  //     order below.
+  //
+  // Calendar-delete failure after a successful flip: the cancel is already
+  // authoritative in the DB. Do NOT roll back or return ok:false — that would
+  // leave the state as 'cancelled' in DB but suggest a retry that could
+  // double-fire later side effects. Instead, log the orphaned calendar event
+  // for reconciliation and return ok:true. (Behavior change from prior code
+  // which returned ok:false on delete error before the state flip.)
+  const [flipped] = await db
+    .update(bookings)
+    .set({
+      state: 'cancelled',
+      cancellationReason: reason ?? null,
+      cancelledByRole,
+      holdExpiresAt: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(bookings.id, bookingId), eq(bookings.businessId, actor.businessId), eq(bookings.state, booking.state)))
+    .returning({ id: bookings.id })
+
+  // ── Idempotent: concurrent cancel already won — no side effects ───────────
+  if (!flipped) {
+    return { ok: true, bookingId, message: 'Booking cancelled.' }
+  }
+
+  // ── Winner path: run all side effects gated on the successful flip ────────
+
+  // Calendar: for group classes only delete the event when the last participant
+  // cancels; otherwise just refresh the shared event's roster.
   if (booking.calendarEventId) {
-    // For group classes, only delete the calendar event when the last participant cancels
     const [service] = await db
       .select({ maxParticipants: serviceTypes.maxParticipants })
       .from(serviceTypes)
@@ -864,30 +920,17 @@ export async function cancelBooking(
     if (shouldDeleteEvent) {
       const deleteResult = await calendar.deleteEvent(booking.calendarEventId)
       if (deleteResult.status === 'error') {
-        return { ok: false, reason: 'Could not remove calendar event — please try again' }
+        // The state flip already committed — do NOT return ok:false or roll back.
+        // Log the orphaned event for reconciliation; the cancel is authoritative.
+        console.error(
+          '[engine] orphaned calendar event after cancel',
+          { bookingId, calendarEventId: booking.calendarEventId, reason: deleteResult.reason },
+        )
       }
     } else if (isGroupClass) {
-      refreshGroupRosterAfter = true
+      // Now that this booking is no longer active, redraw the remaining class roster.
+      await refreshGroupEventRoster(db, calendar, actor.businessId, booking.serviceTypeId, booking.slotStart)
     }
-  }
-
-  const cancelledByRole =
-    actor.role === 'manager' ? 'manager' : actor.role === 'customer' ? 'customer' : 'system'
-
-  await db
-    .update(bookings)
-    .set({
-      state: 'cancelled',
-      cancellationReason: reason ?? null,
-      cancelledByRole,
-      holdExpiresAt: null,
-      updatedAt: new Date(),
-    })
-    .where(eq(bookings.id, bookingId))
-
-  // Now that this booking is no longer active, redraw the remaining class roster.
-  if (refreshGroupRosterAfter) {
-    await refreshGroupEventRoster(db, calendar, actor.businessId, booking.serviceTypeId, booking.slotStart)
   }
 
   await logAudit(db, {
