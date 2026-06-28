@@ -1,4 +1,4 @@
-import { eq, and, or, lt, lte, gt, gte, count, isNotNull, ne, sql } from 'drizzle-orm'
+import { eq, and, or, lt, lte, gt, gte, count, isNotNull, ne, sql, inArray } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { bookings, serviceTypes, businesses, identities } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
@@ -351,12 +351,12 @@ async function requestPrivateBooking(
   )
 
   if (holdResult.status === 'conflict') {
-    await markFailed(db, result.bookingId, actor.id, 'Calendar slot became occupied')
+    await markFailed(db, actor.businessId, result.bookingId, actor.id, 'Calendar slot became occupied')
     return { ok: false, reason: 'Slot is no longer available' }
   }
 
   if (holdResult.status === 'error') {
-    await markFailed(db, result.bookingId, actor.id, holdResult.reason)
+    await markFailed(db, actor.businessId, result.bookingId, actor.id, holdResult.reason)
     return { ok: false, reason: 'Could not place hold — please try again' }
   }
 
@@ -369,7 +369,7 @@ async function requestPrivateBooking(
   if (requiresApproval) {
     const toHeld = transition('requested', 'held')
     if (!toHeld.ok) {
-      await markFailed(db, result.bookingId, actor.id, toHeld.reason)
+      await markFailed(db, actor.businessId, result.bookingId, actor.id, toHeld.reason)
       return { ok: false, reason: 'Internal state error' }
     }
 
@@ -413,7 +413,7 @@ async function requestPrivateBooking(
     // Payment-first flow: set state to pending_payment, notify customer to pay
     const toPayment = transition('requested', 'pending_payment')
     if (!toPayment.ok) {
-      await markFailed(db, result.bookingId, actor.id, toPayment.reason)
+      await markFailed(db, actor.businessId, result.bookingId, actor.id, toPayment.reason)
       return { ok: false, reason: 'Internal state error' }
     }
 
@@ -454,7 +454,7 @@ async function requestPrivateBooking(
   // Immediate confirmation flow (default)
   const toHeld = transition('requested', 'held')
   if (!toHeld.ok) {
-    await markFailed(db, result.bookingId, actor.id, toHeld.reason)
+    await markFailed(db, actor.businessId, result.bookingId, actor.id, toHeld.reason)
     return { ok: false, reason: 'Internal state error' }
   }
 
@@ -623,7 +623,7 @@ async function requestGroupClassBooking(
 
     if (holdResult.status !== 'held') {
       const reason = holdResult.status === 'error' ? holdResult.reason : 'Calendar slot conflict'
-      await markFailed(db, txResult.bookingId, actor.id, reason)
+      await markFailed(db, actor.businessId, txResult.bookingId, actor.id, reason)
       return { ok: false, reason: 'Could not create calendar event — please try again' }
     }
 
@@ -631,7 +631,7 @@ async function requestGroupClassBooking(
     // overwrites title + description with the live roster once the booking is stored.
     const confirmResult = await calendar.confirmHold(holdResult.eventId, service.name, '')
     if (confirmResult.status === 'error') {
-      await markFailed(db, txResult.bookingId, actor.id, 'Calendar confirm failed')
+      await markFailed(db, actor.businessId, txResult.bookingId, actor.id, 'Calendar confirm failed')
       return { ok: false, reason: 'Could not confirm calendar event — please try again' }
     }
 
@@ -703,6 +703,25 @@ export async function confirmBooking(
   customerName: string,
   opts?: { suppressOwnerNewBookingNotice?: boolean },
 ): Promise<BookingEngineResult> {
+  // ── Ordering + loser-resolution contract (T1.5, A4/P1) ───────────────────
+  //
+  // 1. Up-front guards: booking exists, auth, state='held', hold not expired,
+  //    eventId present.
+  // 2. Block re-validation (A4): load the business row, then call isSlotBookable
+  //    with includeBookings:false so the check targets owner blocks + availability
+  //    hours only (a block/personal row or out-of-hours created during the hold).
+  //    excludeBookingId:bookingId excludes this hold itself. Not bookable → fail
+  //    with markFailed; do NOT flip to confirmed.
+  // 3. CAS flip as the atomic arbiter (P1): UPDATE … WHERE id=? AND state='held'
+  //    RETURNING id. Exactly one concurrent caller flips; the other sees 0 rows.
+  // 4. Side effects (calendar.confirmHold, audit, recordCompletedBooking,
+  //    scheduleReminders, owner notice) are gated on the CAS winner (1 row).
+  //    Loser (0 rows) → re-read state:
+  //      - 'confirmed' (a concurrent confirm won) → ok:true idempotent success, NO side effects.
+  //      - anything else (expired/cancelled — hold-expiry or cancel won) → ok:false.
+  // 5. confirmHold failure after a successful flip: the booking is already confirmed
+  //    in the DB. Do NOT roll back. Log for reconciliation and still return ok:true.
+
   const [booking] = await db
     .select()
     .from(bookings)
@@ -732,6 +751,37 @@ export async function confirmBooking(
   const eventId = booking.calendarEventId
   if (!eventId) return { ok: false, reason: 'Booking has no calendar event' }
 
+  // ── A4: Re-validate blocks created during the hold ────────────────────────
+  // Load the business row (needed by isSlotBookable for timezone + available247).
+  // A4 makes block re-validation an INVARIANT: if the business row can't be loaded
+  // we must NOT silently confirm without it — a booking always references a real
+  // businessId, so a missing row is a genuine anomaly, not a normal degrade path.
+  const [business] = await db
+    .select()
+    .from(businesses)
+    .where(eq(businesses.id, actor.businessId))
+    .limit(1)
+
+  if (!business) return { ok: false, reason: 'Business not found' }
+
+  const bookable = await isSlotBookable(
+    db,
+    business,
+    { start: booking.slotStart, end: booking.slotEnd },
+    {
+      excludeBookingId: bookingId,   // exclude this hold itself
+      includeBookings: false,        // only blocks + availability hours (not competing bookings)
+    },
+  )
+  if (!bookable.bookable) {
+    await markFailed(db, actor.businessId, bookingId, actor.id, 'Slot blocked during hold')
+    return {
+      ok: false,
+      reason: "That time is no longer available — the studio blocked it. Let's find another.",
+    }
+  }
+
+  // ── Prepare calendar event content (before CAS so render errors bail early) ─
   const rendered = await buildOneOnOneEventContent(db, actor.businessId, {
     serviceTypeId: booking.serviceTypeId,
     customerId: booking.customerId,
@@ -740,16 +790,47 @@ export async function confirmBooking(
   const confirmTitle = rendered?.title ?? `${service?.name ?? 'Appointment'} — ${customerName}`
   const confirmDescription = rendered?.description ?? `${customerName}`
 
-  const confirmResult = await calendar.confirmHold(eventId, confirmTitle, confirmDescription)
+  // ── P1: CAS flip — the atomic arbiter ─────────────────────────────────────
+  // The WHERE predicate gates on state='held', so exactly one concurrent caller
+  // (confirm or hold-expiry) flips the row. The other sees 0 rows returned.
+  // ALL side effects (calendar write, audit, reminders, owner notice) are gated
+  // on 1 row returned.
+  const [flipped] = await db
+    .update(bookings)
+    .set({ state: 'confirmed', holdExpiresAt: null, updatedAt: new Date() })
+    .where(and(eq(bookings.id, bookingId), eq(bookings.state, 'held')))
+    .returning({ id: bookings.id })
 
-  if (confirmResult.status === 'error') {
-    return { ok: false, reason: 'Could not confirm calendar event — please try again' }
+  // ── Loser path (0 rows): a concurrent operation already flipped the row ────
+  if (!flipped) {
+    // Re-read to determine what happened.
+    const [current] = await db
+      .select({ state: bookings.state })
+      .from(bookings)
+      .where(eq(bookings.id, bookingId))
+      .limit(1)
+    if (current?.state === 'confirmed') {
+      // A concurrent confirm won — idempotent success, no side effects.
+      return { ok: true, bookingId, message: 'Booking confirmed.' }
+    }
+    // Hold expired or was cancelled while we were in flight.
+    return { ok: false, reason: 'Hold has expired — please start a new booking' }
   }
 
-  await db
-    .update(bookings)
-    .set({ state: 'confirmed', holdExpiresAt: null, googleEtag: confirmResult.etag ?? null, updatedAt: new Date() })
-    .where(eq(bookings.id, bookingId))
+  // ── Winner path: fire side effects ────────────────────────────────────────
+  // calendar.confirmHold runs AFTER the CAS so the DB state is canonical first.
+  // If it fails the booking is already confirmed — do NOT roll back, log and continue.
+  const confirmResult = await calendar.confirmHold(eventId, confirmTitle, confirmDescription)
+  if (confirmResult.status === 'error') {
+    console.error('[engine] confirmHold failed after state flip — booking confirmed in DB, calendar event not updated (id:', bookingId, ')')
+    // Update etag only if we have one; leave existing etag if confirmHold errored
+  } else {
+    // Store the updated etag from the successful confirmHold
+    await db
+      .update(bookings)
+      .set({ googleEtag: confirmResult.etag ?? null })
+      .where(eq(bookings.id, bookingId))
+  }
 
   await logAudit(db, {
     businessId: actor.businessId,
@@ -1157,14 +1238,22 @@ export async function finalizePaidBooking(
   return { ok: true, bookingId: booking.id, message: `Booking confirmed for ${customerPhone}.` }
 }
 
-async function markFailed(db: Db, bookingId: string, actorId: string, reason: string) {
+// Mark an in-flight booking as failed. The state predicate is load-bearing: it
+// must NEVER stomp a confirmed/terminal row. The A4 re-validation path in
+// confirmBooking calls this while the row is still 'held' — if a concurrent
+// confirm WON the CAS and flipped it to 'confirmed' in between, this UPDATE must
+// be a no-op (a confirmed booking has a live calendar event + scheduled reminders;
+// overwriting it to 'failed' is a data-integrity violation). Every existing caller
+// invokes this on a requested/held/pending_payment row, so the guard never blocks
+// a legitimate failure — it only closes the confirmed-stomp race.
+async function markFailed(db: Db, businessId: string, bookingId: string, actorId: string, reason: string) {
   await db
     .update(bookings)
     .set({ state: 'failed', updatedAt: new Date() })
-    .where(eq(bookings.id, bookingId))
+    .where(and(eq(bookings.id, bookingId), inArray(bookings.state, ['requested', 'held', 'pending_payment'])))
 
   await logAudit(db, {
-    businessId: '',
+    businessId,
     actorId,
     action: 'booking.failed',
     entityType: 'booking',
