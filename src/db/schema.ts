@@ -602,6 +602,16 @@ export const customerProfiles = pgTable('customer_profiles', {
   lastBookingAt: timestamp('last_booking_at', { withTimezone: true }),
   totalBookings: integer('total_bookings').notNull().default(0),
   notes: text('notes'),
+  // P4: snapshot of the most recently cancelled booking, so a follow-up "give me back the
+  // class we cancelled" can re-offer the exact slot — even across the session boundary
+  // (the cancel session is completed and a fresh session handles the restore).
+  lastCancelledBooking: jsonb('last_cancelled_booking').$type<{
+    bookingId: string
+    serviceTypeId: string
+    serviceName: string
+    slotStartIso: string
+  } | null>(),
+  lastCancelledAt: timestamp('last_cancelled_at', { withTimezone: true }),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
