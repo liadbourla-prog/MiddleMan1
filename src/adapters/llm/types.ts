@@ -33,6 +33,11 @@ export interface CustomerIntentOutput {
     afterHour: number | null // exclude slots starting at/after this business-local hour
     weekdays: number[] | null // exclude these business-local weekdays (0=Sun … 6=Sat)
   } | null
+  // True when the customer asks for an arrangement the standard catalog can't express:
+  // a PRIVATE version of a group class, a GROUP booking beyond a 1-on-1 service's
+  // capacity, an explicitly OUT-OF-HOURS session, or a bespoke event. Shape-only signal;
+  // the deterministic core confirms unfulfillability before any owner escalation.
+  specialArrangementRequest?: boolean
 }
 
 export interface ManagerInstructionOutput {

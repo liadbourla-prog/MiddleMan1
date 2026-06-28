@@ -51,7 +51,7 @@ async function generateConversational(request: GenRequest) {
   }
 }
 
-const customerIntentSchema = z.object({
+export const customerIntentSchema = z.object({
   intent: z.enum(['booking', 'rescheduling', 'cancellation', 'inquiry', 'list_bookings', 'system_explanation', 'unknown']).catch('unknown'),
   slotRequest: z
     .object({
@@ -97,6 +97,7 @@ const customerIntentSchema = z.object({
     })
     .nullable()
     .catch(null),
+  specialArrangementRequest: z.boolean().default(false).catch(false),
 })
 
 // Defensive normalization: gemini-2.5-flash sometimes emits snake_case top-level
@@ -188,6 +189,7 @@ Rules:
 - serviceTypeHint: extract the service name the customer mentions (e.g. "תספורת" → "תספורת", "haircut" → "Haircut"). null if none.
 - customerNameHint: the customer's OWN name when they introduce themselves ("I'm Guy Cohen", "this is Dana", "שמי גיא"). null if they don't state their own name. Never put a staff or third-party name here.
 - participantsHint: number of people if the customer states a party size ("for 3 people"/"לשלושה אנשים"→3). null if not stated.
+- specialArrangementRequest: true ONLY when the customer asks for something the standard service list can't provide as-is — a PRIVATE/one-off version of a normally-group class, a GROUP/party booking larger than a service allows, an explicitly OUTSIDE-OPENING-HOURS session, or a custom event ("private workshop", "just for my group", "after you close", "סדנה פרטית", "מחוץ לשעות הפעילות", "אירוע פרטי"). false for an ordinary booking, a normal party size, or merely asking about a time that happens to be unavailable. When in doubt, false.
 - detectedLanguage: "he" if message is in Hebrew; "en" for English or any other language.
 - Respond only with valid JSON matching the structure above. No explanation.`
 
