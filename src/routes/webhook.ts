@@ -49,6 +49,7 @@ import { generateProactiveCustomerMessage, generateManagerCommandReply, generate
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
 import { loadInstructorRoster, loadTeachingSchedule } from '../domain/provider/roster.js'
+import type { InstructorRosterEntry } from '../domain/provider/roster.js'
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
 import { withBusinessLock, withIdentityLock } from '../domain/flows/concurrency-lock.js'
@@ -627,9 +628,10 @@ async function routeCustomerMessage(
   const transcript = carriedTurns.length > 0 ? [...carriedTurns, ...sessionTranscript] : sessionTranscript
 
   // Skills dispatch — runs before booking engine; first matching skill short-circuits
-  const [businessKnowledge, workflowState] = await Promise.all([
+  const [businessKnowledge, workflowState, instructorRoster] = await Promise.all([
     loadBusinessKnowledge(db, business.id, business.currency),
     loadActiveWorkflow(db, identity.id),
+    loadInstructorRoster(db, business.id).catch((): InstructorRosterEntry[] => []),
   ])
 
   // Image handling — download only for skills that support photos; others get non-text reply
@@ -717,6 +719,7 @@ async function routeCustomerMessage(
     lang,
     businessKnowledge,
     isFirstMessage,
+    instructorRoster.map((r) => ({ name: r.name, services: r.services })),
   )
 
   // Conversation paused — manager is handling it; do not send any reply

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -166,5 +166,21 @@ describe('memoryForActiveService — Root D: do not switch service from cross-se
 
   it('returns null when the customer has no memory at all', () => {
     expect(memoryForActiveService({} as never, 'יוגה')).toBeNull()
+  })
+})
+
+describe('buildBusinessFacts — instructor roster', () => {
+  const svcs = [{ id: 'y', name: 'יוגה', durationMinutes: 60, maxParticipants: 8 }]
+  it('lists real instructors and forbids inventing others', () => {
+    const out = buildBusinessFacts(svcs, undefined, undefined, [
+      { name: 'דנה', services: ['יוגה'] }, { name: 'נועה', services: ['יוגה'] },
+    ])
+    expect(out).toContain('דנה')
+    expect(out).toContain('נועה')
+    expect(out).toMatch(/never name or invent|do not name|do NOT name|do NOT invent/i)
+  })
+  it('keeps the no-invent rule when the roster is empty', () => {
+    const out = buildBusinessFacts(svcs, undefined, undefined, [])
+    expect(out).toMatch(/do NOT name|do NOT invent/i)
   })
 })

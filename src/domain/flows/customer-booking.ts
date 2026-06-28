@@ -678,6 +678,7 @@ export function buildBusinessFacts(
   activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number }>,
   businessKnowledge: BusinessKnowledge | undefined,
   business: Business | undefined,
+  instructors: Array<{ name: string; services: string[] }> = [],
 ): string {
   if (activeServices.length === 0) {
     return 'This business has NO bookable services configured. Do not offer to book anything or invent any service; tell the customer to contact the business directly.'
@@ -693,7 +694,12 @@ export function buildBusinessFacts(
       : 'no price on record — do NOT quote a price'
     lines.push(`• ${s.name} — ${s.durationMinutes} min, ${model}, ${price}`)
   }
-  lines.push('Instructors/staff: do NOT name, list, suggest, or invent any instructor or staff member. If the customer names one, do not confirm or deny by name — say you will check with the business.')
+  if (instructors.length > 0) {
+    const list = instructors.map((i) => i.services.length > 0 ? `${i.name} (${i.services.join(', ')})` : i.name).join('; ')
+    lines.push(`Instructors (this is the COMPLETE list — never name or invent anyone else): ${list}. Do NOT proactively advertise who teaches what; only name an instructor if the customer asks.`)
+  } else {
+    lines.push('Instructors/staff: none on record — do NOT name, suggest, or invent any instructor. If the customer names one, say you will check with the business.')
+  }
   if (business?.maxBookingDaysAhead != null) {
     lines.push(`Bookings can be made up to ${business.maxBookingDaysAhead} days ahead — never claim a date within that window is "not open yet".`)
   }
@@ -714,6 +720,7 @@ export async function handleBookingFlow(
   businessDefaultLanguage?: 'he' | 'en',
   businessKnowledge?: BusinessKnowledge,
   isFirstMessage?: boolean,
+  instructorRoster?: Array<{ name: string; services: string[] }>,
 ): Promise<FlowResult> {
   let ctx = {
     ...(session.context as BookingFlowContext),
@@ -769,7 +776,7 @@ export async function handleBookingFlow(
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))
 
-  const businessFacts = buildBusinessFacts(activeServices, businessKnowledge, business)
+  const businessFacts = buildBusinessFacts(activeServices, businessKnowledge, business, instructorRoster ?? [])
   // L1 grounding: surface any real action involving this customer — chiefly a proactive
   // outreach the business just sent them — so a reply continues that thread instead of
   // cold-greeting, and never invents an action. Best-effort; never block a reply on it.
