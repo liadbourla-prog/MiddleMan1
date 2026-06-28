@@ -34,6 +34,12 @@ export interface WhatsAppWebhookPayload {
           type: string
           text?: { body: string }
           image?: { id: string; mime_type: string; caption?: string }
+          interactive?: {
+            type: string
+            button_reply?: { id: string; title: string }
+            list_reply?: { id: string; title: string }
+          }
+          button?: { text: string; payload?: string }
         }>
         // Delivery-status callbacks (sent/delivered/read/failed). A `failed` status is how Meta
         // reports an ASYNCHRONOUS delivery failure — e.g. re-engagement (code 131047) when a
