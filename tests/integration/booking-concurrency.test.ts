@@ -86,6 +86,8 @@ describe.skipIf(!integrationEnabled)('T1.1a — private booking advisory lock (c
   let customerId2: string
 
   beforeEach(async () => {
+    // calendarMode: 'internal' keeps the hold/placeHold path off real Google Calendar —
+    // no OAuth creds or network calls needed; the booking write-path is fully DB-local.
     biz = await seedBusiness({ available247: true, calendarMode: 'internal' })
     customerId1 = await seedCustomer(biz.businessId, freshPhone())
     customerId2 = await seedCustomer(biz.businessId, freshPhone())

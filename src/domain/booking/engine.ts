@@ -288,9 +288,6 @@ async function requestPrivateBooking(
   // and the existing A6 freebusy probe. This fix targets the dominant race.
   const result = await (db as unknown as { transaction: <T>(fn: (tx: typeof db) => Promise<T>) => Promise<T> })
     .transaction(async (tx) => {
-      // Serialize concurrent bookings for THIS exact slot — advisory lock is the
-      // correct slot-level mutex: no rows to FOR UPDATE when slot is free, so only
-      // an advisory lock prevents the phantom-insert race. Released at tx end.
       const lockKey = privateBookingLockKey(actor.businessId, request.slotStart.toISOString())
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`)
 
@@ -312,6 +309,10 @@ async function requestPrivateBooking(
             ),
           ),
         )
+        // Retained as defense-in-depth: the advisory lock above already serializes the
+        // free-slot race (the phantom-insert case FOR UPDATE could not cover). FOR UPDATE
+        // still adds value when the SELECT *does* find an already-conflicting row — it locks
+        // that row so a concurrent state-change can't slip past us. Belt-and-suspenders.
         .for('update')
         .limit(1)
 
