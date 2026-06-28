@@ -1,6 +1,5 @@
 import crypto from 'crypto'
 import type { InboundMessage, WhatsAppWebhookPayload } from './types.js'
-import { i18n } from '../../domain/i18n/t.js'
 
 const APP_SECRET = process.env['WHATSAPP_APP_SECRET'] ?? ''
 const VERIFY_TOKEN = process.env['WHATSAPP_WEBHOOK_VERIFY_TOKEN'] ?? ''
@@ -28,10 +27,10 @@ export function verifyWebhookChallenge(
 
 export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
   messages: InboundMessage[]
-  nonTextReplies: Array<{ toNumber: string; body: string }>
+  nonTextReplies: Array<{ recipientNumber: string; businessNumber: string }>
 } {
   const messages: InboundMessage[] = []
-  const nonTextReplies: Array<{ toNumber: string; body: string }> = []
+  const nonTextReplies: Array<{ recipientNumber: string; businessNumber: string }> = []
 
   for (const entry of payload.entry) {
     for (const change of entry.changes) {
@@ -96,9 +95,10 @@ export function normalizeWebhookPayload(payload: WhatsAppWebhookPayload): {
         }
 
         if (msg.type !== 'text' || !msg.text) {
-          // Sticker, voice note, video, etc. — reply with guidance
+          // Sticker, voice note, video, etc. — carry routing data only; body resolved in
+          // the route layer once the business language + credentials are known.
           if (fromNumber && toNumber) {
-            nonTextReplies.push({ toNumber: fromNumber, body: i18n.non_text_reply.he })
+            nonTextReplies.push({ recipientNumber: fromNumber, businessNumber: toNumber })
           }
           continue
         }

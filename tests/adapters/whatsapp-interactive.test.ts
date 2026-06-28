@@ -1,9 +1,13 @@
 /**
  * T4.2 — Parse interactive/button/list replies (INJ4/P7)
+ * T4.4 — Non-text reply shape carries routing data only; no hardcoded body (INJ5/F5)
  *
  * Contract: normalizeWebhookPayload must extract the customer-selected text from
  * interactive and button message types into `body`, routing them through the normal
  * InboundMessage path — NOT the non_text_reply dead-end.
+ *
+ * T4.4 contract: non-text replies now emit { recipientNumber, businessNumber } (no body).
+ * Body resolution (language + credentials) happens in routes/webhook.ts after DB lookup.
  *
  * Covered cases:
  *   - button_reply (interactive quick-reply tap) → body === title, nonTextReplies empty
@@ -11,9 +15,12 @@
  *   - button (template quick-reply) → body === button.text, nonTextReplies empty
  *   - malformed interactive (no title/text) → falls to non-text dead-end, no crash
  *   - regression: image, text, and true-non-text (sticker) still behave correctly
+ *   - non-text dead-end shape: { recipientNumber, businessNumber } — no body property
+ *   - i18n: non_text_reply.he and .en are single-language (no bilingual leak)
  */
 import { describe, it, expect } from 'vitest'
 import { normalizeWebhookPayload } from '../../src/adapters/whatsapp/webhook.js'
+import { i18n } from '../../src/domain/i18n/t.js'
 import type { WhatsAppWebhookPayload } from '../../src/adapters/whatsapp/types.js'
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -145,6 +152,10 @@ describe('normalizeWebhookPayload — malformed interactive (no crash, dead-end)
     const { messages, nonTextReplies } = normalizeWebhookPayload(payload)
     expect(messages).toHaveLength(0)
     expect(nonTextReplies).toHaveLength(1)
+    // T4.4: shape carries routing data only — no body baked in
+    expect(nonTextReplies[0]).toHaveProperty('recipientNumber')
+    expect(nonTextReplies[0]).toHaveProperty('businessNumber')
+    expect(nonTextReplies[0]).not.toHaveProperty('body')
   })
 
   it('interactive with button_reply.title empty string falls to non-text dead-end', () => {
@@ -159,6 +170,9 @@ describe('normalizeWebhookPayload — malformed interactive (no crash, dead-end)
     const { messages, nonTextReplies } = normalizeWebhookPayload(payload)
     expect(messages).toHaveLength(0)
     expect(nonTextReplies).toHaveLength(1)
+    expect(nonTextReplies[0]).toHaveProperty('recipientNumber')
+    expect(nonTextReplies[0]).toHaveProperty('businessNumber')
+    expect(nonTextReplies[0]).not.toHaveProperty('body')
   })
 
   it('button with empty text falls to non-text dead-end', () => {
@@ -170,6 +184,9 @@ describe('normalizeWebhookPayload — malformed interactive (no crash, dead-end)
     const { messages, nonTextReplies } = normalizeWebhookPayload(payload)
     expect(messages).toHaveLength(0)
     expect(nonTextReplies).toHaveLength(1)
+    expect(nonTextReplies[0]).toHaveProperty('recipientNumber')
+    expect(nonTextReplies[0]).toHaveProperty('businessNumber')
+    expect(nonTextReplies[0]).not.toHaveProperty('body')
   })
 })
 
@@ -214,7 +231,7 @@ describe('normalizeWebhookPayload — regression: existing message types', () =>
     expect(nonTextReplies).toHaveLength(0)
   })
 
-  it('sticker (true non-text) falls to non-text dead-end', () => {
+  it('sticker (true non-text) falls to non-text dead-end with routing-only shape', () => {
     const payload = makePayload({
       ...BASE_MSG,
       type: 'sticker',
@@ -223,9 +240,13 @@ describe('normalizeWebhookPayload — regression: existing message types', () =>
     const { messages, nonTextReplies } = normalizeWebhookPayload(payload)
     expect(messages).toHaveLength(0)
     expect(nonTextReplies).toHaveLength(1)
+    // T4.4: carries recipientNumber (customer) and businessNumber (PA number), no body
+    expect(nonTextReplies[0].recipientNumber).toBe('+972509999999')
+    expect(nonTextReplies[0].businessNumber).toBe('+972501234567')
+    expect(nonTextReplies[0]).not.toHaveProperty('body')
   })
 
-  it('voice note (true non-text) falls to non-text dead-end', () => {
+  it('voice note (true non-text) falls to non-text dead-end with routing-only shape', () => {
     const payload = makePayload({
       ...BASE_MSG,
       type: 'audio',
@@ -234,5 +255,42 @@ describe('normalizeWebhookPayload — regression: existing message types', () =>
     const { messages, nonTextReplies } = normalizeWebhookPayload(payload)
     expect(messages).toHaveLength(0)
     expect(nonTextReplies).toHaveLength(1)
+    expect(nonTextReplies[0].recipientNumber).toBe('+972509999999')
+    expect(nonTextReplies[0].businessNumber).toBe('+972501234567')
+    expect(nonTextReplies[0]).not.toHaveProperty('body')
+  })
+})
+
+// ─── T4.4: i18n.non_text_reply — per-language, no bilingual leak ────────────
+
+describe('i18n.non_text_reply — per-language strings (T4.4/F5 voice gate)', () => {
+  it('he and en strings are distinct (not the same string)', () => {
+    expect(i18n.non_text_reply.he).not.toBe(i18n.non_text_reply.en)
+  })
+
+  it('he string contains only Hebrew characters (no Latin alphabet — no bilingual leak)', () => {
+    // Allow emoji, digits, punctuation, spaces — but no a-z / A-Z
+    expect(i18n.non_text_reply.he).not.toMatch(/[a-zA-Z]/)
+  })
+
+  it('en string contains no Hebrew characters (no bilingual leak)', () => {
+    // Hebrew Unicode block: ֐–׿
+    expect(i18n.non_text_reply.en).not.toMatch(/[֐-׿]/)
+  })
+
+  it('he string does not read as a dead-end ("only understand text" pattern banned)', () => {
+    // Must NOT contain the old robotic "only understand text" phrasing or equivalent
+    expect(i18n.non_text_reply.he).not.toMatch(/רק הודעות טקסט/)
+    expect(i18n.non_text_reply.he).not.toMatch(/only understand/)
+  })
+
+  it('en string does not read as a dead-end ("only understand text" pattern banned)', () => {
+    expect(i18n.non_text_reply.en).not.toMatch(/only understand text/)
+    expect(i18n.non_text_reply.en).not.toMatch(/רק הודעות טקסט/)
+  })
+
+  it('en string invites the customer to continue (contains an invitation to type)', () => {
+    // Must include some form of invitation to type / describe / write
+    expect(i18n.non_text_reply.en.toLowerCase()).toMatch(/type|write|let me know|describe|just/)
   })
 })

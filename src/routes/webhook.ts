@@ -103,9 +103,12 @@ export async function webhookRoutes(app: FastifyInstance) {
       // optimistic "sent" is corrected and the owner is told honestly. Best-effort, never blocks.
       await handleDeliveryStatuses(request.body, app).catch((err) => app.log.warn({ err }, 'Delivery-status handling failed'))
 
-      // Reply to non-text messages immediately (no DB work needed)
-      for (const { toNumber, body } of nonTextReplies) {
-        await sendMessage({ toNumber, body }).catch(() => { /* fire-and-forget */ })
+      // Reply to non-text messages immediately.
+      // Resolve the business by PA number so the reply goes FROM the correct per-business
+      // number in the business's single configured language (fix INJ5/F5).
+      for (const { recipientNumber, businessNumber } of nonTextReplies) {
+        const nonTextPayload = await resolveNonTextReply(recipientNumber, businessNumber)
+        await sendMessage(nonTextPayload.message, nonTextPayload.creds).catch(() => { /* fire-and-forget */ })
       }
 
       for (const msg of messages) {
@@ -410,6 +413,52 @@ export function chooseAppSecret(
   }
 
   return { secret: trimmed, emptyStored: false }
+}
+
+/**
+ * T4.4 fix (INJ5/F5): Resolve the business-specific language, credentials, and reply body
+ * for a non-text reply so it goes FROM the correct per-business PA number in the
+ * business's single configured language (no bilingual leak).
+ *
+ * Exported for unit testing of the routing logic.
+ *
+ * Falls back safely when the business cannot be found (e.g. MiddleMan number) — uses
+ * the Hebrew string and no per-business credentials so the reply is still delivered
+ * rather than silently dropped, but the caller is not crashed.
+ */
+export async function resolveNonTextReply(
+  recipientNumber: string,
+  businessNumber: string,
+): Promise<{
+  message: { toNumber: string; body: string }
+  creds: { accessToken: string; phoneNumberId: string } | undefined
+}> {
+  try {
+    const [biz] = await db
+      .select({
+        defaultLanguage: businesses.defaultLanguage,
+        whatsappPhoneNumberId: businesses.whatsappPhoneNumberId,
+        whatsappAccessToken: businesses.whatsappAccessToken,
+      })
+      .from(businesses)
+      .where(eq(businesses.whatsappNumber, businessNumber))
+      .limit(1)
+
+    if (!biz) {
+      // Unknown business (e.g. MiddleMan number) — fall back to Hebrew with no per-biz creds
+      return { message: { toNumber: recipientNumber, body: i18n.non_text_reply.he }, creds: undefined }
+    }
+
+    const lang: Lang = (biz.defaultLanguage as Lang | null | undefined) ?? 'he'
+    const creds = biz.whatsappPhoneNumberId && biz.whatsappAccessToken
+      ? { accessToken: biz.whatsappAccessToken, phoneNumberId: biz.whatsappPhoneNumberId }
+      : undefined
+
+    return { message: { toNumber: recipientNumber, body: i18n.non_text_reply[lang] }, creds }
+  } catch {
+    // DB failure — fall back safely rather than crash
+    return { message: { toNumber: recipientNumber, body: i18n.non_text_reply.he }, creds: undefined }
+  }
 }
 
 /**
