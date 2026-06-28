@@ -626,6 +626,8 @@ function makeGenReply(
     //      fullness, RE-READ that day from the spine. If it has open options, the claim
     //      is a laundered lie regardless of what the situation text held — regenerate
     //      with the real options, then OCCUPANCY_FALLBACK. (Kills cross-turn laundering.)
+    //      Signal (a) returns early when a focusDay exists and the spine read fires, so
+    //      signal (b) only runs when there is no focusDay or the spine read was clean.
     //  (b) Situation signal (back-compat): open interior times present in the situation
     //      that the reply hides, now compared DAY-SCOPED so a cross-day HH:MM coincidence
     //      no longer spares a specific-slot false-full.
@@ -787,13 +789,20 @@ export async function handleBookingFlow(
   ])
   // Fresh-spine occupancy reader for the output gate: re-reads a focused day's real
   // class/slot availability so a "full" claim can never launder past makeGenReply
-  // without a current spine check. Best-effort: a failure reports "not open" (the gate
-  // simply doesn't fire — safe), never throws into the reply path.
+  // without a current spine check. `open` counts ONLY genuinely-open capacity (classes
+  // with spotsLeft > 0, or any private gap) — buildDayOptionsText's `offered` includes
+  // FULL classes too, so it must NOT be used as the open signal (that would misfire the
+  // gate on a genuinely full day and degrade a correct "fully booked" reply). We
+  // deliberately read WITHOUT negotiation constraints: the backstop only judges the
+  // truthfulness of a BLANKET "full" claim, and the fallback names no specific time, so
+  // a session-rejected-but-open slot should still prevent a false "the whole day is dead".
   const dayHasOpenOptions = async (dateStr: string, serviceTypeId?: string): Promise<{ open: boolean; text: string | null }> => {
     if (!business) return { open: false, text: null }
     try {
+      const day = await listDayOptions(db, business, dateStr, businessTimezone, serviceTypeId ? { serviceTypeId } : {})
+      const open = day.classes.some((c) => c.spotsLeft > 0) || day.privateOpenings.some((p) => p.slots.length > 0)
       const r = await buildDayOptionsText(db, business, dateStr, businessTimezone, serviceTypeId, undefined)
-      return { open: r.offered.length > 0, text: r.text }
+      return { open, text: r.text }
     } catch {
       return { open: false, text: null }
     }
