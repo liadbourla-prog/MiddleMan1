@@ -356,7 +356,9 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
       try {
         const burst = await flushBurst(business.id, identity.id, seq)
         if (!burst) return // a newer message arrived during the window — it owns the flush
-        await dispatchToRole(combineInbound(burst), identity, business, app)
+        // Pass identity.role so combineInbound applies Gate-2 sanitize to customer bursts
+        // (T4.7/INJ6 — defeats split-across-burst injection).
+        await dispatchToRole(combineInbound(burst, identity.role), identity, business, app)
       } catch (err) {
         app.log.error({ err, messageId: msg.messageId }, 'Coalesced burst flush failed')
         await notifyManagerOfError(msg, err instanceof Error ? err.message : String(err), app).catch(() => { /* fire-and-forget */ })
