@@ -58,6 +58,27 @@ export function validateSlotTiming(
   return null
 }
 
+// ── Advisory-lock key for private (1-on-1) booking slots ─────────────────────
+// Derives the Postgres advisory transaction lock key used by requestPrivateBooking
+// to serialize concurrent conflict-check+insert pairs for the same slot.
+//
+// I/O contract (pinned; the DB lock call is integration-level):
+//   • Same (businessId, slotStartIso) → identical key every time (deterministic).
+//   • Different slotStart → different key (distinct slots never share a lock).
+//   • Different businessId → different key (cross-business isolation).
+//   • Provider-agnostic: providerId is deliberately EXCLUDED from the key because
+//     the private conflict SELECT (engine.ts ~line 255) does NOT filter by providerId.
+//     Including providerId would make the lock FINER than the conflict check and let a
+//     same-slot/different-provider race slip through. The lock must be at least as
+//     coarse as the SELECT it guards.
+//   • Partial-overlap-but-different-start races remain a known residual (closed only
+//     by the optional T1.1b GiST EXCLUDE, out of scope here, and the existing A6
+//     freebusy probe). This key covers the dominant race: two customers grabbing the
+//     EXACT same advertised slot.
+export function privateBookingLockKey(businessId: string, slotStartIso: string): string {
+  return `${businessId}:${slotStartIso}`
+}
+
 // Map a spatial BookableReason to an upstream reason string. These are sanitised
 // into customer-facing wording by the Branch 4 flow (sanitiseReason); managers
 // see them via the orchestrator. Kept stable so REASON_MAP can phrase them.
@@ -248,10 +269,31 @@ async function requestPrivateBooking(
     : new Date(Date.now() + HOLD_EXPIRY_MINUTES * 60 * 1000)
 
   // Wrap conflict check + insert in a transaction to prevent race conditions.
-  // The SELECT uses FOR UPDATE on the bookings table to lock conflicting rows
-  // before we insert, eliminating the TOCTOU window.
+  // An advisory transaction lock (acquired at the top of the transaction, before any
+  // SELECT) serializes concurrent requestPrivateBooking calls for the SAME slot.
+  //
+  // Why FOR UPDATE alone is insufficient: when the slot is FREE the conflict SELECT
+  // returns zero rows, so FOR UPDATE locks nothing — two concurrent requests both see
+  // zero conflicts and both insert (TOCTOU double-book, finding A1, root P1).
+  //
+  // Fix (mirrors the group path at engine.ts:~line 501):
+  //   pg_advisory_xact_lock(hashtext(lockKey)::bigint)
+  //   where lockKey = `${businessId}:${slotStart.toISOString()}` (provider-agnostic —
+  //   see privateBookingLockKey docblock for the granularity rationale).
+  // Postgres releases the advisory lock automatically at transaction end.
+  //
+  // Residual: partial-overlap-but-different-start races (e.g. two bookings that
+  // overlap but start at different times) are NOT closed by this key and remain a
+  // known gap; they are addressed only by the optional T1.1b GiST EXCLUDE constraint
+  // and the existing A6 freebusy probe. This fix targets the dominant race.
   const result = await (db as unknown as { transaction: <T>(fn: (tx: typeof db) => Promise<T>) => Promise<T> })
     .transaction(async (tx) => {
+      // Serialize concurrent bookings for THIS exact slot — advisory lock is the
+      // correct slot-level mutex: no rows to FOR UPDATE when slot is free, so only
+      // an advisory lock prevents the phantom-insert race. Released at tx end.
+      const lockKey = privateBookingLockKey(actor.businessId, request.slotStart.toISOString())
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`)
+
       const conflicts = await tx
         .select({ id: bookings.id })
         .from(bookings)
