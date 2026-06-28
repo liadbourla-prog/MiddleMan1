@@ -74,3 +74,21 @@ describe('parseConfirmation — lenient affirmatives', () => {
     it(`'${t}' → no`, () => expect(parseConfirmation(t)).toBe('no'))
   }
 })
+
+describe('parseConfirmation — bundled yes + question', () => {
+  it('treats a leading yes with a trailing question as yes_with_question', () => {
+    expect(parseConfirmation('כן בבקשה, מי המורה דרך אגב?')).toBe('yes_with_question')
+    expect(parseConfirmation('yes please, who is the instructor?')).toBe('yes_with_question')
+  })
+  it('still treats a plain leading yes as yes', () => {
+    expect(parseConfirmation('כן בבקשה')).toBe('yes')
+    expect(parseConfirmation('yes book me please')).toBe('yes')
+  })
+  it('does NOT confirm a revision that changes the slot', () => {
+    expect(parseConfirmation('כן אבל ביום שלישי ב-19:00')).toBe('unclear')
+    expect(parseConfirmation('yes but make it Tuesday 19:00')).toBe('unclear')
+  })
+  it('does NOT confirm when a negation appears', () => {
+    expect(parseConfirmation('כן אבל לא בא לי, מתי עוד יש?')).toBe('unclear')
+  })
+})

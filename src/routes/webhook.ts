@@ -49,9 +49,10 @@ import { generateProactiveCustomerMessage, generateManagerCommandReply, generate
 import { dispatchSkill } from '../skills/index.js'
 import { loadBusinessKnowledge } from '../domain/skills/knowledge-resolver.js'
 import { loadInstructorRoster, loadTeachingSchedule } from '../domain/provider/roster.js'
+import type { InstructorRosterEntry } from '../domain/provider/roster.js'
 import { loadActiveWorkflow } from '../domain/skills/workflow-helpers.js'
 import { buildSkillContext } from '../domain/skills/context-builder.js'
-import { withBusinessLock } from '../domain/flows/concurrency-lock.js'
+import { withBusinessLock, withIdentityLock } from '../domain/flows/concurrency-lock.js'
 import { bufferInbound, flushBurst, combineInbound, shouldBypassCoalescing, debounceMsForRole, coalescingEnabled } from '../domain/flows/message-coalescer.js'
 import { findActiveByContact } from '../domain/coordination/repository.js'
 import { advanceFromContact, type BusinessCtx } from '../domain/coordination/handler.js'
@@ -552,6 +553,11 @@ async function routeCustomerMessage(
     return
   }
 
+  // Serialize concurrent turns from the same customer. Two messages arriving close
+  // together (past the burst-coalescer's debounce) would otherwise process in parallel
+  // and race on the session row. The session load/create MUST be inside the lock so a
+  // queued (serialized) turn re-reads the prior turn's committed session state.
+  await withIdentityLock(identity.id, async () => {
   // Load or create session — hydrate new sessions with customer memory
   let session = await loadActiveSession(db, identity.id)
   let isFirstMessage = false
@@ -622,9 +628,10 @@ async function routeCustomerMessage(
   const transcript = carriedTurns.length > 0 ? [...carriedTurns, ...sessionTranscript] : sessionTranscript
 
   // Skills dispatch — runs before booking engine; first matching skill short-circuits
-  const [businessKnowledge, workflowState] = await Promise.all([
+  const [businessKnowledge, workflowState, instructorRoster] = await Promise.all([
     loadBusinessKnowledge(db, business.id, business.currency),
     loadActiveWorkflow(db, identity.id),
+    loadInstructorRoster(db, business.id).catch((): InstructorRosterEntry[] => []),
   ])
 
   // Image handling — download only for skills that support photos; others get non-text reply
@@ -712,6 +719,7 @@ async function routeCustomerMessage(
     lang,
     businessKnowledge,
     isFirstMessage,
+    instructorRoster.map((r) => ({ name: r.name, services: r.services })),
   )
 
   // Conversation paused — manager is handling it; do not send any reply
@@ -757,6 +765,7 @@ async function routeCustomerMessage(
       app.log.warn({ err }, 'Failed to enqueue customer summary'),
     )
   }
+  })
 }
 
 async function routeManagerMessage(

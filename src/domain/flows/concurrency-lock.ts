@@ -75,3 +75,48 @@ export async function withBusinessLock<T>(
     await releaseLock(businessId, token)
   }
 }
+
+function customerLockKey(identityId: string): string {
+  return `lock:customer:${identityId}`
+}
+
+// The customer lock holds across a full Branch-4 turn, which can run several LLM calls
+// (intent extraction + genReply with up to two regenerations per output gate). Its TTL
+// must comfortably exceed the slowest realistic handler so the lock does not auto-expire
+// mid-turn and let a queued turn run concurrently (the race this lock prevents). Kept
+// separate from LOCK_TTL_MS (Branch 3, 30s) which has a different — enqueue-on-contention
+// — profile, so widening it here does not change the manager path.
+const CUSTOMER_LOCK_TTL_MS = 60_000
+
+async function acquireIdentityLock(identityId: string): Promise<string | null> {
+  const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const result = await redis.set(customerLockKey(identityId), token, 'PX', CUSTOMER_LOCK_TTL_MS, 'NX')
+  return result === 'OK' ? token : null
+}
+
+async function releaseIdentityLock(identityId: string, token: string): Promise<void> {
+  const script = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`
+  await redis.eval(script, 1, customerLockKey(identityId), token)
+}
+
+/**
+ * Run fn while holding a per-identity lock, SERIALIZING concurrent turns from the same
+ * customer (a customer turn must not be dropped — unlike Branch 3, which enqueues). On
+ * contention, poll for the lock up to ~8s; if still unavailable (a wedged holder), give
+ * up the lock-wait and run anyway so the customer is never left unanswered. This fully
+ * serializes turns separated by less than ~8s (the observed interleaving case); a handler
+ * slower than the poll budget may run concurrently with the next queued turn — an accepted
+ * tradeoff against ever leaving a customer waiting.
+ */
+export async function withIdentityLock<T>(identityId: string, fn: () => Promise<T>): Promise<T> {
+  let token: string | null = null
+  for (let i = 0; i < 40 && !token; i++) {
+    token = await acquireIdentityLock(identityId)
+    if (!token) await new Promise((r) => setTimeout(r, 200))
+  }
+  try {
+    return await fn()
+  } finally {
+    if (token) await releaseIdentityLock(identityId, token)
+  }
+}
