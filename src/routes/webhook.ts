@@ -379,10 +379,47 @@ async function dispatchToRole(
 }
 
 /**
+ * Pure helper (ID5 fix): decides which app secret to use for signature verification.
+ *
+ * An empty or whitespace-only stored secret is treated as ABSENT and falls back to the
+ * global secret. This prevents a misconfigured business row (whatsappAppSecret = '')
+ * from returning '' to verifySignature, which would silently fail verification for every
+ * inbound message from that business (HTTP 401/skip with no diagnostic).
+ *
+ * Returns `emptyStored: true` when the DB row has a non-null but blank secret so the
+ * caller (resolveAppSecret) can log a distinct, greppable warning about the misconfig.
+ *
+ * Trimming is safe: real WhatsApp App Secrets are hex strings with no surrounding
+ * whitespace. We trim defensively and return the trimmed value for legitimate secrets.
+ *
+ * @internal exported for unit testing only
+ */
+export function chooseAppSecret(
+  storedSecret: string | null | undefined,
+  globalSecret: string | undefined,
+): { secret: string | undefined; emptyStored: boolean } {
+  // null/undefined → straightforward absent, no warning needed
+  if (storedSecret == null) {
+    return { secret: globalSecret, emptyStored: false }
+  }
+
+  const trimmed = storedSecret.trim()
+  if (trimmed.length === 0) {
+    // non-null but blank: the business row exists but its secret is empty/whitespace (misconfig)
+    return { secret: globalSecret, emptyStored: true }
+  }
+
+  return { secret: trimmed, emptyStored: false }
+}
+
+/**
  * Resolves the correct App Secret for signature verification.
  * Different Meta apps (MiddleMan vs per-business PA numbers) have different App Secrets.
  * We extract the phone_number_id from the raw payload to look up the business's secret.
  * Falls back to the global WHATSAPP_APP_SECRET when no per-business secret is stored.
+ *
+ * ID5 fix: an empty/whitespace stored secret is treated as absent (falls back to global)
+ * and logs a distinct warning so the misconfiguration is visible in Cloud Logging.
  */
 async function resolveAppSecret(payload: WhatsAppWebhookPayload): Promise<string | undefined> {
   const globalSecret = process.env['WHATSAPP_APP_SECRET']
@@ -401,7 +438,15 @@ async function resolveAppSecret(payload: WhatsAppWebhookPayload): Promise<string
       .where(eq(businesses.whatsappPhoneNumberId, phoneNumberId))
       .limit(1)
 
-    return biz?.waAppSecret ?? globalSecret
+    const { secret, emptyStored } = chooseAppSecret(biz?.waAppSecret, globalSecret)
+
+    if (emptyStored) {
+      // Distinct, greppable warning — a business row exists but its app secret is blank (misconfig).
+      // resolveAppSecret does not have the Fastify logger in scope, so console.warn is intentional.
+      console.warn('[webhook] business has empty whatsappAppSecret; falling back to global', { phoneNumberId })
+    }
+
+    return secret
   } catch {
     return globalSecret
   }
