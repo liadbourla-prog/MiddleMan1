@@ -48,6 +48,18 @@ export const INITIATORS = {
     windowPolicy: 'skip',
     defaultEnabled: true,
   },
+  // Layer B — a customer asked for something the PA can't book on its own (private/
+  // group/out-of-hours/bespoke). Notifies the business owner so they can follow up.
+  'escalation.unfulfillable': {
+    id: 'escalation.unfulfillable',
+    layer: 'B',
+    audience: 'owner',
+    consentClass: 'transactional',
+    autonomy: 'owner_configured',
+    delivery: 'fire_and_forget',
+    windowPolicy: 'skip',
+    defaultEnabled: true,
+  },
 
   // Layer A — reshuffle outreach probe (customer, promotional, managed conversation).
   // Out-of-window sends use the approved `reshuffle_probe` template.

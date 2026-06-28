@@ -317,6 +317,10 @@ const strings = {
     he: (phone: string, msg: string) => `🔔 *פנייה מ-${phone}*\n"${msg}"\n\nענו HANDLED ${phone} לסגירה.`,
     en: (phone: string, msg: string) => `🔔 *Escalation from ${phone}*\n"${msg}"\n\nReply HANDLED ${phone} once resolved.`,
   },
+  escalation_manager_notify_unfulfillable: {
+    he: (phone: string, request: string) => `📩 לקוח (${phone}) ביקש משהו שה-PA לא יכול לסגור לבד:\n"${request}"\nכדאי לחזור אליו ישירות.`,
+    en: (phone: string, request: string) => `📩 A customer (${phone}) asked for something the PA can't book on its own:\n"${request}"\nWorth reaching out directly.`,
+  },
 
   // ── Manager error / system messages ──────────────────────────────────────────
   manager_classify_error: {
