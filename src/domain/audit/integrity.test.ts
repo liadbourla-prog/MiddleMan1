@@ -19,6 +19,7 @@ function booking(over: Partial<BookingSnapshot> = {}): BookingSnapshot {
     rescheduledFrom: over.rescheduledFrom ?? null,
     holdExpiresAt: over.holdExpiresAt ?? null,
     isGroup: over.isGroup ?? false,
+    maxParticipants: over.maxParticipants ?? 1,
     ...(over.createdAt !== undefined ? { createdAt: over.createdAt } : {}),
   }
 }
@@ -386,5 +387,122 @@ describe('runIntegrityChecks', () => {
       bookings: [booking({ id: 'b1', state: 'requested', createdAt: oldCreatedAt })],
     })
     expect(kinds(s)).not.toContain('stranded_requested')
+  })
+
+  // ── INV-11 capacity_exceeded (A3 / P1) ──────────────────────────────────────
+  // Group-class slots where active participant count exceeds maxParticipants.
+
+  it('INV-11 flags a group class with 9 active bookings against a cap of 8 as critical capacity_exceeded', () => {
+    const cap = 8
+    const classBookings = Array.from({ length: 9 }, (_, i) =>
+      booking({
+        id: `b${i + 1}`,
+        serviceTypeId: 'yoga',
+        slotStart: T0,
+        slotEnd: new Date(T0.getTime() + HOUR),
+        isGroup: true,
+        maxParticipants: cap,
+        // createdAt ascending so newest is last
+        createdAt: new Date(T0.getTime() - (9 - i) * 60_000),
+      }),
+    )
+    const s = snapshot({ bookings: classBookings })
+    const findings = runIntegrityChecks(s)
+    const f = findings.find((x) => x.kind === 'capacity_exceeded')
+    expect(f).toBeDefined()
+    expect(f!.severity).toBe('critical')
+    expect(f!.detail['count']).toBe(9)
+    expect(f!.detail['capacity']).toBe(8)
+    expect(f!.detail['excessBookingIds']).toHaveLength(1) // 1 over cap
+    // The dedupKey is stable across runs
+    expect(f!.dedupKey).toBe(`capacity_exceeded:yoga:${T0.toISOString()}`)
+    // autoRemediable is false (no system-role cancel in V1)
+    expect(f!.autoRemediable).toBe(false)
+  })
+
+  it('INV-11 excess list is newest-first (highest createdAt first)', () => {
+    const cap = 2
+    const classBookings = [
+      booking({ id: 'oldest', serviceTypeId: 'yoga', slotStart: T0, isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 300_000) }),
+      booking({ id: 'middle', serviceTypeId: 'yoga', slotStart: T0, isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 200_000) }),
+      booking({ id: 'newest', serviceTypeId: 'yoga', slotStart: T0, isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 100_000) }),
+    ]
+    const s = snapshot({ bookings: classBookings })
+    const f = runIntegrityChecks(s).find((x) => x.kind === 'capacity_exceeded')
+    expect(f).toBeDefined()
+    // excess = 1 booking beyond cap=2, newest first
+    expect(f!.detail['excessBookingIds']).toEqual(['newest'])
+  })
+
+  it('INV-11 does NOT fire when active bookings exactly equal maxParticipants (8/8)', () => {
+    const cap = 8
+    const classBookings = Array.from({ length: 8 }, (_, i) =>
+      booking({
+        id: `b${i + 1}`,
+        serviceTypeId: 'yoga',
+        slotStart: T0,
+        isGroup: true,
+        maxParticipants: cap,
+        createdAt: new Date(T0.getTime() - (8 - i) * 60_000),
+      }),
+    )
+    const s = snapshot({ bookings: classBookings })
+    expect(kinds(s)).not.toContain('capacity_exceeded')
+  })
+
+  it('INV-11 does NOT fire for a private double-book on different services (stays double_book, not capacity_exceeded)', () => {
+    // Two confirmed bookings for different services at the same slot — this is a double_book, not capacity_exceeded
+    const s = snapshot({
+      bookings: [
+        booking({ id: 'b1', serviceTypeId: 'svc1', slotStart: T0, slotEnd: new Date(T0.getTime() + HOUR), isGroup: false, maxParticipants: 1 }),
+        booking({ id: 'b2', serviceTypeId: 'svc2', slotStart: T0, slotEnd: new Date(T0.getTime() + HOUR), isGroup: false, maxParticipants: 1 }),
+      ],
+    })
+    const fs = runIntegrityChecks(s)
+    expect(fs.some((x) => x.kind === 'double_book')).toBe(true)
+    expect(fs.some((x) => x.kind === 'capacity_exceeded')).toBe(false)
+  })
+
+  it('INV-11 G1-guard: legitimate class co-bookings up to capacity are NOT flagged (regression guard)', () => {
+    const cap = 5
+    const classBookings = Array.from({ length: 5 }, (_, i) =>
+      booking({
+        id: `b${i + 1}`,
+        serviceTypeId: 'pilates',
+        slotStart: T0,
+        isGroup: true,
+        maxParticipants: cap,
+        createdAt: new Date(T0.getTime() - (5 - i) * 60_000),
+      }),
+    )
+    const s = snapshot({ bookings: classBookings })
+    // No capacity_exceeded (at cap exactly), and no double_book (same class instance)
+    expect(kinds(s)).not.toContain('capacity_exceeded')
+    expect(kinds(s)).not.toContain('double_book')
+  })
+
+  it('INV-11 only counts ACTIVE bookings (cancelled/expired seats are ignored)', () => {
+    const cap = 2
+    const classBookings = [
+      booking({ id: 'b1', serviceTypeId: 'yoga', slotStart: T0, isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 300_000) }),
+      booking({ id: 'b2', serviceTypeId: 'yoga', slotStart: T0, isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 200_000) }),
+      booking({ id: 'b3', serviceTypeId: 'yoga', slotStart: T0, state: 'cancelled', isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 100_000) }),
+    ]
+    const s = snapshot({ bookings: classBookings })
+    // 2 active (b1, b2), 1 cancelled (b3) — at cap, no finding
+    expect(kinds(s)).not.toContain('capacity_exceeded')
+  })
+
+  it('INV-11 slotStart in dedupKey is the ISO string of the slot (stable)', () => {
+    const cap = 1
+    const s = snapshot({
+      bookings: [
+        booking({ id: 'b1', serviceTypeId: 'svc', slotStart: T0, isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 200_000) }),
+        booking({ id: 'b2', serviceTypeId: 'svc', slotStart: T0, isGroup: true, maxParticipants: cap, createdAt: new Date(T0.getTime() - 100_000) }),
+      ],
+    })
+    const f = runIntegrityChecks(s).find((x) => x.kind === 'capacity_exceeded')
+    expect(f!.dedupKey).toBe(`capacity_exceeded:svc:${T0.toISOString()}`)
+    expect(f!.slotStart).toEqual(T0)
   })
 })

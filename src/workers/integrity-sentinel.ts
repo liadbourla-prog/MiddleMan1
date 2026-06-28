@@ -146,6 +146,7 @@ function buildSnapshot(
       holdExpiresAt: b.holdExpiresAt,
       createdAt: b.createdAt,
       isGroup: (b.maxParticipants ?? 1) > 1,
+      maxParticipants: b.maxParticipants ?? 1,
     })),
     googleEvents,
     knownBlockEventIds: blockRows.map((r) => r.googleEventId).filter((x): x is string => !!x),
@@ -401,6 +402,7 @@ function describeFinding(f: IntegrityFinding, lang: Lang, businessName: string):
     out_of_hours: 'a booking sits inside a break / blocked time',
     unmirrored: 'an event saved here has not synced to Google Calendar yet',
     stranded_requested: 'a booking request got stuck and its slot may be blocked',
+    capacity_exceeded: 'a group class has more active bookings than its participant cap',
   }
   const he: Record<string, string> = {
     double_book: 'שתי הזמנות חופפות באותו זמן',
@@ -411,6 +413,7 @@ function describeFinding(f: IntegrityFinding, lang: Lang, businessName: string):
     out_of_hours: 'הזמנה נמצאת בתוך הפסקה / זמן חסום',
     unmirrored: 'אירוע שנשמר כאן עדיין לא סונכרן ל-Google Calendar',
     stranded_requested: 'בקשת הזמנה נתקעה והחריץ עשוי להיות חסום',
+    capacity_exceeded: 'שיעור קבוצתי נרשמו אליו יותר משתתפים ממגבלת הכיתה',
   }
   const desc = (lang === 'he' ? he : en)[f.kind] ?? f.kind
   return lang === 'he'
