@@ -7,7 +7,7 @@ import { GoogleGenAI, Type, FunctionCallingConfigMode } from '@google/genai'
 import type { Content, FunctionDeclaration } from '@google/genai'
 import { and, desc, eq } from 'drizzle-orm'
 import { db } from '../../db/client.js'
-import { managerMemory, identities, businesses as businessesTable } from '../../db/schema.js'
+import { managerMemory, identities, businesses as businessesTable, serviceTypes } from '../../db/schema.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../../domain/authorization/check.js'
 import { buildInstructorRosterBlock, buildTeachingScheduleBlock, type InstructorRosterEntry, type TeachingSlot } from '../../domain/provider/roster.js'
@@ -658,6 +658,32 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
 
 // ── System prompt builder ─────────────────────────────────────────────────────
 
+// Authoritative, closed-world list of what the business ACTUALLY offers — built from
+// the live `service_types` rows (the same operational source of truth customers book
+// against), NOT from the curated brand description / FAQs, which can lag reality. The
+// orchestrator otherwise inferred "services" from the knowledge block, so when a
+// service was added later (e.g. physiotherapy) the FAQ doc didn't mention it and the
+// PA confidently DENIED a real, bookable service — while Branch 4 correctly offered
+// it. This block grounds Branch 3 in the same truth and is marked as overriding.
+function buildActiveServicesBlock(
+  services: Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number }>,
+): string {
+  if (services.length === 0) {
+    return '## Services offered (authoritative)\nThis business has NO active bookable services configured. Do not claim any service is offered.'
+  }
+  const lines = services.map((s) => {
+    const model = s.schedulingMode === 'class'
+      ? (s.maxParticipants > 1 ? `group class, up to ${s.maxParticipants}` : 'class')
+      : '1-on-1 appointment'
+    return `- ${s.name} (${model})`
+  })
+  return [
+    '## Services offered (authoritative — the COMPLETE list of what customers can book right now)',
+    'This comes from the live booking configuration and OVERRIDES anything implied by the business description or FAQs below. Never deny a service listed here, and never claim a service exists if it is not here. If the owner asks what is offered, answer from THIS list.',
+    ...lines,
+  ].join('\n')
+}
+
 function buildBusinessKnowledgeBlock(bk: BusinessKnowledge | null): string {
   if (!bk?.brandVoice && (!bk?.faqs || bk.faqs.length === 0)) return ''
 
@@ -692,6 +718,7 @@ function buildSystemPrompt(params: {
   timezone: string
   lang: Lang
   businessKnowledge: BusinessKnowledge | null
+  activeServices: Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number }>
   instructorRoster: InstructorRosterEntry[]
   teachingSchedule: TeachingSlot[]
   managerMemorySummaries: string[]
@@ -701,7 +728,7 @@ function buildSystemPrompt(params: {
   bookingAuthority: 'auto' | 'owner_approval'
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, outreachIdentity, bookingAuthority, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, activeServices, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, outreachIdentity, bookingAuthority, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -716,6 +743,7 @@ function buildSystemPrompt(params: {
   const language = lang === 'he' ? 'Hebrew' : 'English'
 
   const knowledgeBlock = buildBusinessKnowledgeBlock(businessKnowledge)
+  const servicesBlock = buildActiveServicesBlock(activeServices)
   const rosterBlock = buildInstructorRosterBlock(instructorRoster, lang)
   const teachingScheduleBlock = buildTeachingScheduleBlock(teachingSchedule, lang)
 
@@ -787,6 +815,7 @@ When the owner asks how many people are booked for a session, who is booked, or 
 
 ## Reflect committed reality — never ask to approve what is already done
 The "What actually happened" block below is the single source of truth about what customers have done. If it shows a customer already booked, cancelled, or changed an appointment themselves, that is FINAL and committed — the customer was already told. REFLECT it to the owner as a done fact ("Yoni already booked Pilates himself for Sunday 17:00"). NEVER ask the owner to approve, confirm, or re-book something the ground truth shows is already done, and never tell the owner an action is "still pending" or "waiting" when the block shows it completed. The first committed action wins; your job is to report it truthfully, not to re-litigate it.
+${servicesBlock ? `\n${servicesBlock}` : ''}
 ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 ${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
@@ -1089,6 +1118,15 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     .limit(1)
     .catch(() => [undefined as { mode: 'business' | 'owner_name' | null; bookingAuthority: 'auto' | 'owner_approval' } | undefined])
   const bookingAuthority: 'auto' | 'owner_approval' = bizRow?.bookingAuthority ?? 'auto'
+
+  // Authoritative active-service list (source of truth = service_types), so the owner
+  // is never told a real bookable service doesn't exist (or a removed one still does).
+  const activeServices = await db
+    .select({ name: serviceTypes.name, schedulingMode: serviceTypes.schedulingMode, maxParticipants: serviceTypes.maxParticipants })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.isActive, true)))
+    .orderBy(serviceTypes.createdAt)
+    .catch(() => [] as Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number }>)
   const ownerNameOnFile = mgrName?.name && mgrName.name.trim().toLowerCase() !== 'owner' ? mgrName.name.trim() : null
   const outreachIdentity = bizRow?.mode === 'business'
     ? `When reaching out on the owner's behalf, introduce yourself as "${businessName}".`
@@ -1101,6 +1139,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     timezone,
     lang,
     businessKnowledge,
+    activeServices,
     instructorRoster,
     teachingSchedule,
     managerMemorySummaries,
