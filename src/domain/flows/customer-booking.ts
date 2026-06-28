@@ -1522,16 +1522,30 @@ async function handleBookingIntent(
   // unworkable date/time (keep the service), reset the counter, and nudge toward a
   // call while staying open to keep trying. One continuous session, state intact.
   const nudgeAfterRepeatedTries = async (): Promise<FlowResult> => {
+    // Only nudge toward a phone call when the spine GENUINELY has nothing — never on a
+    // string of fabricated/empty turns. If real options exist, surface them instead.
+    const svcId = draft.serviceTypeId
+    const next = business
+      ? await suggestNextClassesText(db, business, svcId, businessTimezone, ctx.negotiationConstraints).catch(() => NO_SUGGESTION)
+      : NO_SUGGESTION
     const { dateStr: _droppedDate, time: _droppedTime, ...keptDraft } = draft
-    await updateSessionContext(
-      db, session.id,
-      { ...ctx, slotDraft: keptDraft, clarificationAttempts: 0 },
-      'waiting_clarification',
-    )
+    if (next.text) {
+      await updateSessionContext(db, session.id, {
+        ...ctx, slotDraft: keptDraft, clarificationAttempts: 0,
+        ...(next.offered.length > 0 ? { lastOfferedSlots: next.offered } : {}),
+      }, 'waiting_clarification')
+      const reply = await genReply({
+        businessTimezone,
+        businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+        situation: `The customer has gone back and forth on dates/times. Don't suggest a phone call — there ARE real upcoming options: ${next.text} Offer these and ask which they'd like. Do NOT say anything is full.`,
+      })
+      return { reply, sessionComplete: false }
+    }
+    await updateSessionContext(db, session.id, { ...ctx, slotDraft: keptDraft, clarificationAttempts: 0 }, 'waiting_clarification')
     const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
-      situation: 'The customer has struggled to land on a workable date/time after several tries. Warmly suggest it might be quickest to sort out by phone with the business — but stay open: invite them to just name another day and you will keep trying. Do NOT end the conversation or say goodbye.',
+      situation: 'The customer has struggled to land on a workable date/time after several tries, and there are genuinely no upcoming openings to offer. Warmly suggest it might be quickest to sort out by phone with the business — but stay open: invite them to name another day and you will keep trying. Do NOT end the conversation or say goodbye.',
     })
     return { reply, sessionComplete: false }
   }
