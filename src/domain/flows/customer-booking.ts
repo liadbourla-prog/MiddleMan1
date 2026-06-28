@@ -22,7 +22,7 @@ import type { FlowResult, BookingFlowContext } from './types.js'
 import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 import type { HydratedContext } from '../session/hydration.js'
-import { checkOwnerEscalationRules, escalateToPlatform } from '../escalation/engine.js'
+import { checkOwnerEscalationRules, escalateToPlatform, escalateUnfulfillableRequest } from '../escalation/engine.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
@@ -1445,6 +1445,32 @@ async function rebuildOnSlotPivot(
   )
 }
 
+// P3: when the customer asks for an arrangement the catalog can't express (private/
+// group/out-of-hours — flagged by the LLM as `specialArrangementRequest`) and the
+// deterministic core has confirmed it's unfulfillable, notify the owner once per session
+// and tell the customer it's been passed on. Returns a FlowResult to short-circuit the
+// reject/clarify branch, or null to keep today's behaviour (no flag, no business, or
+// already escalated this session).
+export async function maybeEscalateSpecial(
+  db: Db,
+  business: Business | undefined,
+  ctx: BookingFlowContext,
+  session: ActiveSession,
+  identity: ResolvedIdentity,
+  intent: CustomerIntentOutput,
+  transcript: TranscriptTurn[],
+  lang: 'he' | 'en',
+): Promise<FlowResult | null> {
+  if (!business || !intent.specialArrangementRequest || ctx.specialRequestEscalated) return null
+  const lastCustomer = [...transcript].reverse().find((t) => t.role === 'customer')?.text
+  const requestText = intent.summary ?? lastCustomer ?? 'a special arrangement'
+  const { customerReply } = await escalateUnfulfillableRequest(db, business, identity.phoneNumber, requestText, lang)
+  // Keep the session OPEN (the customer may continue) but mark it escalated so we never
+  // re-notify the owner for the same conversation.
+  await updateSessionContext(db, session.id, { ...ctx, specialRequestEscalated: true }, 'active')
+  return { reply: customerReply ?? '', sessionComplete: false, escalated: true }
+}
+
 // ── Intent handlers ───────────────────────────────────────────────────────────
 
 async function handleBookingIntent(
@@ -1613,6 +1639,10 @@ async function handleBookingIntent(
 
   // Party-size vs service model: don't silently confirm "yoga for 3" on a 1-on-1.
   if (draft.participants != null && draft.participants > 1 && svc.maxParticipants === 1) {
+    // A genuine special-arrangement request (e.g. "private session for 5") → pass it to
+    // the owner instead of dead-ending with "it's 1-on-1".
+    const esc = await maybeEscalateSpecial(db, business, ctx, session, identity, intent, transcript, lang)
+    if (esc) return esc
     const { participants: _dropParticipants, ...draftKeep } = draft
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
     const reply = await genReply({
@@ -1623,6 +1653,8 @@ async function handleBookingIntent(
     return { reply, sessionComplete: false }
   }
   if (draft.participants != null && draft.participants > svc.maxParticipants && svc.maxParticipants > 1) {
+    const esc = await maybeEscalateSpecial(db, business, ctx, session, identity, intent, transcript, lang)
+    if (esc) return esc
     const { participants: _dropParticipants, ...draftKeep } = draft
     await updateSessionContext(db, session.id, { ...ctx, slotDraft: draftKeep, clarificationAttempts: attempts + 1 }, 'waiting_clarification')
     const reply = await genReply({
@@ -1660,6 +1692,14 @@ async function handleBookingIntent(
   }
 
   if (timingError || outsideHours) {
+    // A genuine "private session OUTSIDE opening hours" request → pass it to the owner
+    // rather than just bouncing the customer to in-hours slots. Only when the time is
+    // actually out-of-hours (not a past/buffer timingError) and the LLM flagged a
+    // special arrangement; an ordinary bad-time keeps today's "here are real openings".
+    if (outsideHours && !timingError) {
+      const esc = await maybeEscalateSpecial(db, business, ctx, session, identity, intent, transcript, lang)
+      if (esc) return esc
+    }
     // Drop the bad time, keep date + service, and offer real openings immediately.
     const { time: _dropTime, ...draftKeep } = draft
     const suggestion = business

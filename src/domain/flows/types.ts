@@ -133,6 +133,9 @@ export interface BookingFlowContext {
   isReschedulingFlow?: boolean
   botPersona?: 'female' | 'male' | 'neutral'
   sessionUnknownCount?: number
+  // Set once a genuine special-arrangement request (private/group/out-of-hours) has been
+  // escalated to the owner this session, so we notify them at most once per conversation.
+  specialRequestEscalated?: boolean
   // Language: override locks the language for the session; offerPending means the inline offer was appended last turn
   languageOverride?: 'he' | 'en'
   languageSwitchOfferPending?: boolean
