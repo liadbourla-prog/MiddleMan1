@@ -70,7 +70,12 @@ export function resetMockApp(): void { _mockApp = createMockApp() }
 
 // ── Core simulate function ────────────────────────────────────────────────────
 
-export async function sim(ctx: SimContext, body: string, appOverride?: MockApp): Promise<SimResponse> {
+export async function sim(
+  ctx: SimContext,
+  body: string,
+  appOverride?: MockApp,
+  imageOpts?: { imageMediaId?: string; imageMediaType?: string },
+): Promise<SimResponse> {
   const app = appOverride ?? _mockApp
 
   const msg: InboundMessage = {
@@ -80,6 +85,8 @@ export async function sim(ctx: SimContext, body: string, appOverride?: MockApp):
     body,
     timestamp: new Date(),
     rawPayload: null,
+    ...(imageOpts?.imageMediaId ? { imageMediaId: imageOpts.imageMediaId } : {}),
+    ...(imageOpts?.imageMediaType ? { imageMediaType: imageOpts.imageMediaType } : {}),
   }
 
   const captured: string[] = []
