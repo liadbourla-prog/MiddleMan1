@@ -318,3 +318,39 @@ describe('buildBusinessFacts — instructor roster', () => {
     expect(out).toMatch(/do NOT name|do NOT invent/i)
   })
 })
+
+describe('buildBusinessFacts — service narrative grounding (T2b.1, H13/H15)', () => {
+  it('surfaces an owner-authored narrative so the attribute is answerable without a relay', () => {
+    const svcs = [{ id: 'p', name: 'Apparatus Pilates', durationMinutes: 50, maxParticipants: 4, narrative: 'Apparatus pilates uses reformers — spring-loaded carriages for resistance work.' }]
+    const out = buildBusinessFacts(svcs, undefined, undefined, [])
+    // The owner's own words are present, so the model can answer "what equipment?" from real facts.
+    expect(out).toContain('reformers')
+    expect(out).toContain('Apparatus Pilates')
+  })
+  it('a service with no narrative surfaces no attribute text (the relay/no-invent path stays the only honest route)', () => {
+    const svcs = [{ id: 'y', name: 'Yoga', durationMinutes: 60, maxParticipants: 8 }]
+    const out = buildBusinessFacts(svcs, undefined, undefined, [])
+    expect(out).not.toContain('reformers')
+    // No fabricated attribute block is emitted when the owner never authored one.
+    expect(out).not.toMatch(/equipment|uses |details:/i)
+  })
+  it('mixes narrated and un-narrated services without leaking one onto the other', () => {
+    const svcs = [
+      { id: 'p', name: 'Apparatus Pilates', durationMinutes: 50, maxParticipants: 4, narrative: 'uses reformers' },
+      { id: 'y', name: 'Yoga', durationMinutes: 60, maxParticipants: 8 },
+    ]
+    const out = buildBusinessFacts(svcs, undefined, undefined, [])
+    expect(out).toContain('reformers')
+    // The narrative is attached to its own service line, not the other one.
+    const yogaLine = out.split('\n').find((l) => l.includes('Yoga')) ?? ''
+    expect(yogaLine).not.toContain('reformers')
+  })
+})
+
+describe('buildActiveServicesBlock — Branch-3 narrative parity (T2b.1)', () => {
+  it('surfaces the same owner-authored narrative in the manager-facing services block', () => {
+    const src = readFileSync(new URL('../../adapters/llm/orchestrator.ts', import.meta.url), 'utf8')
+    // The Branch-3 services block must consume narrative so the two grounders do not diverge.
+    expect(src).toMatch(/buildActiveServicesBlock[\s\S]{0,400}narrative/)
+  })
+})

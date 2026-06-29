@@ -763,7 +763,7 @@ export function makeGenReply(
 // no-invented-staff rule + the real booking-horizon policy. This is the ground
 // truth that overrides anything the transcript implies (kills C3/C4).
 export function buildBusinessFacts(
-  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number }>,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; maxParticipants: number; narrative?: string | null }>,
   businessKnowledge: BusinessKnowledge | undefined,
   business: Business | undefined,
   instructors: Array<{ name: string; services: string[] }> = [],
@@ -781,6 +781,13 @@ export function buildBusinessFacts(
       ? `${k.price}${k.currency ? ' ' + k.currency : ''}`
       : 'no price on record — do NOT quote a price'
     lines.push(`• ${s.name} — ${s.durationMinutes} min, ${model}, ${price}`)
+    // T2b.1: surface the owner-authored narrative closed-world. This is the studio's own
+    // words about the service (equipment, level, what to expect) — the model may answer
+    // from it verbatim instead of inventing or relaying. Attached to ITS service line so a
+    // narrated service never leaks attributes onto an un-narrated one. When absent, nothing
+    // is emitted: the only honest route stays "answer from facts, else relay" (no invention).
+    const narrative = s.narrative?.trim()
+    if (narrative) lines.push(`   ↳ ${s.name} — about this service (owner's own description, treat as authoritative): ${narrative}`)
   }
   if (instructors.length > 0) {
     const list = instructors.map((i) => i.services.length > 0 ? `${i.name} (${i.services.join(', ')})` : i.name).join('; ')
@@ -935,6 +942,7 @@ export async function handleBookingFlow(
       maxParticipants: serviceTypes.maxParticipants,
       category: serviceTypes.category,
       schedulingMode: serviceTypes.schedulingMode,
+      narrative: serviceTypes.narrative,
     })
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, identity.businessId), eq(serviceTypes.isActive, true)))

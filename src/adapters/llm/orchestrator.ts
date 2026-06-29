@@ -685,16 +685,21 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
 // PA confidently DENIED a real, bookable service — while Branch 4 correctly offered
 // it. This block grounds Branch 3 in the same truth and is marked as overriding.
 function buildActiveServicesBlock(
-  services: Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number }>,
+  services: Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number; narrative?: string | null }>,
 ): string {
   if (services.length === 0) {
     return '## Services offered (authoritative)\nThis business has NO active bookable services configured. Do not claim any service is offered.'
   }
-  const lines = services.map((s) => {
+  const lines = services.flatMap((s) => {
     const model = s.schedulingMode === 'class'
       ? (s.maxParticipants > 1 ? `group class, up to ${s.maxParticipants}` : 'class')
       : '1-on-1 appointment'
-    return `- ${s.name} (${model})`
+    const out = [`- ${s.name} (${model})`]
+    // T2b.1: surface the owner-authored narrative closed-world so Branch 3 grounds on the
+    // same real attribute text as Branch 4 (no divergence between the two service blocks).
+    const narrative = s.narrative?.trim()
+    if (narrative) out.push(`  · ${s.name} — about this service (owner's own description): ${narrative}`)
+    return out
   })
   return [
     '## Services offered (authoritative — the COMPLETE list of what customers can book right now)',
@@ -737,7 +742,7 @@ function buildSystemPrompt(params: {
   timezone: string
   lang: Lang
   businessKnowledge: BusinessKnowledge | null
-  activeServices: Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number }>
+  activeServices: Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number; narrative?: string | null }>
   instructorRoster: InstructorRosterEntry[]
   teachingSchedule: TeachingSlot[]
   managerMemorySummaries: string[]
@@ -1359,11 +1364,11 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
   // Authoritative active-service list (source of truth = service_types), so the owner
   // is never told a real bookable service doesn't exist (or a removed one still does).
   const activeServices = await db
-    .select({ name: serviceTypes.name, schedulingMode: serviceTypes.schedulingMode, maxParticipants: serviceTypes.maxParticipants })
+    .select({ name: serviceTypes.name, schedulingMode: serviceTypes.schedulingMode, maxParticipants: serviceTypes.maxParticipants, narrative: serviceTypes.narrative })
     .from(serviceTypes)
     .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.isActive, true)))
     .orderBy(serviceTypes.createdAt)
-    .catch(() => [] as Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number }>)
+    .catch(() => [] as Array<{ name: string; schedulingMode: 'appointment' | 'class'; maxParticipants: number; narrative: string | null }>)
   const ownerNameOnFile = mgrName?.name && mgrName.name.trim().toLowerCase() !== 'owner' ? mgrName.name.trim() : null
   const outreachIdentity = bizRow?.mode === 'business'
     ? `When reaching out on the owner's behalf, introduce yourself as "${businessName}".`
