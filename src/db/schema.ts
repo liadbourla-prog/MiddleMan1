@@ -545,6 +545,10 @@ export const conversationSessions = pgTable(
       enum: ['active', 'waiting_confirmation', 'waiting_clarification', 'completed', 'expired', 'failed'],
     }).notNull(),
     context: jsonb('context').notNull().default({}),
+    // B3 (T1.9, migration 0051): optimistic-concurrency token. updateSessionContext bumps it
+    // on every write; a CAS write that expects a stale version is rejected so a fail-open
+    // second turn can't clobber newer in-flight booking state.
+    contextVersion: integer('context_version').notNull().default(0),
     lastMessageAt: timestamp('last_message_at', { withTimezone: true }).notNull(),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),

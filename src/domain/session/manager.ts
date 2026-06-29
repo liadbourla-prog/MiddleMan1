@@ -59,6 +59,7 @@ export async function loadActiveSession(
     intent: row.intent ?? 'unknown',
     state: row.state,
     context: (row.context as Record<string, unknown>) ?? {},
+    contextVersion: row.contextVersion ?? 0,
     expiresAt: row.expiresAt,
   }
 }
@@ -108,17 +109,28 @@ export async function createSession(
     intent: row.intent ?? 'unknown',
     state: row.state,
     context: {},
+    contextVersion: row.contextVersion ?? 0,
     expiresAt: row.expiresAt,
   }
 }
 
+// B3 (T1.9): the in-lock session-context write is an OPTIMISTIC compare-and-set.
+//
+// Every write bumps `context_version` so a concurrent writer can detect it. When the caller
+// passes `expectedVersion` (the version it read at load time), the write is gated on the
+// version being unchanged — a fail-open second turn (withIdentityLock releases after ~8s) that
+// read an older version is REJECTED (returns false) instead of silently clobbering the newer
+// in-flight booking state. When `expectedVersion` is omitted the write is unconditional (the
+// pre-existing last-write-wins behavior) but STILL bumps the version, so a concurrent CAS
+// writer against the old version still loses. Returns whether the write was applied.
 export async function updateSessionContext(
   db: Db,
   sessionId: string,
   context: Record<string, unknown>,
   state?: SessionState,
   expiryMinutes?: number,
-): Promise<void> {
+  expectedVersion?: number,
+): Promise<boolean> {
   // Mid-flow states get a longer idle grace (unless the caller set an explicit
   // window) so a customer pausing mid-booking doesn't lose their slot.
   const minutes = expiryMinutes
@@ -126,15 +138,35 @@ export async function updateSessionContext(
       ? MID_FLOW_EXPIRY_MINUTES
       : undefined)
 
-  await db
+  const setClause = {
+    context,
+    contextVersion: sql`${conversationSessions.contextVersion} + 1`,
+    ...(state !== undefined ? { state } : {}),
+    lastMessageAt: new Date(),
+    expiresAt: expiryFromNow(minutes),
+  }
+
+  if (expectedVersion === undefined) {
+    await db
+      .update(conversationSessions)
+      .set(setClause)
+      .where(eq(conversationSessions.id, sessionId))
+    return true
+  }
+
+  // CAS path: only write if the version is still the one we read. Under READ COMMITTED, a
+  // concurrent winner that bumps the version first makes this UPDATE's predicate fail on
+  // re-evaluation → 0 rows → rejected.
+  const applied = await db
     .update(conversationSessions)
-    .set({
-      context,
-      ...(state !== undefined ? { state } : {}),
-      lastMessageAt: new Date(),
-      expiresAt: expiryFromNow(minutes),
-    })
-    .where(eq(conversationSessions.id, sessionId))
+    .set(setClause)
+    .where(and(
+      eq(conversationSessions.id, sessionId),
+      eq(conversationSessions.contextVersion, expectedVersion),
+    ))
+    .returning({ id: conversationSessions.id })
+
+  return applied.length > 0
 }
 
 export async function completeSession(db: Db, sessionId: string): Promise<void> {

@@ -228,4 +228,33 @@ describe('WS1 session-lifecycle races (real Redis + real Postgres)', () => {
         .where(eq(conversationSessions.identityId, cid))
     })
   })
+
+  // ───────────────────────────── S-B3 (B3, GREEN) ───────────────────────────
+  // Optimistic context CAS. Two turns both loaded the session at version V (the fail-open race
+  // where withIdentityLock released after ~8s) and both try to write slotDraft with
+  // expectedVersion=V. Exactly one CAS write applies (version → V+1); the stale one is REJECTED
+  // (returns false), never silently clobbering the winner's newer in-flight booking state.
+  describe('S-B3 — optimistic context CAS rejects a stale write', () => {
+    it('two concurrent same-version CAS writes: one applies, one rejected, across rounds', async () => {
+      for (let r = 0; r < ROUNDS; r++) {
+        const cid = await seedCustomer(biz.businessId, freshPhone())
+        const session = await createSession(db, biz.businessId, cid, 'booking') // contextVersion 0
+
+        const results = await raceN(
+          (d) => updateSessionContext(d, session.id, { slotDraft: `r${r}` }, undefined, undefined, session.contextVersion),
+          2,
+        )
+
+        // Exactly one write applied; the stale-version write was rejected (not a silent clobber).
+        expect(results.filter((x) => x === true)).toHaveLength(1)
+        expect(results.filter((x) => x === false)).toHaveLength(1)
+        // The version advanced by exactly one — only the winning write took effect.
+        const [row] = await db.select({ v: conversationSessions.contextVersion })
+          .from(conversationSessions).where(eq(conversationSessions.id, session.id)).limit(1)
+        expect(Number(row?.v)).toBe(1)
+
+        await completeSession(db, session.id)
+      }
+    })
+  })
 })
