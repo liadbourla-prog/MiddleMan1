@@ -11,6 +11,7 @@ import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
+import { observeVoiceTells } from './voice-guard.js'
 import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability, extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
 import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
@@ -718,6 +719,7 @@ function makeGenReply(
   actionLedger: string,
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
   dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
+  businessId?: string,
 ): GenReply {
   return async (input, opts = {}) => {
     const grounded = {
@@ -727,7 +729,7 @@ function makeGenReply(
     }
     let reply = await generateCustomerReply(grounded)
     const replySurfacesAnyTime = (text: string): boolean => extractClockTimes(text).length > 0
-    if (opts.bookingConfirmed) return reply
+    if (opts.bookingConfirmed) return observeVoiceTells(reply, { businessId, language: input.language })
 
     // Gate 1 — phantom booking-confirmed claim.
     if (assertsBookingConfirmed(reply, input.language)) {
@@ -771,9 +773,10 @@ function makeGenReply(
             ...grounded,
             situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}${spine.text ? ` Real open options: ${spine.text}` : ''}`,
           })
-          return assertsNoAvailability(corrected) && !replySurfacesAnyTime(corrected)
+          const out = assertsNoAvailability(corrected) && !replySurfacesAnyTime(corrected)
             ? OCCUPANCY_FALLBACK[input.language]
             : corrected
+          return observeVoiceTells(out, { businessId, language: input.language }, { isSafeFallback: out === OCCUPANCY_FALLBACK[input.language] })
         }
       }
       // (b) situation signal, day-scoped
@@ -797,7 +800,11 @@ function makeGenReply(
       }
     }
 
-    return reply
+    return observeVoiceTells(reply, { businessId, language: input.language }, {
+      isSafeFallback: reply === FABRICATED_TIME_FALLBACK[input.language]
+        || reply === OCCUPANCY_FALLBACK[input.language]
+        || reply === BOOKING_NOT_CONFIRMED_FALLBACK[input.language],
+    })
   }
 }
 
@@ -945,7 +952,7 @@ export async function handleBookingFlow(
       return { open: false, text: null }
     }
   }
-  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions)
+  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i

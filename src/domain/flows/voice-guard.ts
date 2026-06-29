@@ -181,3 +181,40 @@ const DETECTORS: ReadonlyArray<readonly [BotTell, (text: string) => boolean]> = 
 export function detectBotTells(text: string): BotTell[] {
   return DETECTORS.filter(([, fn]) => fn(text)).map(([tell]) => tell)
 }
+
+// ── Gate 7 observer (MONITOR-ONLY) ─────────────────────────────────────────
+// Regen is OFF by default. The flag is read into a const that is never true in
+// this wave; the regen body is intentionally absent (see TODO below). When the
+// flag is ever enabled, the regenerate-once path lands behind it.
+const VOICE_REGEN_ENABLED = process.env.VOICE_REGEN_ENABLED === '1'
+
+/**
+ * Observe Branch-4 reply for mechanical bot-tells and LOG when present.
+ * MONITOR-ONLY: returns `reply` byte-for-byte, never mutates or regenerates.
+ *
+ * Intentional safe-fallback strings (FABRICATED_TIME_FALLBACK / OCCUPANCY_FALLBACK)
+ * are deliberately terse — exempt them from the dead-end tell so the monitor isn't
+ * flooded. Other tells, if any, are still logged.
+ */
+export function observeVoiceTells(
+  reply: string,
+  ctx: { businessId?: string | undefined; language: 'he' | 'en' },
+  opts?: { isSafeFallback?: boolean },
+): string {
+  let tells = detectBotTells(reply)
+  if (opts?.isSafeFallback) tells = tells.filter((t) => t !== 'dead_end')
+  if (tells.length > 0) {
+    console.warn('[voice-gate] bot-tell detected (monitor-only)', {
+      businessId: ctx.businessId, gate: 'voice', tells, draftExcerpt: reply.slice(0, 200),
+    })
+  }
+  // MONITOR-ONLY: never mutate the reply here. TODO(voice-regen): when VOICE_REGEN_ENABLED
+  // (default OFF) is set AND the Gemini-vs-Claude model decision is made, regenerate once
+  // with a corrective instruction citing the violated Voice Bible rule and ship the BETTER
+  // of the two — "better" = passes fabrication AND has fewer mechanical tells, never
+  // "warmer but unbacked". Counts against the unified per-turn regeneration cap (WS5).
+  if (VOICE_REGEN_ENABLED) {
+    // No-op in this wave: the regenerate path is intentionally not implemented yet.
+  }
+  return reply
+}
