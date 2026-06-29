@@ -549,7 +549,16 @@ export const conversationSessions = pgTable(
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('sessions_identity_state_idx').on(t.identityId, t.state)],
+  (t) => [
+    index('sessions_identity_state_idx').on(t.identityId, t.state),
+    // B4 (T1.8d, migration 0050): at most ONE non-terminal session per identity — the DB
+    // backstop behind loadActiveSession's newest-first selection. A second concurrent
+    // createSession for the same identity raises 23505, which createSession recovers from
+    // by re-loading the existing live session.
+    uniqueIndex('conversation_sessions_one_active_idx')
+      .on(t.identityId)
+      .where(sql`${t.state} in ('active', 'waiting_confirmation', 'waiting_clarification')`),
+  ],
 )
 
 export const managerInstructions = pgTable('manager_instructions', {
