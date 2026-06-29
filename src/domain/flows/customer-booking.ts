@@ -27,7 +27,7 @@ import { recordLastCancellation, loadLastCancellation } from '../customer/profil
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
-import { listDayOptions, type ClassSession } from '../availability/day-options.js'
+import { listDayOptions, type ClassSession, type DayOptions } from '../availability/day-options.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
@@ -274,6 +274,14 @@ interface SuggestionResult {
 }
 const NO_SUGGESTION: SuggestionResult = { text: null, offered: [] }
 
+// H1: the lower bound for a same-day availability search. Floors at the START of the
+// requested business-local day (so an already-taken 14:00 still surfaces an open 10:00
+// the same day), but never reaches into the past — clamped to `now`. Pure + unit-tested.
+export function dayStartFloor(requestedStart: Date, now: Date, tz: string): Date {
+  const dayStart = resolveSlotStart(localParts(requestedStart, tz).dateStr, { hour: 0, minute: 0 }, tz)
+  return dayStart.getTime() > now.getTime() ? dayStart : now
+}
+
 // Enumerate up to 4 real bookable openings for a service, starting from the
 // requested time, over the next 14 days. Returns compact human text for the LLM to
 // phrase plus the concrete slots offered. Uses the canonical availability spine so
@@ -289,7 +297,9 @@ async function suggestOpenSlotsText(
 ): Promise<SuggestionResult> {
   const durationMinutes = Math.max(15, Math.round((requestedEnd.getTime() - requestedStart.getTime()) / 60_000))
   const now = new Date()
-  const from = requestedStart.getTime() > now.getTime() ? requestedStart : now
+  // H1: floor the search at the START of the requested DAY (never in the past), not at
+  // the requested CLOCK time — so a taken 14:00 still surfaces an open 10:00 the SAME day.
+  const from = dayStartFloor(requestedStart, now, tz)
   const to = new Date(from.getTime() + 14 * 24 * 60 * 60_000)
   try {
     // Over-fetch then subtract rejected/avoided times so we still surface up to 4 FRESH
@@ -392,8 +402,27 @@ async function buildDayOptionsText(
   serviceTypeId: string | undefined,
   constraints?: NegotiationConstraints,
   timeOfDay?: TimeOfDay | null,
+  offerable = false,
 ): Promise<SuggestionResult> {
   const day = await listDayOptions(db, business, dateStr, tz, serviceTypeId ? { serviceTypeId } : {})
+  return renderDayOptions(day, dateStr, tz, { offerable, ...(timeOfDay != null ? { timeOfDay } : {}), ...(constraints != null ? { constraints } : {}) })
+}
+
+// PURE renderer for an already-fetched DayOptions — the human-facing facts string plus the
+// concrete `offered` slots. Split out of buildDayOptionsText so it's unit-testable (no DB).
+//
+// Two modes:
+//   offerable:false (GROUNDING) — current behavior unchanged. FULL classes are LISTED with a
+//     "(full)" label and pushed to `offered` (so grounding/no-availability checks see them).
+//   offerable:true (CUSTOMER OFFER) — full classes (spotsLeft <= 0) are DROPPED entirely: they
+//     appear in neither the text nor `offered`, so the PA can never present an unpickable slot.
+export function renderDayOptions(
+  day: DayOptions,
+  dateStr: string,
+  tz: string,
+  opts: { offerable: boolean; timeOfDay?: TimeOfDay | null; constraints?: NegotiationConstraints },
+): SuggestionResult {
+  const { offerable, timeOfDay, constraints } = opts
   const dayLabel = formatLocalDate(dateStr, tz)
   const parts: string[] = []
   const offered: RejectedSlot[] = []
@@ -406,7 +435,9 @@ async function buildDayOptionsText(
     timeOfDay ? ds.filter((d) => startInBucket(d, tz, timeOfDay)) : ds
 
   // Drop class instances and private openings the customer already ruled out this session.
-  const classes = byBucket(filterOpenSlots(day.classes, constraints, tz))
+  // In offerable mode, additionally drop FULL classes — they must never be presented.
+  let classes = byBucket(filterOpenSlots(day.classes, constraints, tz))
+  if (offerable) classes = classes.filter((c) => c.spotsLeft > 0)
   if (classes.length > 0) {
     const items = classes.slice(0, 10).map((c) => {
       offered.push({ start: c.start.toISOString(), end: c.end.toISOString(), serviceTypeId: c.serviceTypeId })
