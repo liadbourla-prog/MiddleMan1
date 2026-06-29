@@ -7,6 +7,7 @@ import {
   hasStackedQuestions,
   hasGrovel,
   hasDeadEnd,
+  hasActionFabrication,
   detectBotTells,
   type BotTell,
 } from './voice-guard.js'
@@ -175,5 +176,35 @@ describe('detectBotTells', () => {
     const tells = detectBotTells('I sincerely apologize. What day? What time?')
     expect(tells).toContain<BotTell>('grovel')
     expect(tells).toContain<BotTell>('stacked_questions')
+  })
+})
+
+// Gate 4 (F3a/F3b/S3) — action-fabrication: an LLM reply that CLAIMS an escalation/follow-up
+// the PA can't self-perform. Honest escalation replies come from code templates and bypass
+// this gate, so any such claim here is the model fabricating a follow-up with no backing.
+describe('hasActionFabrication (Gate 4)', () => {
+  const fabrications = [
+    "I'll check with the studio and get back to you.",
+    "I've asked the owner — one of our guides will get back to you with the answer.",
+    'אחזור אליך עם תשובה מדויקת.',
+    'בדקתי את זה מול הסטודיו, אין לי את המידע.',
+    'העברתי את השאלה למנהל.',
+    'אחד המדריכים יחזור אליך.',
+  ]
+  for (const t of fabrications) {
+    it(`flags: "${t.slice(0, 32)}…"`, () => expect(hasActionFabrication(t)).toBe(true))
+  }
+  const clean = [
+    'יש שיעור יוגה היום ב-16:00. מתאים לך?',
+    'We have classes at 10:00 and 12:00 — which works for you?',
+    'אין לי את המידע הזה כרגע — הכי טוב לפנות ישירות לעסק.',
+  ]
+  for (const t of clean) {
+    it(`clean: "${t.slice(0, 32)}…"`, () => expect(hasActionFabrication(t)).toBe(false))
+  }
+  it('is a SEPARATE signal — NOT in the mechanical detectBotTells aggregator (a backed escalation hand-off must pass the voice bar)', () => {
+    // A warm, backed hand-off reads clean to the mechanical detectors; action-fabrication is
+    // monitored separately (Gate 4) because text alone can't prove it's unbacked.
+    expect(detectBotTells("I'll check and get back to you")).not.toContain('action_fabrication')
   })
 })

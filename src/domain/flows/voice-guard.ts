@@ -159,6 +159,25 @@ export function hasDeadEnd(text: string): boolean {
   return true
 }
 
+// Gate 4 (F3a/F3b/S3) — ACTION FABRICATION. A reply that CLAIMS the PA took an action it
+// cannot self-perform — asked/checked with the owner, reached out, "I'll get back to you",
+// "one of our guides will" — is honest ONLY when a real escalation produced it. The honest
+// escalation replies are emitted by CODE (i18n templates) and bypass makeGenReply, so any
+// such claim reaching THIS detector (which runs on LLM genReply output) is a fabrication: the
+// model promising a follow-up with no backing dispatch. Monitor-only, like the other tells.
+const ACTION_FABRICATION_RE: RegExp[] = [
+  /\bi(?:'ll| will|'m going to| am going to)\s+(?:check|ask|find out|look into|get back|reach out)/i,
+  /\bi(?:'ve| have)?\s*(?:asked|checked with|reached out|passed (?:it|this|your)|forwarded (?:it|this|your))/i,
+  /\b(?:get|getting)\s+back\s+to\s+you\b/i,
+  /\bone of (?:our|the)\s+(?:guides|instructors|team|staff|trainers)\s+will\b/i,
+  /אחזור אלי(?:ך|כם)/, /נחזור אלי(?:ך|כם)/, /יחזור אלי(?:ך|כם)/, /יחזרו אלי(?:ך|כם)/,
+  /אבדוק (?:מול|עם|את זה|ואחזור)/, /בדקתי (?:מול|עם|את זה)/, /שאלתי את/, /העברתי (?:את|ל)/, /פניתי (?:אל|ל)/,
+  /אחד המדריכים/,
+]
+export function hasActionFabrication(text: string): boolean {
+  return !!text && ACTION_FABRICATION_RE.some((re) => re.test(text))
+}
+
 // ── Aggregator ─────────────────────────────────────────────────────────────
 export type BotTell =
   | 'numbered_menu'
@@ -168,6 +187,7 @@ export type BotTell =
   | 'stacked_questions'
   | 'grovel'
   | 'dead_end'
+  | 'action_fabrication'
 
 const DETECTORS: ReadonlyArray<readonly [BotTell, (text: string) => boolean]> = [
   ['numbered_menu', hasNumberedMenu],
@@ -178,6 +198,11 @@ const DETECTORS: ReadonlyArray<readonly [BotTell, (text: string) => boolean]> = 
   ['grovel', hasGrovel],
   ['dead_end', hasDeadEnd],
 ]
+// NOTE: hasActionFabrication is deliberately NOT in this aggregator. A warm, BACKED escalation
+// hand-off ("passed it to the studio, they'll get back to you") reads great and is honest, so
+// it must not fail the mechanical-voice quality bar (detectBotTells / the golden set). It is a
+// fabrication signal, monitored SEPARATELY in observeVoiceTells (Gate 4) — and only ever sees
+// LLM output there, since the honest escalation replies are code templates that bypass it.
 
 /** Every bot-tell that fires for `text`. Empty array → clean. */
 export function detectBotTells(text: string): BotTell[] {
@@ -208,6 +233,14 @@ export function observeVoiceTells(
   if (tells.length > 0) {
     console.warn('[voice-gate] bot-tell detected (monitor-only)', {
       businessId: ctx.businessId, gate: 'voice', tells, draftExcerpt: reply.slice(0, 200),
+    })
+  }
+  // Gate 4 (F3a/F3b/S3) — action-fabrication, a SEPARATE signal from the mechanical tells.
+  // Honest escalation hand-offs are code templates that never reach this observer; a reply
+  // here is LLM output, so a check/ask/"get back to you" claim is unbacked. Monitor-only.
+  if (!opts?.isSafeFallback && hasActionFabrication(reply)) {
+    console.warn('[voice-gate] action-fabrication detected (monitor-only)', {
+      businessId: ctx.businessId, gate: 'gate4', tell: 'action_fabrication', draftExcerpt: reply.slice(0, 200),
     })
   }
   // MONITOR-ONLY: never mutate the reply here. TODO(voice-regen): when VOICE_REGEN_ENABLED
