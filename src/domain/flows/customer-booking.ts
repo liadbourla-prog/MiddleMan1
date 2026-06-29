@@ -2753,25 +2753,42 @@ async function handleHoldConfirmation(
     return { reply, sessionComplete: true }
   }
 
-  // Private session — hold placed, ask for a final confirmation (plain words)
-  const newCtx: BookingFlowContext = {
-    ...ctx,
-    pendingBookingId: result.bookingId,
-    awaitingConfirmationFor: 'hold',
+  // Private session — hold placed. F1b/S1: the customer ALREADY said yes (we only reach
+  // requestBooking here on a 'yes'), so confirm IMMEDIATELY instead of asking a second time.
+  // The old flow set pendingBookingId + re-asked "lock it in?", producing the double-confirm
+  // ("to book?" then "lock it in?") — one yes must be one confirm, mirroring the class path.
+  const confirmAfterHold = await confirmBooking(
+    db, calendar, identity, result.bookingId,
+    (ctx as unknown as Record<string, string>)['displayName'] ?? 'Customer',
+    { suppressOwnerNewBookingNotice: Boolean(ctx.rescheduledFrom) },
+  )
+  await completeSession(db, session.id)
+  if (!confirmAfterHold.ok) {
+    const reply = await genReply({
+      businessTimezone,
+      businessName,
+      language: lang,
+      situation: `The booking could not be finalised because ${sanitiseReason(confirmAfterHold.reason)}. Apologise and suggest they try again or contact the business directly.`,
+      transcript,
+      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+      customerMemory: extractMemory(ctx),
+    })
+    return { reply, sessionComplete: true }
   }
-  await updateSessionContext(db, session.id, newCtx, 'waiting_confirmation')
-
-  const heldDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
-  const heldTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
+  // New booking committed — release any slot it replaces (reschedule).
+  await releaseSupersededBooking(db, calendar, identity, ctx, result.bookingId)
+  const confirmedDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
+  const confirmedTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
   const reply = await genReply({
     businessTimezone,
     businessName,
     language: lang,
-    situation: `Slot successfully held for ${pendingSlot.serviceName} on ${heldDate} at ${heldTime}. Ask the customer to confirm they want it locked in — naturally, no menu.`,
+    situation: `Booking confirmed for ${pendingSlot.serviceName} on ${confirmedDate} at ${confirmedTime}.`,
     transcript,
+    ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
     customerMemory: extractMemory(ctx),
-  })
-  return { reply, sessionComplete: false }
+  }, { bookingConfirmed: true })
+  return { reply, sessionComplete: true }
 }
 
 async function handleClarification(

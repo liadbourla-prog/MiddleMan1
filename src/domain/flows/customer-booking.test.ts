@@ -153,6 +153,21 @@ describe('promotableOfferedSlots — never reject the slot under active confirma
   })
 })
 
+// F1b/S1 — an appointment used to require TWO yeses: handleBookingIntent asked "to book?",
+// the yes placed a hold and asked AGAIN "lock it in?", the second yes confirmed. The
+// customer only reaches the private-hold path on a 'yes', so it must confirm IMMEDIATELY
+// (one yes = one confirm), mirroring the class direct-confirm path.
+describe('single-confirm appointment path — no double-confirm (F1b)', () => {
+  it('the private-hold path confirms immediately rather than re-asking', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    // The old second-ask situation string is gone.
+    expect(src).not.toContain('Ask the customer to confirm they want it locked in')
+    // The private hold is confirmed in the same turn and reported as a booking.
+    expect(src).toMatch(/confirmAfterHold = await confirmBooking\(/)
+    expect(src).toMatch(/Booking confirmed for \$\{pendingSlot\.serviceName\}/)
+  })
+})
+
 describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
   it('this-turn day wins over draft and lastInquiry', () => {
     expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')
