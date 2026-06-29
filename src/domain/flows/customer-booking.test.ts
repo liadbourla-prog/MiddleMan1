@@ -214,6 +214,30 @@ describe('ask-the-owner sentinel + de-fabrication (F3a/F3b)', () => {
   })
 })
 
+describe('ASK_STUDIO escape hatch on explanation + default paths (T2b.2, H15 mid-conversation)', () => {
+  const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+  // Isolate each path's body so an assertion can't be satisfied by the inquiry path's wiring.
+  const explanationBody = src.slice(src.indexOf("case 'system_explanation'"), src.indexOf("default: {"))
+  const defaultBody = src.slice(src.indexOf("default: {"), src.indexOf('})()'))
+
+  it("the system_explanation path carries the ASK_STUDIO escape hatch and relays on the sentinel", () => {
+    expect(explanationBody).toContain('ASK_STUDIO_INSTRUCTION')
+    // On the deliberate sentinel it performs the REAL owner relay over the customer's message.
+    expect(explanationBody).toMatch(/isAskStudioSentinel\(explainReply\)[\s\S]*relayUnansweredToOwner\(db, business, identity, messageText/)
+  })
+
+  it("the default/unknown path carries the ASK_STUDIO escape hatch and relays on the sentinel", () => {
+    expect(defaultBody).toContain('ASK_STUDIO_INSTRUCTION')
+    expect(defaultBody).toMatch(/isAskStudioSentinel\(unknownReply\)[\s\S]*relayUnansweredToOwner\(db, business, identity, messageText/)
+  })
+
+  it("steers first: the escape hatch never fires on a pure first-message greeting (no relay before genReply)", () => {
+    // The greeting situation (mayGreet) must not itself instruct the sentinel — steering is the
+    // default; the relay only ever triggers off the model's deliberate sentinel on a real gap.
+    expect(defaultBody).toMatch(/mayGreet\s*\n?\s*\?[\s\S]*Greet them warmly/)
+  })
+})
+
 describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
   it('this-turn day wins over draft and lastInquiry', () => {
     expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')

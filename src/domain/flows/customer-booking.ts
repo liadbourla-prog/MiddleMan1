@@ -1395,7 +1395,10 @@ export async function handleBookingFlow(
         // Read-only intent — keep the session active (see inquiry note above).
         await updateSessionContext(db, session.id, updatedCtx, 'active')
         const oneLiner = middlemanOneLiner(detectedLanguage, businessName)
-        const situation = `${firstMsgPrefix}The customer EXPLICITLY asked what system, platform, or technology powers this assistant. Authorized platform explanation — give exactly this one fact, phrased naturally, and nothing more (no marketing, no extra detail): "${oneLiner}". Then briefly invite them back to booking.`
+        // T2b.2: the explanation path passes FAQs but had no escape hatch — a bundled question
+        // the one-liner can't answer would be fabricated. Add the sentinel so a genuine gap
+        // relays for real instead of inventing; the default is still to answer/steer.
+        const situation = `${firstMsgPrefix}The customer EXPLICITLY asked what system, platform, or technology powers this assistant. Authorized platform explanation — give exactly this one fact, phrased naturally, and nothing more (no marketing, no extra detail): "${oneLiner}". Then briefly invite them back to booking. ${ASK_STUDIO_INSTRUCTION}`
         const knowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
           ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
@@ -1410,6 +1413,11 @@ export async function handleBookingFlow(
           customerMemory: extractMemory(updatedCtx),
           ...knowledgeFields,
         })
+        // F3a/S3: the model signalled it can't answer a bundled gap → relay for real.
+        if (isAskStudioSentinel(explainReply)) {
+          const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
+          return { reply: relay, sessionComplete: false }
+        }
         return { reply: explainReply, sessionComplete: false }
       }
 
@@ -1476,6 +1484,13 @@ export async function handleBookingFlow(
         const unknownSituationGrounded = unknownDayText
           ? `${unknownSituation} Real options for the day in question: ${unknownDayText} Never tell the customer a day/class is full if options are listed here.`
           : unknownSituation
+        // T2b.2: give the mid-conversation unknown path the same escape hatch the inquiry path
+        // has — a real, unanswerable side-question relays for real instead of being fabricated.
+        // The first-message greeting (mayGreet) is excluded: there is no question to relay, and
+        // steering is always the default — the relay only ever fires on the model's sentinel.
+        const unknownSituationFinal = mayGreet
+          ? unknownSituationGrounded
+          : `${unknownSituationGrounded} ${ASK_STUDIO_INSTRUCTION}`
         const unknownKnowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
           ...(businessKnowledge.communicationStyle ? { communicationStyle: businessKnowledge.communicationStyle } : {}),
@@ -1485,11 +1500,16 @@ export async function handleBookingFlow(
           businessTimezone,
           businessName,
           language: detectedLanguage,
-          situation: unknownSituationGrounded,
+          situation: unknownSituationFinal,
           transcript,
           customerMemory: extractMemory(updatedCtx),
           ...unknownKnowledgeFields,
         }, unknownFocus ? { focusDay: unknownFocus } : undefined)
+        // F3a/S3: the model signalled it can't answer → relay the question to the owner for real.
+        if (isAskStudioSentinel(unknownReply)) {
+          const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
+          return { reply: relay, sessionComplete: false }
+        }
         return { reply: unknownReply, sessionComplete: false }
       }
     }
