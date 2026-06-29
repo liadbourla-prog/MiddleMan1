@@ -16,7 +16,7 @@ import { matchCancelBookings, type CancelBooking } from './cancellation-match.js
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
-import { parseConfirmation, parseRetentionReply } from './types.js'
+import { parseConfirmation, parseRetentionReply, hasRevisionSignal } from './types.js'
 import { logAudit } from '../audit/logger.js'
 import type { FlowResult, BookingFlowContext } from './types.js'
 import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
@@ -2266,7 +2266,14 @@ async function handleHoldConfirmation(
   const parsed = parseConfirmation(messageText)
   // A leading yes bundled with a side question (e.g. "yes, who's the instructor?") is still
   // a confirmation — the grounded reply answers the question (roster/facts are in businessFacts).
-  const confirmation: 'yes' | 'no' | 'unclear' = parsed === 'yes_with_question' ? 'yes' : parsed
+  // BUT (C1): a yes_with_question carrying a DAY REVISION ("yes, anything Thursday?") parses as
+  // yes_with_question (it has a '?', no clock time) yet must NOT book the stale slot. When a
+  // weekday/relative-day token is present, treat it as unclear so it falls into the pivot path
+  // (rebuildOnSlotPivot) and the revision is handled instead of silently confirming.
+  const confirmation: 'yes' | 'no' | 'unclear' =
+    parsed === 'yes_with_question'
+      ? (hasRevisionSignal(messageText) ? 'unclear' : 'yes')
+      : parsed
 
   // Root B: a non-"yes" reply may be REVISING the slot, not answering. If so, rebuild
   // from the new request so the revised slot is what gets booked (not the stale one).
@@ -2341,6 +2348,15 @@ async function handleHoldConfirmation(
     await releaseSupersededBooking(db, calendar, identity, ctx)
 
     const pendingSlot = ctx.pendingSlot
+    // C2 (belt-and-suspenders): guarantee the just-confirmed slot is never left in
+    // rejectedSlots, so a future re-suggest in any later session can't shadow-suppress what
+    // was actually booked. The session completes immediately below, so this has no live
+    // effect today (the hold-placement path already un-suppressed the slot and dropped
+    // lastOfferedSlots before this turn — see ~ctx un-suppress at hold creation), but it
+    // closes the gap structurally and is correct regardless of upstream changes.
+    if (pendingSlot) {
+      ctx = withConstraints(ctx, removeRejectedSlot(ctx.negotiationConstraints, new Date(pendingSlot.start).toISOString()))
+    }
     const confirmedDate = pendingSlot ? formatSlotDate(new Date(pendingSlot.start), businessTimezone) : 'the requested date'
     const confirmedTime = pendingSlot ? formatSlotTime(new Date(pendingSlot.start), businessTimezone) : 'the requested time'
     // C4: a "yes + side question" (e.g. "yes, btw is Sunday full?") collapsed to a plain

@@ -88,6 +88,22 @@ export function parseConfirmation(text: string): ConfirmationParse {
   return 'unclear'
 }
 
+// A weekday or relative-day token signalling a slot REVISION (a different day than the one
+// pending confirmation). Used by the hold-confirm handler to stop a "yes + day question"
+// ("yes, anything Thursday?") — which parseConfirmation reports as yes_with_question because
+// it has a '?' and no clock time — from collapsing to a plain confirm and booking the STALE
+// slot. A revision must fall into the pivot path (rebuildOnSlotPivot) instead.
+//
+// RESIDUAL (documented, out of scope here): this covers weekday/relative-day revisions only.
+// A SERVICE-NAME revision ("yes, but for a massage instead?") needs the business service list,
+// which this pure helper does not have — that case is NOT caught here and remains a known gap.
+const REVISION_DAY_RE =
+  /(\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b)|(\b(tomorrow|today|next\s+week)\b)|(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|מחר|מחרתיים|היום|שבוע\s+הבא)/i
+
+export function hasRevisionSignal(text: string): boolean {
+  return REVISION_DAY_RE.test(text)
+}
+
 export type RetentionReply =
   | { kind: 'accept'; index: number } // 0-based index into the offered slots
   | { kind: 'decline' }

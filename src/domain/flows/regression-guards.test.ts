@@ -18,7 +18,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { resolveRequestedDate, resolveSlotStart } from '../availability/resolve-slot.js'
 import { findUnbackedTimes, assertsNoAvailability, extractClockTimes } from './slot-fabrication-guard.js'
-import { parseConfirmation } from './types.js'
+import { parseConfirmation, hasRevisionSignal } from './types.js'
 import { isSlotSuppressed, filterOpenSlots } from './negotiation-constraints.js'
 import { matchBookingSelection } from './customer-booking.js'
 import type { CancelBooking } from './cancellation-match.js'
@@ -116,6 +116,40 @@ describe('DO-NOT-REGRESS · C-PIVOT — a revision never parses as a plain confi
       'yes but no, maybe Thursday',
     ]) {
       expect(parseConfirmation(revision)).not.toBe('yes')
+    }
+  })
+
+  // WS3-T3.7 (C1): the gap parseConfirmation alone can't close — a "yes + day revision"
+  // phrased as a QUESTION ("yes, anything Thursday?") parses as yes_with_question (it has a
+  // '?' and no clock time), which the hold-confirm handler would collapse to a plain confirm
+  // and book the STALE slot. hasRevisionSignal is the second signal the handler ANDs in: a
+  // weekday/relative-day token flips that case to non-confirm so the pivot path rebuilds.
+  it('a "yes + day revision" question is yes_with_question AND carries a revision signal', () => {
+    expect(parseConfirmation('yes anything thursday?')).toBe('yes_with_question')
+    expect(hasRevisionSignal('yes anything thursday?')).toBe(true)
+    // Hebrew weekday revision
+    expect(hasRevisionSignal('כן אולי ביום חמישי?')).toBe(true)
+    // relative-day revisions also count
+    expect(hasRevisionSignal('yes but tomorrow?')).toBe(true)
+    expect(hasRevisionSignal('כן אבל מחר?')).toBe(true)
+  })
+
+  it('a pure side-question carries NO revision signal (stays a confirm)', () => {
+    expect(parseConfirmation('yes, is parking available?')).toBe('yes_with_question')
+    expect(hasRevisionSignal('yes, is parking available?')).toBe(false)
+    expect(hasRevisionSignal('כן, יש חניה?')).toBe(false)
+  })
+
+  it('hasRevisionSignal: weekday + relative-day tokens (he + en) are revisions, plain text is not', () => {
+    for (const t of [
+      'sunday', 'on Monday please', 'make it Tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
+      'ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת',
+      'tomorrow', 'today', 'next week', 'מחר', 'מחרתיים', 'היום', 'שבוע הבא',
+    ]) {
+      expect(hasRevisionSignal(t)).toBe(true)
+    }
+    for (const t of ['yes', 'sure book it', 'is parking available?', 'how much does it cost?', 'כן', 'יש חניה?']) {
+      expect(hasRevisionSignal(t)).toBe(false)
     }
   })
 
