@@ -66,6 +66,7 @@ import {
 } from '../../domain/orchestrator-log.js'
 import { buildActionLedgerBlock, hasCalendarConnected } from '../../domain/audit/ledger-block.js'
 import { detectActionClaims, type ActionClaim } from '../../domain/flows/reply-guard.js'
+import { extractClockTimes } from '../../domain/flows/slot-fabrication-guard.js'
 import { observeVoiceTells } from '../../domain/flows/voice-guard.js'
 import { logAudit } from '../../domain/audit/logger.js'
 
@@ -953,6 +954,53 @@ async function dispatchTool(
     default:
       return { error: `Unknown tool: ${name}` }
   }
+}
+
+// ── Per-turn time allowlist accumulator (T1.1 — H1 prep) ─────────────────────────
+//
+// The Branch-3 analog of Branch-4's `buildAllowedTimes` boundary/booking base: seed the
+// allowlist from what the AVAILABILITY tools actually surfaced this turn, so a manager
+// reply that states one of those real times is never flagged as a fabrication. The tool
+// result strings are system-authored en-GB/he-IL 24h ("Tue, 3 Jun, 14:00" / "14:00"), so
+// `extractClockTimes` recovers the canonical HH:MM — verified against orchestrator-tools
+// (`freeSlots[].start/.end`, `buildScheduleView` events). Only the availability READ tools
+// are scanned: a stray "14:00" inside a searchWeb snippet is NOT a bookable time and must
+// never widen the allowlist. The owner's own quoted times this turn are admitted separately
+// in the loop (mirrors Branch-4 `extractMentionedTimes`).
+//
+// KNOWN LATENT GAP (RED-TEAM D2, out of scope per locked D2): English manager *replies* are
+// authored 12h am/pm (lawbook §3.3) and `extractClockTimes` is 24h-only, so the ported time
+// gate no-ops for am/pm English replies. H1's time leg is "closed for Hebrew/24h; am/pm is a
+// documented follow-up." TODO(am/pm): extend extractClockTimes to 12h before claiming am/pm closed.
+const TIME_BEARING_TOOLS = new Set(['listCalendarEvents', 'getSessionRoster'])
+
+/** Recursively collect every string value in an arbitrary tool-result object. */
+function collectStrings(value: unknown, out: string[]): void {
+  if (typeof value === 'string') { out.push(value); return }
+  if (Array.isArray(value)) { for (const v of value) collectStrings(v, out); return }
+  if (value && typeof value === 'object') {
+    for (const v of Object.values(value as Record<string, unknown>)) collectStrings(v, out)
+  }
+}
+
+/**
+ * Canonical HH:MM times an AVAILABILITY tool surfaced in its result this turn. Returns []
+ * for non-availability tools, failed/empty results, or null. Order-preserving, deduped.
+ */
+export function extractAllowedTimesFromToolResult(name: string, result: unknown): string[] {
+  if (!TIME_BEARING_TOOLS.has(name)) return []
+  const r = (result ?? {}) as Record<string, unknown>
+  if ('error' in r || r['ok'] === false || r['success'] === false) return []
+  const strings: string[] = []
+  collectStrings(result, strings)
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const s of strings) {
+    for (const t of extractClockTimes(s)) {
+      if (!seen.has(t)) { seen.add(t); out.push(t) }
+    }
+  }
+  return out
 }
 
 // ── L2 claim auditor ────────────────────────────────────────────────────────────
