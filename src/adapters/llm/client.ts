@@ -97,8 +97,8 @@ export const customerIntentSchema = z.object({
     })
     .nullable()
     .catch(null),
-  specialArrangementRequest: z.boolean().default(false).catch(false),
-  restorePrevious: z.boolean().default(false).catch(false),
+  specialArrangementRequest: z.boolean().optional().catch(undefined),
+  restorePrevious: z.boolean().optional().catch(undefined),
 })
 
 // Defensive normalization: gemini-2.5-flash sometimes emits snake_case top-level
@@ -168,7 +168,9 @@ Return a JSON object with EXACTLY this structure (all fields required):
   "summary": "one sentence summary" | null,
   "rawEntities": {},
   "detectedLanguage": "he" | "en",
-  "avoidConstraints": { "beforeHour": 0-23|null, "afterHour": 0-23|null, "weekdays": [0-6]|null } | null
+  "avoidConstraints": { "beforeHour": 0-23|null, "afterHour": 0-23|null, "weekdays": [0-6]|null } | null,
+  "specialArrangementRequest": boolean,
+  "restorePrevious": boolean
 }
 
 Rules:

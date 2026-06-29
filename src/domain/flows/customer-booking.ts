@@ -1084,7 +1084,7 @@ export async function handleBookingFlow(
   const intentResult2 = await (async (): Promise<FlowResult> => {
     // P4: "give me back the class we cancelled" → re-offer the exact cancelled slot from
     // the snapshot. Falls through to normal handling when there's nothing fresh to restore.
-    if (intent.restorePrevious) {
+    if (intent.restorePrevious === true) {
       const restored = await handleRestoreCancelled(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply, activeServices, business)
       if (restored) return restored
     }
@@ -1549,7 +1549,7 @@ export async function maybeEscalateSpecial(
   transcript: TranscriptTurn[],
   lang: 'he' | 'en',
 ): Promise<FlowResult | null> {
-  if (!business || !intent.specialArrangementRequest || ctx.specialRequestEscalated) return null
+  if (!business || intent.specialArrangementRequest !== true || ctx.specialRequestEscalated) return null
   const lastCustomer = [...transcript].reverse().find((t) => t.role === 'customer')?.text
   const requestText = intent.summary ?? lastCustomer ?? 'a special arrangement'
   const { customerReply } = await escalateUnfulfillableRequest(db, business, identity.phoneNumber, requestText, lang)
