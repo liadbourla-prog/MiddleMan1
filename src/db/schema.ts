@@ -407,6 +407,13 @@ export const bookings = pgTable(
     cancellationReason: text('cancellation_reason'),
     cancelledByRole: text('cancelled_by_role', { enum: ['customer', 'manager', 'system'] }),
     slotTzAtCreation: text('slot_tz_at_creation'),
+    // T1.1b (WS1): denormalized exclusivity flag. true for 1-on-1 (private/appointment)
+    // bookings that exclusively own their time range; false for class co-bookings (many
+    // customers legitimately share one class slot). Set at insert by the engine. Backs the
+    // `bookings_exclusive_no_overlap` GiST EXCLUDE constraint (migration 0049) — that
+    // constraint is expressed in raw SQL because Drizzle has no EXCLUDE builder; it scopes
+    // the overlap rejection to is_exclusive rows so class co-bookings are never rejected (G1).
+    isExclusive: boolean('is_exclusive').notNull().default(true),
     rescheduledFrom: uuid('rescheduled_from'),
     // Set when manager bulk-cancels and agrees to help customer rebook
     rebookingRequested: boolean('rebooking_requested').notNull().default(false),

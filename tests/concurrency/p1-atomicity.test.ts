@@ -7,10 +7,11 @@
 // contend at the DB layer), and asserts the atomicity invariant EVERY round.
 //
 // EXPECTED RESULT MAP:
-//   C1 GREEN  C2 RED (deliverable)  C3 GREEN  C4 GREEN  C5 GREEN  C6 GREEN  C7 GREEN
+//   C1 GREEN  C2 GREEN (closed by T1.1b)  C3 GREEN  C4 GREEN  C5 GREEN  C6 GREEN  C7 GREEN
 //
-// C2 is intentionally RED — see its block for the full explanation. Any of C1/C3–C7 going
-// RED is a REAL atomicity bug surfaced by a real DB, not a harness defect.
+// C2 was the proven partial-overlap private double-book; it is now CLOSED for real by the
+// T1.1b GiST EXCLUDE constraint (migration 0049). Any of C1–C7 going RED is a REAL atomicity
+// bug surfaced by a real DB, not a harness defect.
 // ============================================================================
 
 import { vi } from 'vitest'
@@ -139,13 +140,17 @@ async function insertBooking(
   businessId: string, customerId: string, serviceId: string,
   slotStart: Date, slotEnd: Date,
   state: 'confirmed' | 'held' | 'pending_payment',
-  extra: { holdExpiresAt?: Date | null; calendarEventId?: string | null } = {},
+  extra: { holdExpiresAt?: Date | null; calendarEventId?: string | null; isExclusive?: boolean } = {},
 ): Promise<string> {
   const [row] = await d.insert(bookings).values({
     businessId, serviceTypeId: serviceId, customerId,
     requestedAt: new Date(), slotStart, slotEnd, state, slotTzAtCreation: 'UTC',
     holdExpiresAt: extra.holdExpiresAt ?? null,
     calendarEventId: extra.calendarEventId ?? null,
+    // T1.1b: class prefill rows are non-exclusive (many co-bookings share a slot); private
+    // rows default to exclusive. The column default is true, so class callers MUST pass false
+    // or the overlap-exclusion constraint rejects the second prefill row.
+    isExclusive: extra.isExclusive ?? true,
   }).returning({ id: bookings.id })
   if (!row) throw new Error('insertBooking failed')
   return row.id
@@ -187,19 +192,19 @@ describe('WS1 P1-atomicity merge-gate (real ephemeral Postgres)', () => {
     })
   })
 
-  // ───────────────────────────── C2 (A1, RED) ───────────────────────────────
-  // EXPECTED-RED: documents the partial-overlap gap. T1.1a's advisory lock is keyed on
-  // slotStart.toISOString(), so two OVERLAPPING-but-different-start private slots
-  // (14:00–15:00 vs 14:30–15:30) take DIFFERENT locks and BOTH commit. The CORRECT
-  // invariant is exactly 1 winner (an overlap is mutually exclusive on one provider), so
-  // this assertion stays at 1 and FAILS RED — proving the residual that only T1.1b's gist
-  // EXCLUDE constraint closes.
-  // Do NOT change the assertion to 2 to make it green. The RED is the deliverable.
-  describe('C2 — partial-overlap private double-book (expect RED; closed only by T1.1b)', () => {
+  // ───────────────────────────── C2 (A1, GREEN — closed by T1.1b) ────────────
+  // T1.1a's advisory lock is keyed on slotStart.toISOString(), so two OVERLAPPING-but-
+  // different-start private slots (14:00–15:00 vs 14:30–15:30) take DIFFERENT locks and both
+  // pass the advisory gate. The DB-level `bookings_exclusive_no_overlap` GiST EXCLUDE
+  // constraint (T1.1b, migration 0049) is the backstop: both racers insert a `requested` row
+  // (NOT in the constraint's state set), but the loser's requested→held transition raises a
+  // 23P01 exclusion_violation, which the engine maps to a clean ok:false (markFailed). Exactly
+  // ONE winner — the correct invariant for a mutually-exclusive overlap on one business.
+  describe('C2 — partial-overlap private double-book (GREEN; closed by T1.1b)', () => {
     let biz: TestBusiness
     beforeAll(async () => { biz = await seedBusiness({ available247: true, calendarMode: 'internal' }) })
 
-    it('overlapping different-start slots must yield exactly one winner (RED until T1.1b)', async () => {
+    it('overlapping different-start slots yield exactly one winner (closed by T1.1b)', async () => {
       let observedTwoWinnersAtLeastOnce = false
       await repeat(ROUNDS, async () => {
         const c1 = await seedCustomer(biz.businessId, freshPhone())
@@ -219,11 +224,11 @@ describe('WS1 P1-atomicity merge-gate (real ephemeral Postgres)', () => {
         )
         const winners = countOk(results, (r) => r.ok)
         if (winners === 2) observedTwoWinnersAtLeastOnce = true
-        // The CORRECT invariant for an exclusive overlap. This goes RED today.
+        // The CORRECT invariant for an exclusive overlap — now enforced by T1.1b.
         expect(winners).toBe(1)
         await resetRows(biz.businessId)
       })
-      // (unreached while RED — kept so the intent is explicit if/when T1.1b lands)
+      // T1.1b closes the double-book: a second winner must NEVER be observed.
       expect(observedTwoWinnersAtLeastOnce).toBe(false)
       await teardown(biz.businessId)
     })
@@ -246,10 +251,10 @@ describe('WS1 P1-atomicity merge-gate (real ephemeral Postgres)', () => {
     it('last-seat: exactly one of two concurrent bookings wins, across 30 rounds', async () => {
       await repeat(ROUNDS, async () => {
         const { slotStart, slotEnd } = privateSlot()
-        // Pre-fill 7 of 8 seats so exactly one remains.
+        // Pre-fill 7 of 8 seats so exactly one remains. Class rows are non-exclusive.
         for (let i = 0; i < 7; i++) {
           const cid = await seedCustomer(biz.businessId, freshPhone())
-          await insertBooking(db, biz.businessId, cid, classServiceId, slotStart, slotEnd, 'confirmed')
+          await insertBooking(db, biz.businessId, cid, classServiceId, slotStart, slotEnd, 'confirmed', { isExclusive: false })
         }
         const a1 = customerActor(await seedCustomer(biz.businessId, freshPhone()), biz.businessId)
         const a2 = customerActor(await seedCustomer(biz.businessId, freshPhone()), biz.businessId)
@@ -263,10 +268,39 @@ describe('WS1 P1-atomicity merge-gate (real ephemeral Postgres)', () => {
       })
     })
 
+    // G1 trap (§v2-B): the T1.1b EXCLUDE constraint MUST NOT reject legitimate class
+    // co-bookings. Class rows are is_exclusive=false, so multiple DIFFERENT customers booking
+    // the SAME class slot concurrently must ALL succeed (up to capacity). If the constraint
+    // were mis-scoped (applied to all bookings), this would collapse to one winner → outage.
+    it('G1: concurrent class co-bookings at the same slot all succeed (constraint not mis-scoped)', async () => {
+      await repeat(ROUNDS, async () => {
+        // Distinct hour from the last-seat case so the two never share a slot across rounds.
+        const { slotStart, slotEnd } = offsetSlot(16, 0, 60)
+        // Three distinct customers race into the same empty 8-cap class slot.
+        const actors = [
+          customerActor(await seedCustomer(biz.businessId, freshPhone()), biz.businessId),
+          customerActor(await seedCustomer(biz.businessId, freshPhone()), biz.businessId),
+          customerActor(await seedCustomer(biz.businessId, freshPhone()), biz.businessId),
+        ]
+        const results = await raceN(
+          (d) => requestBooking(d, calendar(biz.businessId), actors.shift()!, { serviceTypeId: classServiceId, slotStart, slotEnd }),
+          3,
+        )
+        // All three are legitimate class co-bookings — none rejected by the overlap constraint.
+        expect(countOk(results, (r) => r.ok)).toBe(3)
+        // And exactly three active rows occupy the slot (no overlap rejection silently dropped one).
+        const [{ total }] = await db.select({ total: sql<number>`count(*)::int` }).from(bookings)
+          .where(and(eq(bookings.serviceTypeId, classServiceId), eq(bookings.slotStart, slotStart),
+            sql`${bookings.state} in ('requested','held','pending_payment','confirmed')`))
+        expect(Number(total)).toBe(3)
+        await resetRows(biz.businessId)
+      })
+    })
+
     it('pending_payment dup guard: same customer cannot slip a second booking', async () => {
       const { slotStart, slotEnd } = privateSlot()
       const cid = await seedCustomer(biz.businessId, freshPhone())
-      await insertBooking(db, biz.businessId, cid, classServiceId, slotStart, slotEnd, 'pending_payment')
+      await insertBooking(db, biz.businessId, cid, classServiceId, slotStart, slotEnd, 'pending_payment', { isExclusive: false })
       const result = await requestBooking(db, calendar(biz.businessId), customerActor(cid, biz.businessId), { serviceTypeId: classServiceId, slotStart, slotEnd })
       expect(result.ok).toBe(false)
       if (!result.ok) expect(result.reason).toMatch(/already booked/i)

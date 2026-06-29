@@ -71,12 +71,55 @@ export function validateSlotTiming(
 //     Including providerId would make the lock FINER than the conflict check and let a
 //     same-slot/different-provider race slip through. The lock must be at least as
 //     coarse as the SELECT it guards.
-//   • Partial-overlap-but-different-start races remain a known residual (closed only
-//     by the optional T1.1b GiST EXCLUDE, out of scope here, and the existing A6
-//     freebusy probe). This key covers the dominant race: two customers grabbing the
-//     EXACT same advertised slot.
+//   • Partial-overlap-but-different-start races (14:00–15:00 vs 14:30–15:30) are NOT
+//     covered by this key (different slotStart → different lock). They are closed at the
+//     DB level by the T1.1b `bookings_exclusive_no_overlap` GiST EXCLUDE constraint
+//     (migration 0049): the loser's requested→held transition raises 23P01 and is mapped
+//     to a graceful "slot taken" failure (see isOverlapExclusionViolation). This advisory
+//     key remains the fast path for the dominant race (two customers grabbing the EXACT
+//     same advertised slot — resolved without ever reaching the constraint).
 export function privateBookingLockKey(businessId: string, slotStartIso: string): string {
   return `${businessId}:${slotStartIso}`
+}
+
+// T1.1b: detect that an exclusive (1-on-1) requested→held transition lost the overlap race
+// against the `bookings_exclusive_no_overlap` GiST EXCLUDE constraint. Two shapes occur:
+//   • 23P01 (exclusion_violation): the other booking already committed its held row, so this
+//     transition is rejected outright.
+//   • 40P01 (deadlock_detected): both racers insert their conflicting index entry at the same
+//     instant and wait on each other; Postgres aborts ONE victim. The victim is, by definition,
+//     the loser of a mutually-exclusive overlap — exactly one survivor commits, so treating the
+//     victim as an overlap-loss preserves the "exactly one winner" invariant.
+// postgres-js surfaces the SQLSTATE on `err.code`. This guard is applied ONLY around the
+// held-transition UPDATE (runExclusiveTransition), where the exclusion constraint is the sole
+// lock interaction — so a deadlock there can only be this race, never an unrelated cycle.
+function isOverlapExclusionViolation(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  const code = (err as { code?: unknown }).code
+  return code === '23P01' || code === '40P01'
+}
+
+// T1.1b: run an exclusive (1-on-1) requested→held / requested→pending_payment transition,
+// converting a GiST-exclusion violation (the loser of a partial-overlap race) into a clean
+// "slot no longer available" failure. The orphaned `requested` row is flipped to `failed`
+// (markFailed) so it can't strand a seat. A non-23P01 error is rethrown untouched.
+async function runExclusiveTransition(
+  db: Db,
+  businessId: string,
+  bookingId: string,
+  actorId: string,
+  apply: () => Promise<unknown>,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  try {
+    await apply()
+    return { ok: true }
+  } catch (err) {
+    if (isOverlapExclusionViolation(err)) {
+      await markFailed(db, businessId, bookingId, actorId, 'Slot taken by a concurrent overlapping booking')
+      return { ok: false, reason: 'Slot is no longer available' }
+    }
+    throw err
+  }
 }
 
 // Map a spatial BookableReason to an upstream reason string. These are sanitised
@@ -330,6 +373,9 @@ async function requestPrivateBooking(
           slotEnd: request.slotEnd,
           slotTzAtCreation: businessTz,
           state: 'requested',
+          // T1.1b: a 1-on-1 booking exclusively owns its time range — backs the GiST
+          // EXCLUDE constraint that rejects partial-overlap double-books (finding A1).
+          isExclusive: true,
           // Pin the price at booking time for accurate lifetime-spend (Phase 3).
           amount: service.paymentAmount ?? null,
         })
@@ -373,17 +419,20 @@ async function requestPrivateBooking(
       return { ok: false, reason: 'Internal state error' }
     }
 
-    await db
-      .update(bookings)
-      .set({
-        state: 'held',
-        approvalStatus: 'pending',
-        holdExpiresAt,
-        calendarEventId: holdResult.eventId,
-        googleEtag: holdResult.etag ?? null,
-        updatedAt: new Date(),
-      })
-      .where(eq(bookings.id, result.bookingId))
+    const approvalHeld = await runExclusiveTransition(db, actor.businessId, result.bookingId, actor.id, () =>
+      db
+        .update(bookings)
+        .set({
+          state: 'held',
+          approvalStatus: 'pending',
+          holdExpiresAt,
+          calendarEventId: holdResult.eventId,
+          googleEtag: holdResult.etag ?? null,
+          updatedAt: new Date(),
+        })
+        .where(eq(bookings.id, result.bookingId)),
+    )
+    if (!approvalHeld.ok) return approvalHeld
 
     await logAudit(db, {
       businessId: actor.businessId,
@@ -417,17 +466,20 @@ async function requestPrivateBooking(
       return { ok: false, reason: 'Internal state error' }
     }
 
-    await db
-      .update(bookings)
-      .set({
-        state: 'pending_payment',
-        holdExpiresAt,
-        calendarEventId: holdResult.eventId,
-        googleEtag: holdResult.etag ?? null,
-        paymentStatus: 'pending',
-        updatedAt: new Date(),
-      })
-      .where(eq(bookings.id, result.bookingId))
+    const toPaymentHeld = await runExclusiveTransition(db, actor.businessId, result.bookingId, actor.id, () =>
+      db
+        .update(bookings)
+        .set({
+          state: 'pending_payment',
+          holdExpiresAt,
+          calendarEventId: holdResult.eventId,
+          googleEtag: holdResult.etag ?? null,
+          paymentStatus: 'pending',
+          updatedAt: new Date(),
+        })
+        .where(eq(bookings.id, result.bookingId)),
+    )
+    if (!toPaymentHeld.ok) return toPaymentHeld
 
     await logAudit(db, {
       businessId: actor.businessId,
@@ -458,16 +510,19 @@ async function requestPrivateBooking(
     return { ok: false, reason: 'Internal state error' }
   }
 
-  await db
-    .update(bookings)
-    .set({
-      state: 'held',
-      holdExpiresAt,
-      calendarEventId: holdResult.eventId,
-      googleEtag: holdResult.etag ?? null,
-      updatedAt: new Date(),
-    })
-    .where(eq(bookings.id, result.bookingId))
+  const immediateHeld = await runExclusiveTransition(db, actor.businessId, result.bookingId, actor.id, () =>
+    db
+      .update(bookings)
+      .set({
+        state: 'held',
+        holdExpiresAt,
+        calendarEventId: holdResult.eventId,
+        googleEtag: holdResult.etag ?? null,
+        updatedAt: new Date(),
+      })
+      .where(eq(bookings.id, result.bookingId)),
+  )
+  if (!immediateHeld.ok) return immediateHeld
 
   await logAudit(db, {
     businessId: actor.businessId,
@@ -597,6 +652,10 @@ async function requestGroupClassBooking(
           slotEnd: request.slotEnd,
           slotTzAtCreation: businessTz,
           state: 'requested',
+          // T1.1b: a class booking is NON-exclusive — many customers share one class slot
+          // up to capacity. is_exclusive=false keeps these rows OUT of the overlap-exclusion
+          // constraint so legitimate class co-bookings are never rejected (the G1 trap).
+          isExclusive: false,
           // Pin the price at booking time for accurate lifetime-spend (Phase 3).
           amount: service.paymentAmount ?? null,
         })
