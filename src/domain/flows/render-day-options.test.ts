@@ -99,10 +99,30 @@ describe('renderDayOptions — timeOfDay bucket filtering', () => {
     expect(res.text).not.toContain('Yoga')
   })
 
-  it('returns an explicit "No <bucket>" text when nothing falls in the bucket', () => {
-    const day = dayWith([openClass]) // only 14:00 afternoon
+  // F2a / Symptom-2 — SAME-DAY-FIRST. When the asked part-of-day is empty but the day has
+  // real options at OTHER times, offer those (with a part-scoped negative) instead of
+  // dead-ending on "no <part>" — which the caller generalized into a false whole-day-empty
+  // and a premature jump to OTHER days.
+  it('offers same-day alternatives when the bucket is empty but the day has other-time options', () => {
+    const day = dayWith([openClass]) // only 14:00 afternoon Pilates
     const res = renderDayOptions(day, DATE, TZ, { offerable: true, timeOfDay: 'morning' })
-    expect(res.text).not.toBeNull()
+    expect(res.text).toContain('morning') // part-scoped negative retained
+    expect(res.text).toContain('Pilates') // the same-day alternative IS offered
+    expect(res.offered.map((o) => o.serviceTypeId)).toContain('svc-pilates')
+  })
+
+  it('returns a bare "No <bucket>" with no offers ONLY when the day is genuinely empty', () => {
+    const day = dayWith([]) // nothing at all that day
+    const res = renderDayOptions(day, DATE, TZ, { offerable: true, timeOfDay: 'morning' })
+    expect(res.text).toContain('morning')
+    expect(res.offered).toHaveLength(0)
+  })
+
+  it('drops a full class from the same-day alternative (offerable mode)', () => {
+    // morning asked; the day has only a FULL morning-adjacent... use afternoon full + open
+    const day = dayWith([{ ...fullClass, start: at(14, 0), end: at(15, 0) }]) // afternoon, full
+    const res = renderDayOptions(day, DATE, TZ, { offerable: true, timeOfDay: 'morning' })
+    // the only other-time option is full → not offerable → bare "No morning" + no offers
     expect(res.text).toContain('morning')
     expect(res.offered).toHaveLength(0)
   })

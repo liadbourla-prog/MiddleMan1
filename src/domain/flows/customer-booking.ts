@@ -502,9 +502,38 @@ export function renderDayOptions(
   }
 
   if (parts.length > 0) return { text: parts.join(' '), offered }
-  // A part-of-day was asked but nothing real falls in it — state that explicitly so
-  // the caller does NOT fall back to an all-day answer (which reopens the fabrication).
-  if (timeOfDay) return { text: `No ${timeOfDay} classes or open times on ${dayLabel}.`, offered: [] }
+  // A part-of-day was asked but nothing real falls in it.
+  if (timeOfDay) {
+    // F2a / Symptom-2 — SAME-DAY-FIRST. The asked part is empty, but if the day HAS real
+    // options at OTHER times, offer those (scoping the negative to the asked part) instead
+    // of dead-ending on "no <part>" — which the caller generalized into a false
+    // whole-day-empty and a premature jump to OTHER days ("Tuesday at 5pm has no class" must
+    // NOT become "Tuesday has no classes at all"). Render the day UNFILTERED by part.
+    const altItems: string[] = []
+    let altClasses = filterOpenSlots(day.classes, constraints, tz)
+    if (offerable) altClasses = altClasses.filter((c) => c.spotsLeft > 0)
+    for (const c of altClasses.slice(0, 10)) {
+      offered.push({ start: c.start.toISOString(), end: c.end.toISOString(), serviceTypeId: c.serviceTypeId })
+      const cap = c.spotsLeft <= 0 ? 'full' : `${c.spotsLeft} spot${c.spotsLeft === 1 ? '' : 's'} left`
+      altItems.push(`${c.serviceName} at ${formatSlotTime(c.start, tz)} (${cap})`)
+    }
+    const altPrivate = day.privateOpenings
+      .map((p) => ({ ...p, slots: p.slots.filter((s) => !isSlotSuppressed(s, constraints, tz)) }))
+      .filter((p) => p.slots.length > 0)
+    for (const p of altPrivate.slice(0, 6)) {
+      const shown = p.slots.slice(0, 4)
+      for (const s of shown) {
+        offered.push({ start: s.toISOString(), end: new Date(s.getTime() + p.durationMinutes * 60_000).toISOString(), serviceTypeId: p.serviceTypeId })
+      }
+      altItems.push(`${p.serviceName} at ${shown.map((s) => formatSlotTime(s, tz)).join(', ')}`)
+    }
+    if (altItems.length > 0) {
+      return { text: `No ${timeOfDay} classes or open times on ${dayLabel}, but ${dayLabel} does have: ${altItems.join('; ')}. Offer these same-day times first.`, offered }
+    }
+    // Genuinely nothing that day — state it explicitly so the caller does NOT fall back to
+    // an all-day answer (which reopens the fabrication).
+    return { text: `No ${timeOfDay} classes or open times on ${dayLabel}.`, offered: [] }
+  }
   return NO_SUGGESTION
 }
 
