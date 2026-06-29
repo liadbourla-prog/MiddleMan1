@@ -12,7 +12,8 @@ import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
 import { observeVoiceTells } from './voice-guard.js'
-import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability, extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
+import { extractClockTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability, extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
+import { buildAllowedTimes } from '../grounding/turn-ledger.js'
 import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
@@ -751,22 +752,10 @@ type GenReply = (
 //
 // `businessFacts` is closed over here and merged into every reply so the LLM is
 // grounded in the real, exhaustive config on EVERY path — not just inquiries.
-// Assemble the set of clock times a reply is allowed to state, WITHOUT any per-path
-// wiring: the situation string is system-authored and already block-aware, so every
-// time the spine legitimately surfaced this turn is in it. Union that with the times
-// the customer raised (a reply may echo/refuse them), the business-hour boundaries,
-// and the customer's own booking times. Anything else in the reply is a fabrication.
-function buildAllowedTimes(
-  input: Parameters<typeof generateCustomerReply>[0],
-  timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
-): Set<string> {
-  const allowed = new Set<string>([...timeGuard.boundaryTimes, ...timeGuard.bookingTimes])
-  for (const t of extractClockTimes(input.situation ?? '')) allowed.add(t)
-  for (const turn of input.transcript ?? []) {
-    if (turn.role === 'customer') for (const t of extractMentionedTimes(turn.text)) allowed.add(t)
-  }
-  return allowed
-}
+// The time-allowlist assembly now lives in `../grounding/turn-ledger.ts` (branch-agnostic,
+// reused by every seam). It is still called PER-CALL here (D1): the ledger holds only the
+// per-turn base (boundary ∪ booking); buildAllowedTimes merges this call's situation +
+// customer-raised times on top. See turn-ledger.ts for the rationale.
 
 // Reply-vs-state binding guard. Every customer reply goes through here. Two output
 // gates run unless the caller asserted a real persisted booking (bookingConfirmed):
