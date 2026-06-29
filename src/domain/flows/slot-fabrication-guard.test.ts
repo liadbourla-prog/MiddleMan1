@@ -143,6 +143,34 @@ describe('assertsNoAvailability — blanket fullness claim', () => {
       expect(assertsNoAvailability('we have 10:00 and 12:00 open')).toBe(false)
     })
   })
+
+  // F2b / Symptom-2 — SCHEDULE-EMPTY claims ("no yoga classes that day"). The earlier
+  // detector only knew CAPACITY-full phrasing, so a blanket schedule-empty assertion (the
+  // wording the model actually emitted for the single-time-miss bug) slipped past Gate 3
+  // entirely. Always AND-gated with the fresh-spine open signal, so a genuinely class-less
+  // day (no open signal) is never touched.
+  describe('schedule-empty family (T2.2/F2b)', () => {
+    it('flags blanket "no <service> classes [that day]" (verbatim live-test)', () => {
+      expect(assertsNoAvailability('ביום שלישי הבא אין שיעורי יוגה בכלל.')).toBe(true)
+      expect(assertsNoAvailability('כרגע אין שיעור יוגה ביום שלישי הבא (7.7).')).toBe(true)
+      expect(assertsNoAvailability('אין שיעורי יוגה בשלישי הבא')).toBe(true)
+    })
+    it('flags a class-less day with no service named', () => {
+      expect(assertsNoAvailability('אין שיעור ביום שלישי הבא')).toBe(true)
+    })
+    it('flags English "no classes / none scheduled"', () => {
+      expect(assertsNoAvailability('There are no classes next Tuesday.')).toBe(true)
+      expect(assertsNoAvailability('None are scheduled that day.')).toBe(true)
+    })
+    // The cardinal false-positive guard: a TIME-scoped negative that surfaces an
+    // alternative is NOT a blanket no-availability claim (the existing contract).
+    it('does NOT flag a time-scoped negative with an alternative', () => {
+      expect(assertsNoAvailability('ב-19:00 אין לנו שיעור, אבל יש ב-18:00.')).toBe(false)
+    })
+    it('does NOT flag "no class at <time>" (time-scoped, not blanket)', () => {
+      expect(assertsNoAvailability('אין שיעור ב-15:00')).toBe(false)
+    })
+  })
 })
 
 describe('extractDayScopedTimes', () => {

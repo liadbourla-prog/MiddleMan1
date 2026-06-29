@@ -800,8 +800,14 @@ function makeGenReply(
     //      that the reply hides, now compared DAY-SCOPED so a cross-day HH:MM coincidence
     //      no longer spares a specific-slot false-full.
     if (assertsNoAvailability(reply)) {
-      // (a) spine backstop
-      if (opts.focusDay) {
+      // (a) spine backstop. Skip when the reply ALREADY surfaces a concrete time — a
+      // time-scoped negative that lists same-day alternatives ("no class at 15:00; there
+      // are 10:00/12:00/16:00") is correct and must not be regenerated (F2b: the broadened
+      // schedule-empty detector now matches "אין שיעור יוגה ב-15:00", so without this guard
+      // a correct same-day-alternatives reply would be needlessly re-rolled). Signal (b)
+      // still day-scopes such replies. The blanket bug ("no classes that day", no time
+      // surfaced) has no time, so it still regenerates here.
+      if (opts.focusDay && !replySurfacesAnyTime(reply)) {
         const spine = await dayHasOpenOptions(opts.focusDay.dateStr, opts.focusDay.serviceTypeId)
         if (spine.open) {
           const corrected = await generateCustomerReply({

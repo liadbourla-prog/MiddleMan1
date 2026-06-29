@@ -121,6 +121,15 @@ const NO_AVAILABILITY_RE: RegExp[] = [
   /(?:ה)?מקומות\s+(?:כבר\s+)?(?:נתפסו|תפוסים)/, /(?:נתפסו|תפוסים)\s+(?:כל\s+)?(?:ה)?מקומות/,
   // "no spots left" — windowed so מקומ stays near the negation.
   /לא\s+נשארו\s[^.]{0,20}מקומ/,
+  // SCHEDULE-EMPTY (F2b / Symptom-2): "no class(es) [of a concept / that day]" — a BLANKET
+  // schedule claim ("אין שיעורי יוגה", "אין שיעור ביום שלישי"), distinct from a TIME-scoped
+  // "אין שיעור ב-15:00" (which is spared). The (?!ב-?\d) lookahead keeps a clock-time negative
+  // out; a comma/clause break (the time-scoped "אין לנו שיעור, אבל יש ב-18:00") fails the
+  // \s+[א-ת] adjacency. Always AND-gated downstream with the fresh-spine open signal, so a
+  // genuinely class-less day (no open signal) is never laundered.
+  /אין\s+(?:לנו\s+)?שיעור(?:ים|י)?\s+(?!ב-?\d)[א-ת]/,
+  /אין\s+(?:לנו\s+)?שיעורים(?!\s+(?:פנויים|ב-?\d))/,
+  /no\s+(?:more\s+)?(?:classes|sessions)\b/i, /none\s+(?:are\s+)?scheduled/i,
 ]
 export function assertsNoAvailability(text: string): boolean {
   return !!text && NO_AVAILABILITY_RE.some((re) => re.test(text))
