@@ -1,6 +1,6 @@
-import { eq, and, or, gt, gte, isNull, count, inArray } from 'drizzle-orm'
+import { eq, and, or, gt, gte, isNull, count, inArray, desc } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { serviceTypes, bookings, identities, availability, conversationSessions } from '../../db/schema.js'
+import { serviceTypes, bookings, identities, availability, conversationSessions, waitlist } from '../../db/schema.js'
 import type { Business, CalendarBlockType, SessionState } from '../../db/schema.js'
 import type { ResolvedIdentity } from '../identity/types.js'
 import type { ActiveSession } from '../session/types.js'
@@ -914,6 +914,36 @@ export function buildBusinessFacts(
   return lines.join('\n')
 }
 
+// F1c/S1 — the open waitlist offer (if any) this customer can accept by replying. The
+// "a spot opened" proactive offer (workers/waitlist.ts) flips the row to 'offered' but wires
+// NO session state and has no inbound consumer, so a "yes" used to fall through to fresh
+// intent and the system flailed (the live-test loop's primary trigger). This is that
+// consumer's loader: the most recent un-expired offered row + its service name.
+async function loadOpenWaitlistOffer(
+  db: Db,
+  businessId: string,
+  customerId: string,
+  now: Date,
+): Promise<{ id: string; serviceTypeId: string; slotStart: Date; slotEnd: Date } | null> {
+  const [row] = await db
+    .select({
+      id: waitlist.id,
+      serviceTypeId: waitlist.serviceTypeId,
+      slotStart: waitlist.slotStart,
+      slotEnd: waitlist.slotEnd,
+      offerExpiresAt: waitlist.offerExpiresAt,
+    })
+    .from(waitlist)
+    .where(and(eq(waitlist.businessId, businessId), eq(waitlist.customerId, customerId), eq(waitlist.status, 'offered')))
+    .orderBy(desc(waitlist.offeredAt))
+    .limit(1)
+  if (!row) return null
+  // Respect the offer TTL: an expired offer is no longer bindable (the expire_offer worker
+  // may not have swept it yet). A null expiry is treated as still-open (defensive).
+  if (row.offerExpiresAt && row.offerExpiresAt <= now) return null
+  return { id: row.id, serviceTypeId: row.serviceTypeId, slotStart: row.slotStart, slotEnd: row.slotEnd }
+}
+
 // F1e/S1 — which of last turn's offered slots may be batch-rejected this turn. Everything
 // offered is off the table EXCEPT the slot currently awaiting confirmation: rejecting that
 // one suppresses it from a later re-resolution and drifts the booking to a different date.
@@ -1105,6 +1135,56 @@ export async function handleBookingFlow(
         sessionComplete: true,
         escalated: true,
       }
+    }
+  }
+
+  // ── Branch: waitlist offer acceptance (F1c/S1) ───────────────────────────
+  // The "a spot opened" proactive offer sets no session pending state; bind the reply to the
+  // open offer HERE so a "yes" actually books it, instead of falling through to fresh intent
+  // (the loop's primary trigger). Only engages when no booking step is already in flight, so
+  // it never hijacks an in-progress confirmation/clarification.
+  if (session.state === 'active' && !ctx.pendingSlot && !ctx.pendingDecision && !ctx.awaitingConfirmationFor) {
+    const offer = await loadOpenWaitlistOffer(db, identity.businessId, identity.id, new Date())
+    if (offer) {
+      const offerServiceName = activeServices.find((s) => s.id === offer.serviceTypeId)?.name ?? (lang === 'he' ? 'התור' : 'the appointment')
+      const decision = parseConfirmation(messageText)
+      if (decision === 'no') {
+        await db.update(waitlist).set({ status: 'expired' }).where(eq(waitlist.id, offer.id))
+        await completeSession(db, session.id)
+        const reply = await genReply({
+          businessTimezone, businessName, language: lang,
+          situation: `The customer declined the ${offerServiceName} spot that just opened up. Acknowledge warmly and let them know they can reach out anytime to book.`,
+          transcript, ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}), customerMemory: extractMemory(ctx),
+        })
+        return { reply, sessionComplete: true }
+      }
+      if (decision === 'yes') {
+        const result = await requestBooking(db, calendar, identity, { serviceTypeId: offer.serviceTypeId, slotStart: offer.slotStart, slotEnd: offer.slotEnd })
+        const offerDate = formatSlotDate(offer.slotStart, businessTimezone)
+        const offerTime = formatSlotTime(offer.slotStart, businessTimezone)
+        if (result.ok || (!result.ok && result.code === 'already_booked')) {
+          await db.update(waitlist).set({ status: 'accepted' }).where(eq(waitlist.id, offer.id))
+          await completeSession(db, session.id)
+          const reply = await genReply({
+            businessTimezone, businessName, language: lang,
+            situation: result.ok
+              ? `Booking confirmed for ${offerServiceName} on ${offerDate} at ${offerTime} — the spot that opened up is now theirs.`
+              : `The customer is ALREADY booked for ${offerServiceName} on ${offerDate} at ${offerTime}. Warmly reassure them their spot is confirmed; do NOT offer another time.`,
+            transcript, ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}), customerMemory: extractMemory(ctx),
+          }, { bookingConfirmed: true })
+          return { reply, sessionComplete: true }
+        }
+        // The freed spot was taken before we could lock it in — honest, never a fabricated hold.
+        await db.update(waitlist).set({ status: 'expired' }).where(eq(waitlist.id, offer.id))
+        await completeSession(db, session.id)
+        const reply = await genReply({
+          businessTimezone, businessName, language: lang,
+          situation: `Unfortunately the ${offerServiceName} spot on ${offerDate} at ${offerTime} was taken before it could be locked in. Apologise warmly and offer to keep them on the waitlist or find another time.`,
+          transcript, ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}), customerMemory: extractMemory(ctx),
+        })
+        return { reply, sessionComplete: true }
+      }
+      // Unclear → fall through to normal handling; the offer stays open until its TTL.
     }
   }
 

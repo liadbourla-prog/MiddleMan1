@@ -168,6 +168,27 @@ describe('single-confirm appointment path — no double-confirm (F1b)', () => {
   })
 })
 
+// F1c/S1 — the "a spot opened" waitlist offer must be bindable on the inbound side: a "yes"
+// books the offered slot, a "no" releases it. Previously it set no session state and had no
+// consumer, so the reply fell through to fresh intent (the loop's primary trigger). This
+// reads the source so a future edit that drops the consumer fails loudly.
+describe('waitlist offer acceptance — inbound consumer binds the reply (F1c)', () => {
+  it('the consumer loads an open offer and books on yes / releases on no, before the dispatch', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    const idxConsumer = src.indexOf('loadOpenWaitlistOffer(db, identity.businessId, identity.id')
+    const idxBookingSelection = src.indexOf("pendingDecision?.kind === 'booking_selection'")
+    expect(idxConsumer).toBeGreaterThan(-1)
+    // Runs before the normal dispatch branches.
+    expect(idxConsumer).toBeLessThan(idxBookingSelection)
+    // yes → books the offered slot and marks it accepted; no → releases it.
+    expect(src).toMatch(/decision === 'yes'[\s\S]*requestBooking\(db, calendar, identity, \{ serviceTypeId: offer\.serviceTypeId/)
+    expect(src).toMatch(/status: 'accepted'/)
+    expect(src).toMatch(/decision === 'no'[\s\S]*status: 'expired'/)
+    // Only engages when no booking step is already in flight (never hijacks a confirmation).
+    expect(src).toMatch(/!ctx\.pendingSlot && !ctx\.pendingDecision && !ctx\.awaitingConfirmationFor/)
+  })
+})
+
 describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
   it('this-turn day wins over draft and lastInquiry', () => {
     expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')
