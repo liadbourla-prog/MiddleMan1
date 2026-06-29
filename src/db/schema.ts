@@ -1093,6 +1093,33 @@ export const escalatedTasks = pgTable(
   ],
 )
 
+// F3a/S3 — a customer asked a Branch-4 question the PA could not answer from business
+// facts/FAQs. Instead of fabricating "I'll check with the studio" (the reported bug), the PA
+// dispatches the question to the owner (Branch 3) and records it here so the owner's later
+// reply can be relayed BACK to the customer. The full round-trip: pending → owner answers via
+// the answerCustomerQuestion tool → answered (relayed) ; or the expiry worker → expired.
+export const pendingOwnerQuestions = pgTable(
+  'pending_owner_questions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    businessId: uuid('business_id').notNull().references(() => businesses.id),
+    customerId: uuid('customer_id').notNull().references(() => identities.id),
+    // Snapshot so a relay can reach the customer even without an active session/identity load.
+    customerPhone: text('customer_phone').notNull(),
+    questionText: text('question_text').notNull(),
+    status: text('status', { enum: ['pending', 'answered', 'expired'] }).notNull().default('pending'),
+    // The manager the question was sent to (for the owner-reply binding / free-text fallback).
+    askedManagerId: uuid('asked_manager_id').references(() => identities.id),
+    answerText: text('answer_text'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    answeredAt: timestamp('answered_at', { withTimezone: true }),
+  },
+  (t) => [
+    index('pending_owner_questions_status_idx').on(t.businessId, t.status),
+    index('pending_owner_questions_customer_idx').on(t.businessId, t.customerId, t.status),
+  ],
+)
+
 // Log of operator-triggered bulk updates pushed to all agents
 export const agentUpdateLog = pgTable('agent_update_log', {
   id: uuid('id').primaryKey().defaultRandom(),
