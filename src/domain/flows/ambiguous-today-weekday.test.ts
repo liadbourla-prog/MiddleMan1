@@ -1,5 +1,26 @@
 import { describe, it, expect } from 'vitest'
-import { decideAmbiguousTodayWeekday, ambiguousTodayWeekdayAsk, consumeWeekdayClarification } from './customer-booking.js'
+import { decideAmbiguousTodayWeekday, ambiguousTodayWeekdayAsk, consumeWeekdayClarification, carriesWeekdayClarification } from './customer-booking.js'
+
+// WS3-T3.5 BUG4: a same-day weekday with no service that turn must NOT silently book today —
+// the ambiguity marker survives a serviceless turn so the "today or next week?" ask still
+// fires once the service is named.
+describe('carriesWeekdayClarification — marker survives a serviceless turn', () => {
+  it('keeps the marker when no date bound AND no fresh day this turn (e.g. just named the service)', () => {
+    expect(carriesWeekdayClarification(true, false, false)).toBe(true)
+  })
+
+  it('drops the marker when the answer BOUND a date (today/next week)', () => {
+    expect(carriesWeekdayClarification(true, true, false)).toBe(false)
+  })
+
+  it('drops the marker when a fresh concrete day supersedes it', () => {
+    expect(carriesWeekdayClarification(true, false, true)).toBe(false)
+  })
+
+  it('no marker → nothing to carry', () => {
+    expect(carriesWeekdayClarification(false, false, false)).toBe(false)
+  })
+})
 
 // WS3-T3.5 BUG3: the consume must BIND the stashed date for a today/next-week answer so the
 // date-resolution block is skipped — a bare "next week" answer (relativeDay:'next_week',

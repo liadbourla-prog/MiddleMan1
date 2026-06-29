@@ -589,6 +589,19 @@ export function decideAmbiguousTodayWeekday(
   return 'roll' // every session already started → next week
 }
 
+// WS3-T3.5 BUG4: should a previously-stashed ambiguity marker survive THIS turn? PURE.
+// True when the marker exists, the customer gave neither a today/next-week answer (which would
+// BIND a date) nor a fresh concrete day (which supersedes it) — e.g. they just named the
+// service after a serviceless ambiguity turn. The caller then re-raises the "today or next
+// week?" ask once the service resolves, instead of silently booking today.
+export function carriesWeekdayClarification(
+  hasMarker: boolean,
+  boundADate: boolean,
+  broughtFreshDay: boolean,
+): boolean {
+  return hasMarker && !boundADate && !broughtFreshDay
+}
+
 // WS3-T3.5: consume a customer's answer to the "today or next week?" ambiguity ask. PURE.
 // Returns the bound 'YYYY-MM-DD' (today or next-week, from the stashed pair) when the answer
 // resolves the ambiguity, or null when this turn names a DIFFERENT concrete day (the caller
@@ -1799,12 +1812,22 @@ async function handleBookingIntent(
   // perfectly good bound date. A different concrete day this turn does NOT bind here and falls
   // through to normal resolution (which wins).
   let boundFromWeekdayClarification = false
+  // WS3-T3.5 BUG4: a marker may survive a serviceless turn — when last turn detected the
+  // ambiguity but no service was known yet (so the "today or next week?" ask couldn't fire),
+  // we stashed the marker WITHOUT committing a date. If this turn brings neither a today/
+  // next-week answer NOR a fresh concrete day (e.g. the customer just now names the service),
+  // keep the marker alive so the ask re-fires once the service resolves below — never let it
+  // silently fall through and book today.
+  let carriedWeekdayClarification: BookingFlowContext['pendingWeekdayClarification'] | null = null
   if (ctx.pendingWeekdayClarification) {
-    const bound = consumeWeekdayClarification(ctx.pendingWeekdayClarification, {
+    const pending = ctx.pendingWeekdayClarification
+    const bound = consumeWeekdayClarification(pending, {
       relativeDay: slot?.relativeDay ?? null,
       weekdayAnchor: slot?.weekdayAnchor ?? null,
     })
+    const broughtFreshDay = Boolean(slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate))
     if (bound) { draft.dateStr = bound; boundFromWeekdayClarification = true }
+    else if (carriesWeekdayClarification(true, false, broughtFreshDay)) carriedWeekdayClarification = pending
     // else: a different concrete day this turn → normal resolution below wins.
     const { pendingWeekdayClarification: _clearedPending, ...restCtx } = ctx
     ctx = restCtx as BookingFlowContext
@@ -1829,6 +1852,17 @@ async function handleBookingIntent(
         ambiguousTodayWeekday = { weekday: slot.weekday, todayStr: resolved.dateStr, nextWeekStr: resolved.nextWeekStr }
       }
     } else if (resolved.reason !== 'no_date') dateProblem = resolved.reason
+  }
+  // WS3-T3.5 BUG4: re-hydrate the deferred ambiguity from a carried marker (a serviceless turn
+  // last time stashed it without a date). Only when this turn produced no fresh ambiguity of its
+  // own and bound no date — so once the service resolves below, the "today or next week?" ask
+  // fires instead of silently booking today.
+  if (!ambiguousTodayWeekday && !boundFromWeekdayClarification && carriedWeekdayClarification && draft.dateStr == null) {
+    ambiguousTodayWeekday = {
+      weekday: carriedWeekdayClarification.weekday,
+      todayStr: carriedWeekdayClarification.todayStr,
+      nextWeekStr: carriedWeekdayClarification.nextWeekStr,
+    }
   }
   if (slot?.time) draft.time = { hour: slot.time.hour, minute: slot.time.minute }
 
@@ -1903,10 +1937,36 @@ async function handleBookingIntent(
     return { reply, sessionComplete: false }
   }
 
+  // ── WS3-T3.5 BUG4: ambiguity detected but no service yet → DON'T silently book today.
+  // Previously this branch was gated on draft.serviceTypeId, so a serviceless turn skipped it,
+  // the missing-pieces gate persisted draft.dateStr=today, and next turn (service named, no
+  // weekday) the ambiguity was gone → silent same-day booking. Instead: drop the provisional
+  // `today` date and stash the marker (without a serviceTypeId — it's still unknown) so the
+  // ask survives. Once the service arrives next turn, the carried-marker re-hydration above
+  // re-raises the ambiguity and the ask fires. No customer-facing string here.
+  if (ambiguousTodayWeekday && !draft.serviceTypeId) {
+    const { dateStr: _dropProvisionalToday, ...draftNoDate } = draft
+    await updateSessionContext(db, session.id, {
+      ...ctx,
+      slotDraft: draftNoDate,
+      pendingWeekdayClarification: {
+        weekday: ambiguousTodayWeekday.weekday,
+        todayStr: ambiguousTodayWeekday.todayStr,
+        nextWeekStr: ambiguousTodayWeekday.nextWeekStr,
+      },
+    }, 'waiting_clarification')
+    const list = activeServices.map((s) => s.name).join(', ')
+    const reply = await genReply({
+      businessTimezone,
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${firstMsgPrefix}The customer wants to book but hasn't said which service. Available: ${list}. Ask which one — one question, naturally.`,
+    })
+    return { reply, sessionComplete: false }
+  }
+
   // ── WS3-T3.5: bare same-day weekday — today or same day next week? ──────────
   // The resolver flagged ambiguity; the decision needs the resolved SERVICE, so it runs
-  // HERE (after service resolution). If no service is known yet, skip — the missing-pieces
-  // gate below asks for the service first and next turn re-runs this branch.
+  // HERE (after service resolution). If no service is known yet, the branch above handled it.
   if (ambiguousTodayWeekday && draft.serviceTypeId && business) {
     const serviceTypeId = draft.serviceTypeId
     const serviceName = draft.serviceName ?? 'this'
