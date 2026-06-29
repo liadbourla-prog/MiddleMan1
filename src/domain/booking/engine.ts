@@ -1,4 +1,4 @@
-import { eq, and, or, lt, lte, gt, gte, count, isNotNull, ne, sql } from 'drizzle-orm'
+import { eq, and, or, lt, lte, gt, gte, count, isNotNull, ne, sql, inArray } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { bookings, serviceTypes, businesses, identities } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
@@ -56,6 +56,70 @@ export function validateSlotTiming(
   if (slotEnd <= slotStart) return 'Slot end must be after slot start'
 
   return null
+}
+
+// ── Advisory-lock key for private (1-on-1) booking slots ─────────────────────
+// Derives the Postgres advisory transaction lock key used by requestPrivateBooking
+// to serialize concurrent conflict-check+insert pairs for the same slot.
+//
+// I/O contract (pinned; the DB lock call is integration-level):
+//   • Same (businessId, slotStartIso) → identical key every time (deterministic).
+//   • Different slotStart → different key (distinct slots never share a lock).
+//   • Different businessId → different key (cross-business isolation).
+//   • Provider-agnostic: providerId is deliberately EXCLUDED from the key because
+//     the private conflict SELECT (engine.ts ~line 255) does NOT filter by providerId.
+//     Including providerId would make the lock FINER than the conflict check and let a
+//     same-slot/different-provider race slip through. The lock must be at least as
+//     coarse as the SELECT it guards.
+//   • Partial-overlap-but-different-start races (14:00–15:00 vs 14:30–15:30) are NOT
+//     covered by this key (different slotStart → different lock). They are closed at the
+//     DB level by the T1.1b `bookings_exclusive_no_overlap` GiST EXCLUDE constraint
+//     (migration 0049): the loser's requested→held transition raises 23P01 and is mapped
+//     to a graceful "slot taken" failure (see isOverlapExclusionViolation). This advisory
+//     key remains the fast path for the dominant race (two customers grabbing the EXACT
+//     same advertised slot — resolved without ever reaching the constraint).
+export function privateBookingLockKey(businessId: string, slotStartIso: string): string {
+  return `${businessId}:${slotStartIso}`
+}
+
+// T1.1b: detect that an exclusive (1-on-1) requested→held transition lost the overlap race
+// against the `bookings_exclusive_no_overlap` GiST EXCLUDE constraint. Two shapes occur:
+//   • 23P01 (exclusion_violation): the other booking already committed its held row, so this
+//     transition is rejected outright.
+//   • 40P01 (deadlock_detected): both racers insert their conflicting index entry at the same
+//     instant and wait on each other; Postgres aborts ONE victim. The victim is, by definition,
+//     the loser of a mutually-exclusive overlap — exactly one survivor commits, so treating the
+//     victim as an overlap-loss preserves the "exactly one winner" invariant.
+// postgres-js surfaces the SQLSTATE on `err.code`. This guard is applied ONLY around the
+// held-transition UPDATE (runExclusiveTransition), where the exclusion constraint is the sole
+// lock interaction — so a deadlock there can only be this race, never an unrelated cycle.
+function isOverlapExclusionViolation(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  const code = (err as { code?: unknown }).code
+  return code === '23P01' || code === '40P01'
+}
+
+// T1.1b: run an exclusive (1-on-1) requested→held / requested→pending_payment transition,
+// converting a GiST-exclusion violation (the loser of a partial-overlap race) into a clean
+// "slot no longer available" failure. The orphaned `requested` row is flipped to `failed`
+// (markFailed) so it can't strand a seat. A non-23P01 error is rethrown untouched.
+async function runExclusiveTransition(
+  db: Db,
+  businessId: string,
+  bookingId: string,
+  actorId: string,
+  apply: () => Promise<unknown>,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  try {
+    await apply()
+    return { ok: true }
+  } catch (err) {
+    if (isOverlapExclusionViolation(err)) {
+      await markFailed(db, businessId, bookingId, actorId, 'Slot taken by a concurrent overlapping booking')
+      return { ok: false, reason: 'Slot is no longer available' }
+    }
+    throw err
+  }
 }
 
 // Map a spatial BookableReason to an upstream reason string. These are sanitised
@@ -248,10 +312,28 @@ async function requestPrivateBooking(
     : new Date(Date.now() + HOLD_EXPIRY_MINUTES * 60 * 1000)
 
   // Wrap conflict check + insert in a transaction to prevent race conditions.
-  // The SELECT uses FOR UPDATE on the bookings table to lock conflicting rows
-  // before we insert, eliminating the TOCTOU window.
+  // An advisory transaction lock (acquired at the top of the transaction, before any
+  // SELECT) serializes concurrent requestPrivateBooking calls for the SAME slot.
+  //
+  // Why FOR UPDATE alone is insufficient: when the slot is FREE the conflict SELECT
+  // returns zero rows, so FOR UPDATE locks nothing — two concurrent requests both see
+  // zero conflicts and both insert (TOCTOU double-book, finding A1, root P1).
+  //
+  // Fix (mirrors the group path at engine.ts:~line 501):
+  //   pg_advisory_xact_lock(hashtext(lockKey)::bigint)
+  //   where lockKey = `${businessId}:${slotStart.toISOString()}` (provider-agnostic —
+  //   see privateBookingLockKey docblock for the granularity rationale).
+  // Postgres releases the advisory lock automatically at transaction end.
+  //
+  // Residual: partial-overlap-but-different-start races (e.g. two bookings that
+  // overlap but start at different times) are NOT closed by this key and remain a
+  // known gap; they are addressed only by the optional T1.1b GiST EXCLUDE constraint
+  // and the existing A6 freebusy probe. This fix targets the dominant race.
   const result = await (db as unknown as { transaction: <T>(fn: (tx: typeof db) => Promise<T>) => Promise<T> })
     .transaction(async (tx) => {
+      const lockKey = privateBookingLockKey(actor.businessId, request.slotStart.toISOString())
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`)
+
       const conflicts = await tx
         .select({ id: bookings.id })
         .from(bookings)
@@ -270,6 +352,10 @@ async function requestPrivateBooking(
             ),
           ),
         )
+        // Retained as defense-in-depth: the advisory lock above already serializes the
+        // free-slot race (the phantom-insert case FOR UPDATE could not cover). FOR UPDATE
+        // still adds value when the SELECT *does* find an already-conflicting row — it locks
+        // that row so a concurrent state-change can't slip past us. Belt-and-suspenders.
         .for('update')
         .limit(1)
 
@@ -287,6 +373,9 @@ async function requestPrivateBooking(
           slotEnd: request.slotEnd,
           slotTzAtCreation: businessTz,
           state: 'requested',
+          // T1.1b: a 1-on-1 booking exclusively owns its time range — backs the GiST
+          // EXCLUDE constraint that rejects partial-overlap double-books (finding A1).
+          isExclusive: true,
           // Pin the price at booking time for accurate lifetime-spend (Phase 3).
           amount: service.paymentAmount ?? null,
         })
@@ -308,12 +397,12 @@ async function requestPrivateBooking(
   )
 
   if (holdResult.status === 'conflict') {
-    await markFailed(db, result.bookingId, actor.id, 'Calendar slot became occupied')
+    await markFailed(db, actor.businessId, result.bookingId, actor.id, 'Calendar slot became occupied')
     return { ok: false, reason: 'Slot is no longer available' }
   }
 
   if (holdResult.status === 'error') {
-    await markFailed(db, result.bookingId, actor.id, holdResult.reason)
+    await markFailed(db, actor.businessId, result.bookingId, actor.id, holdResult.reason)
     return { ok: false, reason: 'Could not place hold — please try again' }
   }
 
@@ -326,21 +415,24 @@ async function requestPrivateBooking(
   if (requiresApproval) {
     const toHeld = transition('requested', 'held')
     if (!toHeld.ok) {
-      await markFailed(db, result.bookingId, actor.id, toHeld.reason)
+      await markFailed(db, actor.businessId, result.bookingId, actor.id, toHeld.reason)
       return { ok: false, reason: 'Internal state error' }
     }
 
-    await db
-      .update(bookings)
-      .set({
-        state: 'held',
-        approvalStatus: 'pending',
-        holdExpiresAt,
-        calendarEventId: holdResult.eventId,
-        googleEtag: holdResult.etag ?? null,
-        updatedAt: new Date(),
-      })
-      .where(eq(bookings.id, result.bookingId))
+    const approvalHeld = await runExclusiveTransition(db, actor.businessId, result.bookingId, actor.id, () =>
+      db
+        .update(bookings)
+        .set({
+          state: 'held',
+          approvalStatus: 'pending',
+          holdExpiresAt,
+          calendarEventId: holdResult.eventId,
+          googleEtag: holdResult.etag ?? null,
+          updatedAt: new Date(),
+        })
+        .where(eq(bookings.id, result.bookingId)),
+    )
+    if (!approvalHeld.ok) return approvalHeld
 
     await logAudit(db, {
       businessId: actor.businessId,
@@ -370,21 +462,24 @@ async function requestPrivateBooking(
     // Payment-first flow: set state to pending_payment, notify customer to pay
     const toPayment = transition('requested', 'pending_payment')
     if (!toPayment.ok) {
-      await markFailed(db, result.bookingId, actor.id, toPayment.reason)
+      await markFailed(db, actor.businessId, result.bookingId, actor.id, toPayment.reason)
       return { ok: false, reason: 'Internal state error' }
     }
 
-    await db
-      .update(bookings)
-      .set({
-        state: 'pending_payment',
-        holdExpiresAt,
-        calendarEventId: holdResult.eventId,
-        googleEtag: holdResult.etag ?? null,
-        paymentStatus: 'pending',
-        updatedAt: new Date(),
-      })
-      .where(eq(bookings.id, result.bookingId))
+    const toPaymentHeld = await runExclusiveTransition(db, actor.businessId, result.bookingId, actor.id, () =>
+      db
+        .update(bookings)
+        .set({
+          state: 'pending_payment',
+          holdExpiresAt,
+          calendarEventId: holdResult.eventId,
+          googleEtag: holdResult.etag ?? null,
+          paymentStatus: 'pending',
+          updatedAt: new Date(),
+        })
+        .where(eq(bookings.id, result.bookingId)),
+    )
+    if (!toPaymentHeld.ok) return toPaymentHeld
 
     await logAudit(db, {
       businessId: actor.businessId,
@@ -411,20 +506,23 @@ async function requestPrivateBooking(
   // Immediate confirmation flow (default)
   const toHeld = transition('requested', 'held')
   if (!toHeld.ok) {
-    await markFailed(db, result.bookingId, actor.id, toHeld.reason)
+    await markFailed(db, actor.businessId, result.bookingId, actor.id, toHeld.reason)
     return { ok: false, reason: 'Internal state error' }
   }
 
-  await db
-    .update(bookings)
-    .set({
-      state: 'held',
-      holdExpiresAt,
-      calendarEventId: holdResult.eventId,
-      googleEtag: holdResult.etag ?? null,
-      updatedAt: new Date(),
-    })
-    .where(eq(bookings.id, result.bookingId))
+  const immediateHeld = await runExclusiveTransition(db, actor.businessId, result.bookingId, actor.id, () =>
+    db
+      .update(bookings)
+      .set({
+        state: 'held',
+        holdExpiresAt,
+        calendarEventId: holdResult.eventId,
+        googleEtag: holdResult.etag ?? null,
+        updatedAt: new Date(),
+      })
+      .where(eq(bookings.id, result.bookingId)),
+  )
+  if (!immediateHeld.ok) return immediateHeld
 
   await logAudit(db, {
     businessId: actor.businessId,
@@ -477,6 +575,18 @@ async function requestGroupClassBooking(
       // (business, service, slot) is the correct slot-level mutex: it forces
       // concurrent bookers of the same class to take turns through the count→insert
       // window, and Postgres releases it automatically at transaction end.
+      //
+      // A2 — canonical-key invariant (finding A2, T1.2):
+      //   `request.slotStart` is canonical by construction. Offered class slots come
+      //   directly from `calendarBlocks.startTs` (the DB-authoritative schedule) and
+      //   are stored as ISO strings in `pendingSlot.start`, round-tripped via
+      //   `new Date(pendingSlot.start)` — bit-identical to the original. For
+      //   `schedulingMode:'class'` services the `no_class_at_time` gate (engine.ts
+      //   line ~156) rejects any slotStart that doesn't exactly match a DB block, so
+      //   only canonical values reach this function. The advisory lock key and the
+      //   capacity COUNT below both key on this same `request.slotStart`, so they are
+      //   guaranteed consistent — no separate canonical-block lookup is needed.
+      //   NO DB construct added (gated per §A2 backfill requirement).
       const lockKey = `${actor.businessId}:${request.serviceTypeId}:${request.slotStart.toISOString()}`
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`)
 
@@ -502,7 +612,12 @@ async function requestGroupClassBooking(
         return { ok: false as const, reason: `Class is full (${currentCount}/${maxParticipants} spots taken)` }
       }
 
-      // Also prevent the same customer from double-booking the same class
+      // Also prevent the same customer from double-booking the same class.
+      // A5 fix (T1.2): include `pending_payment` in the state set so a customer
+      // with an unpaid-but-active seat cannot slip a second booking through while
+      // payment is outstanding. Mirrors the state set used by the capacity count
+      // above (requested | confirmed | pending_payment) — both guards must agree
+      // on what counts as an "occupying" booking.
       const [duplicate] = await tx
         .select({ id: bookings.id })
         .from(bookings)
@@ -512,7 +627,11 @@ async function requestGroupClassBooking(
             eq(bookings.serviceTypeId, request.serviceTypeId),
             eq(bookings.slotStart, request.slotStart),
             eq(bookings.customerId, actor.id),
-            or(eq(bookings.state, 'requested'), eq(bookings.state, 'confirmed')),
+            or(
+              eq(bookings.state, 'requested'),
+              eq(bookings.state, 'confirmed'),
+              eq(bookings.state, 'pending_payment'),
+            ),
           ),
         )
         .limit(1)
@@ -533,6 +652,10 @@ async function requestGroupClassBooking(
           slotEnd: request.slotEnd,
           slotTzAtCreation: businessTz,
           state: 'requested',
+          // T1.1b: a class booking is NON-exclusive — many customers share one class slot
+          // up to capacity. is_exclusive=false keeps these rows OUT of the overlap-exclusion
+          // constraint so legitimate class co-bookings are never rejected (the G1 trap).
+          isExclusive: false,
           // Pin the price at booking time for accurate lifetime-spend (Phase 3).
           amount: service.paymentAmount ?? null,
         })
@@ -580,7 +703,7 @@ async function requestGroupClassBooking(
 
     if (holdResult.status !== 'held') {
       const reason = holdResult.status === 'error' ? holdResult.reason : 'Calendar slot conflict'
-      await markFailed(db, txResult.bookingId, actor.id, reason)
+      await markFailed(db, actor.businessId, txResult.bookingId, actor.id, reason)
       return { ok: false, reason: 'Could not create calendar event — please try again' }
     }
 
@@ -588,7 +711,7 @@ async function requestGroupClassBooking(
     // overwrites title + description with the live roster once the booking is stored.
     const confirmResult = await calendar.confirmHold(holdResult.eventId, service.name, '')
     if (confirmResult.status === 'error') {
-      await markFailed(db, txResult.bookingId, actor.id, 'Calendar confirm failed')
+      await markFailed(db, actor.businessId, txResult.bookingId, actor.id, 'Calendar confirm failed')
       return { ok: false, reason: 'Could not confirm calendar event — please try again' }
     }
 
@@ -660,6 +783,25 @@ export async function confirmBooking(
   customerName: string,
   opts?: { suppressOwnerNewBookingNotice?: boolean },
 ): Promise<BookingEngineResult> {
+  // ── Ordering + loser-resolution contract (T1.5, A4/P1) ───────────────────
+  //
+  // 1. Up-front guards: booking exists, auth, state='held', hold not expired,
+  //    eventId present.
+  // 2. Block re-validation (A4): load the business row, then call isSlotBookable
+  //    with includeBookings:false so the check targets owner blocks + availability
+  //    hours only (a block/personal row or out-of-hours created during the hold).
+  //    excludeBookingId:bookingId excludes this hold itself. Not bookable → fail
+  //    with markFailed; do NOT flip to confirmed.
+  // 3. CAS flip as the atomic arbiter (P1): UPDATE … WHERE id=? AND state='held'
+  //    RETURNING id. Exactly one concurrent caller flips; the other sees 0 rows.
+  // 4. Side effects (calendar.confirmHold, audit, recordCompletedBooking,
+  //    scheduleReminders, owner notice) are gated on the CAS winner (1 row).
+  //    Loser (0 rows) → re-read state:
+  //      - 'confirmed' (a concurrent confirm won) → ok:true idempotent success, NO side effects.
+  //      - anything else (expired/cancelled — hold-expiry or cancel won) → ok:false.
+  // 5. confirmHold failure after a successful flip: the booking is already confirmed
+  //    in the DB. Do NOT roll back. Log for reconciliation and still return ok:true.
+
   const [booking] = await db
     .select()
     .from(bookings)
@@ -689,6 +831,37 @@ export async function confirmBooking(
   const eventId = booking.calendarEventId
   if (!eventId) return { ok: false, reason: 'Booking has no calendar event' }
 
+  // ── A4: Re-validate blocks created during the hold ────────────────────────
+  // Load the business row (needed by isSlotBookable for timezone + available247).
+  // A4 makes block re-validation an INVARIANT: if the business row can't be loaded
+  // we must NOT silently confirm without it — a booking always references a real
+  // businessId, so a missing row is a genuine anomaly, not a normal degrade path.
+  const [business] = await db
+    .select()
+    .from(businesses)
+    .where(eq(businesses.id, actor.businessId))
+    .limit(1)
+
+  if (!business) return { ok: false, reason: 'Business not found' }
+
+  const bookable = await isSlotBookable(
+    db,
+    business,
+    { start: booking.slotStart, end: booking.slotEnd },
+    {
+      excludeBookingId: bookingId,   // exclude this hold itself
+      includeBookings: false,        // only blocks + availability hours (not competing bookings)
+    },
+  )
+  if (!bookable.bookable) {
+    await markFailed(db, actor.businessId, bookingId, actor.id, 'Slot blocked during hold')
+    return {
+      ok: false,
+      reason: "That time is no longer available — the studio blocked it. Let's find another.",
+    }
+  }
+
+  // ── Prepare calendar event content (before CAS so render errors bail early) ─
   const rendered = await buildOneOnOneEventContent(db, actor.businessId, {
     serviceTypeId: booking.serviceTypeId,
     customerId: booking.customerId,
@@ -697,16 +870,47 @@ export async function confirmBooking(
   const confirmTitle = rendered?.title ?? `${service?.name ?? 'Appointment'} — ${customerName}`
   const confirmDescription = rendered?.description ?? `${customerName}`
 
-  const confirmResult = await calendar.confirmHold(eventId, confirmTitle, confirmDescription)
+  // ── P1: CAS flip — the atomic arbiter ─────────────────────────────────────
+  // The WHERE predicate gates on state='held', so exactly one concurrent caller
+  // (confirm or hold-expiry) flips the row. The other sees 0 rows returned.
+  // ALL side effects (calendar write, audit, reminders, owner notice) are gated
+  // on 1 row returned.
+  const [flipped] = await db
+    .update(bookings)
+    .set({ state: 'confirmed', holdExpiresAt: null, updatedAt: new Date() })
+    .where(and(eq(bookings.id, bookingId), eq(bookings.state, 'held')))
+    .returning({ id: bookings.id })
 
-  if (confirmResult.status === 'error') {
-    return { ok: false, reason: 'Could not confirm calendar event — please try again' }
+  // ── Loser path (0 rows): a concurrent operation already flipped the row ────
+  if (!flipped) {
+    // Re-read to determine what happened.
+    const [current] = await db
+      .select({ state: bookings.state })
+      .from(bookings)
+      .where(eq(bookings.id, bookingId))
+      .limit(1)
+    if (current?.state === 'confirmed') {
+      // A concurrent confirm won — idempotent success, no side effects.
+      return { ok: true, bookingId, message: 'Booking confirmed.' }
+    }
+    // Hold expired or was cancelled while we were in flight.
+    return { ok: false, reason: 'Hold has expired — please start a new booking' }
   }
 
-  await db
-    .update(bookings)
-    .set({ state: 'confirmed', holdExpiresAt: null, googleEtag: confirmResult.etag ?? null, updatedAt: new Date() })
-    .where(eq(bookings.id, bookingId))
+  // ── Winner path: fire side effects ────────────────────────────────────────
+  // calendar.confirmHold runs AFTER the CAS so the DB state is canonical first.
+  // If it fails the booking is already confirmed — do NOT roll back, log and continue.
+  const confirmResult = await calendar.confirmHold(eventId, confirmTitle, confirmDescription)
+  if (confirmResult.status === 'error') {
+    console.error('[engine] confirmHold failed after state flip — booking confirmed in DB, calendar event not updated (id:', bookingId, ')')
+    // Update etag only if we have one; leave existing etag if confirmHold errored
+  } else {
+    // Store the updated etag from the successful confirmHold
+    await db
+      .update(bookings)
+      .set({ googleEtag: confirmResult.etag ?? null })
+      .where(eq(bookings.id, bookingId))
+  }
 
   await logAudit(db, {
     businessId: actor.businessId,
@@ -785,15 +989,71 @@ export async function cancelBooking(
     }
   }
 
+  // Serial-retry idempotency guard: if the booking is ALREADY cancelled at read
+  // time, return success with no side effects. The CAS alone cannot close this —
+  // transition('cancelled','cancelled') passes via its from===to idempotent branch,
+  // and the CAS predicate (state = booking.state = 'cancelled') would match the
+  // already-cancelled row → 1 row "flipped" → side effects would re-fire. This
+  // explicit guard is what makes a repeated cancel of a completed cancel a true
+  // no-op (no duplicate audit, no duplicate notifications, no second waitlist offer).
+  if (booking.state === 'cancelled') {
+    return { ok: true, bookingId, message: 'Booking cancelled.' }
+  }
+
   const t = transition(booking.state, 'cancelled')
   if (!t.ok) return { ok: false, reason: t.reason }
 
-  // When a group participant cancels but others remain, refresh the shared event's
-  // roster after the state flip (below) instead of deleting it.
-  let refreshGroupRosterAfter = false
+  // Computed before the CAS so the same value feeds both the CAS payload and the
+  // winner-side audit row below.
+  const cancelledByRole =
+    actor.role === 'manager' ? 'manager' : actor.role === 'customer' ? 'customer' : 'system'
 
+  // ── Conditional CAS: the state-flip is the atomic arbiter ─────────────────
+  //
+  // ORDER MATTERS: the CAS runs BEFORE any side effects (calendar delete,
+  // notifications, waitlist). This eliminates the TOCTOU race where two
+  // concurrent cancels both pass the transition() guard and both fire side
+  // effects.
+  //
+  // The WHERE predicate gates on the exact state observed at read time
+  // (AND state = <booking.state>), so exactly one concurrent winner can flip
+  // the row. The other sees 0 rows returned and takes the idempotent path.
+  //
+  // Idempotency contract:
+  //   - 0 rows returned  → a concurrent cancel already won; return ok:true
+  //     with NO side effects (no calendar delete, no audit, no notifications,
+  //     no waitlist offer).
+  //   - 1 row returned   → this call is the winner; run all side effects in
+  //     order below.
+  //
+  // Calendar-delete failure after a successful flip: the cancel is already
+  // authoritative in the DB. Do NOT roll back or return ok:false — that would
+  // leave the state as 'cancelled' in DB but suggest a retry that could
+  // double-fire later side effects. Instead, log the orphaned calendar event
+  // for reconciliation and return ok:true. (Behavior change from prior code
+  // which returned ok:false on delete error before the state flip.)
+  const [flipped] = await db
+    .update(bookings)
+    .set({
+      state: 'cancelled',
+      cancellationReason: reason ?? null,
+      cancelledByRole,
+      holdExpiresAt: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(bookings.id, bookingId), eq(bookings.businessId, actor.businessId), eq(bookings.state, booking.state)))
+    .returning({ id: bookings.id })
+
+  // ── Idempotent: concurrent cancel already won — no side effects ───────────
+  if (!flipped) {
+    return { ok: true, bookingId, message: 'Booking cancelled.' }
+  }
+
+  // ── Winner path: run all side effects gated on the successful flip ────────
+
+  // Calendar: for group classes only delete the event when the last participant
+  // cancels; otherwise just refresh the shared event's roster.
   if (booking.calendarEventId) {
-    // For group classes, only delete the calendar event when the last participant cancels
     const [service] = await db
       .select({ maxParticipants: serviceTypes.maxParticipants })
       .from(serviceTypes)
@@ -821,30 +1081,17 @@ export async function cancelBooking(
     if (shouldDeleteEvent) {
       const deleteResult = await calendar.deleteEvent(booking.calendarEventId)
       if (deleteResult.status === 'error') {
-        return { ok: false, reason: 'Could not remove calendar event — please try again' }
+        // The state flip already committed — do NOT return ok:false or roll back.
+        // Log the orphaned event for reconciliation; the cancel is authoritative.
+        console.error(
+          '[engine] orphaned calendar event after cancel',
+          { bookingId, calendarEventId: booking.calendarEventId, reason: deleteResult.reason },
+        )
       }
     } else if (isGroupClass) {
-      refreshGroupRosterAfter = true
+      // Now that this booking is no longer active, redraw the remaining class roster.
+      await refreshGroupEventRoster(db, calendar, actor.businessId, booking.serviceTypeId, booking.slotStart)
     }
-  }
-
-  const cancelledByRole =
-    actor.role === 'manager' ? 'manager' : actor.role === 'customer' ? 'customer' : 'system'
-
-  await db
-    .update(bookings)
-    .set({
-      state: 'cancelled',
-      cancellationReason: reason ?? null,
-      cancelledByRole,
-      holdExpiresAt: null,
-      updatedAt: new Date(),
-    })
-    .where(eq(bookings.id, bookingId))
-
-  // Now that this booking is no longer active, redraw the remaining class roster.
-  if (refreshGroupRosterAfter) {
-    await refreshGroupEventRoster(db, calendar, actor.businessId, booking.serviceTypeId, booking.slotStart)
   }
 
   await logAudit(db, {
@@ -1071,14 +1318,22 @@ export async function finalizePaidBooking(
   return { ok: true, bookingId: booking.id, message: `Booking confirmed for ${customerPhone}.` }
 }
 
-async function markFailed(db: Db, bookingId: string, actorId: string, reason: string) {
+// Mark an in-flight booking as failed. The state predicate is load-bearing: it
+// must NEVER stomp a confirmed/terminal row. The A4 re-validation path in
+// confirmBooking calls this while the row is still 'held' — if a concurrent
+// confirm WON the CAS and flipped it to 'confirmed' in between, this UPDATE must
+// be a no-op (a confirmed booking has a live calendar event + scheduled reminders;
+// overwriting it to 'failed' is a data-integrity violation). Every existing caller
+// invokes this on a requested/held/pending_payment row, so the guard never blocks
+// a legitimate failure — it only closes the confirmed-stomp race.
+async function markFailed(db: Db, businessId: string, bookingId: string, actorId: string, reason: string) {
   await db
     .update(bookings)
     .set({ state: 'failed', updatedAt: new Date() })
-    .where(eq(bookings.id, bookingId))
+    .where(and(eq(bookings.id, bookingId), inArray(bookings.state, ['requested', 'held', 'pending_payment'])))
 
   await logAudit(db, {
-    businessId: '',
+    businessId,
     actorId,
     action: 'booking.failed',
     entityType: 'booking',

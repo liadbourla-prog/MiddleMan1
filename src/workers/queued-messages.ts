@@ -12,6 +12,7 @@ import { buildHydratedContext } from '../domain/session/hydration.js'
 import { updateSessionContext } from '../domain/session/manager.js'
 import { saveMessage, loadTranscript } from '../domain/messages/repository.js'
 import { sendMessage } from '../adapters/whatsapp/sender.js'
+import { withIdentityLock } from '../domain/flows/concurrency-lock.js'
 
 const QUEUE_NAME = 'queued-messages'
 
@@ -43,7 +44,7 @@ export async function queueMessageForLater(
   )
 }
 
-async function processJob(job: { data: QueuedMessageJob }) {
+export async function processJob(job: { data: QueuedMessageJob }) {
   const { businessId, fromNumber, body } = job.data
 
   const [business] = await db
@@ -54,7 +55,7 @@ async function processJob(job: { data: QueuedMessageJob }) {
 
   if (!business || business.paused) return
 
-  let identityResult = await resolveIdentity(db, businessId, fromNumber)
+  const identityResult = await resolveIdentity(db, businessId, fromNumber)
   if (!identityResult.found) return
   if ('reason' in identityResult && identityResult.reason === 'revoked') return
   const identity = identityResult.identity
@@ -65,51 +66,59 @@ async function processJob(job: { data: QueuedMessageJob }) {
     ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
     : undefined
 
-  let session = await loadActiveSession(db, identity.id)
-  if (!session) {
-    const memory = await loadCustomerMemory(db, identity.id)
-    const hydratedContext = await buildHydratedContext(db, identity.id, businessId, memory)
-    session = await createSession(db, businessId, identity.id, 'booking')
-    await updateSessionContext(db, session.id, hydratedContext as unknown as Record<string, unknown>)
-    session = { ...session, context: hydratedContext as unknown as Record<string, unknown> }
-  }
+  // E3 (T1.8b): the queued-message replay writes the SAME session/booking rows as the live
+  // inbound path, which runs under withIdentityLock (webhook.ts). Without the same lock a
+  // queued message racing a live inbound for this identity clobbers the session draft. Wrap
+  // the whole session-load → flow → persist body in the identical per-identity lock so the
+  // two serialize. (withIdentityLock fails open after ~8s so a wedged live turn never
+  // permanently strands a queued reply.)
+  await withIdentityLock(identity.id, async () => {
+    let session = await loadActiveSession(db, identity.id)
+    if (!session) {
+      const memory = await loadCustomerMemory(db, identity.id)
+      const hydratedContext = await buildHydratedContext(db, identity.id, businessId, memory)
+      session = await createSession(db, businessId, identity.id, 'booking')
+      await updateSessionContext(db, session.id, hydratedContext as unknown as Record<string, unknown>)
+      session = { ...session, context: hydratedContext as unknown as Record<string, unknown> }
+    }
 
-  const [managerIdentity] = await db
-    .select({ phoneNumber: identities.phoneNumber })
-    .from(identities)
-    .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
-    .limit(1)
+    const [managerIdentity] = await db
+      .select({ phoneNumber: identities.phoneNumber })
+      .from(identities)
+      .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+      .limit(1)
 
-  const calendar = createCalendarClient({
-    accessToken: '',
-    refreshToken: business.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
-    calendarId: business.googleCalendarId,
-    businessId,
-    calendarMode: business.calendarMode,
-    ...(managerIdentity ? { managerPhoneNumber: managerIdentity.phoneNumber } : {}),
+    const calendar = createCalendarClient({
+      accessToken: '',
+      refreshToken: business.googleRefreshToken ?? process.env['GOOGLE_REFRESH_TOKEN'] ?? '',
+      calendarId: business.googleCalendarId,
+      businessId,
+      calendarMode: business.calendarMode,
+      ...(managerIdentity ? { managerPhoneNumber: managerIdentity.phoneNumber } : {}),
+    })
+
+    await saveMessage(db, session.id, 'customer', body).catch(() => {})
+    const transcript = await loadTranscript(db, session.id, 8).catch(() => [])
+
+    const result = await handleBookingFlow(
+      db, calendar, identity, session, body,
+      business.timezone, business.name, transcript,
+      business.botPersona, business, business.defaultLanguage,
+    )
+
+    // Conversation paused — manager is handling it; do not send any reply
+    if (result.paused) return
+
+    await saveMessage(db, session.id, 'assistant', result.reply).catch(() => {})
+
+    if (result.reply) {
+      await sendMessage({ toNumber: fromNumber, body: result.reply }, waCredentials).catch(() => {})
+    }
+
+    if (result.sessionComplete) {
+      await completeSession(db, session.id)
+    }
   })
-
-  await saveMessage(db, session.id, 'customer', body).catch(() => {})
-  const transcript = await loadTranscript(db, session.id, 8).catch(() => [])
-
-  const result = await handleBookingFlow(
-    db, calendar, identity, session, body,
-    business.timezone, business.name, transcript,
-    business.botPersona, business, business.defaultLanguage,
-  )
-
-  // Conversation paused — manager is handling it; do not send any reply
-  if (result.paused) return
-
-  await saveMessage(db, session.id, 'assistant', result.reply).catch(() => {})
-
-  if (result.reply) {
-    await sendMessage({ toNumber: fromNumber, body: result.reply }, waCredentials).catch(() => {})
-  }
-
-  if (result.sessionComplete) {
-    await completeSession(db, session.id)
-  }
 }
 
 export function startQueuedMessageWorker() {

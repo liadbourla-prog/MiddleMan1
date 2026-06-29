@@ -175,10 +175,42 @@ export async function dispatchInitiation(
     return { kind: 'skip', reason: 'dedup_hit' }
   }
 
-  if (decision.kind === 'send_template' && exec.sendTemplate) {
-    await exec.sendTemplate(decision.templateName)
-  } else {
-    await exec.sendFreeForm()
+  // CONTRACT: the dedup key is only durably committed when the send was successfully
+  // handed off to the durable queue. If the executor throws (e.g. enqueueMessage fails),
+  // we compensate by deleting the just-inserted ledger row so the key is NOT burned
+  // without delivery — a later re-drive can retry with a fresh dedup check.
+  //
+  // RESIDUAL GAP (E2/P7 — documented, out of scope for this fix): a hard process crash
+  // in the sub-millisecond window AFTER the ledger INSERT commits but BEFORE the executor's
+  // enqueue call returns still burns the dedup key without delivery. A full close requires
+  // a transactional outbox pattern (write the job row inside the same DB transaction as the
+  // ledger row). That is architecturally out of scope here; this fix narrows the gap from
+  // "any transient send failure" to "only a hard crash in a sub-ms window".
+  try {
+    if (decision.kind === 'send_template' && exec.sendTemplate) {
+      await exec.sendTemplate(decision.templateName)
+    } else {
+      await exec.sendFreeForm()
+    }
+  } catch (err) {
+    // Executor threw — compensate by deleting the ledger row so the dedup key is not burned.
+    // `inserted[0]!` is safe: the `inserted.length === 0` guard above already returned, so
+    // exactly one row is present here (derived invariant, not a silent assumption).
+    try {
+      await db.delete(initiationLog).where(eq(initiationLog.id, inserted[0]!.id))
+    } catch (compErr) {
+      // Compensation itself failed — the ledger row is now orphaned/burned with no delivery.
+      // Surface it so the stuck dedup key is detectable in logs; still re-throw the original
+      // executor error below (that is the actionable failure for the caller's retry).
+      console.error('[initiations] ledger compensation failed', {
+        businessId: ctx.businessId,
+        initiatorId: initiator.id,
+        dedupKey: ctx.dedupKey,
+        ledgerRowId: inserted[0]!.id,
+        compensationError: compErr,
+      })
+    }
+    throw err
   }
 
   return decision

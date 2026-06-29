@@ -9,5 +9,8 @@ export interface ActiveSession {
   intent: SessionIntent
   state: SessionState
   context: Record<string, unknown>
+  // B3 (T1.9): the context version read at load time. Pass it back to updateSessionContext as
+  // `expectedVersion` to make the write an optimistic CAS that a stale concurrent turn loses.
+  contextVersion: number
   expiresAt: Date
 }
