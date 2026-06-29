@@ -7,6 +7,20 @@
 
 ---
 
+## 0. LOCKED DECISIONS — red-team resolution (owner, 2026-06-29)
+
+Red-team pass: `docs/superpowers/reviews/2026-06-29-redteam-unified-gate-findings.md`. The six design-level flaws it raised are resolved as follows and are **binding** on the plan and the build:
+
+- **D1 — `allowedTimes` is per-turn-base ∪ per-call.** The ledger holds only the stable per-turn base (`boundaryTimes ∪ bookingTimes ∪ backedActions ∪ occupancy spine`). The gate **still merges the per-call `situation` + customer-raised times at check-time** (today's `buildAllowedTimes` behavior, `customer-booking.ts:759-768`). Do **not** flatten into one frozen per-turn set — that false-positives legitimately-offered times into the fallback (a G1/G5 regression). §3.1 below is amended accordingly.
+- **D1 wording note.** The fabricated-time fallback must NOT use "real time" framing (implies the customer asked for a fake one) — steer to **"available" / "open"** instead (plan T0.4).
+- **D2 — am/pm is a documented follow-up, not built now.** The ported time gate is 24h-only; English manager replies in 12h am/pm bypass it. Acceptable while the live business is Hebrew/24h. H1's time leg = "closed for Hebrew/24h; am/pm later."
+- **D3 — proactive seam does NOT enforce time.** On the ~29 automated/worker sends the guard's job is the **action checks + being the structural chokepoint**, not time-enforcement (the callers supply no allowlist). Waitlist/cold-fill truthfulness (H3/H18) is guaranteed by **fresh-spine re-validation before send** (plan T2a.2), not by the gate. §3.3 Seam C and §4 amended.
+- **D4 — Branch-3 occupancy focus day.** The manager-chat occupancy gate derives its `(day, service)` by **reusing the date the manager's own calendar tools resolved this turn**; if there is no single clear day, it **skips** rather than guesses. (plan T1.2)
+- **D5 — entity gating is NOT claimed as built.** Invented service/price/instructor names are blocked by **grounding only** (closed-world facts); there is no entity output gate in this effort. The Tier-1 "entity" row is dropped from the "gated everywhere" claim; "future holes covered by construction" applies to the **gated** classes (time/occupancy/action) only. Entity gate = optional later fast-follow. §4 amended.
+- **D6 — unified regen cap + deadline re-instated.** A single per-turn regeneration budget + shared deadline across all enforced gates and all seams (inherits the master-plan §v2 WS-VOICE rule), plus a final re-check after rewrites so a later-gate regen can't re-introduce an earlier-gate lie. (plan T-REGEN)
+
+---
+
 ## 1. Plain-language summary (read this first)
 
 Every symptom — the fake booking, the false "Tuesday 14:00 is free," the fabricated "I asked the owner" — happens at the *same instant*: the AI has written words and we're about to send them, and some of those words claim something untrue.
@@ -94,7 +108,7 @@ Route the three seams through the same gate. The detectors are already pure (`sl
 
 | Tier | Classes | Mechanism | Why |
 |---|---|---|---|
-| **Tier 1 — gate** | A action-taken · B time · B occupancy · entity (service/price/instructor) | the unified ledger gate at all 3 seams | these have an **enumerable referent** — a finite set the span can be checked against |
+| **Tier 1 — gate** | A action-taken · B time · B occupancy · ~~entity (service/price/instructor)~~ *(entity NOT built — see §0 D5; grounding-only)* | the unified ledger gate at the seams where a truth source exists — **all 3 for action/occupancy; time NOT enforced on the proactive seam (§0 D3)** | these have an **enumerable referent** — a finite set the span can be checked against |
 | **Tier 2 — ground + throttled relay (NOT a blanket gate)** | C business-fact attributes · D third-party · E future-commitment | (a) **extend grounding** (inject `narrative`); (b) **doesn't-know → throttled relay**; (c) de-fabricate inducer prompts (done) | a free-text attribute ("uses reformers") has **no canonical form to regex** — a gate keyed on "any factual-looking sentence" would sweep glue and make the PA cagey (research §4). The doctrine's rule: *make it checkable first (ground it), then the residual gap is small and legitimate.* |
 
 **Tier-2 detail — this is where the owner constraints are enforced:**
@@ -155,7 +169,7 @@ The three shipped symptom fixes (F2b occupancy detector, F3a relay, Gate-4 monit
 
 ## 8. Risks & open decisions (for owner)
 
-1. **Regenerate-vs-monitor in the proactive seam.** Workers can't easily "ask a clarifying question." For a worker reply that fails the gate, the safe fallback is the **template** (already passed as `fallback`). **DECIDED (owner, 2026-06-29): enforce for time + action claims (swap to the safe template on fail), monitor-only for the softer claim types, then calibrate and tighten.**
+1. **Regenerate-vs-monitor in the proactive seam.** Workers can't easily "ask a clarifying question." For a worker reply that fails the gate, the safe fallback is the **template** (already passed as `fallback`). **DECIDED (owner, 2026-06-29), then AMENDED by red-team §0 D3:** enforce **action** claims (swap to the safe template on fail) + use the seam as the structural chokepoint; **do NOT enforce time at this seam** (callers supply no allowlist — it would be inert or over-fire). Waitlist/cold-fill time truthfulness (H3/H18) is guaranteed by **fresh-spine re-validation before send** (plan T2a.2), not the gate. Monitor-only for the softer claim types, then calibrate and tighten.
 2. **Branch-3 allowlist completeness.** The orchestrator's availability tools return display strings; the structured times exist transiently in the executors. We must capture them into the ledger as tools run. Risk: a time the owner legitimately references that no tool surfaced → false positive. *Mitigation: the allowlist also admits owner-message-quoted times within the turn, mirroring Branch 4's `extractMentionedTimes`.*
 3. **`narrative` data quality.** Injecting owner free-text into closed-world grounding assumes it's accurate; it's owner-authored, so it's authoritative by definition — but it widens what the model will state. *Acceptable: it's the owner's own words; the alternative is the relay.*
 4. **Throttle thresholds.** Exact dedup window / per-business rate / hours behavior need owner-chosen numbers. **DECIDED (owner, 2026-06-29): build the throttle mechanism now; set the exact numbers during implementation/testing** (the proposed starting point — one pending question per customer at a time, N≈5 per business per rolling hour, defer-to-hours OFF — is a tunable default, not a commitment).
