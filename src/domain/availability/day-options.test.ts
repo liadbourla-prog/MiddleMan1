@@ -20,4 +20,15 @@ describe('selectPrivateOpeningServices (WS-C: one booking model per service)', (
     const services = [svc('yoga', 1), svc('breath', 1)]
     expect(selectPrivateOpeningServices(services, []).map((s) => s.id)).toEqual(['yoga', 'breath'])
   })
+
+  it('excludes a schedulingMode=class service even when maxParticipants <= 1 (P4 regression)', () => {
+    // A cap-1 class-mode service used to leak as a private opening, surfacing the empty
+    // gaps between owner-set class sessions as "bookable appointment slots". A class-mode
+    // service must NEVER be a private opening, regardless of capacity.
+    const services = [
+      { id: 'yoga', name: 'yoga', maxParticipants: 1, schedulingMode: 'class' as const },
+      { id: 'massage', name: 'massage', maxParticipants: 1, schedulingMode: 'appointment' as const },
+    ]
+    expect(selectPrivateOpeningServices(services, []).map((s) => s.id)).toEqual(['massage'])
+  })
 })

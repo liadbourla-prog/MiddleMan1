@@ -3024,14 +3024,18 @@ async function handleListBookings(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function resolveService<T extends { id: string; name: string }>(
-  hint: string | null,
-  services: T[],
-): T | null {
+export function resolveService<
+  T extends { id: string; name: string; schedulingMode?: 'appointment' | 'class' | null },
+>(hint: string | null, services: T[]): T | null {
   if (services.length === 0) return null
   if (services.length === 1) return services[0]!
   if (!hint) return null
 
   const lower = hint.toLowerCase()
-  return services.find((s) => s.name.toLowerCase().includes(lower)) ?? null
+  const matches = services.filter((s) => s.name.toLowerCase().includes(lower))
+  if (matches.length === 0) return null
+  // Prefer the class twin: when "yoga" matches both an appointment-mode twin and
+  // the real class-mode service, route to the class so only real class instances
+  // surface and the empty gaps between sessions are never offered as slots (P4).
+  return matches.find((s) => s.schedulingMode === 'class') ?? matches[0]!
 }
