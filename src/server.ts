@@ -26,6 +26,7 @@ import { startSeriesMaterializerWorker } from './workers/series-materializer.js'
 import { startIntegritySentinelWorker, scheduleIntegritySentinelJob } from './workers/integrity-sentinel.js'
 import { startOutreachReplyNotifyWorker } from './workers/outreach-reply-notify.js'
 import { startCoordinationExpiryWorker } from './workers/coordination-expiry.js'
+import { startOwnerQuestionExpiryWorker } from './workers/owner-question-expiry.js'
 import { startWinbackWorker, scheduleWinbackJob } from './workers/winback.js'
 import { startPostAppointmentWorker, schedulePostAppointmentJob } from './workers/post-appointment.js'
 import { startDunningWorker, scheduleDunningJob } from './workers/dunning.js'
@@ -115,6 +116,7 @@ startReshuffleCampaignWorker()
 startIntegritySentinelWorker()
 startOutreachReplyNotifyWorker()
 startCoordinationExpiryWorker()
+startOwnerQuestionExpiryWorker()
 startWinbackWorker()
 startPostAppointmentWorker()
 startDunningWorker()

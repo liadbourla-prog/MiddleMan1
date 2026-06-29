@@ -7,7 +7,7 @@ import { GoogleGenAI, Type, FunctionCallingConfigMode } from '@google/genai'
 import type { Content, FunctionDeclaration } from '@google/genai'
 import { and, desc, eq } from 'drizzle-orm'
 import { db } from '../../db/client.js'
-import { managerMemory, identities, businesses as businessesTable, serviceTypes } from '../../db/schema.js'
+import { managerMemory, identities, businesses as businessesTable, serviceTypes, pendingOwnerQuestions } from '../../db/schema.js'
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../../domain/authorization/check.js'
 import { buildInstructorRosterBlock, buildTeachingScheduleBlock, type InstructorRosterEntry, type TeachingSlot } from '../../domain/provider/roster.js'
@@ -52,6 +52,7 @@ import {
   executeRequestPayment,
   executeRefundPayment,
   executeMessageCustomer,
+  executeAnswerCustomerQuestion,
   executeBroadcastAnnouncement,
   executeSetCustomerName,
   type ToolContext,
@@ -445,6 +446,18 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'answerCustomerQuestion',
+    description: "Answer a customer's question that the PA couldn't answer and relayed to you (see 'Customer questions waiting for your answer'). Call this with the owner's answer and the question's id; your answer is sent straight back to the customer. If exactly one question is waiting and the owner just types the answer, you may omit questionId — the single open question is used. Only relay an answer the owner actually gave; never invent one. After it returns ok:true, tell the owner you passed their answer on.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        questionId: { type: Type.STRING, description: "The waiting question's id (the [bracketed] id in the 'Customer questions waiting' list). Omit only when exactly one question is open." },
+        answer: { type: Type.STRING, description: "The answer to send the customer, in the customer's language, composed from what the owner told you. Sent verbatim (with a short lead-in)." },
+      },
+      required: ['answer'],
+    },
+  },
+  {
     name: 'broadcastAnnouncement',
     description: "Send a one-off announcement to MANY customers at once on the owner's behalf — only one of three fixed kinds: a change of opening HOURS, a change of ADDRESS, or a PROMO/special offer. Use this (not messageCustomer, which is for ONE person) when the owner wants to tell their customers something like \"let everyone know we're closed Friday\" or \"tell my regulars about the holiday sale\". Confirm the exact wording of the detail with the owner first. By default it reaches all customers; pass segmentFilter to narrow it (e.g. only lapsed customers, or only a service's customers). Report the real send counts the tool returns — never inflate them.",
     parameters: {
@@ -725,11 +738,12 @@ function buildSystemPrompt(params: {
   managerMemorySummaries: string[]
   actionLedger: string
   activeCoordinations: string
+  openQuestions: string
   outreachIdentity: string
   bookingAuthority: 'auto' | 'owner_approval'
   conversationHistory: TranscriptTurn[]
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, activeServices, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, outreachIdentity, bookingAuthority, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, activeServices, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, openQuestions, outreachIdentity, bookingAuthority, conversationHistory } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -821,6 +835,7 @@ ${knowledgeBlock ? `\n## Business knowledge\n${knowledgeBlock}` : ''}
 ${rosterBlock ? `\n## Instructors\n${rosterBlock}` : ''}
 ${teachingScheduleBlock ? `\n## Upcoming classes\n${teachingScheduleBlock}` : ''}
 ${activeCoordinations ? `\n## Active meeting coordinations\n${activeCoordinations}` : ''}
+${openQuestions ? `\n## Customer questions waiting for your answer\nThese customers asked something the PA couldn't answer and were told you'd get back to them. When you give an answer, it is RELAYED to the customer — so answer them here:\n${openQuestions}` : ''}
 ${outreachIdentity ? `\n## Outreach identity\n${outreachIdentity}` : ''}
 
 ## Booking authority
@@ -897,6 +912,8 @@ async function dispatchTool(
       return executeRefundPayment(args as unknown as Parameters<typeof executeRefundPayment>[0], ctx)
     case 'messageCustomer':
       return executeMessageCustomer(args as unknown as Parameters<typeof executeMessageCustomer>[0], ctx)
+    case 'answerCustomerQuestion':
+      return executeAnswerCustomerQuestion(args as unknown as Parameters<typeof executeAnswerCustomerQuestion>[0], ctx)
     case 'broadcastAnnouncement':
       return executeBroadcastAnnouncement(args as unknown as Parameters<typeof executeBroadcastAnnouncement>[0], ctx)
     case 'coordinateMeeting':
@@ -1106,6 +1123,20 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
       }).join('\n')
     : ''
 
+  // F3a/S3 — customer questions the PA relayed to the owner and is awaiting an answer for.
+  // Surfaced so the model knows to answer them (via answerCustomerQuestion), and so a plain
+  // free-text reply binds to the single open one.
+  const openQuestionRows = await db
+    .select({ id: pendingOwnerQuestions.id, questionText: pendingOwnerQuestions.questionText, customerPhone: pendingOwnerQuestions.customerPhone })
+    .from(pendingOwnerQuestions)
+    .where(and(eq(pendingOwnerQuestions.businessId, businessId), eq(pendingOwnerQuestions.status, 'pending')))
+    .orderBy(desc(pendingOwnerQuestions.createdAt))
+    .limit(10)
+    .catch(() => [] as Array<{ id: string; questionText: string; customerPhone: string }>)
+  const openQuestions = openQuestionRows.length
+    ? openQuestionRows.map((q) => `[${q.id}] customer ${q.customerPhone} asked: "${q.questionText}". To answer, call answerCustomerQuestion with this id and the answer; if this is the only one, a plain reply with the answer also works.`).join('\n')
+    : ''
+
   const [mgrName] = await db
     .select({ name: identities.displayName })
     .from(identities)
@@ -1146,6 +1177,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     managerMemorySummaries,
     actionLedger,
     activeCoordinations,
+    openQuestions,
     outreachIdentity,
     bookingAuthority,
     conversationHistory: transcript.slice(-20),

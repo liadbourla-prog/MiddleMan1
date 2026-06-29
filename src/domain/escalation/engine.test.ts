@@ -80,3 +80,27 @@ describe('escalateUnfulfillableRequest', () => {
     expect(res.customerReply).toBe('passed to the studio')
   })
 })
+
+// F3a/S3 — the expiry sweep flips stale pending owner questions to 'expired' and reports the
+// count. No customer message on expiry (the customer was only told "they'll get back to you").
+describe('expireStaleOwnerQuestions', () => {
+  it('flips pending rows to expired and returns the count', async () => {
+    const captured: { set?: unknown } = {}
+    const chain = {
+      set: (v: unknown) => { captured.set = v; return chain },
+      where: () => chain,
+      returning: async () => [{ id: 'a' }, { id: 'b' }],
+    }
+    const db = { update: () => chain } as unknown as Db
+    const { expireStaleOwnerQuestions } = await import('./engine.js')
+    const n = await expireStaleOwnerQuestions(db, new Date())
+    expect(n).toBe(2)
+    expect(captured.set).toEqual({ status: 'expired' })
+  })
+  it('returns 0 when nothing is stale', async () => {
+    const chain = { set: () => chain, where: () => chain, returning: async () => [] as Array<{ id: string }> }
+    const db = { update: () => chain } as unknown as Db
+    const { expireStaleOwnerQuestions } = await import('./engine.js')
+    expect(await expireStaleOwnerQuestions(db, new Date())).toBe(0)
+  })
+})

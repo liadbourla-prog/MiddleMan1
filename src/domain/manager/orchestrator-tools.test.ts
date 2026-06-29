@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { getTableName } from 'drizzle-orm'
 import {
   executeCreateCalendarEvent,
@@ -10,6 +11,7 @@ import {
   executeRequestPayment,
   executeRefundPayment,
   executeMessageCustomer,
+  executeAnswerCustomerQuestion,
   executeSetCustomerName,
   executeManageAllowedContacts,
   executeConfigureDailyBriefing,
@@ -374,6 +376,21 @@ function twoGuysCtx(): ToolContext {
     businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he', role: 'manager',
   }
 }
+
+describe('answerCustomerQuestion — guards + wiring (F3a/S3)', () => {
+  it('refuses an empty answer before touching the DB', async () => {
+    const res = await executeAnswerCustomerQuestion({ answer: '   ' }, noWriteCtx()) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('empty_answer')
+  })
+  it('is declared as a tool and routed to the executor in the orchestrator', () => {
+    const src = readFileSync(new URL('../../adapters/llm/orchestrator.ts', import.meta.url), 'utf8')
+    expect(src).toMatch(/name: 'answerCustomerQuestion'/)
+    expect(src).toMatch(/case 'answerCustomerQuestion':[\s\S]*executeAnswerCustomerQuestion/)
+    // Open questions are surfaced so the model knows to answer them.
+    expect(src).toMatch(/Customer questions waiting for your answer/)
+  })
+})
 
 describe('messageCustomer — disambiguation', () => {
   it('two same-name customers → ambiguous, no send, candidates returned', async () => {

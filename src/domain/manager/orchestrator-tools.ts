@@ -6,7 +6,8 @@
 
 import { and, desc, eq, gt, ilike, inArray, isNull, lt, or } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries, conversationSessions, conversationMessages, initiationApprovals } from '../../db/schema.js'
+import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries, conversationSessions, conversationMessages, initiationApprovals, pendingOwnerQuestions } from '../../db/schema.js'
+import { enqueueMessage } from '../../workers/message-retry.js'
 import { createSeries } from '../scheduling/series.js'
 import type { IdentityRole } from '../../db/schema.js'
 import { authorize, type Action } from '../authorization/check.js'
@@ -2596,6 +2597,63 @@ export async function executeMessageCustomer(
 
   await recordOutreach('outreach.message_sent', { body })
   return { ok: true, sentTo: target.phoneNumber, guidance: 'The message was actually delivered. Confirm to the owner in your own words that you sent it and will update them when the customer replies.' }
+}
+
+// ── answerCustomerQuestion (F3a/S3) ───────────────────────────────────────────
+// The owner answers a customer question the PA relayed to them; the answer is sent BACK to
+// the customer and the pending row is resolved. Closes the ask-the-owner round-trip.
+export interface AnswerCustomerQuestionArgs {
+  questionId?: string
+  answer: string
+}
+
+export async function executeAnswerCustomerQuestion(
+  args: AnswerCustomerQuestionArgs,
+  ctx: ToolContext,
+): Promise<object> {
+  const answer = (args.answer ?? '').trim()
+  if (!answer) return { ok: false, reason: 'empty_answer', guidance: 'No answer text was provided. Ask the owner what to tell the customer.' }
+
+  // Resolve the target question: by id, or — the free-text fallback — the single open one.
+  let q: { id: string; customerPhone: string } | undefined
+  if (args.questionId) {
+    [q] = await ctx.db
+      .select({ id: pendingOwnerQuestions.id, customerPhone: pendingOwnerQuestions.customerPhone })
+      .from(pendingOwnerQuestions)
+      .where(and(eq(pendingOwnerQuestions.id, args.questionId), eq(pendingOwnerQuestions.businessId, ctx.businessId), eq(pendingOwnerQuestions.status, 'pending')))
+      .limit(1)
+  } else {
+    const open = await ctx.db
+      .select({ id: pendingOwnerQuestions.id, customerPhone: pendingOwnerQuestions.customerPhone })
+      .from(pendingOwnerQuestions)
+      .where(and(eq(pendingOwnerQuestions.businessId, ctx.businessId), eq(pendingOwnerQuestions.status, 'pending')))
+      .orderBy(desc(pendingOwnerQuestions.createdAt))
+      .limit(2)
+    if (open.length === 0) return { ok: false, reason: 'no_open_question', guidance: 'There is no customer question waiting for an answer right now.' }
+    if (open.length > 1) return { ok: false, reason: 'ambiguous', guidance: 'Several customer questions are waiting — ask the owner which one and pass its id.' }
+    q = open[0]
+  }
+  if (!q) return { ok: false, reason: 'not_found', guidance: 'That question was not found or has already been answered.' }
+
+  const [biz] = await ctx.db
+    .select({ name: businesses.name, defaultLanguage: businesses.defaultLanguage })
+    .from(businesses)
+    .where(eq(businesses.id, ctx.businessId))
+    .limit(1)
+  const custLang: Lang = (biz?.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const relayBody = i18n.owner_answer_relay[custLang](biz?.name ?? '', answer)
+
+  // CAS resolve: flip to answered ONLY if still pending, so a double answer no-ops (no double
+  // relay). Enqueue the customer relay only after the row is ours.
+  const resolved = await ctx.db
+    .update(pendingOwnerQuestions)
+    .set({ status: 'answered', answerText: answer.slice(0, 2000), answeredAt: new Date() })
+    .where(and(eq(pendingOwnerQuestions.id, q.id), eq(pendingOwnerQuestions.status, 'pending')))
+    .returning({ id: pendingOwnerQuestions.id })
+  if (resolved.length === 0) return { ok: false, reason: 'already_answered', guidance: 'That question was already answered — nothing further to send.' }
+
+  await enqueueMessage(ctx.businessId, q.customerPhone, relayBody).catch(() => { /* durable retry queue handles transient failures */ })
+  return { ok: true, relayedTo: q.customerPhone, guidance: 'Your answer was sent to the customer. Tell the owner you passed it on.' }
 }
 
 // ── broadcastAnnouncement ─────────────────────────────────────────────────────

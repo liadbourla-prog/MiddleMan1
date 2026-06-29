@@ -11,7 +11,7 @@
  *    → No customer message change (handled by caller).
  */
 
-import { eq, and, isNull } from 'drizzle-orm'
+import { eq, and, isNull, lt } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { escalatedTasks, identities, pendingOwnerQuestions } from '../../db/schema.js'
 import type { EscalationRule, Business } from '../../db/schema.js'
@@ -207,6 +207,20 @@ export async function escalateCustomerQuestion(
   }).catch(() => { /* non-fatal: the row persists so the owner can still answer; reply stays honest */ })
 
   return { customerReply: i18n.question_passed_to_studio[customerLang](business.name), escalated: true }
+}
+
+/**
+ * F3a/S3 — expire stale pending owner questions (created before `olderThan`) so a question
+ * the owner never answered doesn't dangle forever. The customer was only ever told "they'll
+ * get back to you", so an expiry needs no customer message. Returns the count expired.
+ */
+export async function expireStaleOwnerQuestions(db: Db, olderThan: Date): Promise<number> {
+  const rows = await db
+    .update(pendingOwnerQuestions)
+    .set({ status: 'expired' })
+    .where(and(eq(pendingOwnerQuestions.status, 'pending'), lt(pendingOwnerQuestions.createdAt, olderThan)))
+    .returning({ id: pendingOwnerQuestions.id })
+  return rows.length
 }
 
 // ── Platform escalation ───────────────────────────────────────────────────────
