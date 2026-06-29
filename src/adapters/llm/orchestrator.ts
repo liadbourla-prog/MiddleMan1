@@ -65,6 +65,7 @@ import {
 } from '../../domain/orchestrator-log.js'
 import { buildActionLedgerBlock, hasCalendarConnected } from '../../domain/audit/ledger-block.js'
 import { detectActionClaims, type ActionClaim } from '../../domain/flows/reply-guard.js'
+import { observeVoiceTells } from '../../domain/flows/voice-guard.js'
 import { logAudit } from '../../domain/audit/logger.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
@@ -1187,7 +1188,8 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
       })
     } catch (err) {
       logOrchestratorError({ businessId, sessionId, messageId, error: err, iteration: iterations })
-      return fallback
+      // Gate 7 (monitor-only): the LLM-error fallback is a deliberately-terse safe fallback.
+      return observeVoiceTells(fallback, { businessId, language: lang }, { isSafeFallback: true })
     }
 
     const candidate = result.candidates?.[0]
@@ -1259,7 +1261,8 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
         finalReply,
         totalDurationMs: Date.now() - loopStart,
       })
-      return finalReply
+      // Gate 7 (monitor-only): observe the real manager reply for mechanical bot-tells.
+      return observeVoiceTells(finalReply, { businessId, language: lang })
     }
 
     // No function calls, no text — shouldn't happen; break out
@@ -1267,5 +1270,6 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
   }
 
   logOrchestratorError({ businessId, sessionId, messageId, error: `Loop exhausted after ${iterations} iterations` })
-  return fallback
+  // Gate 7 (monitor-only): the loop-exhaustion fallback is a deliberately-terse safe fallback.
+  return observeVoiceTells(fallback, { businessId, language: lang }, { isSafeFallback: true })
 }
