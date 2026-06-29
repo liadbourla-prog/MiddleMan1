@@ -80,6 +80,18 @@ function customerLockKey(identityId: string): string {
   return `lock:customer:${identityId}`
 }
 
+/**
+ * Returns true if an active Branch-4 identity lock exists for the given customer.
+ *
+ * Used by the hold-expiry worker (T1.7) as a belt-and-suspenders guard: if the
+ * customer is mid-turn (possibly confirming), skip the expiry attempt this tick
+ * rather than racing the in-flight confirm.  The CAS in expireHeldBookings is the
+ * primary arbiter; this avoids the race entirely when the customer is still active.
+ */
+export async function isIdentityLocked(identityId: string): Promise<boolean> {
+  return (await redis.exists(customerLockKey(identityId))) === 1
+}
+
 // The customer lock holds across a full Branch-4 turn, which can run several LLM calls
 // (intent extraction + genReply with up to two regenerations per output gate). Its TTL
 // must comfortably exceed the slowest realistic handler so the lock does not auto-expire

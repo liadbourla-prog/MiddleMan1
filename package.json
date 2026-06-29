@@ -12,6 +12,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:quality": "vitest run --config vitest.quality.config.ts",
     "test:quality:smoke": "QUALITY_SAMPLES=1 vitest run --config vitest.quality.config.ts",
+    "test:concurrency": "bash scripts/run-concurrency-harness.sh",
     "db:generate": "drizzle-kit generate",
     "db:apply": "tsx scripts/apply-all-migrations.ts",
     "db:studio": "drizzle-kit studio",

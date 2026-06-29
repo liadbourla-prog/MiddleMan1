@@ -164,23 +164,26 @@ async function importBookingHistory(
 
       // Find service type if mentioned
       let serviceTypeId: string | null = null
+      let serviceMode: string | null = null
       if (serviceName) {
         const [svc] = await db
-          .select({ id: serviceTypes.id })
+          .select({ id: serviceTypes.id, schedulingMode: serviceTypes.schedulingMode })
           .from(serviceTypes)
           .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.name, serviceName)))
           .limit(1)
         serviceTypeId = svc?.id ?? null
+        serviceMode = svc?.schedulingMode ?? null
       }
 
       if (!serviceTypeId) {
         // Use first active service as fallback
         const [svc] = await db
-          .select({ id: serviceTypes.id })
+          .select({ id: serviceTypes.id, schedulingMode: serviceTypes.schedulingMode })
           .from(serviceTypes)
           .where(and(eq(serviceTypes.businessId, businessId), eq(serviceTypes.isActive, true)))
           .limit(1)
         serviceTypeId = svc?.id ?? null
+        serviceMode = svc?.schedulingMode ?? null
       }
 
       if (!serviceTypeId || !identity) continue
@@ -194,6 +197,9 @@ async function importBookingHistory(
         slotEnd,
         state: 'confirmed',
         paymentStatus: 'not_required',
+        // T1.1b: class history is non-exclusive (many customers share a class slot); a
+        // class-mode service must not trip the overlap-exclusion constraint on import.
+        isExclusive: serviceMode !== 'class',
       }).onConflictDoNothing()
 
       summary.bookingHistory++

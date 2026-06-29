@@ -407,6 +407,13 @@ export const bookings = pgTable(
     cancellationReason: text('cancellation_reason'),
     cancelledByRole: text('cancelled_by_role', { enum: ['customer', 'manager', 'system'] }),
     slotTzAtCreation: text('slot_tz_at_creation'),
+    // T1.1b (WS1): denormalized exclusivity flag. true for 1-on-1 (private/appointment)
+    // bookings that exclusively own their time range; false for class co-bookings (many
+    // customers legitimately share one class slot). Set at insert by the engine. Backs the
+    // `bookings_exclusive_no_overlap` GiST EXCLUDE constraint (migration 0049) — that
+    // constraint is expressed in raw SQL because Drizzle has no EXCLUDE builder; it scopes
+    // the overlap rejection to is_exclusive rows so class co-bookings are never rejected (G1).
+    isExclusive: boolean('is_exclusive').notNull().default(true),
     rescheduledFrom: uuid('rescheduled_from'),
     // Set when manager bulk-cancels and agrees to help customer rebook
     rebookingRequested: boolean('rebooking_requested').notNull().default(false),
@@ -538,11 +545,24 @@ export const conversationSessions = pgTable(
       enum: ['active', 'waiting_confirmation', 'waiting_clarification', 'completed', 'expired', 'failed'],
     }).notNull(),
     context: jsonb('context').notNull().default({}),
+    // B3 (T1.9, migration 0051): optimistic-concurrency token. updateSessionContext bumps it
+    // on every write; a CAS write that expects a stale version is rejected so a fail-open
+    // second turn can't clobber newer in-flight booking state.
+    contextVersion: integer('context_version').notNull().default(0),
     lastMessageAt: timestamp('last_message_at', { withTimezone: true }).notNull(),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('sessions_identity_state_idx').on(t.identityId, t.state)],
+  (t) => [
+    index('sessions_identity_state_idx').on(t.identityId, t.state),
+    // B4 (T1.8d, migration 0050): at most ONE non-terminal session per identity — the DB
+    // backstop behind loadActiveSession's newest-first selection. A second concurrent
+    // createSession for the same identity raises 23505, which createSession recovers from
+    // by re-loading the existing live session.
+    uniqueIndex('conversation_sessions_one_active_idx')
+      .on(t.identityId)
+      .where(sql`${t.state} in ('active', 'waiting_confirmation', 'waiting_clarification')`),
+  ],
 )
 
 export const managerInstructions = pgTable('manager_instructions', {

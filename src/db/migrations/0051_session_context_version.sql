@@ -1,0 +1,12 @@
+-- T1.9 / B3 (WS1 write-integrity) — optimistic concurrency version for session context.
+--
+-- Finding B3 (HIGH): withIdentityLock fails open after ~8s, so a Branch-4 turn that exceeds the
+-- poll budget lets the next queued turn run concurrently; both write slotDraft and the later
+-- write silently clobbers newer in-flight booking state. This column is the compare-and-set
+-- token: updateSessionContext bumps it on every write, and a CAS write that expects an older
+-- version is rejected rather than overwriting.
+--
+-- MIGRATION DISCIPLINE (§A2): runs AFTER 0050 (one migration committed before the next). No
+-- backfill needed — DEFAULT 0 is correct for every existing row; ADD COLUMN IF NOT EXISTS is
+-- natively idempotent.
+ALTER TABLE conversation_sessions ADD COLUMN IF NOT EXISTS context_version integer NOT NULL DEFAULT 0;

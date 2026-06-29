@@ -10,6 +10,7 @@ import { t } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 import { notifyOwnerApprovalExpired } from '../domain/initiations/booking-notify.js'
 import { isApprovalExpiry } from '../domain/booking/approval.js'
+import { isIdentityLocked } from '../domain/flows/concurrency-lock.js'
 
 const QUEUE_NAME = 'hold-expiry'
 const REPEAT_EVERY_MS = 60_000
@@ -38,7 +39,45 @@ export async function expireHeldBookings() {
     .from(bookings)
     .where(and(eq(bookings.state, 'held'), lt(bookings.holdExpiresAt, cutoff)))
 
+  let expiredCount = 0
   for (const booking of expiredRows) {
+    // ── Belt-and-suspenders: skip rows under an active identity lock ─────────
+    // If the customer is mid-turn (possibly confirming), skip this tick entirely.
+    // The CAS below is the primary arbiter; this avoids initiating a race with an
+    // in-flight confirm at all.  A later tick will pick up the row if it is still
+    // 'held' once the turn ends and the lock has released.
+    if (await isIdentityLocked(booking.customerId)) {
+      console.info('[hold-expiry] Skipping booking', booking.id, '— identity lock active for customer', booking.customerId)
+      continue
+    }
+
+    // ── E4: CAS flip as the atomic arbiter ───────────────────────────────────
+    // UPDATE … WHERE id=? AND state='held' RETURNING id.
+    // This is the exclusive gate: exactly one concurrent actor (this worker or
+    // confirmBooking) can flip the row.  If the confirm winner already set
+    // state='confirmed', the WHERE predicate misses and we get 0 rows — skip all
+    // side effects so a confirmed booking is never expired or its event deleted.
+    //
+    // CONTRACT (T1.7, E4/P1):
+    //   1. CAS runs FIRST — before any calendar delete, audit, or messaging.
+    //   2. Side effects (calendar delete, audit, messages) only run if CAS returns 1 row.
+    //   3. Lock-skip above prevents racing an in-flight confirm.
+    const [flipped] = await db
+      .update(bookings)
+      .set({ state: 'expired', holdExpiresAt: null, updatedAt: new Date() })
+      .where(and(eq(bookings.id, booking.id), eq(bookings.state, 'held')))
+      .returning({ id: bookings.id })
+
+    if (!flipped) {
+      // A concurrent confirm (or cancellation) already flipped this row.
+      // Do NOT delete the calendar event; do NOT audit; do NOT message.
+      console.info('[hold-expiry] Skipping booking', booking.id, '— CAS missed (already confirmed/cancelled)')
+      continue
+    }
+
+    expiredCount++
+
+    // ── Winner path: fire side effects after the CAS ─────────────────────────
     const [business] = await db
       .select({
         googleRefreshToken: businesses.googleRefreshToken,
@@ -50,6 +89,8 @@ export async function expireHeldBookings() {
       .where(eq(businesses.id, booking.businessId))
       .limit(1)
 
+    // Calendar delete only if this worker won the CAS — a confirmed booking's
+    // event must never be deleted.
     if (booking.calendarEventId && business?.googleRefreshToken) {
       const [manager] = await db
         .select({ phoneNumber: identities.phoneNumber })
@@ -72,15 +113,10 @@ export async function expireHeldBookings() {
 
       const deleteResult = await calendar.deleteEvent(booking.calendarEventId)
       if (deleteResult.status === 'error') {
-        // Log but still expire the DB record — orphaned Calendar event is better than stuck hold
+        // Log but still proceed — orphaned Calendar event is better than stuck hold
         console.warn('[hold-expiry] Calendar delete failed for event', booking.calendarEventId, deleteResult.reason)
       }
     }
-
-    await db
-      .update(bookings)
-      .set({ state: 'expired', holdExpiresAt: null, updatedAt: new Date() })
-      .where(eq(bookings.id, booking.id))
 
     await logAudit(db, {
       businessId: booking.businessId,
@@ -129,7 +165,7 @@ export async function expireHeldBookings() {
     }
   }
 
-  return expiredRows.length
+  return expiredCount
 }
 
 export function startHoldExpiryWorker() {

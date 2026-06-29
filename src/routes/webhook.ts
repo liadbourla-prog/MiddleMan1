@@ -1073,6 +1073,15 @@ async function routeManagerMessage(
     return
   }
 
+  // ── B1 (T1.8a): run the ENTIRE session-dependent manager turn inside the per-business
+  // lock. withBusinessLock ENQUEUES the messageId on contention and runs fn ONLY when the
+  // lock is acquired — so a contended turn never persists its inbound (the orphaned-inbound
+  // bug: a queued-then-dropped turn used to saveMessage its inbound with no assistant reply)
+  // and never reads-then-clobbers session context concurrently with another turn. The
+  // transcript load+save now live INSIDE the lock (§v2-B). Deliberately kept on
+  // withBusinessLock, NOT withIdentityLock — the latter runs-anyway-after-~8s and would
+  // orphan the Branch-3 queue drain / coalescing this path depends on.
+  const lockResult = await withBusinessLock(business.id, msg.messageId, async () => {
   // Load or create 4h manager session for transcript continuity
   let mgSession = await loadActiveSession(db, identity.id)
   if (!mgSession) {
@@ -1209,7 +1218,9 @@ async function routeManagerMessage(
     ? await loadDelegatedPermissions(db, identity.id)
     : undefined
 
-  const lockResult = await withBusinessLock(business.id, msg.messageId, async () => {
+    // (orchestrator + persist run inside the per-business lock opened at the top of the
+    // session body above — the inbound transcript save is now also inside that lock, so a
+    // contended turn that gets enqueued-and-dropped never leaves an orphaned inbound.)
     const reply = await runManagerOrchestratorLoop({
       messageId: msg.messageId,
       message: msg.body,

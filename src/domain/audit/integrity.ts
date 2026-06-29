@@ -20,6 +20,8 @@ export type IntegrityKind =
   | 'reschedule_residue' // INV-8 / F9
   | 'out_of_hours' // INV-4 / F6 — emitted by the worker (needs DB-backed hours), not this pure engine
   | 'unmirrored' // INV-9 / F-c — internal record not yet write-through to Google after the grace window
+  | 'stranded_requested' // INV-10 / CX1 — a `requested` row stranded past the reaper TTL (placeHold or the held-flip crashed; seat leaking)
+  | 'capacity_exceeded' // INV-11 / A3 — active booking count for a group-class slot exceeds maxParticipants
 
 export type Severity = 'critical' | 'warning'
 
@@ -36,8 +38,13 @@ export interface BookingSnapshot {
   holdExpiresAt: Date | null
   /** True when the service is a group class (legitimate to share a slot). */
   isGroup: boolean
-  /** When the row was created — used by INV-9 to age unmirrored records. Optional so
-   *  callers that don't run INV-9 (and existing fixtures) need not supply it. */
+  /** The class capacity from service_types.max_participants.
+   *  Used by INV-11 to detect overrun. Defaults to 1 for private services so
+   *  callers that don't exercise INV-11 need not set it. */
+  maxParticipants?: number
+  /** When the row was created — used by INV-9 to age unmirrored records, and by
+   *  INV-11 to order excess bookings newest-first. Optional so callers that don't
+   *  run those invariants (and existing fixtures) need not supply it. */
   createdAt?: Date
 }
 
@@ -81,6 +88,14 @@ export interface IntegritySnapshot {
   /** INV-9 grace: a record older than this with no Google event id is "unmirrored".
    *  Omit to disable INV-9 entirely (e.g. fixtures that don't exercise it). */
   unmirrorGraceMs?: number
+  /** INV-10: a `requested` row older than this (measured from createdAt) is "stranded" — its
+   *  placeHold or the requested→held_for_approval flip crashed and the seat is leaking.
+   *  Keyed on createdAt, NOT holdExpiresAt (requested rows legitimately have null holdExpiresAt
+   *  mid-flip). Default ≥5 min so the sub-second transient requested→held_for_approval window
+   *  (the engine writes `requested` at ~line 289 and flips to the hold state at ~line 334) is
+   *  never reaped by the threshold — the age gap is the exclusion mechanism.
+   *  Omit to disable INV-10 entirely. */
+  requestedReaperMs?: number
 }
 
 export interface IntegrityFinding {
@@ -305,6 +320,116 @@ export function runIntegrityChecks(snap: IntegritySnapshot): IntegrityFinding[] 
         bookingId: b.id,
         slotStart: b.slotStart,
         detail: { newBooking: b.id, supersededStillActive: b.rescheduledFrom },
+        autoRemediable: false,
+      })
+    }
+  }
+
+  // ── INV-10 stranded_requested (CX1) ─────────────────────────────────────────
+  // A `requested` row that has aged past the reaper TTL means placeHold (or the
+  // requested→held_for_approval/held flip) crashed and the seat is leaking. Key on
+  // createdAt age — NOT holdExpiresAt (requested rows legitimately have null
+  // holdExpiresAt mid-flip). The reaper threshold (default ≥5 min) is precisely what
+  // excludes the sub-second transient requested→held_for_approval window that the engine
+  // passes through at ~line 289→334 during a normal placeHold — a fresh row at age <5 min
+  // is never flagged, giving the flip ample time to complete.
+  if (snap.requestedReaperMs != null) {
+    const requestedCutoff = new Date(snap.now.getTime() - snap.requestedReaperMs)
+    for (const b of snap.bookings) {
+      if (b.state !== 'requested') continue
+      if (!b.createdAt || b.createdAt >= requestedCutoff) continue
+      findings.push({
+        kind: 'stranded_requested',
+        severity: 'warning',
+        dedupKey: `stranded_requested:${b.id}`,
+        bookingId: b.id,
+        slotStart: b.slotStart,
+        detail: {
+          createdAt: b.createdAt.toISOString(),
+          reaperTtlMs: snap.requestedReaperMs,
+          reason: 'requested row stranded past reaper TTL — placeHold or held-flip crashed; seat is leaking',
+        },
+        autoRemediable: true,
+      })
+    }
+  }
+
+  // ── INV-11 capacity_exceeded (A3 / P1) ────────────────────────────────────
+  // A group-class slot where the number of ACTIVE participants exceeds the
+  // service's maxParticipants. INV-1 (double_book) already skips same-class
+  // co-bookings; this invariant is the complementary check that the cap is
+  // not breached — a gap INV-1 intentionally does not close.
+  //
+  // G1 guard (critical regression): at-capacity bookings (count === maxParticipants)
+  // must NOT be flagged. Only count > maxParticipants fires the invariant.
+  //
+  // autoRemediable is false: safe auto-cancel of the excess/newest bookings
+  // requires a `system` role with booking.cancel_any authority. IdentityRole
+  // (schema.ts) only has manager|customer|delegated_user|provider|contact — no
+  // `system` variant exists. Adding one would require a schema migration out of
+  // scope for T1.11. Detection + critical alert is the launch-relevant win.
+  // TODO(T1.11 follow-up): auto-cancel-newest-excess once `system` role or an
+  //   internal admin escape-hatch (e.g. manager-identity lookup for the business)
+  //   is available without a schema migration.
+  {
+    // Group active bookings by (serviceTypeId, slotStart) for group classes only.
+    const classGroups = new Map<string, BookingSnapshot[]>()
+    for (const b of active) {
+      if (!b.isGroup) continue
+      const key = `${b.serviceTypeId}:${b.slotStart.getTime()}`
+      const group = classGroups.get(key)
+      if (group) {
+        group.push(b)
+      } else {
+        classGroups.set(key, [b])
+      }
+    }
+
+    // Stable iteration order: sort by key so findings are deterministic across runs.
+    const sortedKeys = [...classGroups.keys()].sort()
+    for (const key of sortedKeys) {
+      const group = classGroups.get(key)!
+      if (group.length === 0) continue
+
+      // All entries in the group share the same serviceTypeId and slotStart
+      // (by construction). maxParticipants is consistent per service; take from
+      // first member (fall back to group size — i.e. no overrun — if missing).
+      const cap = group[0]!.maxParticipants ?? group.length
+      if (group.length <= cap) continue // at-capacity or under: fine (G1 guard)
+
+      const { serviceTypeId, slotStart } = group[0]!
+
+      // Sort oldest-first (lowest createdAt = earliest in queue = rightful occupant).
+      // The first `cap` entries are the allowed bookings; everything beyond cap is
+      // the excess to be cancelled. Bookings without createdAt sort to the front
+      // (treated as oldest, so they are preferentially kept over newer ones).
+      const sortedOldestFirst = [...group].sort((a, b) => {
+        const aMs = a.createdAt?.getTime() ?? 0
+        const bMs = b.createdAt?.getTime() ?? 0
+        return aMs - bMs // ascending
+      })
+
+      // Excess = the newest bookings beyond cap. Re-sort them newest-first so the
+      // owner / remediator sees the most-recent offender first.
+      const excessBookingIds = sortedOldestFirst
+        .slice(cap) // beyond-cap entries, already oldest-first
+        .reverse() // flip to newest-first for display
+        .map((b) => b.id)
+
+      findings.push({
+        kind: 'capacity_exceeded',
+        severity: 'critical',
+        dedupKey: `capacity_exceeded:${serviceTypeId}:${slotStart.toISOString()}`,
+        slotStart,
+        detail: {
+          serviceTypeId,
+          slotStartISO: slotStart.toISOString(),
+          count: group.length,
+          capacity: cap,
+          excessBookingIds,
+          // All booking ids newest-first (handy for owner review).
+          allBookingIds: [...sortedOldestFirst].reverse().map((b) => b.id),
+        },
         autoRemediable: false,
       })
     }
