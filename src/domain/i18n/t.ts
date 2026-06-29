@@ -635,11 +635,13 @@ const strings = {
   },
 
   // ── Waitlist offer ────────────────────────────────────────────────────────────
+  // Honest, no fabricated hold (T2a.2 / H3/H18): the slot is NOT reserved — it goes to whoever
+  // replies first, and the offer simply lapses after the TTL. Never claim "I'm holding it for you".
   waitlist_offer: {
     he: (biz: string, service: string, date: string, ttl: number) =>
-      `התפנה מקום! ${service} ב${biz} ב-${date}. רוצים אותו? רק תגידו לי ואני תופס לכם — שמרתי אותו ל-${ttl} הדקות הקרובות.`,
+      `התפנה מקום! ${service} ב${biz} ב-${date}. רוצים אותו? הוא פנוי עכשיו ומי שכותב ראשון תופס — ההצעה פתוחה ל-${ttl} הדקות הקרובות.`,
     en: (biz: string, service: string, date: string, ttl: number) =>
-      `A spot just opened — ${service} at ${biz} on ${date}. Want it? Just say the word and it's yours — I'm holding it for the next ${ttl} minutes.`,
+      `A spot just opened — ${service} at ${biz} on ${date}. Want it? It's open now and the first to reply gets it — the offer's open for the next ${ttl} minutes.`,
   },
 
   // ── Freed-slot owner-approval gate (WS-C / #6 / #8) → manager language ─────────

@@ -26,6 +26,12 @@ vi.mock('bullmq', () => ({
 
 vi.mock('../redis.js', () => ({ redisConnection: {} }))
 
+// T2a.2 re-validation is a separate fresh-spine read; stub it open so this suite's
+// sequential-row db mock (which models only the offer-send queries, in order) is unaffected.
+vi.mock('./waitlist-revalidate.js', () => ({
+  revalidateWaitlistSlotOpen: vi.fn(async () => true),
+}))
+
 // db singleton — queries return rows from a shared array, consumed in call order.
 let dbQueryIdx = 0
 const dbRows: unknown[][] = []

@@ -9,6 +9,7 @@ import { redisConnection } from '../redis.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
+import { revalidateWaitlistSlotOpen } from './waitlist-revalidate.js'
 import { queryCustomerSegment } from '../domain/crm/segment-repository.js'
 import { selectColdFillCandidates } from '../domain/crm/cold-fill.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
@@ -270,6 +271,24 @@ export async function processJob(job: { data: WaitlistJob }) {
     return
   }
 
+  // Fresh-spine re-validation (T2a.2 / H3/H18): between the freeing cancellation and now the
+  // slot can be retaken. Never send a "spot opened" offer for a slot that is gone. Fail-open on
+  // a read error (the booking-time check is the backstop). On a retaken slot, mark the entry
+  // expired and stop — there is nothing to offer.
+  const slotStillOpen = await revalidateWaitlistSlotOpen(db, businessId, serviceTypeId, new Date(slotStart)).catch(() => true)
+  if (!slotStillOpen) {
+    await db.update(waitlist).set({ status: 'expired' }).where(eq(waitlist.id, next.id))
+    await logAudit(db, {
+      businessId,
+      actorId: null,
+      action: 'waitlist.offer_slot_retaken',
+      entityType: 'waitlist',
+      entityId: next.id,
+      metadata: { slotStart, slotEnd },
+    })
+    return
+  }
+
   const [customer] = await db
     .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
     .from(identities)
@@ -309,7 +328,9 @@ export async function processJob(job: { data: WaitlistJob }) {
     if (freeFormAllowed) {
       // Durable path: enqueueMessage hands off to the message-retry BullMQ queue so a
       // transient WA send failure is re-driven rather than silently lost (E2/P7 fix).
-      const situation = `A slot just opened up at ${biz.name}: "${serviceName}" on ${dateStr}. Share the good news warmly and invite them to just tell you if they want it — never say "reply YES/NO". Mention you're holding it for ${OFFER_TTL_MINUTES} minutes.`
+      // Honest framing (T2a.2): the slot is NOT held/reserved — it goes to whoever replies first
+      // and the offer simply lapses after the TTL. Never claim it's being held for them.
+      const situation = `A slot just opened up at ${biz.name}: "${serviceName}" on ${dateStr}. Share the good news warmly and invite them to reply if they want it — never say "reply YES/NO". It is first-come: tell them the first to reply gets it and the offer is open for the next ${OFFER_TTL_MINUTES} minutes. Do NOT say you are holding, saving, or reserving it for them — it is not reserved; it goes to whoever replies first.`
       const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: offerBody, timeoutMs: 2500 })
       await enqueueMessage(businessId, customer.phoneNumber, llmBody)
     } else {
