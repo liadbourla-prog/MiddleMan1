@@ -2820,6 +2820,22 @@ export function matchBookingSelection(
   return null
 }
 
+/**
+ * Reorder DB-loaded rows to match the authoritative candidateIds order.
+ *
+ * `enterCancellationSelection` builds candidateIds SORTED by slotStart and numbers the
+ * displayed list in that order. But the DB `inArray(...)` load returns rows in arbitrary
+ * order — so a bare-number pick ("2") via matchBookingSelection (which uses positional
+ * indexing) would resolve against the wrong slot. This binds the rows back to the
+ * displayed (sorted) order so position N always means the Nth shown booking. candidateIds
+ * with no matching row (e.g. a stale id) are dropped.
+ */
+export function orderRowsByCandidates<T extends { id: string }>(rows: T[], candidateIds: string[]): T[] {
+  return candidateIds
+    .map((id) => rows.find((r) => r.id === id))
+    .filter((r): r is T => r != null)
+}
+
 async function enterCancellationSelection(
   db: Db,
   session: ActiveSession,
@@ -2893,12 +2909,17 @@ async function handleBookingSelection(
         .where(and(inArray(bookings.id, candidates), or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held'))))
     : []
 
+  // The DB `inArray` load returns rows in arbitrary order; reorder them to match the
+  // authoritative candidateIds (sorted by slotStart — the displayed/numbered order) so a
+  // bare-number pick resolves against the slot the customer actually saw at that position.
+  const orderedRows = orderRowsByCandidates(rows, candidates)
+
   // DETERMINISTIC BIND FIRST (verified-solid, lifted verbatim into matchBookingSelection):
   // a bare number picks by position; otherwise a UNIQUE service/weekday/time reference
   // auto-selects. Runs BEFORE the pivot escape so a confident pick NEVER reaches an LLM
   // call (zero added latency on the verified path).
-  const pick = matchBookingSelection(messageText, rows, businessTimezone)
-  const selected: (typeof rows)[number] | null = pick ? rows.find((r) => r.id === pick.id) ?? null : null
+  const pick = matchBookingSelection(messageText, orderedRows, businessTimezone)
+  const selected: (typeof rows)[number] | null = pick ? orderedRows.find((r) => r.id === pick.id) ?? null : null
 
   if (!selected) {
     // No confident bind. Before re-asking, give the C-PIVOT escape-hatch a chance: the
