@@ -1,5 +1,35 @@
 import { describe, it, expect } from 'vitest'
-import { extractAllowedTimesFromToolResult } from '../../src/adapters/llm/orchestrator.js'
+import { extractAllowedTimesFromToolResult, resolvedDaysFromToolArgs } from '../../src/adapters/llm/orchestrator.js'
+import { gateReply } from '../../src/domain/grounding/output-gate.js'
+import { buildTurnLedger, type OccupancySpine } from '../../src/domain/grounding/turn-ledger.js'
+
+const TZ = 'Asia/Jerusalem'
+// 2026-06-29 is a Monday (business-local). weekday 3 = Wednesday → next Wed = 2026-07-01.
+const NOW = new Date('2026-06-29T06:00:00Z')
+
+// Build a Branch-3-shaped ledger the way the orchestrator loop will: accumulated tool
+// times go into bookingTimes (no boundary concept in Branch 3); the occupancy spine is a
+// listDayOptions reader; backedActions is the loop's succeededActions set.
+function branch3Ledger(opts: {
+  allowedTimes?: string[]
+  backedActions?: string[]
+  occupancyOpen?: boolean
+  occupancyText?: string | null
+}) {
+  const spine: OccupancySpine = async () => ({
+    open: opts.occupancyOpen ?? false,
+    text: opts.occupancyText ?? null,
+  })
+  return buildTurnLedger({
+    businessFacts: '## Services offered\n- Yoga (group class, up to 10)',
+    actionLedger: '',
+    baseAllowedTimes: { boundaryTimes: [], bookingTimes: opts.allowedTimes ?? [] },
+    occupancySpine: spine,
+    backedActions: (opts.backedActions ?? []) as never[],
+    calendarConnected: false,
+    businessId: 'biz-1',
+  })
+}
 
 // T1.1 — Branch-3 per-turn allowlist accumulator.
 // The orchestrator must seed its time allowlist from the AVAILABILITY tool RESULTS
@@ -61,5 +91,92 @@ describe('extractAllowedTimesFromToolResult (T1.1)', () => {
     }
     const times = extractAllowedTimesFromToolResult('listCalendarEvents', result)
     expect(times.filter((t) => t === '10:00')).toHaveLength(1)
+  })
+})
+
+describe('resolvedDaysFromToolArgs (T1.2 / D4 day-derivation)', () => {
+  it('resolves a single day from a getSessionRoster date arg', () => {
+    const days = resolvedDaysFromToolArgs('getSessionRoster', { serviceName: 'Yoga', date: { weekday: 3 }, time: { hour: 10, minute: 0 } }, TZ, NOW)
+    expect(days).toEqual(['2026-07-01'])
+  })
+
+  it('resolves today for listCalendarEvents list_today', () => {
+    const days = resolvedDaysFromToolArgs('listCalendarEvents', { intent: 'list_today' }, TZ, NOW)
+    expect(days).toEqual(['2026-06-29'])
+  })
+
+  it('resolves BOTH bounds for a list_range (so a multi-day range never pins one focus day)', () => {
+    const days = resolvedDaysFromToolArgs('listCalendarEvents', { intent: 'list_range', dateFrom: { weekday: 3 }, dateTo: { weekday: 4 } }, TZ, NOW)
+    expect(days).toEqual(['2026-07-01', '2026-07-02'])
+  })
+
+  it('pins no day for a multi-day scan (check_free_slots / list_week)', () => {
+    expect(resolvedDaysFromToolArgs('listCalendarEvents', { intent: 'check_free_slots' }, TZ, NOW)).toEqual([])
+    expect(resolvedDaysFromToolArgs('listCalendarEvents', { intent: 'list_week' }, TZ, NOW)).toEqual([])
+  })
+
+  it('ignores non-day-scoped tools', () => {
+    expect(resolvedDaysFromToolArgs('searchWeb', { query: 'x' }, TZ, NOW)).toEqual([])
+    expect(resolvedDaysFromToolArgs('manageBusinessSettings', { instruction: 'x' }, TZ, NOW)).toEqual([])
+  })
+})
+
+describe('Branch-3 gate via gateReply (T1.2 — closes H1)', () => {
+  it("catches a fabricated 'Tuesday 14:00 is free' with no backing time", async () => {
+    let regenCalled = false
+    const res = await gateReply('You\'re free Tuesday at 14:00.', {
+      ledger: branch3Ledger({ allowedTimes: [] }),
+      input: { language: 'en' },
+      opts: {},
+      regen: async () => { regenCalled = true; return 'Let me check what is actually open and get back to you.' },
+    })
+    expect(regenCalled).toBe(true)
+    expect(res.interventions).toContain('time')
+    expect(res.reply).not.toContain('14:00')
+  })
+
+  it("corrects a blanket 'fully booked Wednesday' when the spine still has open capacity", async () => {
+    let regenInstruction = ''
+    const res = await gateReply('Wednesday is completely full, sorry.', {
+      ledger: branch3Ledger({ occupancyOpen: true, occupancyText: 'Yoga 11:00 (3 spots)' }),
+      input: { language: 'en' },
+      opts: { focusDay: { dateStr: '2026-07-01' } },
+      regen: async (instruction) => { regenInstruction = instruction; return 'Actually Wednesday still has the 11:00 Yoga open — want it?' },
+    })
+    expect(res.interventions).toContain('occupancy')
+    expect(regenInstruction).toContain('open')
+    expect(res.reply).toContain('11:00')
+  })
+
+  it('passes a backed time (surfaced by a tool this turn) untouched', async () => {
+    const res = await gateReply('Tuesday 14:00 works — shall I book it?', {
+      ledger: branch3Ledger({ allowedTimes: ['14:00'] }),
+      input: { language: 'en' },
+      opts: {},
+      regen: async () => { throw new Error('regen must not run for a backed time') },
+    })
+    expect(res.interventions).not.toContain('time')
+    expect(res.reply).toContain('14:00')
+  })
+
+  it("passes a real tool-booked 'I booked you' when bookingConfirmed (backedActions has booking_made)", async () => {
+    const res = await gateReply('Done — I booked you for 14:00.', {
+      ledger: branch3Ledger({ allowedTimes: [], backedActions: ['booking_made'] }),
+      input: { language: 'en' },
+      opts: { bookingConfirmed: true },
+      regen: async () => { throw new Error('regen must not run when the booking is backed') },
+    })
+    expect(res.interventions).toHaveLength(0)
+    expect(res.reply).toContain('I booked you')
+  })
+
+  it('skips the occupancy gate when no single clear day was resolved (focusDay undefined)', async () => {
+    const res = await gateReply('Everything is fully booked this week.', {
+      ledger: branch3Ledger({ occupancyOpen: true, occupancyText: 'open' }),
+      input: { language: 'en' },
+      opts: {}, // no focusDay → D4: skip rather than guess
+      regen: async () => { throw new Error('regen must not run without a focus day') },
+    })
+    expect(res.interventions).not.toContain('occupancy')
   })
 })

@@ -66,9 +66,13 @@ import {
 } from '../../domain/orchestrator-log.js'
 import { buildActionLedgerBlock, hasCalendarConnected } from '../../domain/audit/ledger-block.js'
 import { detectActionClaims, type ActionClaim } from '../../domain/flows/reply-guard.js'
-import { extractClockTimes } from '../../domain/flows/slot-fabrication-guard.js'
+import { extractClockTimes, extractMentionedTimes } from '../../domain/flows/slot-fabrication-guard.js'
 import { observeVoiceTells } from '../../domain/flows/voice-guard.js'
 import { logAudit } from '../../domain/audit/logger.js'
+import { buildTurnLedger, type OccupancySpine, type TurnLedger } from '../../domain/grounding/turn-ledger.js'
+import { gateReply } from '../../domain/grounding/output-gate.js'
+import { listDayOptions, type DayOptions } from '../../domain/availability/day-options.js'
+import { resolveRequestedDate, type RequestedDateParts, type RelativeDay } from '../../domain/availability/resolve-slot.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 const MAX_ITERATIONS = 5
@@ -1003,6 +1007,66 @@ export function extractAllowedTimesFromToolResult(name: string, result: unknown)
   return out
 }
 
+// ── Occupancy focus-day derivation (T1.2 / RED-TEAM D4) ──────────────────────────
+//
+// Branch 4's occupancy gate works because the handler threads a deterministic
+// `focusDay {dateStr}` from the resolved intent. Branch 3 is a free-form Gemini loop with
+// no resolved-intent day — so per D4 we REUSE the date the manager's own calendar tools
+// resolved THIS turn. We re-run the same deterministic `resolveRequestedDate` over the
+// tool args (the LLM only classified the pieces; the core resolves them). If exactly ONE
+// distinct day was resolved this turn we feed it to the occupancy gate; if zero or many,
+// the gate SKIPS rather than guesses (D4).
+
+// Tools carrying a single business-local day in a `date` DATE_PIECES arg.
+const DAY_SCOPED_TOOLS = new Set(['getSessionRoster', 'createCalendarEvent', 'scheduleGroupSession', 'editClassSession'])
+
+/** Map a loose Gemini date-pieces object to the resolver's RequestedDateParts (mirror of toDateParts). */
+function looseDateParts(d: unknown): RequestedDateParts {
+  const o = (d ?? {}) as { relativeDay?: RelativeDay; weekday?: number; explicitDate?: { year?: number; month?: number; day?: number } }
+  return {
+    relativeDay: o.relativeDay ?? null,
+    weekday: o.weekday ?? null,
+    explicitDate: o.explicitDate
+      ? { year: o.explicitDate.year ?? null, month: o.explicitDate.month ?? null, day: o.explicitDate.day ?? null }
+      : null,
+  }
+}
+
+/**
+ * The business-local day(s) a calendar tool resolved from its args this turn. A single-day
+ * tool yields its one day; a `list_range` yields BOTH bounds (so a multi-day range never
+ * collapses to a false single focus day); multi-day scans (`list_week`/`check_free_slots`)
+ * and non-calendar tools yield none. Pure given (tz, now).
+ */
+export function resolvedDaysFromToolArgs(name: string, args: Record<string, unknown>, tz: string, now: Date): string[] {
+  const out: string[] = []
+  const tryPush = (d: unknown): void => {
+    const r = resolveRequestedDate(looseDateParts(d), tz, now)
+    if (r.ok) out.push(r.dateStr)
+  }
+  if (name === 'listCalendarEvents') {
+    const intent = args['intent']
+    if (intent === 'list_today') tryPush({ relativeDay: 'today' })
+    else if (intent === 'list_range') { tryPush(args['dateFrom']); tryPush(args['dateTo']) }
+    return out
+  }
+  if (DAY_SCOPED_TOOLS.has(name) && args['date']) tryPush(args['date'])
+  return out
+}
+
+/**
+ * Short, real "open options" string for the occupancy gate's corrective — the genuinely-open
+ * class sessions (spotsLeft > 0) and private slots for the focused day, rendered 24h. Mirrors
+ * Branch-4's open signal (classes with spots OR any private gap). Returns null when nothing is open.
+ */
+function renderOpenDayText(day: DayOptions, tz: string, locale: string): string | null {
+  const fmt = (d: Date): string => d.toLocaleTimeString(locale, { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false })
+  const parts: string[] = []
+  for (const c of day.classes) if (c.spotsLeft > 0) parts.push(`${c.serviceName} ${fmt(c.start)} (${c.spotsLeft} left)`)
+  for (const p of day.privateOpenings) for (const s of p.slots) parts.push(`${p.serviceName} ${fmt(s)}`)
+  return parts.length > 0 ? parts.join(', ') : null
+}
+
 // ── L2 claim auditor ────────────────────────────────────────────────────────────
 //
 // Generalizes Branch 4's assertsBookingConfirmed guard (decision D3): never let the
@@ -1058,10 +1122,14 @@ const SAFE_AUDIT_FALLBACK: Record<Lang, string> = {
   en: "One sec — I want to verify before I say anything's done. I'll check and get back to you.",
 }
 
+// `booking_made` is deliberately excluded: the unified gate (gateReply) now owns the
+// booking claim in Branch 3 via `opts.bookingConfirmed`, so leaving it here would
+// double-regenerate a booking claim (Phase-0 contract / T1.2). The action auditor keeps
+// every NON-booking class.
 function unbackedClaims(text: string, lang: Lang, backed: Set<ActionClaim>, calendarConnected: boolean): ActionClaim[] {
-  return detectActionClaims(text, lang).filter((c) =>
-    c === 'calendar_connected' ? !(calendarConnected || backed.has(c)) : !backed.has(c),
-  )
+  return detectActionClaims(text, lang)
+    .filter((c) => c !== 'booking_made')
+    .filter((c) => (c === 'calendar_connected' ? !(calendarConnected || backed.has(c)) : !backed.has(c)))
 }
 
 async function auditReplyClaims(params: {
@@ -1106,6 +1174,64 @@ async function auditReplyClaims(params: {
   }
   await recordIntervention('corrected')
   return corrected
+}
+
+// ── Unified output gate for Branch 3 (Seam B — H1, CRITICAL) ─────────────────────
+//
+// The SAME gateReply Branch 4 uses, fed a Branch-3 ledger, THEN the L2 action auditor for
+// the non-booking action classes. Extracted to a module-level helper so the main loop's
+// reply-producing region keeps a single voice-wrapped reply-exit (the non-bypass invariant)
+// — the regen closure's own `return` lives here, out of that region. Fail-open throughout.
+//
+// NOTE (RED-TEAM D6 / T-REGEN, cross-cutting, out of Phase-1 scope): gateReply may regen for
+// time + occupancy and the auditor may regen once more — up to three sequential text-only
+// round-trips under the identity lock. A unified per-turn regen cap + shared deadline + a
+// post-regen re-check is the separate T-REGEN task; booking is already de-duplicated here
+// (gateReply owns it via bookingConfirmed; the auditor excludes booking_made).
+async function gateAndAuditBranch3Reply(params: {
+  draft: string
+  ledger: TurnLedger
+  lang: Lang
+  focusDay?: { dateStr: string; serviceTypeId?: string } | undefined
+  bookingConfirmed: boolean
+  succeededActions: Set<ActionClaim>
+  calendarConnected: boolean
+  contents: Content[]
+  systemPrompt: string
+  businessId: string
+  actorId: string
+}): Promise<string> {
+  const { draft, ledger, lang, focusDay, bookingConfirmed, succeededActions, calendarConnected, contents, systemPrompt, businessId, actorId } = params
+
+  // Text-only corrective regeneration: re-run the orchestrator over the same contents + the
+  // draft + the gate's instruction (mirrors auditReplyClaims). No tools — wording only.
+  const gateRegen = async (instruction: string): Promise<string> => {
+    const correctionContents: Content[] = [
+      ...contents,
+      { role: 'model', parts: [{ text: draft }] },
+      { role: 'user', parts: [{ text: instruction }] },
+    ]
+    const r = await generateOrchestratorTurn(correctionContents, { systemInstruction: systemPrompt, maxOutputTokens: 1024 })
+    return r.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text ?? ''
+  }
+
+  const gated = await gateReply(draft, {
+    ledger,
+    input: { language: lang },
+    opts: { bookingConfirmed, ...(focusDay ? { focusDay } : {}) },
+    regen: gateRegen,
+  }).then((g) => g.reply).catch(() => draft)
+
+  return auditReplyClaims({
+    draft: gated,
+    lang,
+    backed: succeededActions,
+    calendarConnected,
+    contents,
+    systemPrompt,
+    businessId,
+    actorId,
+  }).catch(() => gated)
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -1256,6 +1382,36 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
   const succeededActions = new Set<ActionClaim>()
   const calendarAlreadyConnected = await hasCalendarConnected(db, businessId).catch(() => false)
 
+  // ── Unified-gate per-turn state (T1.1/T1.2 — closes H1) ──────────────────────
+  // The time allowlist seeded from availability tool RESULTS + the owner's own quoted times
+  // this turn (mirrors Branch-4 `extractMentionedTimes`); and the business-local day(s) the
+  // manager's calendar tools resolved (D4 focus-day source). Both accumulate in the loop.
+  const allowedTimes = new Set<string>(extractMentionedTimes(message))
+  const resolvedDays = new Set<string>()
+  const gateLocale = lang === 'he' ? 'he-IL' : 'en-GB'
+  // Full business row for the occupancy spine (genuinely-open capacity for a focused day).
+  const [businessRow] = await db
+    .select()
+    .from(businessesTable)
+    .where(eq(businessesTable.id, businessId))
+    .limit(1)
+    .catch(() => [undefined])
+  // Fresh-spine occupancy reader — re-reads the focused day's real class/private capacity so a
+  // blanket "fully booked" claim can never launder past the gate. `open` counts ONLY genuinely-
+  // open capacity (classes with spotsLeft > 0, or any private gap), exactly as Branch-4's
+  // dayHasOpenOptions does. Best-effort — a read failure yields `open:false` (the gate then trusts
+  // the reply, never inventing availability).
+  const occupancySpine: OccupancySpine = async (dateStr, serviceTypeId) => {
+    if (!businessRow) return { open: false, text: null }
+    try {
+      const day = await listDayOptions(db, businessRow, dateStr, timezone, serviceTypeId ? { serviceTypeId } : {})
+      const open = day.classes.some((c) => c.spotsLeft > 0) || day.privateOpenings.some((p) => p.slots.length > 0)
+      return { open, text: open ? renderOpenDayText(day, timezone, gateLocale) : null }
+    } catch {
+      return { open: false, text: null }
+    }
+  }
+
   while (iterations < MAX_ITERATIONS) {
     const iterStart = Date.now()
     let result
@@ -1305,6 +1461,10 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
 
         toolResults.push({ name: toolName, status, result: toolResult })
         actionsFromToolResult(toolName, toolResult).forEach((a) => succeededActions.add(a))
+        // Unified gate (H1): seed the time allowlist from this availability result, and pin the
+        // occupancy focus-day from the day this calendar tool resolved (D4).
+        extractAllowedTimesFromToolResult(toolName, toolResult).forEach((t) => allowedTimes.add(t))
+        resolvedDaysFromToolArgs(toolName, toolArgs, timezone, new Date()).forEach((d) => resolvedDays.add(d))
         functionResponseParts.push({
           functionResponse: { name: toolName, response: { result: toolResult } },
         })
@@ -1323,12 +1483,27 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     }
 
     if (textPart) {
-      // L2: reconcile the reply's claims against what actually happened; correct or
-      // fall back if it asserts an unbacked action. Fail-open — never drop the turn.
-      const finalReply = await auditReplyClaims({
+      // Unified output gate (Seam B — H1, CRITICAL): booking (via bookingConfirmed = a tool-backed
+      // booking), fabricated TIME (allowlist seeded from availability tool results + owner-quoted
+      // times), blanket OCCUPANCY (fresh-spine re-validate on the single D4-resolved focus-day, else
+      // skip), then the L2 action auditor for the non-booking classes. Fail-open — never drop the turn.
+      const focusDay = resolvedDays.size === 1 ? { dateStr: [...resolvedDays][0]! } : undefined
+      const ledger = buildTurnLedger({
+        businessFacts: buildActiveServicesBlock(activeServices),
+        actionLedger,
+        baseAllowedTimes: { boundaryTimes: [], bookingTimes: [...allowedTimes] },
+        occupancySpine,
+        backedActions: succeededActions,
+        calendarConnected: calendarAlreadyConnected,
+        businessId,
+      })
+      const finalReply = await gateAndAuditBranch3Reply({
         draft: textPart,
+        ledger,
         lang,
-        backed: succeededActions,
+        focusDay,
+        bookingConfirmed: succeededActions.has('booking_made'),
+        succeededActions,
         calendarConnected: calendarAlreadyConnected,
         contents,
         systemPrompt,
