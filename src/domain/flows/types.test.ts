@@ -126,3 +126,37 @@ describe('parseConfirmation — bundled yes + question', () => {
     expect(parseConfirmation('כן אבל לא בא לי, מתי עוד יש?')).toBe('unclear')
   })
 })
+
+// F1a / Symptom-1 (live-test confirm loop): an affirmative that is NOT the whole message
+// and NOT the first word ("save it for me, yes" / "you're driving me crazy, yes I'm
+// interested") was misread as 'unclear', so the PA re-asked the same slot indefinitely and
+// the booking never committed. A windowed affirmative — an affirm token ANYWHERE, with no
+// negation, no clock time, and no day-revision token — is a confirmation.
+describe('parseConfirmation — windowed embedded affirmatives (F1a / S1)', () => {
+  const yes = [
+    'תשמור לי כן', // "save it for me, yes" — affirm is the 3rd word (verbatim live-test message)
+    'אתה ממש משגע אותי כן אני מעוניינת', // verbatim live-test message — affirm mid-sentence
+    'אני מעוניינת כן',
+    'לי זה מתאים כן',
+    'go on then, yes',
+  ]
+  for (const t of yes) {
+    it(`'${t}' → yes`, () => expect(parseConfirmation(t)).toBe('yes'))
+  }
+
+  // Guards — an embedded affirmative must NOT auto-confirm when a revision or negation rides along.
+  const unclear = [
+    'בא לי כן אבל ביום חמישי', // embedded yes + a DAY revision → not a plain confirm
+    'כן אבל לא משנה', // a negation appears → hedged
+    'אולי כן ב-19:00', // a clock-time revision
+  ]
+  for (const t of unclear) {
+    it(`'${t}' → unclear`, () => expect(parseConfirmation(t)).toBe('unclear'))
+  }
+
+  // An embedded affirmative bundled with a side QUESTION (no clock) stays yes_with_question
+  // so the hold-confirm handler can discriminate a same-day side question from a revision.
+  it('embedded affirmative + side question → yes_with_question', () => {
+    expect(parseConfirmation('מצוין תודה, כן מי המדריך?')).toBe('yes_with_question')
+  })
+})

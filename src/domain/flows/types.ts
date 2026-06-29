@@ -35,20 +35,6 @@ const AFFIRM_WORDS = new Set([
   'כן', 'כו', 'אוקיי', 'אישור', 'בסדר', 'סבבה', 'בהחלט', 'יאללה', 'קדימה', 'אשר', 'טוב',
 ])
 
-// Confirm-intent filler that may TRAIL a leading affirmative without turning the reply
-// into a revision. If, after the opening affirmative, every remaining word is filler,
-// the reply is a plain yes ("yes book me please" / "כן תקבע לי בבקשה"). Any other
-// content (a day, a time, a different service) leaves it 'unclear' so the revision /
-// re-ask path handles it instead of a wrong auto-confirm.
-const CONFIRM_FILLER = new Set([
-  // en
-  'please', 'book', 'it', 'me', 'that', 'this', 'now', 'go', 'ahead', 'lock', 'in',
-  'sounds', 'good', 'great', 'perfect', 'do', 'lets', "let's", 'the', 'my', 'a', 'for',
-  // he
-  'בבקשה', 'תקבע', 'תזמין', 'תסגור', 'לי', 'את', 'זה', 'המקום', 'מעולה', 'נשמע', 'יופי',
-  'בוא', 'נסגור', 'נקבע', 'אפשר', 'רוצה', 'לסגור', 'לקבוע', 'בטוח', 'מצוין', 'תודה',
-])
-
 function confirmationWords(text: string): string[] {
   return text
     .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '')
@@ -75,17 +61,28 @@ export function parseConfirmation(text: string): ConfirmationParse {
   if (YES_PATTERNS.test(text)) return 'yes'
   if (NEG_TOKEN.test(text)) return 'unclear'
   const words = confirmationWords(text)
-  if (words.length === 0 || !AFFIRM_WORDS.has(words[0]!)) return 'unclear'
-  const rest = words.slice(1)
-  if (rest.every((w) => CONFIRM_FILLER.has(w))) return 'yes'
-  // A leading affirmative followed by a SIDE QUESTION (not a slot revision): confirm,
-  // and let the caller answer the question. Reject if it carries a clock time (a likely
-  // revision) — weekday/service revisions are caught by the booking-path re-extraction,
-  // but a time is the strongest revision signal and must not auto-confirm.
-  const hasQuestion = QUESTION_RE.test(text) || rest.some((w) => INTERROGATIVE_WORDS.has(w))
+  if (words.length === 0) return 'unclear'
+
+  // F1a / Symptom-1 — WINDOWED affirmative. The earlier gate accepted an affirmative ONLY
+  // as the first word, so a "yes" buried mid-message ("תשמור לי כן" / "…כן אני מעוניינת")
+  // fell to 'unclear' and the PA re-asked the same slot indefinitely (the live-test confirm
+  // loop). An affirmative token ANYWHERE is a confirmation, gated by the same revision/negation
+  // signals the first-word path used: negation (handled above, anywhere), a clock time, or a
+  // day-revision token mean the reply may be steering a DIFFERENT slot, not confirming this one.
+  const hasAffirm = words.some((w) => AFFIRM_WORDS.has(w))
+  if (!hasAffirm) return 'unclear'
+
+  // A side QUESTION (with no clock time) stays yes_with_question so the hold-confirm handler
+  // can discriminate a same-day side question from a genuine day revision (C1/C4). A clock
+  // time is the strongest revision signal and must never auto-confirm.
+  const hasQuestion = QUESTION_RE.test(text) || words.some((w) => INTERROGATIVE_WORDS.has(w))
   const hasClockTime = /(?<![\d:])[\d]{1,2}:[\d]{2}(?![\d:])/.test(text)
   if (hasQuestion && !hasClockTime) return 'yes_with_question'
-  return 'unclear'
+
+  // No question: a clock time or a weekday/relative-day token marks a revision, not a plain
+  // confirm of the pending slot (preserves "כן אבל יום שלישי" / "yes but Tuesday 19:00").
+  if (hasClockTime || hasRevisionSignal(text)) return 'unclear'
+  return 'yes'
 }
 
 // A weekday or relative-day token signalling a slot REVISION (a different day than the one
