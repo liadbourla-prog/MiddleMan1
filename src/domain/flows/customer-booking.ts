@@ -1121,6 +1121,13 @@ export async function handleBookingFlow(
         return handleListBookings(db, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply)
 
       case 'inquiry': {
+        // Symptom 3: a "private/one-off version of a group class" request is inquiry-shaped
+        // (no concrete date/time), so it never reaches the post-slot escalation branches.
+        // Ping the owner once here too — the guard inside is idempotent per session.
+        if (intent.specialArrangementRequest === true) {
+          const esc = await maybeEscalateSpecial(db, business, updatedCtx, session, identity, intent, transcript, detectedLanguage)
+          if (esc) return esc
+        }
         // Read-only intent: keep the session ACTIVE so a continuing conversation
         // stays ONE session. Completing here spawns a fresh session on the next
         // turn → isFirstMessage=true → re-greeting (the session-churn bug). The
@@ -1257,6 +1264,13 @@ export async function handleBookingFlow(
       }
 
       default: {
+        // Symptom 3: an unknown/unclear-shaped special-arrangement request (the LLM set
+        // the flag but couldn't map a concrete slot) must still ping the owner once,
+        // before it dead-ends in the generic "I couldn't map that" reply below.
+        if (intent.specialArrangementRequest === true) {
+          const esc = await maybeEscalateSpecial(db, business, updatedCtx, session, identity, intent, transcript, detectedLanguage)
+          if (esc) return esc
+        }
         // Greetings / social pleasantries land here (no greeting intent exists) but
         // are benign — they must NOT count toward unknown-intent escalation. Only a
         // genuine unparseable message advances the consecutive-unknown tally.
@@ -2484,6 +2498,16 @@ async function handleClarification(
 
   const detectedLanguage = intentResult.data.detectedLanguage
   const mergedCtx: BookingFlowContext = { ...updatedContext, detectedLanguage }
+
+  // Symptom 3: a special-arrangement request can arrive as the clarification reply
+  // (e.g. after we asked them to specify, they restate "actually I want a private
+  // version of the group class"). Escalate once before re-routing into booking, where
+  // an inquiry/unknown-shaped restatement would otherwise dead-end with no owner ping.
+  if (intentResult.data.specialArrangementRequest === true) {
+    const esc = await maybeEscalateSpecial(db, business, mergedCtx, session, identity, intentResult.data, transcript, detectedLanguage)
+    if (esc) return esc
+  }
+
   await updateSessionContext(db, session.id, mergedCtx, 'active')
   return handleBookingIntent(
     db, calendar, identity,
