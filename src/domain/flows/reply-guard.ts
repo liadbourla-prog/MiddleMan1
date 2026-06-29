@@ -58,7 +58,14 @@ export function assertsBookingConfirmed(text: string, lang: 'he' | 'en'): boolea
 // Detection is COMPLETED-claims only — offers/questions ("אשלח לו?", "want me to text
 // him?") move the action forward and must never be flagged.
 
-export type ActionClaim = 'booking_made' | 'message_sent' | 'calendar_connected' | 'cancelled'
+export type ActionClaim =
+  | 'booking_made'
+  | 'message_sent'
+  | 'calendar_connected'
+  | 'cancelled'
+  | 'refunded'
+  | 'broadcast_sent'
+  | 'settings_changed'
 
 // Sending a message TO A CUSTOMER (third person). Deliberately excludes "שלחתי לך" /
 // "sent you" — that is the PA handing the owner something in-chat (e.g. a link), not a
@@ -99,6 +106,53 @@ const EN_CANCELLED = [
   /\b(?:booking|appointment|class|session)\s+(?:has\s+been\s+|was\s+|is\s+)?cancell?ed\b/i,
 ]
 
+// A completed REFUND to a customer ("I refunded ₪300", "the refund was issued"). Excludes
+// offers ("want me to refund?", "להחזיר?") by requiring the completed first-person/passive form.
+const HE_REFUNDED = [
+  /החזרתי/, // I refunded/returned (money)
+  /(?:ה)?זיכוי\s+בוצע/, // the refund was processed
+  /הוחזר\s+(?:לך|ה?כסף|התשלום)/, // the money/payment was returned
+  /זוכית/, // you were refunded/credited
+]
+const EN_REFUNDED = [
+  /\bi(?:'| ha)ve\s+refunded\b/i,
+  /\bi\s+refunded\b/i,
+  /\b(?:i(?:'| ha)ve\s+)?issued\s+(?:the\s+|a\s+)?refund\b/i,
+  /\brefund\s+(?:has\s+been\s+|was\s+|is\s+)?(?:processed|issued|done|complete)\b/i,
+  /\b(?:processed|issued)\s+(?:the\s+|a\s+)?refund\b/i,
+]
+
+// A completed BROADCAST / "everyone has been told" claim (announcement to MANY customers).
+// Distinct from message_sent (one customer). Excludes offers ("should I let everyone know?").
+const HE_BROADCAST_SENT = [
+  /שלחתי\s+ל(?:כל|כולם)/, // I sent to all/everyone
+  /(?:ההודעה|ההכרזה|העדכון)\s+נשלח(?:ה)?\s+לכל/, // the message/announcement was sent to all
+  /עדכנתי\s+את\s+(?:כל\s+)?(?:ה)?לקוחות/, // I updated (all) the customers
+  /יידעתי\s+את\s+(?:כל\s+)?(?:ה)?לקוחות|יידעתי\s+את\s+כולם/, // I informed the customers/everyone
+]
+const EN_BROADCAST_SENT = [
+  /\b(?:i(?:'| ha)ve\s+)?notified\s+(?:all\s+|every\s+|your\s+|the\s+)*(?:customers|clients|everyone)\b/i,
+  /\bcustomers\s+have\s+been\s+notified\b/i,
+  /\b(?:the\s+)?(?:announcement|broadcast)\s+(?:has\s+been\s+|was\s+|is\s+)?(?:sent|sent\s+out)\b/i,
+  // Completed first-person only ("I told everyone", "I've let all customers know") — the offer
+  // form ("Should I let everyone know?") deliberately stays out (it moves the action forward).
+  /\bi(?:'| ha)ve\s+(?:let|told)\s+(?:everyone|all\s+(?:your\s+)?(?:customers|clients))\b/i,
+  /\bi\s+told\s+(?:everyone|all\s+(?:your\s+)?(?:customers|clients))\b/i,
+]
+
+// A completed business-config change ("I set the price", "updated your hours"). Scoped to a
+// settings noun so it never sweeps conversational glue, and deliberately avoids קבעתי/booked
+// (that is the booking class). Excludes offers ("want me to change the price?").
+const HE_SETTINGS_CHANGED = [
+  /(?:עדכנתי|שיניתי|הגדרתי)\s+(?:את\s+)?(?:ה)?(?:מחיר|מחירים|תמחור|שעות|שעת|צבע|קיבולת|הגדרות|מדיניות)/,
+  /(?:המחיר|המחירים|השעות|הקיבולת|הצבע)\s+(?:עודכן|עודכנו|שונה|שונו|הוגדר|הוגדרו)/,
+]
+const EN_SETTINGS_CHANGED = [
+  /\bi(?:'| ha)ve\s+(?:set|updated|changed|adjusted)\s+(?:the\s+|your\s+)?(?:price|pricing|rate|hours|colou?r|capacity|settings?|schedule|policy)\b/i,
+  /\bi\s+(?:set|updated|changed|adjusted)\s+(?:the\s+|your\s+)?(?:price|pricing|rate|hours|colou?r|capacity|settings?|schedule|policy)\b/i,
+  /\b(?:the\s+|your\s+)?(?:price|pricing|hours|capacity|colou?r)\s+(?:has\s+been\s+|have\s+been\s+|is\s+now\s+|are\s+now\s+)?(?:updated|changed|set|adjusted)\b/i,
+]
+
 export function detectActionClaims(text: string, lang: 'he' | 'en'): ActionClaim[] {
   if (!text) return []
   const he = lang === 'he'
@@ -107,5 +161,8 @@ export function detectActionClaims(text: string, lang: 'he' | 'en'): ActionClaim
   if ((he ? HE_MESSAGE_SENT : EN_MESSAGE_SENT).some((re) => re.test(text))) claims.push('message_sent')
   if ((he ? HE_CALENDAR_CONNECTED : EN_CALENDAR_CONNECTED).some((re) => re.test(text))) claims.push('calendar_connected')
   if ((he ? HE_CANCELLED : EN_CANCELLED).some((re) => re.test(text))) claims.push('cancelled')
+  if ((he ? HE_REFUNDED : EN_REFUNDED).some((re) => re.test(text))) claims.push('refunded')
+  if ((he ? HE_BROADCAST_SENT : EN_BROADCAST_SENT).some((re) => re.test(text))) claims.push('broadcast_sent')
+  if ((he ? HE_SETTINGS_CHANGED : EN_SETTINGS_CHANGED).some((re) => re.test(text))) claims.push('settings_changed')
   return claims
 }

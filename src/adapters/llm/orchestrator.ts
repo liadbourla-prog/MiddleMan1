@@ -1075,13 +1075,19 @@ function renderOpenDayText(day: DayOptions, tz: string, locale: string): string 
 // prior real connection). Unbacked claims trigger one corrective regeneration, then a safe
 // honest fallback — the same regenerate-or-fall-back shape the booking guard already uses.
 
-// Maps a tool's result to the claims it legitimately backs. Inspects the result object,
-// not just ok/error status: messageCustomer returns {ok:false,reason} on a blocked send,
-// which is not an "error" and must NOT back a "message sent" claim. connectGoogleCalendar
-// is deliberately absent — it only produces a link, it does not connect the calendar.
-function actionsFromToolResult(name: string, result: unknown): ActionClaim[] {
+// Maps a tool call to the claims it legitimately backs. Inspects the result object — not
+// just ok/error status: messageCustomer returns {ok:false,reason} on a blocked send, which
+// is not an "error" and must NOT back a "message sent" claim. Some tools (coordination)
+// also need the ARGS to know which action was taken (confirm vs counter vs abandon).
+// connectGoogleCalendar is deliberately absent — it only produces a link, not a connection.
+//
+// PARTIAL≠BACKED (T1.3 / H4): a `{partial:true}` success (e.g. coordinateMeeting saved the
+// request but could not message the contact yet) backs NOTHING — a partial action must never
+// stand in for a completed one.
+export function actionsFromToolResult(name: string, args: Record<string, unknown>, result: unknown): ActionClaim[] {
   const r = (result ?? {}) as Record<string, unknown>
-  const failed = 'error' in r || r['ok'] === false || r['success'] === false || r['needsClarification'] === true
+  const failed = 'error' in r || r['ok'] === false || r['success'] === false
+    || r['needsClarification'] === true || r['partial'] === true
   if (failed) return []
   switch (name) {
     case 'messageCustomer':
@@ -1103,8 +1109,30 @@ function actionsFromToolResult(name: string, result: unknown): ActionClaim[] {
       // pending_payment — not booked yet — and a decline cancels it.
       return r['outcome'] === 'confirmed' ? ['booking_made'] : r['outcome'] === 'declined' ? ['cancelled'] : []
     case 'deleteCalendarEvent':
-    case 'manageBusinessSettings':
       return ['cancelled']
+    case 'manageBusinessSettings':
+      // One tool, two legitimate outcomes: it cancels a customer booking OR changes config.
+      // The result doesn't distinguish, so a success backs BOTH classes (keeps the prior
+      // cancellation backing; adds settings-change backing — H9/H10/H11).
+      return ['cancelled', 'settings_changed']
+    case 'refundTransaction':
+      // ok:true ⇒ the processor actually issued the refund (H5/H20).
+      return ['refunded']
+    case 'broadcastAnnouncement':
+      // Backs "customers were notified" ONLY when something actually went out (H12): a
+      // zero-match broadcast is ok:true with sent:0 and must not back the claim.
+      return typeof r['sent'] === 'number' && (r['sent'] as number) > 0 ? ['broadcast_sent'] : []
+    case 'coordinateMeeting':
+      // A full send reaches the counterparty (message_sent). A {partial:true} save was already
+      // dropped by the `failed` guard above (H4 — no "texted Harel" off a partial).
+      return ['message_sent']
+    case 'resolveMeetingCoordination':
+      // The action lives in the args (the result is a bare {success:true}). A 'confirm' BOOKS
+      // the meeting (H16 → booking_made); a 'counter_offer' messages the contact a new time;
+      // an 'abandon' claims nothing.
+      return args['action'] === 'confirm' ? ['booking_made']
+        : args['action'] === 'counter_offer' ? ['message_sent']
+          : []
     default:
       return []
   }
@@ -1115,6 +1143,9 @@ const CLAIM_LABEL: Record<ActionClaim, string> = {
   message_sent: 'that a message was sent to a customer',
   calendar_connected: 'that the Google Calendar is connected',
   cancelled: 'that a booking was cancelled',
+  refunded: 'that a refund was issued',
+  broadcast_sent: 'that an announcement was sent to customers',
+  settings_changed: 'that a business setting was changed',
 }
 
 const SAFE_AUDIT_FALLBACK: Record<Lang, string> = {
@@ -1460,7 +1491,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
         }
 
         toolResults.push({ name: toolName, status, result: toolResult })
-        actionsFromToolResult(toolName, toolResult).forEach((a) => succeededActions.add(a))
+        actionsFromToolResult(toolName, toolArgs, toolResult).forEach((a) => succeededActions.add(a))
         // Unified gate (H1): seed the time allowlist from this availability result, and pin the
         // occupancy focus-day from the day this calendar tool resolved (D4).
         extractAllowedTimesFromToolResult(toolName, toolResult).forEach((t) => allowedTimes.add(t))

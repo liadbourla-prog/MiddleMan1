@@ -81,3 +81,34 @@ describe('detectActionClaims (L2 multi-action auditor)', () => {
     expect(detectActionClaims('What time works for you?', 'en')).toEqual([])
   })
 })
+
+// ── T1.3 — new backed-action classes (refund / broadcast / settings) ──────────────
+describe('detectActionClaims — refund / broadcast / settings (T1.3)', () => {
+  it('flags completed REFUND claims (He + En), not offers', () => {
+    expect(detectActionClaims('Done — I refunded ₪300 to Dana.', 'en')).toContain('refunded')
+    expect(detectActionClaims("I've issued the refund.", 'en')).toContain('refunded')
+    expect(detectActionClaims('החזרתי לדנה את ה-300 ₪.', 'he')).toContain('refunded')
+    expect(detectActionClaims('הזיכוי בוצע.', 'he')).toContain('refunded')
+    // Offers/questions move the action forward — never flagged.
+    expect(detectActionClaims('Want me to refund Dana?', 'en')).not.toContain('refunded')
+    expect(detectActionClaims('להחזיר לדנה את התשלום?', 'he')).not.toContain('refunded')
+  })
+
+  it('flags completed BROADCAST/notify-everyone claims (He + En), not offers', () => {
+    expect(detectActionClaims("I've notified all your customers about the new hours.", 'en')).toContain('broadcast_sent')
+    expect(detectActionClaims('The announcement was sent out.', 'en')).toContain('broadcast_sent')
+    expect(detectActionClaims('עדכנתי את כל הלקוחות על השעות החדשות.', 'he')).toContain('broadcast_sent')
+    expect(detectActionClaims('ההודעה נשלחה לכל הלקוחות.', 'he')).toContain('broadcast_sent')
+    expect(detectActionClaims('Should I let everyone know about the new hours?', 'en')).not.toContain('broadcast_sent')
+  })
+
+  it('flags completed SETTINGS-change claims (He + En), not booking/offers', () => {
+    expect(detectActionClaims("Done — I've set the price to ₪300.", 'en')).toContain('settings_changed')
+    expect(detectActionClaims('I updated your hours to 09:00–18:00.', 'en')).toContain('settings_changed')
+    expect(detectActionClaims('עדכנתי את המחיר ל-300 ₪.', 'he')).toContain('settings_changed')
+    expect(detectActionClaims('שיניתי את השעות.', 'he')).toContain('settings_changed')
+    // Must not collide with the booking class (קבעתי = booked, not a settings change).
+    expect(detectActionClaims('קבעתי לך תור מחר ב-10:00', 'he')).not.toContain('settings_changed')
+    expect(detectActionClaims('Want me to change the price?', 'en')).not.toContain('settings_changed')
+  })
+})

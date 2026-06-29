@@ -180,3 +180,45 @@ describe('Branch-3 gate via gateReply (T1.2 — closes H1)', () => {
     expect(res.interventions).not.toContain('occupancy')
   })
 })
+
+import { actionsFromToolResult } from '../../src/adapters/llm/orchestrator.js'
+
+describe('actionsFromToolResult — extended backed-action coverage (T1.3)', () => {
+  it('backs a refund only on ok:true (refundTransaction)', () => {
+    expect(actionsFromToolResult('refundTransaction', {}, { ok: true, fact: '{}' })).toEqual(['refunded'])
+    expect(actionsFromToolResult('refundTransaction', {}, { ok: false, reason: 'no_refundable_charge' })).toEqual([])
+  })
+
+  it('backs a broadcast only when something was actually sent (sent > 0)', () => {
+    expect(actionsFromToolResult('broadcastAnnouncement', {}, { ok: true, matched: 10, sent: 8 })).toEqual(['broadcast_sent'])
+    // matched 0 / sent 0 → nothing was sent → must NOT back "customers notified" (H12).
+    expect(actionsFromToolResult('broadcastAnnouncement', {}, { ok: true, matched: 0, sent: 0 })).toEqual([])
+    expect(actionsFromToolResult('broadcastAnnouncement', {}, { ok: false, reason: 'missing_detail' })).toEqual([])
+  })
+
+  it('backs a settings change (and cancellation) on manageBusinessSettings success; clarification backs nothing', () => {
+    const ok = actionsFromToolResult('manageBusinessSettings', { instruction: 'set price 300' }, { success: true, fact: 'price set' })
+    expect(ok).toContain('settings_changed')
+    expect(ok).toContain('cancelled')
+    // clarificationNeeded → success:false → nothing backed (the "set the price" repro).
+    expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'change price' }, { success: false, clarificationNeeded: 'which service?' })).toEqual([])
+  })
+
+  it('coordinateMeeting: partial:true must NOT back a "texted them" claim; a full send does', () => {
+    // saved-but-couldn't-message → partial → no backing (H4 — "texted Harel" on partial).
+    expect(actionsFromToolResult('coordinateMeeting', { contactName: 'Harel' }, { success: true, partial: true, message: '...' })).toEqual([])
+    expect(actionsFromToolResult('coordinateMeeting', { contactName: 'Harel' }, { success: true, coordinationId: 'c1', message: '...' })).toEqual(['message_sent'])
+    expect(actionsFromToolResult('coordinateMeeting', {}, { success: false, reason: 'no_recipient' })).toEqual([])
+  })
+
+  it('resolveMeetingCoordination: confirm → booking_made (H16); counter_offer → message_sent; abandon → none', () => {
+    expect(actionsFromToolResult('resolveMeetingCoordination', { coordinationId: 'c1', action: 'confirm' }, { success: true })).toEqual(['booking_made'])
+    expect(actionsFromToolResult('resolveMeetingCoordination', { coordinationId: 'c1', action: 'counter_offer' }, { success: true })).toEqual(['message_sent'])
+    expect(actionsFromToolResult('resolveMeetingCoordination', { coordinationId: 'c1', action: 'abandon' }, { success: true })).toEqual([])
+    expect(actionsFromToolResult('resolveMeetingCoordination', { coordinationId: 'c1', action: 'confirm' }, { success: false })).toEqual([])
+  })
+
+  it('a partial result never backs (global partial≠backed rule)', () => {
+    expect(actionsFromToolResult('messageCustomer', {}, { ok: true, partial: true })).toEqual([])
+  })
+})
