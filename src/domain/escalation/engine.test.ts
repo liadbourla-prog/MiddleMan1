@@ -143,14 +143,22 @@ function makeQDb(opts: { manager?: boolean; dedup?: unknown[]; rate?: unknown[] 
 const customer = { id: 'cust-1', phoneNumber: '+972546372400' }
 
 describe('isSubstantiveQuestion — owner-ping substance gate (pure)', () => {
-  it('rejects greetings/social and trivially short noise', () => {
-    expect(isSubstantiveQuestion('hi', 8)).toBe(false)
-    expect(isSubstantiveQuestion('שלום', 8)).toBe(false)
-    expect(isSubstantiveQuestion('???', 8)).toBe(false)
-    expect(isSubstantiveQuestion('   ', 8)).toBe(false)
+  it('rejects greetings/social and trivially short noise (via the greeting detector, not a char floor)', () => {
+    expect(isSubstantiveQuestion('hi')).toBe(false)
+    expect(isSubstantiveQuestion('שלום')).toBe(false)
+    expect(isSubstantiveQuestion('???')).toBe(false)
+    expect(isSubstantiveQuestion('   ')).toBe(false)
   })
   it('accepts a real question', () => {
-    expect(isSubstantiveQuestion('Do you have parking near the studio?', 8)).toBe(true)
+    expect(isSubstantiveQuestion('Do you have parking near the studio?')).toBe(true)
+  })
+  // RED-TEAM (Phase-2c review #1): the char floor must NOT suppress legitimate SHORT questions
+  // the model already flagged as unanswerable (it emitted [[ASK_STUDIO]]). The greeting detector
+  // is the real social filter; a 5–7 char real question is a genuine gap worth relaying.
+  it('accepts legitimate short questions (no over-suppression by the char floor)', () => {
+    for (const q of ['price?', 'מחיר?', 'vegan?', 'kosher?', 'WiFi?', 'חניה?', 'gym?']) {
+      expect(isSubstantiveQuestion(q)).toBe(true)
+    }
   })
 })
 

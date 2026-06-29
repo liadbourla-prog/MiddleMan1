@@ -175,7 +175,11 @@ export async function escalateUnfulfillableRequest(
 // hours" is intentionally OFF for now (design §4, owner decision). All gates use data already
 // in scope (the (businessId,customerId,status) + (businessId,status) indexes, schema.ts:1119).
 
-const OWNER_PING_MIN_CHARS_DEFAULT = 8
+// Minimal floor only — guards against empty/punctuation-only noise. The REAL social filter is
+// looksLikeGreetingOrSocial (below), and the model already gated this by emitting [[ASK_STUDIO]].
+// A higher floor (was 8) silently suppressed legitimate short questions — "price?", "מחיר?",
+// "vegan?", "WiFi?", "חניה?" — that are genuine knowledge gaps worth relaying (red-team 2c #1).
+const OWNER_PING_MIN_CHARS_DEFAULT = 3
 
 /**
  * Substance gate (pure, exported for tests): a question worth pinging the owner over is neither
@@ -185,6 +189,10 @@ const OWNER_PING_MIN_CHARS_DEFAULT = 8
 export function isSubstantiveQuestion(text: string, minChars: number = OWNER_PING_MIN_CHARS_DEFAULT): boolean {
   const trimmed = text.trim()
   if (trimmed.length < minChars) return false
+  // Reject punctuation-only / no-content noise ("???", "...") — a real question has a word
+  // character. Unicode-aware so Hebrew ("מחיר?") counts. This (not a high char floor) is what
+  // filters noise; legitimate short questions ("price?", "WiFi?") pass.
+  if (!/[\p{L}\p{N}]/u.test(trimmed)) return false
   if (looksLikeGreetingOrSocial(trimmed)) return false
   return true
 }
