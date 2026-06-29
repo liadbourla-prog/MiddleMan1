@@ -1,5 +1,39 @@
 import { describe, it, expect } from 'vitest'
-import { parseConfirmation, parseRetentionReply, type RetentionReply } from './types.js'
+import { parseConfirmation, parseRetentionReply, classifyConfirmWithQuestion, type RetentionReply } from './types.js'
+
+describe('classifyConfirmWithQuestion — same-day side-question vs day revision (C1)', () => {
+  const SUN = 0, TUE = 2
+
+  it('C4 canonical: "yes, is Sunday full?" with held slot ON Sunday → confirm (side question)', () => {
+    expect(classifyConfirmWithQuestion('yes, is Sunday full?', SUN)).toBe('confirm')
+  })
+
+  it('"yes, anything Thursday?" with held slot on Tuesday → revise (different day)', () => {
+    expect(classifyConfirmWithQuestion('yes, anything Thursday?', TUE)).toBe('revise')
+  })
+
+  it('a relative-day token ("tomorrow"/"next week") always revises', () => {
+    expect(classifyConfirmWithQuestion('yes, but tomorrow instead?', TUE)).toBe('revise')
+    expect(classifyConfirmWithQuestion('yes, can we do next week?', SUN)).toBe('revise')
+  })
+
+  it('mentioning the held weekday AND a different one → revise', () => {
+    expect(classifyConfirmWithQuestion('yes, is Sunday or Thursday better?', SUN)).toBe('revise')
+  })
+
+  it('no resolvable day token → confirm (plain side question)', () => {
+    expect(classifyConfirmWithQuestion("yes, who's the instructor?", SUN)).toBe('confirm')
+  })
+
+  it('no held weekday known + a day token → revise (cannot prove same-day)', () => {
+    expect(classifyConfirmWithQuestion('yes, is Sunday full?', null)).toBe('revise')
+  })
+
+  it('Hebrew held-day side question confirms', () => {
+    // ראשון = Sunday
+    expect(classifyConfirmWithQuestion('כן, ראשון מלא?', SUN)).toBe('confirm')
+  })
+})
 
 describe('parseRetentionReply', () => {
   // Truth table with offeredCount=3 (the v1 max offered).

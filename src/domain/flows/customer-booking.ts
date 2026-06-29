@@ -17,7 +17,7 @@ import { matchCancelBookings, type CancelBooking } from './cancellation-match.js
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
-import { parseConfirmation, parseRetentionReply, hasRevisionSignal } from './types.js'
+import { parseConfirmation, parseRetentionReply, hasRevisionSignal, classifyConfirmWithQuestion } from './types.js'
 import { logAudit } from '../audit/logger.js'
 import type { FlowResult, BookingFlowContext } from './types.js'
 import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
@@ -182,6 +182,13 @@ function formatSlotTime(date: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
   }).format(date)
+}
+
+// Business-local weekday (0=Sun..6=Sat) of an instant. Used by the C1 confirm-with-question
+// arbiter to tell a same-held-day side question from a genuine day revision.
+function localWeekdayOf(date: Date, tz: string): number {
+  const name = date.toLocaleDateString('en-US', { timeZone: tz, weekday: 'short' })
+  return { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[name] ?? date.getUTCDay()
 }
 
 // Render a resolved 'YYYY-MM-DD' business-local date for use inside situation
@@ -2274,12 +2281,21 @@ async function handleHoldConfirmation(
   // A leading yes bundled with a side question (e.g. "yes, who's the instructor?") is still
   // a confirmation — the grounded reply answers the question (roster/facts are in businessFacts).
   // BUT (C1): a yes_with_question carrying a DAY REVISION ("yes, anything Thursday?") parses as
-  // yes_with_question (it has a '?', no clock time) yet must NOT book the stale slot. When a
-  // weekday/relative-day token is present, treat it as unclear so it falls into the pivot path
-  // (rebuildOnSlotPivot) and the revision is handled instead of silently confirming.
+  // yes_with_question (it has a '?', no clock time) yet must NOT book the stale slot. The cheap
+  // hasRevisionSignal pre-gate flags ANY day token — but that over-triggers on a confirming
+  // side-QUESTION about the HELD day ("yes, is Sunday full?" when the held slot IS Sunday).
+  // classifyConfirmWithQuestion is the arbiter: it compares the mentioned day to the held slot's
+  // weekday. Only a DIFFERENT day (or a relative-day token) is a revision → 'unclear' (pivot
+  // path); a same-held-day side question stays 'yes' so the confirm+bundled-answer split (T3.6)
+  // books AND answers it.
+  const heldWeekday = ctx.pendingSlot
+    ? localWeekdayOf(new Date(ctx.pendingSlot.start), businessTimezone)
+    : null
   const confirmation: 'yes' | 'no' | 'unclear' =
     parsed === 'yes_with_question'
-      ? (hasRevisionSignal(messageText) ? 'unclear' : 'yes')
+      ? (hasRevisionSignal(messageText) && classifyConfirmWithQuestion(messageText, heldWeekday) === 'revise'
+          ? 'unclear'
+          : 'yes')
       : parsed
 
   // Root B: a non-"yes" reply may be REVISING the slot, not answering. If so, rebuild
