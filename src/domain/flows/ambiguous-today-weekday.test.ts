@@ -1,5 +1,33 @@
 import { describe, it, expect } from 'vitest'
-import { decideAmbiguousTodayWeekday, ambiguousTodayWeekdayAsk } from './customer-booking.js'
+import { decideAmbiguousTodayWeekday, ambiguousTodayWeekdayAsk, consumeWeekdayClarification } from './customer-booking.js'
+
+// WS3-T3.5 BUG3: the consume must BIND the stashed date for a today/next-week answer so the
+// date-resolution block is skipped — a bare "next week" answer (relativeDay:'next_week',
+// weekday:null) must NOT be re-resolved (resolveRequestedDate → ambiguous_date → clarify loop).
+describe('consumeWeekdayClarification — bind today/next-week answer to a stashed date', () => {
+  const pending = { todayStr: '2026-06-29', nextWeekStr: '2026-07-06' }
+
+  it('"next week" (relativeDay) binds to nextWeekStr, not ambiguous re-resolution', () => {
+    expect(consumeWeekdayClarification(pending, { relativeDay: 'next_week', weekdayAnchor: null })).toBe('2026-07-06')
+  })
+
+  it('"next" anchor binds to nextWeekStr', () => {
+    expect(consumeWeekdayClarification(pending, { relativeDay: null, weekdayAnchor: 'next' })).toBe('2026-07-06')
+  })
+
+  it('"today" (relativeDay) binds to todayStr', () => {
+    expect(consumeWeekdayClarification(pending, { relativeDay: 'today', weekdayAnchor: null })).toBe('2026-06-29')
+  })
+
+  it('"this" anchor binds to todayStr', () => {
+    expect(consumeWeekdayClarification(pending, { relativeDay: null, weekdayAnchor: 'this' })).toBe('2026-06-29')
+  })
+
+  it('a different concrete day this turn does NOT bind → null (normal resolution wins)', () => {
+    expect(consumeWeekdayClarification(pending, { relativeDay: null, weekdayAnchor: null })).toBeNull()
+    expect(consumeWeekdayClarification(pending, { relativeDay: 'tomorrow', weekdayAnchor: null })).toBeNull()
+  })
+})
 
 // WS3-T3.5: pure tests for the bare same-day weekday clarification — the 3-state decision
 // and the VOICE-GATE ask string.

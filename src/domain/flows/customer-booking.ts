@@ -589,6 +589,21 @@ export function decideAmbiguousTodayWeekday(
   return 'roll' // every session already started → next week
 }
 
+// WS3-T3.5: consume a customer's answer to the "today or next week?" ambiguity ask. PURE.
+// Returns the bound 'YYYY-MM-DD' (today or next-week, from the stashed pair) when the answer
+// resolves the ambiguity, or null when this turn names a DIFFERENT concrete day (the caller
+// then falls through to normal date resolution). Binding here is authoritative: the answer
+// "next week" carries no weekday of its own (relativeDay:'next_week', weekday:null), so it
+// must NOT be re-resolved (resolveRequestedDate would return ambiguous_date and loop).
+export function consumeWeekdayClarification(
+  pending: { todayStr: string; nextWeekStr: string },
+  slot: { relativeDay: string | null; weekdayAnchor: string | null },
+): string | null {
+  if (slot.relativeDay === 'today' || slot.weekdayAnchor === 'this') return pending.todayStr
+  if (slot.relativeDay === 'next_week' || slot.weekdayAnchor === 'next') return pending.nextWeekStr
+  return null
+}
+
 // WS3-T3.5 VOICE-GATE: the "today or next week?" ask. English-neutral situation instruction;
 // the LLM emits in the detected language. One warm first-person question — no numbered menu,
 // no yes/no — naming the service and "next week" to keep it moving toward booking.
@@ -1777,11 +1792,19 @@ async function handleBookingIntent(
   // asked because a bare same-day weekday was ambiguous; bind this turn's answer to one of
   // the two stashed dates, then clear the pending marker (whatever the answer was — a
   // different concrete day falls through to normal resolution below, which wins).
+  // When the consume BINDS the date from the two stashed dates (the answer was today/this or
+  // next_week/next), the date-resolution block below must be SKIPPED — otherwise it re-runs
+  // resolveRequestedDate on the bare "next week" answer (relativeDay:'next_week', weekday:null),
+  // gets ambiguous_date, and dead-ends into the "which day?" clarify loop, discarding the
+  // perfectly good bound date. A different concrete day this turn does NOT bind here and falls
+  // through to normal resolution (which wins).
+  let boundFromWeekdayClarification = false
   if (ctx.pendingWeekdayClarification) {
-    const pending = ctx.pendingWeekdayClarification
-    const a = slot?.weekdayAnchor ?? null
-    if (slot?.relativeDay === 'today' || a === 'this') draft.dateStr = pending.todayStr
-    else if (slot?.relativeDay === 'next_week' || a === 'next') draft.dateStr = pending.nextWeekStr
+    const bound = consumeWeekdayClarification(ctx.pendingWeekdayClarification, {
+      relativeDay: slot?.relativeDay ?? null,
+      weekdayAnchor: slot?.weekdayAnchor ?? null,
+    })
+    if (bound) { draft.dateStr = bound; boundFromWeekdayClarification = true }
     // else: a different concrete day this turn → normal resolution below wins.
     const { pendingWeekdayClarification: _clearedPending, ...restCtx } = ctx
     ctx = restCtx as BookingFlowContext
@@ -1790,7 +1813,7 @@ async function handleBookingIntent(
   // Date — resolved DETERMINISTICALLY from structured pieces; LLM never computes.
   let dateProblem: string | null = null
   let ambiguousTodayWeekday: { weekday: number; todayStr: string; nextWeekStr: string } | null = null
-  if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
+  if (!boundFromWeekdayClarification && slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
     const parts: RequestedDateParts = {
       relativeDay: slot.relativeDay ?? null,
       weekday: slot.weekday ?? null,
