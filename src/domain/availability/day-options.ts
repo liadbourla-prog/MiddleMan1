@@ -54,12 +54,15 @@ export interface DayOptions {
  * services eligible for private openings: genuinely private (cap ≤ 1) AND not
  * already running as a class that day.
  */
-export function selectPrivateOpeningServices<T extends { id: string; maxParticipants?: number | null }>(
-  services: T[],
-  serviceIdsRunningAsClasses: Iterable<string>,
-): T[] {
+export function selectPrivateOpeningServices<
+  T extends { id: string; maxParticipants?: number | null; schedulingMode?: 'appointment' | 'class' | null },
+>(services: T[], serviceIdsRunningAsClasses: Iterable<string>): T[] {
   const classIds = new Set(serviceIdsRunningAsClasses)
-  return services.filter((s) => (s.maxParticipants ?? 1) <= 1 && !classIds.has(s.id))
+  // A class-mode service must NEVER be a private opening regardless of capacity —
+  // otherwise the empty gaps between class sessions leak as bookable slots (P4).
+  return services.filter(
+    (s) => s.schedulingMode !== 'class' && (s.maxParticipants ?? 1) <= 1 && !classIds.has(s.id),
+  )
 }
 
 export interface ListDayOptionsOpts {
@@ -100,6 +103,7 @@ export async function listDayOptions(
       name: serviceTypes.name,
       durationMinutes: serviceTypes.durationMinutes,
       maxParticipants: serviceTypes.maxParticipants,
+      schedulingMode: serviceTypes.schedulingMode,
     })
     .from(serviceTypes)
     .where(and(...serviceConds))

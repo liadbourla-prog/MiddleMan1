@@ -19,6 +19,7 @@ export type RelativeDay = 'today' | 'tomorrow' | 'day_after_tomorrow' | 'this_we
 export interface RequestedDateParts {
   relativeDay: RelativeDay | null
   weekday: number | null // 0=Sun … 6=Sat
+  weekdayAnchor?: 'this' | 'next' | null
   explicitDate: { year: number | null; month: number | null; day: number | null } | null
 }
 
@@ -36,7 +37,7 @@ export type DateResolutionReason =
   | 'past_year' // an explicit year already in the past (the 2016 bug)
 
 export type DateResolution =
-  | { ok: true; dateStr: string } // 'YYYY-MM-DD' in business-local calendar
+  | { ok: true; dateStr: string; ambiguousToday?: true; nextWeekStr?: string } // 'YYYY-MM-DD' in business-local calendar
   | { ok: false; reason: DateResolutionReason }
 
 // ── small pure date-string helpers (calendar-only, tz-agnostic) ──────────────
@@ -101,11 +102,16 @@ export function resolveRequestedDate(parts: RequestedDateParts, tz: string, now:
     return { ok: false, reason: 'impossible_date' }
   }
 
-  // 2. Weekday (optionally modified by this_week/next_week).
+  // 2. Weekday (optionally modified by this_week/next_week or weekdayAnchor).
   if (parts.weekday != null && parts.weekday >= 0 && parts.weekday <= 6) {
     const base = nextOccurrenceOfWeekday(todayStr, parts.weekday)
-    const dateStr = parts.relativeDay === 'next_week' ? addDaysToDateStr(base, 7) : base
-    return { ok: true, dateStr }
+    if (parts.relativeDay === 'next_week' || parts.weekdayAnchor === 'next') {
+      return { ok: true, dateStr: addDaysToDateStr(base, 7) }
+    }
+    if (base === todayStr && parts.weekdayAnchor == null && parts.relativeDay == null) {
+      return { ok: true, dateStr: base, ambiguousToday: true, nextWeekStr: addDaysToDateStr(base, 7) }
+    }
+    return { ok: true, dateStr: base }
   }
 
   // 3. Pure relative day.

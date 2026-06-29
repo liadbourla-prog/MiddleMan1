@@ -88,6 +88,63 @@ export function parseConfirmation(text: string): ConfirmationParse {
   return 'unclear'
 }
 
+// A weekday or relative-day token signalling a slot REVISION (a different day than the one
+// pending confirmation). Used by the hold-confirm handler to stop a "yes + day question"
+// ("yes, anything Thursday?") — which parseConfirmation reports as yes_with_question because
+// it has a '?' and no clock time — from collapsing to a plain confirm and booking the STALE
+// slot. A revision must fall into the pivot path (rebuildOnSlotPivot) instead.
+//
+// RESIDUAL (documented, out of scope here): this covers weekday/relative-day revisions only.
+// A SERVICE-NAME revision ("yes, but for a massage instead?") needs the business service list,
+// which this pure helper does not have — that case is NOT caught here and remains a known gap.
+const REVISION_DAY_RE =
+  /(\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b)|(\b(tomorrow|today|next\s+week)\b)|(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת|מחר|מחרתיים|היום|שבוע\s+הבא)/i
+
+export function hasRevisionSignal(text: string): boolean {
+  return REVISION_DAY_RE.test(text)
+}
+
+// Weekday tokens (0=Sun … 6=Sat) for distinguishing a same-day side-question from a
+// genuine day revision. Mirrors hasRevisionSignal's vocabulary.
+const CONFIRM_WEEKDAY_TOKENS: ReadonlyArray<readonly [RegExp, number]> = [
+  [/\bsunday\b|ראשון/i, 0], [/\bmonday\b|שני/i, 1], [/\btuesday\b|שלישי/i, 2],
+  [/\bwednesday\b|רביעי/i, 3], [/\bthursday\b|חמישי/i, 4], [/\bfriday\b|שישי/i, 5],
+  [/\bsaturday\b|שבת/i, 6],
+]
+// A relative-day token always points at a day OTHER than the held slot's fixed weekday
+// (or, for "today", a re-resolution the customer is steering) — so it signals a revision,
+// never a same-day confirm.
+const RELATIVE_DAY_RE = /\b(tomorrow|today|next\s+week)\b|מחר|מחרתיים|היום|שבוע\s+הבא/i
+
+/**
+ * WS2/C1 — discriminate a "yes + day-mentioning question" between a same-context side
+ * QUESTION (confirm + answer) and a genuine slot REVISION (route to the pivot).
+ *
+ * Called only when parseConfirmation === 'yes_with_question' AND hasRevisionSignal fired
+ * (a day token is present). The crude token-presence test over-triggered: "yes, is Sunday
+ * full?" while the held slot IS Sunday is a side question about the HELD day, not a revision,
+ * yet it was forced to 'unclear' and the booking neither confirmed nor the question answered.
+ *
+ * Discriminator = the DIFFERENT-DAY check (robust without a DB round-trip):
+ *   • a relative-day token (tomorrow / today / next week) → 'revise' (a different resolution)
+ *   • a weekday token that DIFFERS from the held slot's weekday → 'revise'
+ *   • only the held slot's own weekday mentioned (or no resolvable day) → 'confirm'
+ *
+ * `heldWeekday` is the local weekday (0=Sun..6=Sat) of the pending slot, or null when none.
+ * With no held slot we cannot prove same-day, so a day token is treated as a revision.
+ */
+export function classifyConfirmWithQuestion(
+  messageText: string,
+  heldWeekday: number | null,
+): 'confirm' | 'revise' {
+  if (RELATIVE_DAY_RE.test(messageText)) return 'revise'
+  const mentioned = CONFIRM_WEEKDAY_TOKENS.filter(([re]) => re.test(messageText)).map(([, dow]) => dow)
+  if (mentioned.length === 0) return 'confirm' // no resolvable weekday → a plain side question
+  if (heldWeekday == null) return 'revise' // can't prove same-day → treat as a revision
+  // Same-day side question only when EVERY mentioned weekday is the held day.
+  return mentioned.every((dow) => dow === heldWeekday) ? 'confirm' : 'revise'
+}
+
 export type RetentionReply =
   | { kind: 'accept'; index: number } // 0-based index into the offered slots
   | { kind: 'decline' }
@@ -122,6 +179,17 @@ export interface BookingFlowContext {
   // against re-asking every booking turn — the request is appended at most once per session.
   nameAsked?: boolean
   awaitingConfirmationFor?: 'hold' | 'cancellation' | 'cancellation_selection' | 'retention_offer'
+  // WS3-T3.2: typed binding for a customer's answer to a PA list-question, so the reply
+  // binds to THAT question's options BEFORE fresh intent re-extraction. `candidateIds` are
+  // the booking ids offered (sorted order); `isRescheduling` distinguishes the reschedule
+  // selection from the cancellation selection (same path, one flag). Set in PARALLEL with
+  // the legacy fields (cancellationCandidates / awaitingConfirmationFor / isReschedulingFlow)
+  // which remain the source of truth for the confirm/reschedule callers.
+  pendingDecision?: {
+    kind: 'booking_selection'
+    candidateIds: string[]
+    isRescheduling: boolean
+  }
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'
   cancellationCandidates?: string[]
@@ -148,6 +216,16 @@ export interface BookingFlowContext {
   // book one of them, they're promoted to rejectedSlots (batch rejection — "none of
   // those work"). Transient: consumed/cleared at the start of each turn.
   lastOfferedSlots?: import('./negotiation-constraints.js').RejectedSlot[]
+  // The day an availability INQUIRY focused on, persisted so a bare continuation turn
+  // ("I want to join") after the inquiry re-reads the SAME day's fresh spine — Gate 3's
+  // strongest signal — and corrects a stale "full". Naturally dropped when the next turn
+  // names a different day (that day wins). See resolveContinuationFocusDay.
+  lastInquiryFocus?: { dateStr: string; serviceTypeId?: string }
+  // WS3-T3.5: a bare same-day weekday ("Sunday" when today IS Sunday) is ambiguous —
+  // the customer may mean today or the same day next week. When today still has open
+  // sessions we ask one warm question and stash the two candidate dates here so the
+  // next turn binds the answer ("today" / "next week") without re-resolving.
+  pendingWeekdayClarification?: { weekday: number; todayStr: string; nextWeekStr: string; serviceTypeId?: string }
   [key: string]: unknown
 }
 

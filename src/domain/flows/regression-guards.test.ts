@@ -15,11 +15,21 @@
  * these guarantees (e.g. the booking-request path never consulting rejectedSlots) are
  * covered by customer-booking.test.ts; this file is the fast tripwire.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { resolveRequestedDate, resolveSlotStart } from '../availability/resolve-slot.js'
 import { findUnbackedTimes, assertsNoAvailability, extractClockTimes } from './slot-fabrication-guard.js'
-import { parseConfirmation } from './types.js'
+import { parseConfirmation, hasRevisionSignal } from './types.js'
 import { isSlotSuppressed, filterOpenSlots } from './negotiation-constraints.js'
+import { matchBookingSelection } from './customer-booking.js'
+import type { CancelBooking } from './cancellation-match.js'
+
+// classInstanceMissing's only DB dependency. Mocked so this fast tripwire stays pure —
+// the mock affects ONLY the blocks import; the 14 pure guards above never touch it.
+vi.mock('../availability/blocks.js', () => ({
+  findClassBlockProviderForSlot: vi.fn(),
+}))
+import { findClassBlockProviderForSlot } from '../availability/blocks.js'
+import { classInstanceMissing } from './customer-booking.js'
 
 const TZ = 'Asia/Jerusalem'
 // 2026-06-28 12:00 local (UTC+3 in summer) — a SUNDAY. Fixed so tests are deterministic.
@@ -108,6 +118,71 @@ describe('DO-NOT-REGRESS · C-PIVOT — a revision never parses as a plain confi
       expect(parseConfirmation(revision)).not.toBe('yes')
     }
   })
+
+  // WS3-T3.7 (C1): the gap parseConfirmation alone can't close — a "yes + day revision"
+  // phrased as a QUESTION ("yes, anything Thursday?") parses as yes_with_question (it has a
+  // '?' and no clock time), which the hold-confirm handler would collapse to a plain confirm
+  // and book the STALE slot. hasRevisionSignal is the second signal the handler ANDs in: a
+  // weekday/relative-day token flips that case to non-confirm so the pivot path rebuilds.
+  it('a "yes + day revision" question is yes_with_question AND carries a revision signal', () => {
+    expect(parseConfirmation('yes anything thursday?')).toBe('yes_with_question')
+    expect(hasRevisionSignal('yes anything thursday?')).toBe(true)
+    // Hebrew weekday revision
+    expect(hasRevisionSignal('כן אולי ביום חמישי?')).toBe(true)
+    // relative-day revisions also count
+    expect(hasRevisionSignal('yes but tomorrow?')).toBe(true)
+    expect(hasRevisionSignal('כן אבל מחר?')).toBe(true)
+  })
+
+  it('a pure side-question carries NO revision signal (stays a confirm)', () => {
+    expect(parseConfirmation('yes, is parking available?')).toBe('yes_with_question')
+    expect(hasRevisionSignal('yes, is parking available?')).toBe(false)
+    expect(hasRevisionSignal('כן, יש חניה?')).toBe(false)
+  })
+
+  it('hasRevisionSignal: weekday + relative-day tokens (he + en) are revisions, plain text is not', () => {
+    for (const t of [
+      'sunday', 'on Monday please', 'make it Tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
+      'ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת',
+      'tomorrow', 'today', 'next week', 'מחר', 'מחרתיים', 'היום', 'שבוע הבא',
+    ]) {
+      expect(hasRevisionSignal(t)).toBe(true)
+    }
+    for (const t of ['yes', 'sure book it', 'is parking available?', 'how much does it cost?', 'כן', 'יש חניה?']) {
+      expect(hasRevisionSignal(t)).toBe(false)
+    }
+  })
+
+  // WS3-T3.2 extension: the bind helper that answers a PA list-question is the FIRST
+  // gate before the pivot escape-hatch. A mid-flow REVISION ("actually Thursday instead")
+  // must NOT bind as an answer to the asked question — otherwise it would commit the wrong
+  // booking instead of falling through to fresh handling. A clean number / unique
+  // reference DOES bind (preserving the verified deterministic pick with zero LLM).
+  describe('matchBookingSelection — a pivot phrase never binds as an answer', () => {
+    const TZ = 'Asia/Jerusalem'
+    // 1=Pilates(Mon 10:00), 2=Massage(Wed 16:00), 3=Yoga(Fri 12:00)
+    const cands: CancelBooking[] = [
+      { id: 'b-pilates', slotStart: new Date('2026-06-29T07:00:00Z'), serviceTypeId: 'svc-pilates', serviceName: 'Pilates' },
+      { id: 'b-massage', slotStart: new Date('2026-07-01T13:00:00Z'), serviceTypeId: 'svc-massage', serviceName: 'Deep Massage' },
+      { id: 'b-yoga', slotStart: new Date('2026-07-03T09:00:00Z'), serviceTypeId: 'svc-yoga', serviceName: 'Yoga' },
+    ]
+
+    it('a pivot phrase yields NO match (falls through to the pivot path)', () => {
+      // Thursday is not any candidate's weekday → no bind; the dispatcher routes this to
+      // rebuildOnSlotPivot for fresh handling instead of mis-binding it as a pick.
+      expect(matchBookingSelection('actually Thursday instead', cands, TZ)).toBeNull()
+      expect(matchBookingSelection('כן אבל ביום חמישי', cands, TZ)).toBeNull()
+    })
+
+    it('a clean number DOES bind (verified deterministic pick preserved)', () => {
+      expect(matchBookingSelection('2', cands, TZ)).toEqual({ id: 'b-massage' })
+    })
+
+    it('a unique service/day reference DOES bind', () => {
+      expect(matchBookingSelection('the yoga one', cands, TZ)).toEqual({ id: 'b-yoga' })
+      expect(matchBookingSelection('the Monday one', cands, TZ)).toEqual({ id: 'b-pilates' })
+    })
+  })
 })
 
 describe('DO-NOT-REGRESS · G1 — an available slot is never wrongly suppressed', () => {
@@ -131,5 +206,38 @@ describe('DO-NOT-REGRESS · G1 — an available slot is never wrongly suppressed
     const kept = filterOpenSlots(slots, constraints, TZ)
     expect(kept).toHaveLength(1)
     expect(kept[0]!.start.toISOString()).toBe('2026-06-29T09:00:00.000Z')
+  })
+})
+
+describe('DO-NOT-REGRESS · class studio refuses between-session times (owner invariant; extends G5)', () => {
+  // OWNER CARDINAL GUARANTEE (P4): a class-mode service can NEVER be booked at a time with no
+  // scheduled class instance — the empty gaps between owner-set class sessions are never bookable.
+  // classInstanceMissing is the chokepoint that enforces it. This locks the chokepoint at the
+  // pure-function level: refuse the gap, allow the real instance, skip the DB for appointments.
+  //
+  // KNOWN GAP (deferred): the SPINE-level half of this guarantee — that getOpenSlots / isSlotBookable
+  // exclude calendar_blocks (block/personal) times so a blocked 15:00 is never offered as a private
+  // gap — has NO unit harness today (no service.test.ts / DB fixture exists). A "blocked 15:00 never
+  // offered" assertion is deferred to a future availability DB-harness task; NOT built here.
+  const db = {} as never
+  const slot = new Date('2026-06-29T14:00:00.000Z') // a between-session time — no class scheduled here
+
+  it('class-mode + NO class block at the slot → refused (the between-session gap is never bookable)', async () => {
+    vi.mocked(findClassBlockProviderForSlot).mockResolvedValue({ found: false })
+    const svc = { id: 'svc-yoga', schedulingMode: 'class' as const }
+    expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(true)
+  })
+
+  it('class-mode + a real class block at the slot → allowed (a real instance IS bookable; protects G1)', async () => {
+    vi.mocked(findClassBlockProviderForSlot).mockResolvedValue({ found: true, providerId: null, maxParticipants: 8 })
+    const svc = { id: 'svc-yoga', schedulingMode: 'class' as const }
+    expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(false)
+  })
+
+  it('appointment-mode → never refused and never hits the DB (early return)', async () => {
+    vi.mocked(findClassBlockProviderForSlot).mockClear()
+    const svc = { id: 'svc-appt', schedulingMode: 'appointment' as const }
+    expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(false)
+    expect(findClassBlockProviderForSlot).not.toHaveBeenCalled()
   })
 })

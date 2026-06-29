@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
+import { resolveService } from './customer-booking.js'
 
 const SERVICES = [
   { id: 'yoga', name: 'יוגה' },
@@ -37,6 +38,41 @@ describe('inferFocusService', () => {
 
   it('returns the only service when a business has just one', () => {
     expect(inferFocusService([], [{ id: 'a', name: 'Massage' }])?.id).toBe('a')
+  })
+})
+
+describe('resolveService — class-twin preference (P4: never offer between-class gaps)', () => {
+  // The live July-5 leak: "yoga" matched both an appointment-mode twin ("שיעור יוגה")
+  // and the real class-mode "יוגה". Resolving to the appointment twin turned the empty
+  // gaps between class sessions into "bookable appointment slots". Resolution must prefer
+  // the class twin so the downstream class path runs and only real class instances surface.
+  const apptYoga = { id: 'appt-yoga', name: 'שיעור יוגה', schedulingMode: 'appointment' as const }
+  const classYoga = { id: 'class-yoga', name: 'יוגה', schedulingMode: 'class' as const }
+
+  it('prefers the class-mode twin when the hint matches both', () => {
+    expect(resolveService('יוגה', [apptYoga, classYoga])?.id).toBe('class-yoga')
+  })
+
+  it('prefers the class twin regardless of match order', () => {
+    expect(resolveService('יוגה', [classYoga, apptYoga])?.id).toBe('class-yoga')
+  })
+
+  it('returns the appointment match unchanged when no class twin is among matches', () => {
+    const apptOnly = { id: 'massage', name: 'עיסוי', schedulingMode: 'appointment' as const }
+    const other = { id: 'pilates', name: 'פילאטיס', schedulingMode: 'appointment' as const }
+    expect(resolveService('עיסוי', [apptOnly, other])?.id).toBe('massage')
+  })
+
+  it('returns the single service unchanged (no hint needed)', () => {
+    expect(resolveService(null, [apptYoga])?.id).toBe('appt-yoga')
+  })
+
+  it('returns null with multiple services and no hint', () => {
+    expect(resolveService(null, [apptYoga, classYoga])).toBeNull()
+  })
+
+  it('returns null when no service matches the hint', () => {
+    expect(resolveService('zumba', [apptYoga, classYoga])).toBeNull()
   })
 })
 

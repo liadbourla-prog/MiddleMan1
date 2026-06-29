@@ -11,12 +11,13 @@ import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
+import { observeVoiceTells } from './voice-guard.js'
 import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability, extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
-import { matchCancelBookings } from './cancellation-match.js'
+import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
-import { parseConfirmation, parseRetentionReply } from './types.js'
+import { parseConfirmation, parseRetentionReply, hasRevisionSignal, classifyConfirmWithQuestion } from './types.js'
 import { logAudit } from '../audit/logger.js'
 import type { FlowResult, BookingFlowContext } from './types.js'
 import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
@@ -27,7 +28,7 @@ import { recordLastCancellation, loadLastCancellation } from '../customer/profil
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
-import { listDayOptions, type ClassSession } from '../availability/day-options.js'
+import { listDayOptions, type ClassSession, type DayOptions } from '../availability/day-options.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
@@ -156,6 +157,21 @@ export function looksLikeGreetingOrSocial(text: string): boolean {
   return GREETING_SOCIAL_RE.test(cleaned)
 }
 
+/**
+ * Which day's spine a continuation turn should re-read (T2.2 Hole B). Precedence:
+ * the day the customer named THIS turn → the in-flight draft day → the day the prior
+ * availability inquiry focused on. The this-turn day winning is exactly the day-change
+ * scoping: if they name a different day, the stale inquiry focus is naturally dropped.
+ * Pure.
+ */
+export function resolveContinuationFocusDay(
+  thisTurnDateStr: string | undefined,
+  draftDateStr: string | undefined,
+  lastInquiryDateStr: string | undefined,
+): string | undefined {
+  return thisTurnDateStr ?? draftDateStr ?? lastInquiryDateStr
+}
+
 function formatSlotDate(date: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, weekday: 'long', day: 'numeric', month: 'long',
@@ -168,10 +184,49 @@ function formatSlotTime(date: Date, tz: string): string {
   }).format(date)
 }
 
+// Business-local weekday (0=Sun..6=Sat) of an instant. Used by the C1 confirm-with-question
+// arbiter to tell a same-held-day side question from a genuine day revision.
+function localWeekdayOf(date: Date, tz: string): number {
+  const name = date.toLocaleDateString('en-US', { timeZone: tz, weekday: 'short' })
+  return { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[name] ?? date.getUTCDay()
+}
+
 // Render a resolved 'YYYY-MM-DD' business-local date for use inside situation
 // strings (G2: the customer never sees the raw YYYY-MM-DD form).
 function formatLocalDate(dateStr: string, tz: string): string {
   return formatSlotDate(resolveSlotStart(dateStr, { hour: 12, minute: 0 }, tz), tz)
+}
+
+// Best-effort focusDay for a bundled side-question on the confirm path (C4). The customer
+// asked something like "yes, is Sunday full?" alongside their confirm; if the question names
+// a weekday or relative day we can resolve, hand the occupancy gate a focusDay so it can
+// re-read the spine for that day (kills cross-turn "full" laundering). Deliberately narrow:
+// weekday/relative-day tokens only (mirrors hasRevisionSignal's vocabulary). Returns null
+// when no clean day is present — the caller then omits focusDay and gates 1-3 still run.
+const FOCUS_WEEKDAY_TOKENS: ReadonlyArray<readonly [RegExp, number]> = [
+  [/\b(sunday)\b|ראשון/i, 0], [/\b(monday)\b|שני/i, 1], [/\b(tuesday)\b|שלישי/i, 2],
+  [/\b(wednesday)\b|רביעי/i, 3], [/\b(thursday)\b|חמישי/i, 4], [/\b(friday)\b|שישי/i, 5],
+  [/\b(saturday)\b|שבת/i, 6],
+]
+function resolveFocusDayFromText(
+  text: string,
+  tz: string,
+  now: Date,
+  serviceTypeId?: string,
+): { dateStr: string; serviceTypeId?: string } | null {
+  let parts: RequestedDateParts | null = null
+  if (/\btomorrow\b|מחר(?!תיים)/i.test(text)) parts = { relativeDay: 'tomorrow', weekday: null, explicitDate: null }
+  else if (/מחרתיים/.test(text)) parts = { relativeDay: 'day_after_tomorrow', weekday: null, explicitDate: null }
+  else if (/\btoday\b|היום/i.test(text)) parts = { relativeDay: 'today', weekday: null, explicitDate: null }
+  else {
+    for (const [re, dow] of FOCUS_WEEKDAY_TOKENS) {
+      if (re.test(text)) { parts = { relativeDay: null, weekday: dow, explicitDate: null }; break }
+    }
+  }
+  if (!parts) return null
+  const res = resolveRequestedDate(parts, tz, now)
+  if (!res.ok) return null
+  return serviceTypeId ? { dateStr: res.dateStr, serviceTypeId } : { dateStr: res.dateStr }
 }
 
 type TimeOfDay = 'morning' | 'afternoon' | 'evening'
@@ -259,6 +314,14 @@ interface SuggestionResult {
 }
 const NO_SUGGESTION: SuggestionResult = { text: null, offered: [] }
 
+// H1: the lower bound for a same-day availability search. Floors at the START of the
+// requested business-local day (so an already-taken 14:00 still surfaces an open 10:00
+// the same day), but never reaches into the past — clamped to `now`. Pure + unit-tested.
+export function dayStartFloor(requestedStart: Date, now: Date, tz: string): Date {
+  const dayStart = resolveSlotStart(localParts(requestedStart, tz).dateStr, { hour: 0, minute: 0 }, tz)
+  return dayStart.getTime() > now.getTime() ? dayStart : now
+}
+
 // Enumerate up to 4 real bookable openings for a service, starting from the
 // requested time, over the next 14 days. Returns compact human text for the LLM to
 // phrase plus the concrete slots offered. Uses the canonical availability spine so
@@ -274,7 +337,9 @@ async function suggestOpenSlotsText(
 ): Promise<SuggestionResult> {
   const durationMinutes = Math.max(15, Math.round((requestedEnd.getTime() - requestedStart.getTime()) / 60_000))
   const now = new Date()
-  const from = requestedStart.getTime() > now.getTime() ? requestedStart : now
+  // H1: floor the search at the START of the requested DAY (never in the past), not at
+  // the requested CLOCK time — so a taken 14:00 still surfaces an open 10:00 the SAME day.
+  const from = dayStartFloor(requestedStart, now, tz)
   const to = new Date(from.getTime() + 14 * 24 * 60 * 60_000)
   try {
     // Over-fetch then subtract rejected/avoided times so we still surface up to 4 FRESH
@@ -377,8 +442,27 @@ async function buildDayOptionsText(
   serviceTypeId: string | undefined,
   constraints?: NegotiationConstraints,
   timeOfDay?: TimeOfDay | null,
+  offerable = false,
 ): Promise<SuggestionResult> {
   const day = await listDayOptions(db, business, dateStr, tz, serviceTypeId ? { serviceTypeId } : {})
+  return renderDayOptions(day, dateStr, tz, { offerable, ...(timeOfDay != null ? { timeOfDay } : {}), ...(constraints != null ? { constraints } : {}) })
+}
+
+// PURE renderer for an already-fetched DayOptions — the human-facing facts string plus the
+// concrete `offered` slots. Split out of buildDayOptionsText so it's unit-testable (no DB).
+//
+// Two modes:
+//   offerable:false (GROUNDING) — current behavior unchanged. FULL classes are LISTED with a
+//     "(full)" label and pushed to `offered` (so grounding/no-availability checks see them).
+//   offerable:true (CUSTOMER OFFER) — full classes (spotsLeft <= 0) are DROPPED entirely: they
+//     appear in neither the text nor `offered`, so the PA can never present an unpickable slot.
+export function renderDayOptions(
+  day: DayOptions,
+  dateStr: string,
+  tz: string,
+  opts: { offerable: boolean; timeOfDay?: TimeOfDay | null; constraints?: NegotiationConstraints },
+): SuggestionResult {
+  const { offerable, timeOfDay, constraints } = opts
   const dayLabel = formatLocalDate(dateStr, tz)
   const parts: string[] = []
   const offered: RejectedSlot[] = []
@@ -391,7 +475,9 @@ async function buildDayOptionsText(
     timeOfDay ? ds.filter((d) => startInBucket(d, tz, timeOfDay)) : ds
 
   // Drop class instances and private openings the customer already ruled out this session.
-  const classes = byBucket(filterOpenSlots(day.classes, constraints, tz))
+  // In offerable mode, additionally drop FULL classes — they must never be presented.
+  let classes = byBucket(filterOpenSlots(day.classes, constraints, tz))
+  if (offerable) classes = classes.filter((c) => c.spotsLeft > 0)
   if (classes.length > 0) {
     const items = classes.slice(0, 10).map((c) => {
       offered.push({ start: c.start.toISOString(), end: c.end.toISOString(), serviceTypeId: c.serviceTypeId })
@@ -456,6 +542,86 @@ export async function suggestNextClassesText(
     return `${c.serviceName} on ${formatSlotDate(c.start, tz)} at ${formatSlotTime(c.start, tz)} (${cap})`
   })
   return { text: `Upcoming scheduled classes (these are the real options — there are no others): ${items.join('; ')}.`, offered }
+}
+
+// PURE situation-string builder for the three class-offer sites (day-known/time-missing,
+// classInstanceMissing gate, taken-at-confirm class miss). It is the testable seam for
+// "never dead-end a lead": given the requested day's offerable options and the next-real-class
+// substitute, it returns the LLM instruction for whichever of the three states holds.
+//
+//   1. sameDayText present              → offer the real same-day class times.
+//   2. sameDayText null, substituteText → no more that day; offer the next REAL classes
+//                                         (a later day) so the lead is never dead-ended.
+//   3. both null                        → genuinely nothing on the horizon; an honest, warm,
+//                                         forward-moving close (check another day OR let the
+//                                         studio know) — never a bare dead-end, never a menu.
+//
+// VOICE GATE: every branch yields a first-person, single-question, no-IVR-menu, no-grovel
+// reply that ALWAYS carries a concrete next step. Branches 2/3 must never instruct offering a
+// "(full)" class — the offerable inputs have already dropped those.
+export function classOfferSituation(
+  serviceName: string,
+  dayLabel: string,
+  sameDayText: string | null,
+  substituteText: string | null,
+): string {
+  if (sameDayText) {
+    return `Booking ${serviceName} on ${dayLabel}. These are the only real class times that day: ${sameDayText} Offer ONLY these and ask which they'd like — do NOT re-ask the day or service, and never invent a time.`
+  }
+  if (substituteText) {
+    return `There are no more ${serviceName} classes on ${dayLabel}. The next real classes are: ${substituteText} Offer these and ask which they'd like — never invent a time.`
+  }
+  return `There are no more ${serviceName} classes on ${dayLabel}, and nothing else is scheduled in the period ahead. Warmly let them know, and in a single question ask whether they'd like you to check another day or to let the studio know they're after this — never invent a time, and keep the conversation moving.`
+}
+
+// WS3-T3.5: a bare same-day weekday ("Sunday" when today IS Sunday) is ambiguous — the
+// customer may mean today or the same day next week. PURE 3-state decision over today's
+// sessions that have NOT yet started (the rest of the day):
+//   'ask'  → some today-session is still bookable → ask "today or next week?"
+//   'full' → sessions remain today but every one is full → say so + offer next real classes
+//   'roll' → every session already started → silently roll to next week
+export function decideAmbiguousTodayWeekday(
+  liveClasses: { spotsLeft: number }[], // today's sessions that have NOT yet started
+  livePrivateOpen: boolean, // any open private slot still to come today
+): 'ask' | 'roll' | 'full' {
+  if (liveClasses.some((c) => c.spotsLeft > 0) || livePrivateOpen) return 'ask'
+  if (liveClasses.length > 0) return 'full' // sessions remain today but all full
+  return 'roll' // every session already started → next week
+}
+
+// WS3-T3.5 BUG4: should a previously-stashed ambiguity marker survive THIS turn? PURE.
+// True when the marker exists, the customer gave neither a today/next-week answer (which would
+// BIND a date) nor a fresh concrete day (which supersedes it) — e.g. they just named the
+// service after a serviceless ambiguity turn. The caller then re-raises the "today or next
+// week?" ask once the service resolves, instead of silently booking today.
+export function carriesWeekdayClarification(
+  hasMarker: boolean,
+  boundADate: boolean,
+  broughtFreshDay: boolean,
+): boolean {
+  return hasMarker && !boundADate && !broughtFreshDay
+}
+
+// WS3-T3.5: consume a customer's answer to the "today or next week?" ambiguity ask. PURE.
+// Returns the bound 'YYYY-MM-DD' (today or next-week, from the stashed pair) when the answer
+// resolves the ambiguity, or null when this turn names a DIFFERENT concrete day (the caller
+// then falls through to normal date resolution). Binding here is authoritative: the answer
+// "next week" carries no weekday of its own (relativeDay:'next_week', weekday:null), so it
+// must NOT be re-resolved (resolveRequestedDate would return ambiguous_date and loop).
+export function consumeWeekdayClarification(
+  pending: { todayStr: string; nextWeekStr: string },
+  slot: { relativeDay: string | null; weekdayAnchor: string | null },
+): string | null {
+  if (slot.relativeDay === 'today' || slot.weekdayAnchor === 'this') return pending.todayStr
+  if (slot.relativeDay === 'next_week' || slot.weekdayAnchor === 'next') return pending.nextWeekStr
+  return null
+}
+
+// WS3-T3.5 VOICE-GATE: the "today or next week?" ask. English-neutral situation instruction;
+// the LLM emits in the detected language. One warm first-person question — no numbered menu,
+// no yes/no — naming the service and "next week" to keep it moving toward booking.
+export function ambiguousTodayWeekdayAsk(serviceName: string, weekdayLabel: string): string {
+  return `The customer asked to book ${serviceName} on ${weekdayLabel}, and that weekday is in fact TODAY — they may have meant today or the same day next week. There are still open ${serviceName} sessions today. In ONE warm, first-person question, check whether they'd like one of today's remaining sessions or the same day next week — do not present a numbered menu, do not ask a yes/no, and keep it moving toward booking.`
 }
 
 /**
@@ -588,6 +754,7 @@ function makeGenReply(
   actionLedger: string,
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
   dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
+  businessId?: string,
 ): GenReply {
   return async (input, opts = {}) => {
     const grounded = {
@@ -597,7 +764,7 @@ function makeGenReply(
     }
     let reply = await generateCustomerReply(grounded)
     const replySurfacesAnyTime = (text: string): boolean => extractClockTimes(text).length > 0
-    if (opts.bookingConfirmed) return reply
+    if (opts.bookingConfirmed) return observeVoiceTells(reply, { businessId, language: input.language })
 
     // Gate 1 — phantom booking-confirmed claim.
     if (assertsBookingConfirmed(reply, input.language)) {
@@ -641,9 +808,10 @@ function makeGenReply(
             ...grounded,
             situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}${spine.text ? ` Real open options: ${spine.text}` : ''}`,
           })
-          return assertsNoAvailability(corrected) && !replySurfacesAnyTime(corrected)
+          const out = assertsNoAvailability(corrected) && !replySurfacesAnyTime(corrected)
             ? OCCUPANCY_FALLBACK[input.language]
             : corrected
+          return observeVoiceTells(out, { businessId, language: input.language }, { isSafeFallback: out === OCCUPANCY_FALLBACK[input.language] })
         }
       }
       // (b) situation signal, day-scoped
@@ -667,7 +835,11 @@ function makeGenReply(
       }
     }
 
-    return reply
+    return observeVoiceTells(reply, { businessId, language: input.language }, {
+      isSafeFallback: reply === FABRICATED_TIME_FALLBACK[input.language]
+        || reply === OCCUPANCY_FALLBACK[input.language]
+        || reply === BOOKING_NOT_CONFIRMED_FALLBACK[input.language],
+    })
   }
 }
 
@@ -815,7 +987,7 @@ export async function handleBookingFlow(
       return { open: false, text: null }
     }
   }
-  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions)
+  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
@@ -886,9 +1058,20 @@ export async function handleBookingFlow(
     }
   }
 
-  // ── Branch: cancellation_selection (multi-booking numbered pick) ──────────
-  if (session.state === 'waiting_clarification' && ctx.awaitingConfirmationFor === 'cancellation_selection') {
-    return handleCancellationSelection(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply)
+  // ── Branch: booking_selection (multi-booking pick — cancel or reschedule) ──
+  // WS3-T3.2: a customer's answer binds to THE asked list-question's options first
+  // (deterministic pick), with a C-PIVOT escape-hatch — a mid-flow revision ("actually
+  // Thursday instead") falls through to fresh handling instead of mis-binding as an answer.
+  if (session.state === 'waiting_clarification' &&
+      (ctx.pendingDecision?.kind === 'booking_selection' ||
+       ctx.awaitingConfirmationFor === 'cancellation_selection')) {
+    const sel = await handleBookingSelection(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
+    if (!sel.redispatch) return sel
+    // Pivot/redirect → the handler (via rebuildOnSlotPivot) already cleared pending state in
+    // the DB; mirror that in-memory and fall through to fresh intent (mirrors the hold branch).
+    const { pendingDecision: _pd, cancellationCandidates: _cc, awaitingConfirmationFor: _a, isReschedulingFlow: _r, ...cleared } = ctx
+    ctx = cleared as BookingFlowContext
+    session = { ...session, state: 'active', context: ctx }
   }
 
   // ── Branch: waiting for hold confirmation ────────────────────────────────
@@ -1008,7 +1191,7 @@ export async function handleBookingFlow(
   const intentResult2 = await (async (): Promise<FlowResult> => {
     // P4: "give me back the class we cancelled" → re-offer the exact cancelled slot from
     // the snapshot. Falls through to normal handling when there's nothing fresh to restore.
-    if (intent.restorePrevious) {
+    if (intent.restorePrevious === true) {
       const restored = await handleRestoreCancelled(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply, activeServices, business)
       if (restored) return restored
     }
@@ -1034,6 +1217,13 @@ export async function handleBookingFlow(
         return handleListBookings(db, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply)
 
       case 'inquiry': {
+        // Symptom 3: a "private/one-off version of a group class" request is inquiry-shaped
+        // (no concrete date/time), so it never reaches the post-slot escalation branches.
+        // Ping the owner once here too — the guard inside is idempotent per session.
+        if (intent.specialArrangementRequest === true) {
+          const esc = await maybeEscalateSpecial(db, business, updatedCtx, session, identity, intent, transcript, detectedLanguage)
+          if (esc) return esc
+        }
         // Read-only intent: keep the session ACTIVE so a continuing conversation
         // stays ONE session. Completing here spawns a fresh session on the next
         // turn → isFirstMessage=true → re-greeting (the session-churn bug). The
@@ -1083,7 +1273,7 @@ export async function handleBookingFlow(
             ctx = withConstraints(ctx, removeRejectedSlot(ctx.negotiationConstraints, askedStart.toISOString()))
           }
           if (resolvedDay && resolvedDay.ok) {
-            const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null)
+            const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null, true)
             availabilityText = r.text
             inquiryOffered.push(...r.offered)
           }
@@ -1112,6 +1302,11 @@ export async function handleBookingFlow(
           // inquiry path is otherwise read-only and wouldn't carry this forward.
           let inquiryCtx = withConstraints(updatedCtx, ctx.negotiationConstraints ?? {})
           if (inquiryOffered.length > 0) inquiryCtx = { ...inquiryCtx, lastOfferedSlots: inquiryOffered }
+          // Persist the focused day so a bare continuation ("I want to join") re-reads the
+          // SAME day's fresh spine and corrects a stale "full" (T2.2 Hole B).
+          if (resolvedDay && resolvedDay.ok) {
+            inquiryCtx = { ...inquiryCtx, lastInquiryFocus: { dateStr: resolvedDay.dateStr, ...(inquiryService ? { serviceTypeId: inquiryService.id } : {}) } }
+          }
           await updateSessionContext(db, session.id, inquiryCtx, 'active')
         }
         const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
@@ -1165,6 +1360,13 @@ export async function handleBookingFlow(
       }
 
       default: {
+        // Symptom 3: an unknown/unclear-shaped special-arrangement request (the LLM set
+        // the flag but couldn't map a concrete slot) must still ping the owner once,
+        // before it dead-ends in the generic "I couldn't map that" reply below.
+        if (intent.specialArrangementRequest === true) {
+          const esc = await maybeEscalateSpecial(db, business, updatedCtx, session, identity, intent, transcript, detectedLanguage)
+          if (esc) return esc
+        }
         // Greetings / social pleasantries land here (no greeting intent exists) but
         // are benign — they must NOT count toward unknown-intent escalation. Only a
         // genuine unparseable message advances the consecutive-unknown tally.
@@ -1200,8 +1402,8 @@ export async function handleBookingFlow(
           const dp = intent.slotRequest && (intent.slotRequest.relativeDay || intent.slotRequest.weekday != null || intent.slotRequest.explicitDate)
             ? resolveRequestedDate({ relativeDay: intent.slotRequest.relativeDay ?? null, weekday: intent.slotRequest.weekday ?? null, explicitDate: intent.slotRequest.explicitDate ?? null }, businessTimezone, new Date())
             : null
-          const focusDateStr = (dp?.ok ? dp.dateStr : undefined) ?? updatedCtx.slotDraft?.dateStr
-          const focusSvc = resolveService(intent.serviceTypeHint, activeServices)?.id ?? updatedCtx.slotDraft?.serviceTypeId
+          const focusDateStr = resolveContinuationFocusDay(dp?.ok ? dp.dateStr : undefined, updatedCtx.slotDraft?.dateStr, updatedCtx.lastInquiryFocus?.dateStr)
+          const focusSvc = resolveService(intent.serviceTypeHint, activeServices)?.id ?? updatedCtx.slotDraft?.serviceTypeId ?? updatedCtx.lastInquiryFocus?.serviceTypeId
           if (focusDateStr) {
             const r = await buildDayOptionsText(db, business, focusDateStr, businessTimezone, focusSvc, updatedCtx.negotiationConstraints)
             unknownDayText = r.text
@@ -1424,7 +1626,9 @@ async function rebuildOnSlotPivot(
 
   const ps = ctx.pendingSlot
   const seededDraft = ps ? slotDraftFromPending(ps, businessTimezone) : ctx.slotDraft
-  const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, ...rest } = ctx
+  // WS3-T3.2: also drop pendingDecision (and its legacy twins) so a redirect can't leave
+  // stale booking-selection state that would re-bind the redirected reply next turn.
+  const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, pendingDecision: _pd, cancellationCandidates: _cc, isReschedulingFlow: _ir, ...rest } = ctx
   // Negotiation memory: the customer just moved OFF the slot that was awaiting
   // confirmation — record it as rejected so we never re-offer that exact instant later
   // this session. (The new slot they pivoted to is pursued explicitly below, which
@@ -1468,7 +1672,7 @@ export async function maybeEscalateSpecial(
   transcript: TranscriptTurn[],
   lang: 'he' | 'en',
 ): Promise<FlowResult | null> {
-  if (!business || !intent.specialArrangementRequest || ctx.specialRequestEscalated) return null
+  if (!business || intent.specialArrangementRequest !== true || ctx.specialRequestEscalated) return null
   const lastCustomer = [...transcript].reverse().find((t) => t.role === 'customer')?.text
   const requestText = intent.summary ?? lastCustomer ?? 'a special arrangement'
   const { customerReply } = await escalateUnfulfillableRequest(db, business, identity.phoneNumber, requestText, lang)
@@ -1597,17 +1801,68 @@ async function handleBookingIntent(
   // We never re-ask something already captured. Internal state only (G2).
   const draft: NonNullable<BookingFlowContext['slotDraft']> = { ...(ctx.slotDraft ?? {}) }
 
+  // WS3-T3.5: consume a pending "today or next week?" clarification FIRST. Last turn we
+  // asked because a bare same-day weekday was ambiguous; bind this turn's answer to one of
+  // the two stashed dates, then clear the pending marker (whatever the answer was — a
+  // different concrete day falls through to normal resolution below, which wins).
+  // When the consume BINDS the date from the two stashed dates (the answer was today/this or
+  // next_week/next), the date-resolution block below must be SKIPPED — otherwise it re-runs
+  // resolveRequestedDate on the bare "next week" answer (relativeDay:'next_week', weekday:null),
+  // gets ambiguous_date, and dead-ends into the "which day?" clarify loop, discarding the
+  // perfectly good bound date. A different concrete day this turn does NOT bind here and falls
+  // through to normal resolution (which wins).
+  let boundFromWeekdayClarification = false
+  // WS3-T3.5 BUG4: a marker may survive a serviceless turn — when last turn detected the
+  // ambiguity but no service was known yet (so the "today or next week?" ask couldn't fire),
+  // we stashed the marker WITHOUT committing a date. If this turn brings neither a today/
+  // next-week answer NOR a fresh concrete day (e.g. the customer just now names the service),
+  // keep the marker alive so the ask re-fires once the service resolves below — never let it
+  // silently fall through and book today.
+  let carriedWeekdayClarification: BookingFlowContext['pendingWeekdayClarification'] | null = null
+  if (ctx.pendingWeekdayClarification) {
+    const pending = ctx.pendingWeekdayClarification
+    const bound = consumeWeekdayClarification(pending, {
+      relativeDay: slot?.relativeDay ?? null,
+      weekdayAnchor: slot?.weekdayAnchor ?? null,
+    })
+    const broughtFreshDay = Boolean(slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate))
+    if (bound) { draft.dateStr = bound; boundFromWeekdayClarification = true }
+    else if (carriesWeekdayClarification(true, false, broughtFreshDay)) carriedWeekdayClarification = pending
+    // else: a different concrete day this turn → normal resolution below wins.
+    const { pendingWeekdayClarification: _clearedPending, ...restCtx } = ctx
+    ctx = restCtx as BookingFlowContext
+  }
+
   // Date — resolved DETERMINISTICALLY from structured pieces; LLM never computes.
   let dateProblem: string | null = null
-  if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
+  let ambiguousTodayWeekday: { weekday: number; todayStr: string; nextWeekStr: string } | null = null
+  if (!boundFromWeekdayClarification && slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
     const parts: RequestedDateParts = {
       relativeDay: slot.relativeDay ?? null,
       weekday: slot.weekday ?? null,
+      weekdayAnchor: slot.weekdayAnchor ?? null,
       explicitDate: slot.explicitDate ?? null,
     }
     const resolved = resolveRequestedDate(parts, businessTimezone, now)
-    if (resolved.ok) draft.dateStr = resolved.dateStr
-    else if (resolved.reason !== 'no_date') dateProblem = resolved.reason
+    if (resolved.ok) {
+      draft.dateStr = resolved.dateStr
+      // WS3-T3.5: bare same-day weekday — the resolver flags it; the actual ask/roll/full
+      // decision needs the resolved SERVICE, so we defer it to AFTER service resolution.
+      if (resolved.ambiguousToday && resolved.nextWeekStr && slot.weekday != null) {
+        ambiguousTodayWeekday = { weekday: slot.weekday, todayStr: resolved.dateStr, nextWeekStr: resolved.nextWeekStr }
+      }
+    } else if (resolved.reason !== 'no_date') dateProblem = resolved.reason
+  }
+  // WS3-T3.5 BUG4: re-hydrate the deferred ambiguity from a carried marker (a serviceless turn
+  // last time stashed it without a date). Only when this turn produced no fresh ambiguity of its
+  // own and bound no date — so once the service resolves below, the "today or next week?" ask
+  // fires instead of silently booking today.
+  if (!ambiguousTodayWeekday && !boundFromWeekdayClarification && carriedWeekdayClarification && draft.dateStr == null) {
+    ambiguousTodayWeekday = {
+      weekday: carriedWeekdayClarification.weekday,
+      todayStr: carriedWeekdayClarification.todayStr,
+      nextWeekStr: carriedWeekdayClarification.nextWeekStr,
+    }
   }
   if (slot?.time) draft.time = { hour: slot.time.hour, minute: slot.time.minute }
 
@@ -1682,6 +1937,81 @@ async function handleBookingIntent(
     return { reply, sessionComplete: false }
   }
 
+  // ── WS3-T3.5 BUG4: ambiguity detected but no service yet → DON'T silently book today.
+  // Previously this branch was gated on draft.serviceTypeId, so a serviceless turn skipped it,
+  // the missing-pieces gate persisted draft.dateStr=today, and next turn (service named, no
+  // weekday) the ambiguity was gone → silent same-day booking. Instead: drop the provisional
+  // `today` date and stash the marker (without a serviceTypeId — it's still unknown) so the
+  // ask survives. Once the service arrives next turn, the carried-marker re-hydration above
+  // re-raises the ambiguity and the ask fires. No customer-facing string here.
+  if (ambiguousTodayWeekday && !draft.serviceTypeId) {
+    const { dateStr: _dropProvisionalToday, ...draftNoDate } = draft
+    await updateSessionContext(db, session.id, {
+      ...ctx,
+      slotDraft: draftNoDate,
+      pendingWeekdayClarification: {
+        weekday: ambiguousTodayWeekday.weekday,
+        todayStr: ambiguousTodayWeekday.todayStr,
+        nextWeekStr: ambiguousTodayWeekday.nextWeekStr,
+      },
+    }, 'waiting_clarification')
+    const list = activeServices.map((s) => s.name).join(', ')
+    const reply = await genReply({
+      businessTimezone,
+      businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `${firstMsgPrefix}The customer wants to book but hasn't said which service. Available: ${list}. Ask which one — one question, naturally.`,
+    })
+    return { reply, sessionComplete: false }
+  }
+
+  // ── WS3-T3.5: bare same-day weekday — today or same day next week? ──────────
+  // The resolver flagged ambiguity; the decision needs the resolved SERVICE, so it runs
+  // HERE (after service resolution). If no service is known yet, the branch above handled it.
+  if (ambiguousTodayWeekday && draft.serviceTypeId && business) {
+    const serviceTypeId = draft.serviceTypeId
+    const serviceName = draft.serviceName ?? 'this'
+    const todayStr = ambiguousTodayWeekday.todayStr // == business-local today
+    // Single DB fetch with now=midnight disables past-filtering → ALL of today's sessions.
+    const dayMidnight = resolveSlotStart(todayStr, { hour: 0, minute: 0 }, businessTimezone)
+    const fullDay = await listDayOptions(db, business, todayStr, businessTimezone, { serviceTypeId, now: dayMidnight })
+    // Split in memory against the REAL now: only sessions still to come today are "live".
+    const liveClasses = fullDay.classes.filter((c) => c.start.getTime() >= now.getTime())
+    const livePrivateOpen = fullDay.privateOpenings.some((p) => p.slots.some((s) => s.getTime() >= now.getTime()))
+    const decision = decideAmbiguousTodayWeekday(liveClasses, livePrivateOpen)
+
+    if (decision === 'roll') {
+      // Every session already started → silently roll to next week; fall through to normal flow.
+      draft.dateStr = ambiguousTodayWeekday.nextWeekStr
+    } else if (decision === 'ask') {
+      const weekdayLabel = formatLocalDate(todayStr, businessTimezone)
+      await updateSessionContext(db, session.id, {
+        ...ctx,
+        slotDraft: draft,
+        pendingWeekdayClarification: { weekday: ambiguousTodayWeekday.weekday, todayStr, nextWeekStr: ambiguousTodayWeekday.nextWeekStr, serviceTypeId },
+      }, 'waiting_clarification')
+      const reply = await genReply({
+        businessTimezone,
+        businessName, language: lang, transcript, ...persona, customerMemory: memoryForActiveService(ctx, serviceName),
+        situation: `${firstMsgPrefix}${ambiguousTodayWeekdayAsk(serviceName, weekdayLabel)}`,
+      })
+      return { reply, sessionComplete: false }
+    } else {
+      // 'full': sessions remain today but all full → say so + offer the next real classes.
+      const substitute = await suggestNextClassesText(db, business, serviceTypeId, businessTimezone, ctx.negotiationConstraints)
+      await updateSessionContext(db, session.id, {
+        ...ctx,
+        slotDraft: draft,
+        ...(substitute.offered.length > 0 ? { lastOfferedSlots: substitute.offered } : {}),
+      }, 'waiting_clarification')
+      const reply = await genReply({
+        businessTimezone,
+        businessName, language: lang, transcript, ...persona, customerMemory: memoryForActiveService(ctx, serviceName),
+        situation: `${firstMsgPrefix}${classOfferSituation(serviceName, formatLocalDate(todayStr, businessTimezone), null, substitute.text)}`,
+      })
+      return { reply, sessionComplete: false }
+    }
+  }
+
   // ── A bad date (past / impossible / ambiguous): clarify, don't echo it back ─
   if (dateProblem) {
     const newAttempts = attempts + 1
@@ -1713,13 +2043,16 @@ async function handleBookingIntent(
       // recalling them from the transcript (which the guard strips → unhelpful "which
       // day?" fallback) or, worse, asserting the day is full.
       const dayOpts = business
-        ? await buildDayOptionsText(db, business, draft.dateStr, businessTimezone, draft.serviceTypeId, ctx.negotiationConstraints)
+        ? await buildDayOptionsText(db, business, draft.dateStr, businessTimezone, draft.serviceTypeId, ctx.negotiationConstraints, null, true)
         : NO_SUGGESTION
-      offeredSlots = dayOpts.offered
       const dayLabel = formatLocalDate(draft.dateStr, businessTimezone)
-      ask = dayOpts.text
-        ? `Booking ${draft.serviceName} on ${dayLabel}. These are the only real times that day: ${dayOpts.text} Offer ONLY these and ask which they'd like — do NOT re-ask the day or service, and do NOT invent any other time.`
-        : `Booking ${draft.serviceName} on ${dayLabel}, but there is nothing available that day. Say so plainly and offer to check another day — do NOT invent a time.`
+      // Same-day empty/all-full → substitute the next REAL class on a later day so the lead
+      // is never dead-ended; bind the pick to whichever set actually carries options.
+      const substitute = dayOpts.text || !business
+        ? NO_SUGGESTION
+        : await suggestNextClassesText(db, business, draft.serviceTypeId, businessTimezone, ctx.negotiationConstraints)
+      offeredSlots = dayOpts.text ? dayOpts.offered : substitute.offered
+      ask = classOfferSituation(draft.serviceName ?? 'this', dayLabel, dayOpts.text, substitute.text)
     }
     await updateSessionContext(db, session.id, {
       ...ctx, slotDraft: draft, clarificationAttempts: newAttempts,
@@ -1835,23 +2168,26 @@ async function handleBookingIntent(
   // confirmation step, so the PA never asserts a class that isn't on the schedule.
   if (business && await classInstanceMissing(db, business.id, svc, slotStart)) {
     const { time: _dropTime, ...draftKeep } = draft
-    const suggestion = await buildDayOptionsText(db, business, localParts(slotStart, businessTimezone).dateStr, businessTimezone, svc.id, ctx.negotiationConstraints)
+    const missDateStr = localParts(slotStart, businessTimezone).dateStr
+    const suggestion = await buildDayOptionsText(db, business, missDateStr, businessTimezone, svc.id, ctx.negotiationConstraints, null, true)
+    // Same-day empty/all-full → substitute the next REAL class so we never dead-end the lead.
+    const substitute = suggestion.text
+      ? NO_SUGGESTION
+      : await suggestNextClassesText(db, business, svc.id, businessTimezone, ctx.negotiationConstraints)
+    const offeredAlts = suggestion.text ? suggestion.offered : substitute.offered
     await updateSessionContext(db, session.id, {
       ...ctx, slotDraft: draftKeep, clarificationAttempts: 0,
-      ...(suggestion.offered.length > 0 ? { lastOfferedSlots: suggestion.offered } : {}),
+      ...(offeredAlts.length > 0 ? { lastOfferedSlots: offeredAlts } : {}),
     }, 'waiting_clarification')
-    const classTimesText = suggestion.text
     const situation = [
       `${svc.name} doesn't run at the time the customer asked — it only runs at set class times, so that exact time can't be booked.`,
-      classTimesText
-        ? `Offer these actual scheduled times and ask which they'd like: ${classTimesText}.`
-        : `There are no more ${svc.name} classes on that day. Don't invent a time — offer to check another day.`,
+      classOfferSituation(svc.name, formatLocalDate(missDateStr, businessTimezone), suggestion.text, substitute.text),
     ].filter(Boolean).join(' ')
     const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation,
-    }, { focusDay: { dateStr: localParts(slotStart, businessTimezone).dateStr, serviceTypeId: svc.id } })
+    }, { focusDay: { dateStr: missDateStr, serviceTypeId: svc.id } })
     return { reply, sessionComplete: false }
   }
 
@@ -2027,7 +2363,23 @@ async function handleHoldConfirmation(
   const parsed = parseConfirmation(messageText)
   // A leading yes bundled with a side question (e.g. "yes, who's the instructor?") is still
   // a confirmation — the grounded reply answers the question (roster/facts are in businessFacts).
-  const confirmation: 'yes' | 'no' | 'unclear' = parsed === 'yes_with_question' ? 'yes' : parsed
+  // BUT (C1): a yes_with_question carrying a DAY REVISION ("yes, anything Thursday?") parses as
+  // yes_with_question (it has a '?', no clock time) yet must NOT book the stale slot. The cheap
+  // hasRevisionSignal pre-gate flags ANY day token — but that over-triggers on a confirming
+  // side-QUESTION about the HELD day ("yes, is Sunday full?" when the held slot IS Sunday).
+  // classifyConfirmWithQuestion is the arbiter: it compares the mentioned day to the held slot's
+  // weekday. Only a DIFFERENT day (or a relative-day token) is a revision → 'unclear' (pivot
+  // path); a same-held-day side question stays 'yes' so the confirm+bundled-answer split (T3.6)
+  // books AND answers it.
+  const heldWeekday = ctx.pendingSlot
+    ? localWeekdayOf(new Date(ctx.pendingSlot.start), businessTimezone)
+    : null
+  const confirmation: 'yes' | 'no' | 'unclear' =
+    parsed === 'yes_with_question'
+      ? (hasRevisionSignal(messageText) && classifyConfirmWithQuestion(messageText, heldWeekday) === 'revise'
+          ? 'unclear'
+          : 'yes')
+      : parsed
 
   // Root B: a non-"yes" reply may be REVISING the slot, not answering. If so, rebuild
   // from the new request so the revised slot is what gets booked (not the stale one).
@@ -2102,18 +2454,48 @@ async function handleHoldConfirmation(
     await releaseSupersededBooking(db, calendar, identity, ctx)
 
     const pendingSlot = ctx.pendingSlot
+    // C2 (belt-and-suspenders): guarantee the just-confirmed slot is never left in
+    // rejectedSlots, so a future re-suggest in any later session can't shadow-suppress what
+    // was actually booked. The session completes immediately below, so this has no live
+    // effect today (the hold-placement path already un-suppressed the slot and dropped
+    // lastOfferedSlots before this turn — see ~ctx un-suppress at hold creation), but it
+    // closes the gap structurally and is correct regardless of upstream changes.
+    if (pendingSlot) {
+      ctx = withConstraints(ctx, removeRejectedSlot(ctx.negotiationConstraints, new Date(pendingSlot.start).toISOString()))
+    }
     const confirmedDate = pendingSlot ? formatSlotDate(new Date(pendingSlot.start), businessTimezone) : 'the requested date'
     const confirmedTime = pendingSlot ? formatSlotTime(new Date(pendingSlot.start), businessTimezone) : 'the requested time'
-    const reply = await genReply({
+    // C4: a "yes + side question" (e.g. "yes, btw is Sunday full?") collapsed to a plain
+    // confirm above. The confirmation reply is bookingConfirmed-exempt (gates 1-3 skipped),
+    // so it must NOT also answer the bundled question — an ungated availability claim could
+    // be fabricated. Split: confirm here (exempt, told to ignore the question), then answer
+    // the question in a SEPARATE genReply WITHOUT bookingConfirmed so gates 1-3 run on it.
+    const bundledQuestion = parsed === 'yes_with_question'
+    const confirmedReply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
-      situation: `Booking confirmed for ${pendingSlot?.serviceName ?? 'appointment'} on ${confirmedDate} at ${confirmedTime}.`,
+      situation: `Booking confirmed for ${pendingSlot?.serviceName ?? 'appointment'} on ${confirmedDate} at ${confirmedTime}.${bundledQuestion ? ' Do NOT answer any other question the customer asked in this message — a separate reply handles that.' : ''}`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     }, { bookingConfirmed: true })
-    return { reply, sessionComplete: true }
+    if (!bundledQuestion) return { reply: confirmedReply, sessionComplete: true }
+
+    // Answer the bundled side-question on a GATED path (no bookingConfirmed). If the question
+    // references a day we can resolve, pass a focusDay so the occupancy gate can re-read the
+    // spine; otherwise omit it — gates 1-3 still run either way.
+    const bundledFocusDay = resolveFocusDayFromText(messageText, businessTimezone, new Date(), pendingSlot?.serviceTypeId)
+    const answerReply = await genReply({
+      businessTimezone,
+      businessName,
+      language: lang,
+      situation: `The customer confirmed their booking and ALSO asked a question in the same message: "${messageText}". Answer ONLY that question, grounded strictly in the real business facts/availability provided — do not restate or re-confirm the booking. If you don't have grounded info to answer, say you'll check with the studio rather than guessing.`,
+      transcript,
+      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+      customerMemory: extractMemory(ctx),
+    }, bundledFocusDay ? { focusDay: bundledFocusDay } : {})
+    return { reply: `${confirmedReply}\n\n${answerReply}`, sessionComplete: true }
   }
 
   // No hold placed yet — place the hold first
@@ -2199,10 +2581,17 @@ async function handleHoldConfirmation(
     const openSuggestion = !classModeMiss && business
       ? await suggestOpenSlotsText(db, business, pendingSlot.serviceTypeId, new Date(pendingSlot.start), new Date(pendingSlot.end), businessTimezone, ctx.negotiationConstraints)
       : NO_SUGGESTION
+    const classDateStr = localParts(new Date(pendingSlot.start), businessTimezone).dateStr
     const classSuggestion = classModeMiss && business
-      ? await buildDayOptionsText(db, business, localParts(new Date(pendingSlot.start), businessTimezone).dateStr, businessTimezone, pendingSlot.serviceTypeId, ctx.negotiationConstraints)
+      ? await buildDayOptionsText(db, business, classDateStr, businessTimezone, pendingSlot.serviceTypeId, ctx.negotiationConstraints, null, true)
       : NO_SUGGESTION
-    const offeredAlternatives = classModeMiss ? classSuggestion.offered : openSuggestion.offered
+    // Class same-day empty/all-full → substitute the next REAL class on a later day.
+    const classSubstitute = classModeMiss && business && !classSuggestion.text
+      ? await suggestNextClassesText(db, business, pendingSlot.serviceTypeId, businessTimezone, ctx.negotiationConstraints)
+      : NO_SUGGESTION
+    const offeredAlternatives = classModeMiss
+      ? (classSuggestion.text ? classSuggestion.offered : classSubstitute.offered)
+      : openSuggestion.offered
     await updateSessionContext(
       db,
       session.id,
@@ -2224,9 +2613,7 @@ async function handleHoldConfirmation(
       : classModeMiss
         ? [
             `${pendingSlot.serviceName} doesn't run at the time the customer asked — it only runs at set class times, so that time can't be booked.`,
-            classTimesText
-              ? `Offer these actual scheduled times and ask which they'd like: ${classTimesText}.`
-              : `There are no more ${pendingSlot.serviceName} classes on that day. Don't invent a time — offer to check another day.`,
+            classOfferSituation(pendingSlot.serviceName, formatLocalDate(classDateStr, businessTimezone), classTimesText, classSubstitute.text),
           ].filter(Boolean).join(' ')
       : [
           `The requested slot is unavailable because ${sanitiseReason(result.reason)}.`,
@@ -2379,6 +2766,16 @@ async function handleClarification(
 
   const detectedLanguage = intentResult.data.detectedLanguage
   const mergedCtx: BookingFlowContext = { ...updatedContext, detectedLanguage }
+
+  // Symptom 3: a special-arrangement request can arrive as the clarification reply
+  // (e.g. after we asked them to specify, they restate "actually I want a private
+  // version of the group class"). Escalate once before re-routing into booking, where
+  // an inquiry/unknown-shaped restatement would otherwise dead-end with no owner ping.
+  if (intentResult.data.specialArrangementRequest === true) {
+    const esc = await maybeEscalateSpecial(db, business, mergedCtx, session, identity, intentResult.data, transcript, detectedLanguage)
+    if (esc) return esc
+  }
+
   await updateSessionContext(db, session.id, mergedCtx, 'active')
   return handleBookingIntent(
     db, calendar, identity,
@@ -2493,6 +2890,51 @@ async function handleCancellationIntent(
   return enterCancellationSelection(db, session, ctx, activeBookings, businessTimezone, businessName, transcript, genReply, lang, false)
 }
 
+/**
+ * WS3-T3.2 — deterministically resolve a customer's answer to the "which booking?"
+ * list-question against the offered candidates. Lifted VERBATIM from the inline match
+ * that used to live in handleBookingSelection so the bind path has a pure regression net:
+ *
+ *   • a bare number in range → that candidate by SORTED position (candidates arrive sorted)
+ *   • else a UNIQUE matchCancelBookings hit (service/weekday/time) → that candidate
+ *   • else null (ambiguous / no usable criterion / out of range)
+ *
+ * Returns ONLY the id so the caller stays in control of the row it confirms. This runs
+ * FIRST in the handler, before the pivot escape-hatch — so a confident pick never reaches
+ * an LLM call (zero added latency on the verified path), and a mid-flow revision
+ * ("actually Thursday instead") yields null here and falls through to the pivot.
+ */
+export function matchBookingSelection(
+  messageText: string,
+  candidates: CancelBooking[],
+  tz: string,
+): { id: string } | null {
+  const n = parseInt(messageText.trim(), 10)
+  if (!isNaN(n) && n >= 1 && n <= candidates.length) {
+    const byPos = candidates[n - 1]
+    return byPos ? { id: byPos.id } : null
+  }
+  const matches = matchCancelBookings(messageText, candidates, tz)
+  if (matches.length === 1) return { id: matches[0]!.id }
+  return null
+}
+
+/**
+ * Reorder DB-loaded rows to match the authoritative candidateIds order.
+ *
+ * `enterCancellationSelection` builds candidateIds SORTED by slotStart and numbers the
+ * displayed list in that order. But the DB `inArray(...)` load returns rows in arbitrary
+ * order — so a bare-number pick ("2") via matchBookingSelection (which uses positional
+ * indexing) would resolve against the wrong slot. This binds the rows back to the
+ * displayed (sorted) order so position N always means the Nth shown booking. candidateIds
+ * with no matching row (e.g. a stale id) are dropped.
+ */
+export function orderRowsByCandidates<T extends { id: string }>(rows: T[], candidateIds: string[]): T[] {
+  return candidateIds
+    .map((id) => rows.find((r) => r.id === id))
+    .filter((r): r is T => r != null)
+}
+
 async function enterCancellationSelection(
   db: Db,
   session: ActiveSession,
@@ -2518,6 +2960,9 @@ async function enterCancellationSelection(
 
   const newCtx: BookingFlowContext = {
     ...ctx,
+    // WS3-T3.2: typed binding set IN PARALLEL with the legacy fields below (kept as the
+    // source of truth for the confirm/reschedule callers, untouched this task).
+    pendingDecision: { kind: 'booking_selection', candidateIds: candidates, isRescheduling },
     cancellationCandidates: candidates,
     awaitingConfirmationFor: 'cancellation_selection',
     isReschedulingFlow: isRescheduling,
@@ -2536,7 +2981,7 @@ async function enterCancellationSelection(
   return { reply, sessionComplete: false }
 }
 
-async function handleCancellationSelection(
+async function handleBookingSelection(
   db: Db,
   calendar: CalendarClient,
   identity: ResolvedIdentity,
@@ -2547,9 +2992,11 @@ async function handleCancellationSelection(
   businessName: string,
   transcript: TranscriptTurn[],
   genReply: GenReply,
+  business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
-  const candidates = ctx.cancellationCandidates ?? []
+  const candidates = ctx.pendingDecision?.candidateIds ?? ctx.cancellationCandidates ?? []
+  const isRescheduling = ctx.pendingDecision?.isRescheduling ?? ctx.isReschedulingFlow ?? false
 
   // Candidate bookings with service names, so we can resolve a natural-language
   // pick and name the chosen slot back in the confirmation.
@@ -2561,19 +3008,30 @@ async function handleCancellationSelection(
         .where(and(inArray(bookings.id, candidates), or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held'))))
     : []
 
-  // A bare number picks by position; otherwise resolve the customer's words
-  // ("Friday at 12", "the yoga one") against the candidates deterministically. Only
-  // a UNIQUE match auto-selects — anything ambiguous falls through to a re-ask.
-  const n = parseInt(messageText.trim(), 10)
-  let selected: (typeof rows)[number] | null = null
-  if (!isNaN(n) && n >= 1 && n <= candidates.length) {
-    selected = rows.find((r) => r.id === candidates[n - 1]) ?? null
-  } else {
-    const matches = matchCancelBookings(messageText, rows, businessTimezone)
-    if (matches.length === 1) selected = matches[0]!
-  }
+  // The DB `inArray` load returns rows in arbitrary order; reorder them to match the
+  // authoritative candidateIds (sorted by slotStart — the displayed/numbered order) so a
+  // bare-number pick resolves against the slot the customer actually saw at that position.
+  const orderedRows = orderRowsByCandidates(rows, candidates)
+
+  // DETERMINISTIC BIND FIRST (verified-solid, lifted verbatim into matchBookingSelection):
+  // a bare number picks by position; otherwise a UNIQUE service/weekday/time reference
+  // auto-selects. Runs BEFORE the pivot escape so a confident pick NEVER reaches an LLM
+  // call (zero added latency on the verified path).
+  const pick = matchBookingSelection(messageText, orderedRows, businessTimezone)
+  const selected: (typeof rows)[number] | null = pick ? orderedRows.find((r) => r.id === pick.id) ?? null : null
 
   if (!selected) {
+    // No confident bind. Before re-asking, give the C-PIVOT escape-hatch a chance: the
+    // reply may be a mid-flow revision ("actually Thursday instead") rather than an answer
+    // to the asked question. rebuildOnSlotPivot re-extracts intent and either rebuilds the
+    // booking (returns the result) or redirects (returns { redispatch:true }); only when it
+    // returns null does the warm re-ask run. The deterministic bind above already consumed
+    // every confident pick, so a clean number/reference never lands here.
+    const pivoted = await rebuildOnSlotPivot(
+      db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business,
+    )
+    if (pivoted) return pivoted
+
     const reply = await genReply({
       businessTimezone,
       businessName,
@@ -2596,7 +3054,7 @@ async function handleCancellationSelection(
   // Ask for explicit confirmation before acting — do NOT auto-confirm. Name the
   // exact slot so the customer confirms the right one with a single yes.
   const slotLabel = `${selected.serviceName} on ${formatSlotDate(selected.slotStart, businessTimezone)} at ${formatSlotTime(selected.slotStart, businessTimezone)}`
-  const situation = ctx.isReschedulingFlow
+  const situation = isRescheduling
     ? `Customer chose ${slotLabel} as the one to move. Confirm that's the booking they want to reschedule — naturally, no menu. (It stays booked until the new time is set.)`
     : `Customer wants to cancel ${slotLabel}. Ask them to confirm the cancellation — naturally, no menu.`
   const reply = await genReply({
@@ -2678,7 +3136,7 @@ async function handleCancellationConfirmation(
   // path via the `rescheduledFrom` guard in the intent dispatch, so the still-active
   // original does not bounce us back into booking selection.
   if (ctx.isReschedulingFlow) {
-    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, ...rest } = ctx
+    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, pendingDecision: _pd, ...rest } = ctx
     const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: bookingId }
 
     // If the customer already gave the new slot up front ("move my yoga to Sunday
@@ -2921,7 +3379,7 @@ async function handleRetentionResponse(
 
   // parsed.kind === 'accept' — convert the cancel into a reschedule (deferred-cancel).
   const chosen = offered[parsed.index]!
-  const { targetBookingId: _t, awaitingConfirmationFor: _a, retentionOfferedSlots: _r, cancellationCandidates: _c, isReschedulingFlow: _i, ...rest } = ctx
+  const { targetBookingId: _t, awaitingConfirmationFor: _a, retentionOfferedSlots: _r, cancellationCandidates: _c, isReschedulingFlow: _i, pendingDecision: _pd, ...rest } = ctx
   const lp = localParts(new Date(chosen.start), businessTimezone)
   const slotDraft = {
     serviceTypeId: chosen.serviceTypeId,
@@ -3024,14 +3482,18 @@ async function handleListBookings(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function resolveService<T extends { id: string; name: string }>(
-  hint: string | null,
-  services: T[],
-): T | null {
+export function resolveService<
+  T extends { id: string; name: string; schedulingMode?: 'appointment' | 'class' | null },
+>(hint: string | null, services: T[]): T | null {
   if (services.length === 0) return null
   if (services.length === 1) return services[0]!
   if (!hint) return null
 
   const lower = hint.toLowerCase()
-  return services.find((s) => s.name.toLowerCase().includes(lower)) ?? null
+  const matches = services.filter((s) => s.name.toLowerCase().includes(lower))
+  if (matches.length === 0) return null
+  // Prefer the class twin: when "yoga" matches both an appointment-mode twin and
+  // the real class-mode service, route to the class so only real class instances
+  // surface and the empty gaps between sessions are never offered as slots (P4).
+  return matches.find((s) => s.schedulingMode === 'class') ?? matches[0]!
 }
