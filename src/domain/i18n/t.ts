@@ -321,6 +321,20 @@ const strings = {
     he: (phone: string, request: string) => `📩 לקוח (${phone}) ביקש משהו שה-PA לא יכול לסגור לבד:\n"${request}"\nכדאי לחזור אליו ישירות.`,
     en: (phone: string, request: string) => `📩 A customer (${phone}) asked for something the PA can't book on its own:\n"${request}"\nWorth reaching out directly.`,
   },
+  // F3a/S3 — ask-the-owner relay. Owner sees the question + how to answer; the customer is
+  // told the truth (passed on, an answer is coming) — NEVER a fabricated "I checked".
+  owner_question_notify: {
+    he: (phone: string, question: string) => `❓ לקוח (${phone}) שאל שאלה שלא ידעתי לענות עליה:\n"${question}"\n\nפשוט השב/י לי את התשובה ואעביר אותה אליו.`,
+    en: (phone: string, question: string) => `❓ A customer (${phone}) asked something I couldn't answer:\n"${question}"\n\nJust reply to me with the answer and I'll pass it on to them.`,
+  },
+  question_passed_to_studio: {
+    he: (biz: string) => `שאלה טובה — אין לי את המידע הזה כרגע, אז העברתי אותה ל${biz}. נחזור אליך עם תשובה בהקדם.`,
+    en: (biz: string) => `Good question — I don't have that on hand, so I've passed it to ${biz}. We'll get back to you with an answer shortly.`,
+  },
+  owner_answer_relay: {
+    he: (biz: string, answer: string) => `חזרו אליי מ${biz} בקשר לשאלה ששאלת:\n${answer}`,
+    en: (biz: string, answer: string) => `${biz} got back to me about your question:\n${answer}`,
+  },
 
   // ── Manager error / system messages ──────────────────────────────────────────
   manager_classify_error: {

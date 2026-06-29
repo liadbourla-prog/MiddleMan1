@@ -23,7 +23,7 @@ import type { FlowResult, BookingFlowContext } from './types.js'
 import type { CustomerIntentOutput } from '../../adapters/llm/types.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
 import type { HydratedContext } from '../session/hydration.js'
-import { checkOwnerEscalationRules, escalateToPlatform, escalateUnfulfillableRequest } from '../escalation/engine.js'
+import { checkOwnerEscalationRules, escalateToPlatform, escalateUnfulfillableRequest, escalateCustomerQuestion } from '../escalation/engine.js'
 import { recordLastCancellation, loadLastCancellation } from '../customer/profile.js'
 import type { BusinessKnowledge } from '../../shared/skill-types.js'
 import { t } from '../i18n/t.js'
@@ -906,12 +906,42 @@ export function buildBusinessFacts(
     const list = instructors.map((i) => i.services.length > 0 ? `${i.name} (${i.services.join(', ')})` : i.name).join('; ')
     lines.push(`Instructors (this is the COMPLETE list — never name or invent anyone else): ${list}. Do NOT proactively advertise who teaches what; only name an instructor if the customer asks.`)
   } else {
-    lines.push('Instructors/staff: none on record — do NOT name, suggest, or invent any instructor. If the customer names one, say you will check with the business.')
+    lines.push('Instructors/staff: none on record — do NOT name, suggest, or invent any instructor. If the customer names one, say plainly there is no one by that name on record; do NOT promise to check or get back to them.')
   }
   if (business?.maxBookingDaysAhead != null) {
     lines.push(`Bookings can be made up to ${business.maxBookingDaysAhead} days ahead — never claim a date within that window is "not open yet".`)
   }
   return lines.join('\n')
+}
+
+// F3a/S3 — ask-the-owner sentinel. The answering model (which HAS the facts/FAQs) decides it
+// cannot answer and emits ONLY this token; code then performs the REAL escalation and an honest
+// reply. This replaces the model freely saying "I'll check with the studio" with no backing
+// action (the reported fabrication) — the model can no longer self-author that promise.
+const ASK_STUDIO_SENTINEL = '[[ASK_STUDIO]]'
+const ASK_STUDIO_INSTRUCTION = `If — and ONLY if — you genuinely cannot answer the customer's specific question from the business facts, FAQs, and availability provided above, output EXACTLY this token and nothing else: ${ASK_STUDIO_SENTINEL}. Do NOT say you will check, ask, or get back to them yourself, and do NOT guess — the system relays the question to the business and sends the reply. Never output this token if you can answer from the information above.`
+
+// True when a drafted reply is the model's "I can't answer" signal. Pure + exported for tests.
+export function isAskStudioSentinel(reply: string): boolean {
+  return reply.trim().includes(ASK_STUDIO_SENTINEL)
+}
+
+// F3a/S3 — perform the real owner escalation for an unanswerable question and return the honest
+// customer reply. On no business / no reachable owner, returns a truthful no-promise message
+// (never claims it asked anyone — that would re-introduce the fabrication).
+async function relayUnansweredToOwner(
+  db: Db,
+  business: Business | undefined,
+  identity: ResolvedIdentity,
+  questionText: string,
+  lang: 'he' | 'en',
+): Promise<string> {
+  const honestNoOwner = lang === 'he'
+    ? 'אין לי את המידע הזה כרגע — הכי טוב לפנות ישירות לעסק.'
+    : "I don't have that information on hand right now — it's best to contact the business directly."
+  if (!business) return honestNoOwner
+  const res = await escalateCustomerQuestion(db, business, { id: identity.id, phoneNumber: identity.phoneNumber }, questionText, lang)
+  return res.escalated && res.customerReply ? res.customerReply : honestNoOwner
 }
 
 // F1c/S1 — the open waitlist offer (if any) this customer can accept by replying. The
@@ -1448,7 +1478,7 @@ export async function handleBookingFlow(
         const hoursCtx = hoursSummary ? ` ${hoursSummary}` : ''
 
         const situation = activeServices.length > 0
-          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above. CRITICAL on times: the ONLY bookable times are those explicitly listed above as open times / classes. Business hours describe when the studio is OPEN — they are NOT a list of bookable slots; never present a time as available just because it falls within opening hours or between classes. If they asked which times/days are open, give the listed open times as a short bullet list and invite them to pick one. If nothing is listed for what they asked, say plainly there is nothing available and offer the listed alternatives or another day — never invent or infer a time. If the customer asks to book with a specific instructor by name, that is supported — bookings go through here. Do NOT proactively bring up, list, or advertise individual instructors or who teaches what; only engage with instructor specifics if the customer raises them first.`
+          ? `${firstMsgPrefix}Customer asked a question about the business, services, hours, or availability. ${customerCtx}${hoursCtx}${slotCtx} Services available: ${serviceDescriptions}. Answer their specific question using the FAQs and service info above. CRITICAL on times: the ONLY bookable times are those explicitly listed above as open times / classes. Business hours describe when the studio is OPEN — they are NOT a list of bookable slots; never present a time as available just because it falls within opening hours or between classes. If they asked which times/days are open, give the listed open times as a short bullet list and invite them to pick one. If nothing is listed for what they asked, say plainly there is nothing available and offer the listed alternatives or another day — never invent or infer a time. If the customer asks to book with a specific instructor by name, that is supported — bookings go through here. Do NOT proactively bring up, list, or advertise individual instructors or who teaches what; only engage with instructor specifics if the customer raises them first. ${ASK_STUDIO_INSTRUCTION}`
           : `${firstMsgPrefix}Customer asked about the business. ${customerCtx} No services are configured yet. Direct them to contact the business directly.`
         const knowledgeFields = businessKnowledge ? {
           brandVoice: businessKnowledge.brandVoice,
@@ -1464,6 +1494,12 @@ export async function handleBookingFlow(
           customerMemory: extractMemory(updatedCtx),
           ...knowledgeFields,
         }, (resolvedDay && resolvedDay.ok) ? { focusDay: { dateStr: resolvedDay.dateStr, ...(inquiryService ? { serviceTypeId: inquiryService.id } : {}) } } : undefined)
+        // F3a/S3: the model signalled it can't answer → relay the question to the owner FOR
+        // REAL and reply honestly, instead of fabricating "I'll check with the studio".
+        if (isAskStudioSentinel(inquiryReply)) {
+          const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
+          return { reply: relay, sessionComplete: false }
+        }
         return { reply: inquiryReply, sessionComplete: false }
       }
 
@@ -2620,7 +2656,7 @@ async function handleHoldConfirmation(
       businessTimezone,
       businessName,
       language: lang,
-      situation: `The customer confirmed their booking and ALSO asked a question in the same message: "${messageText}". Answer ONLY that question, grounded strictly in the real business facts/availability provided — do not restate or re-confirm the booking. If you don't have grounded info to answer, say you'll check with the studio rather than guessing.`,
+      situation: `The customer confirmed their booking and ALSO asked a question in the same message: "${messageText}". Answer ONLY that question, grounded strictly in the real business facts/availability provided — do not restate or re-confirm the booking. If you don't have grounded info to answer, say plainly you don't have that detail to hand rather than guessing — do NOT promise to check or get back to them.`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),

@@ -13,7 +13,7 @@
 
 import { eq, and, isNull } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
-import { escalatedTasks, identities } from '../../db/schema.js'
+import { escalatedTasks, identities, pendingOwnerQuestions } from '../../db/schema.js'
 import type { EscalationRule, Business } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { i18n, type Lang } from '../i18n/t.js'
@@ -152,6 +152,61 @@ export async function escalateUnfulfillableRequest(
     timeoutMs: 2500,
   })
   return { customerReply }
+}
+
+// ── Ask-the-owner question relay (F3a/S3) ─────────────────────────────────────
+
+/**
+ * A Branch-4 customer asked something the PA could not answer from business facts/FAQs.
+ * Instead of fabricating "I'll check with the studio" (the reported bug), record the question
+ * and ACTUALLY message the owner, so their later reply can be relayed back to the customer.
+ *
+ * Records the pending row FIRST (so the owner's reply can bind even if the notify retries),
+ * then dispatches the owner message through the durable initiation path. Returns the honest
+ * customer-facing reply ONLY when an owner exists and the question was recorded — the caller
+ * must fall back to a non-committal reply (never claim an escalation) when `escalated` is false.
+ */
+export async function escalateCustomerQuestion(
+  db: Db,
+  business: Business,
+  customer: { id: string; phoneNumber: string },
+  questionText: string,
+  customerLang: Lang = 'he',
+): Promise<{ customerReply: string | null; escalated: boolean }> {
+  const [managerIdentity] = await db
+    .select({ id: identities.id, phoneNumber: identities.phoneNumber })
+    .from(identities)
+    .where(and(eq(identities.businessId, business.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+  // No reachable owner → we cannot honestly promise a follow-up. Signal not-escalated so the
+  // caller gives a truthful "I don't have that" without claiming it asked anyone.
+  if (!managerIdentity) return { customerReply: null, escalated: false }
+
+  const trimmed = questionText.slice(0, 1000)
+  const [row] = await db
+    .insert(pendingOwnerQuestions)
+    .values({
+      businessId: business.id,
+      customerId: customer.id,
+      customerPhone: customer.phoneNumber,
+      questionText: trimmed,
+      status: 'pending',
+      askedManagerId: managerIdentity.id,
+    })
+    .returning({ id: pendingOwnerQuestions.id })
+  if (!row) return { customerReply: null, escalated: false }
+
+  const managerLang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
+  const managerMessage = i18n.owner_question_notify[managerLang](customer.phoneNumber, trimmed.slice(0, 300))
+  await dispatchInitiation(db, getInitiator('question.relay'), {
+    businessId: business.id,
+    recipientId: managerIdentity.id,
+    dedupKey: `question.relay:${row.id}`,
+  }, {
+    sendFreeForm: async () => { await enqueueMessage(business.id, managerIdentity.phoneNumber, managerMessage).catch(() => {}) },
+  }).catch(() => { /* non-fatal: the row persists so the owner can still answer; reply stays honest */ })
+
+  return { customerReply: i18n.question_passed_to_studio[customerLang](business.name), escalated: true }
 }
 
 // ── Platform escalation ───────────────────────────────────────────────────────

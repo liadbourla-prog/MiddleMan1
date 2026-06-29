@@ -60,6 +60,18 @@ export const INITIATORS = {
     windowPolicy: 'skip',
     defaultEnabled: true,
   },
+  // F3a/S3 — relay a customer's unanswerable Branch-4 question to the owner. Transactional
+  // (the customer asked); fire-and-forget to the owner, who answers via the Branch-3 tool.
+  'question.relay': {
+    id: 'question.relay',
+    layer: 'B',
+    audience: 'owner',
+    consentClass: 'transactional',
+    autonomy: 'owner_configured',
+    delivery: 'fire_and_forget',
+    windowPolicy: 'skip',
+    defaultEnabled: true,
+  },
 
   // Layer A — reshuffle outreach probe (customer, promotional, managed conversation).
   // Out-of-window sends use the approved `reshuffle_probe` template.

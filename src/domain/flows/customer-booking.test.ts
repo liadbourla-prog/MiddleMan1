@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -186,6 +186,31 @@ describe('waitlist offer acceptance — inbound consumer binds the reply (F1c)',
     expect(src).toMatch(/decision === 'no'[\s\S]*status: 'expired'/)
     // Only engages when no booking step is already in flight (never hijacks a confirmation).
     expect(src).toMatch(/!ctx\.pendingSlot && !ctx\.pendingDecision && !ctx\.awaitingConfirmationFor/)
+  })
+})
+
+// F3a/F3b/S3 — ask-the-owner. When the PA can't answer, the model emits a sentinel; code
+// performs the REAL escalation and replies honestly. The PA must never be told to fabricate
+// "I'll check with the business" with no backing action.
+describe('ask-the-owner sentinel + de-fabrication (F3a/F3b)', () => {
+  it('isAskStudioSentinel detects the can\'t-answer token, not normal replies', () => {
+    expect(isAskStudioSentinel('[[ASK_STUDIO]]')).toBe(true)
+    expect(isAskStudioSentinel('  [[ASK_STUDIO]] ')).toBe(true)
+    expect(isAskStudioSentinel('We have classes at 10:00 and 12:00.')).toBe(false)
+  })
+  it('the inquiry path escalates for real on the sentinel instead of fabricating a check', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    // The inquiry reply checks the sentinel and routes to the real owner relay.
+    expect(src).toMatch(/isAskStudioSentinel\(inquiryReply\)[\s\S]*relayUnansweredToOwner\(db, business, identity, messageText/)
+    // The relay actually calls the escalation engine.
+    expect(src).toMatch(/escalateCustomerQuestion\(db, business, \{ id: identity\.id, phoneNumber: identity\.phoneNumber \}/)
+    // De-fabrication: no surviving instruction telling the model to SAY it will check.
+    expect(src).not.toContain('say you will check with the business')
+    expect(src).not.toContain("say you'll check with the studio")
+  })
+  it('the global customer prompt no longer instructs "you\'ll check with the business"', () => {
+    const src = readFileSync(new URL('../../adapters/llm/client.ts', import.meta.url), 'utf8')
+    expect(src).not.toContain("you'll check with the business")
   })
 })
 
