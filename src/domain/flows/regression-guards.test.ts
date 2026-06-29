@@ -15,11 +15,19 @@
  * these guarantees (e.g. the booking-request path never consulting rejectedSlots) are
  * covered by customer-booking.test.ts; this file is the fast tripwire.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { resolveRequestedDate, resolveSlotStart } from '../availability/resolve-slot.js'
 import { findUnbackedTimes, assertsNoAvailability, extractClockTimes } from './slot-fabrication-guard.js'
 import { parseConfirmation } from './types.js'
 import { isSlotSuppressed, filterOpenSlots } from './negotiation-constraints.js'
+
+// classInstanceMissing's only DB dependency. Mocked so this fast tripwire stays pure —
+// the mock affects ONLY the blocks import; the 14 pure guards above never touch it.
+vi.mock('../availability/blocks.js', () => ({
+  findClassBlockProviderForSlot: vi.fn(),
+}))
+import { findClassBlockProviderForSlot } from '../availability/blocks.js'
+import { classInstanceMissing } from './customer-booking.js'
 
 const TZ = 'Asia/Jerusalem'
 // 2026-06-28 12:00 local (UTC+3 in summer) — a SUNDAY. Fixed so tests are deterministic.
@@ -131,5 +139,38 @@ describe('DO-NOT-REGRESS · G1 — an available slot is never wrongly suppressed
     const kept = filterOpenSlots(slots, constraints, TZ)
     expect(kept).toHaveLength(1)
     expect(kept[0]!.start.toISOString()).toBe('2026-06-29T09:00:00.000Z')
+  })
+})
+
+describe('DO-NOT-REGRESS · class studio refuses between-session times (owner invariant; extends G5)', () => {
+  // OWNER CARDINAL GUARANTEE (P4): a class-mode service can NEVER be booked at a time with no
+  // scheduled class instance — the empty gaps between owner-set class sessions are never bookable.
+  // classInstanceMissing is the chokepoint that enforces it. This locks the chokepoint at the
+  // pure-function level: refuse the gap, allow the real instance, skip the DB for appointments.
+  //
+  // KNOWN GAP (deferred): the SPINE-level half of this guarantee — that getOpenSlots / isSlotBookable
+  // exclude calendar_blocks (block/personal) times so a blocked 15:00 is never offered as a private
+  // gap — has NO unit harness today (no service.test.ts / DB fixture exists). A "blocked 15:00 never
+  // offered" assertion is deferred to a future availability DB-harness task; NOT built here.
+  const db = {} as never
+  const slot = new Date('2026-06-29T14:00:00.000Z') // a between-session time — no class scheduled here
+
+  it('class-mode + NO class block at the slot → refused (the between-session gap is never bookable)', async () => {
+    vi.mocked(findClassBlockProviderForSlot).mockResolvedValue({ found: false })
+    const svc = { id: 'svc-yoga', schedulingMode: 'class' as const }
+    expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(true)
+  })
+
+  it('class-mode + a real class block at the slot → allowed (a real instance IS bookable; protects G1)', async () => {
+    vi.mocked(findClassBlockProviderForSlot).mockResolvedValue({ found: true, providerId: null, maxParticipants: 8 })
+    const svc = { id: 'svc-yoga', schedulingMode: 'class' as const }
+    expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(false)
+  })
+
+  it('appointment-mode → never refused and never hits the DB (early return)', async () => {
+    vi.mocked(findClassBlockProviderForSlot).mockClear()
+    const svc = { id: 'svc-appt', schedulingMode: 'appointment' as const }
+    expect(await classInstanceMissing(db, 'biz1', svc, slot)).toBe(false)
+    expect(findClassBlockProviderForSlot).not.toHaveBeenCalled()
   })
 })
