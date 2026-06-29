@@ -189,6 +189,38 @@ function formatLocalDate(dateStr: string, tz: string): string {
   return formatSlotDate(resolveSlotStart(dateStr, { hour: 12, minute: 0 }, tz), tz)
 }
 
+// Best-effort focusDay for a bundled side-question on the confirm path (C4). The customer
+// asked something like "yes, is Sunday full?" alongside their confirm; if the question names
+// a weekday or relative day we can resolve, hand the occupancy gate a focusDay so it can
+// re-read the spine for that day (kills cross-turn "full" laundering). Deliberately narrow:
+// weekday/relative-day tokens only (mirrors hasRevisionSignal's vocabulary). Returns null
+// when no clean day is present — the caller then omits focusDay and gates 1-3 still run.
+const FOCUS_WEEKDAY_TOKENS: ReadonlyArray<readonly [RegExp, number]> = [
+  [/\b(sunday)\b|ראשון/i, 0], [/\b(monday)\b|שני/i, 1], [/\b(tuesday)\b|שלישי/i, 2],
+  [/\b(wednesday)\b|רביעי/i, 3], [/\b(thursday)\b|חמישי/i, 4], [/\b(friday)\b|שישי/i, 5],
+  [/\b(saturday)\b|שבת/i, 6],
+]
+function resolveFocusDayFromText(
+  text: string,
+  tz: string,
+  now: Date,
+  serviceTypeId?: string,
+): { dateStr: string; serviceTypeId?: string } | null {
+  let parts: RequestedDateParts | null = null
+  if (/\btomorrow\b|מחר(?!תיים)/i.test(text)) parts = { relativeDay: 'tomorrow', weekday: null, explicitDate: null }
+  else if (/מחרתיים/.test(text)) parts = { relativeDay: 'day_after_tomorrow', weekday: null, explicitDate: null }
+  else if (/\btoday\b|היום/i.test(text)) parts = { relativeDay: 'today', weekday: null, explicitDate: null }
+  else {
+    for (const [re, dow] of FOCUS_WEEKDAY_TOKENS) {
+      if (re.test(text)) { parts = { relativeDay: null, weekday: dow, explicitDate: null }; break }
+    }
+  }
+  if (!parts) return null
+  const res = resolveRequestedDate(parts, tz, now)
+  if (!res.ok) return null
+  return serviceTypeId ? { dateStr: res.dateStr, serviceTypeId } : { dateStr: res.dateStr }
+}
+
 type TimeOfDay = 'morning' | 'afternoon' | 'evening'
 
 // Business definition of the day's parts, by a slot's LOCAL start time:
@@ -2311,16 +2343,37 @@ async function handleHoldConfirmation(
     const pendingSlot = ctx.pendingSlot
     const confirmedDate = pendingSlot ? formatSlotDate(new Date(pendingSlot.start), businessTimezone) : 'the requested date'
     const confirmedTime = pendingSlot ? formatSlotTime(new Date(pendingSlot.start), businessTimezone) : 'the requested time'
-    const reply = await genReply({
+    // C4: a "yes + side question" (e.g. "yes, btw is Sunday full?") collapsed to a plain
+    // confirm above. The confirmation reply is bookingConfirmed-exempt (gates 1-3 skipped),
+    // so it must NOT also answer the bundled question — an ungated availability claim could
+    // be fabricated. Split: confirm here (exempt, told to ignore the question), then answer
+    // the question in a SEPARATE genReply WITHOUT bookingConfirmed so gates 1-3 run on it.
+    const bundledQuestion = parsed === 'yes_with_question'
+    const confirmedReply = await genReply({
       businessTimezone,
       businessName,
       language: lang,
-      situation: `Booking confirmed for ${pendingSlot?.serviceName ?? 'appointment'} on ${confirmedDate} at ${confirmedTime}.`,
+      situation: `Booking confirmed for ${pendingSlot?.serviceName ?? 'appointment'} on ${confirmedDate} at ${confirmedTime}.${bundledQuestion ? ' Do NOT answer any other question the customer asked in this message — a separate reply handles that.' : ''}`,
       transcript,
       ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
       customerMemory: extractMemory(ctx),
     }, { bookingConfirmed: true })
-    return { reply, sessionComplete: true }
+    if (!bundledQuestion) return { reply: confirmedReply, sessionComplete: true }
+
+    // Answer the bundled side-question on a GATED path (no bookingConfirmed). If the question
+    // references a day we can resolve, pass a focusDay so the occupancy gate can re-read the
+    // spine; otherwise omit it — gates 1-3 still run either way.
+    const bundledFocusDay = resolveFocusDayFromText(messageText, businessTimezone, new Date(), pendingSlot?.serviceTypeId)
+    const answerReply = await genReply({
+      businessTimezone,
+      businessName,
+      language: lang,
+      situation: `The customer confirmed their booking and ALSO asked a question in the same message: "${messageText}". Answer ONLY that question, grounded strictly in the real business facts/availability provided — do not restate or re-confirm the booking. If you don't have grounded info to answer, say you'll check with the studio rather than guessing.`,
+      transcript,
+      ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+      customerMemory: extractMemory(ctx),
+    }, bundledFocusDay ? { focusDay: bundledFocusDay } : {})
+    return { reply: `${confirmedReply}\n\n${answerReply}`, sessionComplete: true }
   }
 
   // No hold placed yet — place the hold first
