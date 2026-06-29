@@ -20,6 +20,8 @@ import { resolveRequestedDate, resolveSlotStart } from '../availability/resolve-
 import { findUnbackedTimes, assertsNoAvailability, extractClockTimes } from './slot-fabrication-guard.js'
 import { parseConfirmation } from './types.js'
 import { isSlotSuppressed, filterOpenSlots } from './negotiation-constraints.js'
+import { matchBookingSelection } from './customer-booking.js'
+import type { CancelBooking } from './cancellation-match.js'
 
 // classInstanceMissing's only DB dependency. Mocked so this fast tripwire stays pure —
 // the mock affects ONLY the blocks import; the 14 pure guards above never touch it.
@@ -115,6 +117,37 @@ describe('DO-NOT-REGRESS · C-PIVOT — a revision never parses as a plain confi
     ]) {
       expect(parseConfirmation(revision)).not.toBe('yes')
     }
+  })
+
+  // WS3-T3.2 extension: the bind helper that answers a PA list-question is the FIRST
+  // gate before the pivot escape-hatch. A mid-flow REVISION ("actually Thursday instead")
+  // must NOT bind as an answer to the asked question — otherwise it would commit the wrong
+  // booking instead of falling through to fresh handling. A clean number / unique
+  // reference DOES bind (preserving the verified deterministic pick with zero LLM).
+  describe('matchBookingSelection — a pivot phrase never binds as an answer', () => {
+    const TZ = 'Asia/Jerusalem'
+    // 1=Pilates(Mon 10:00), 2=Massage(Wed 16:00), 3=Yoga(Fri 12:00)
+    const cands: CancelBooking[] = [
+      { id: 'b-pilates', slotStart: new Date('2026-06-29T07:00:00Z'), serviceTypeId: 'svc-pilates', serviceName: 'Pilates' },
+      { id: 'b-massage', slotStart: new Date('2026-07-01T13:00:00Z'), serviceTypeId: 'svc-massage', serviceName: 'Deep Massage' },
+      { id: 'b-yoga', slotStart: new Date('2026-07-03T09:00:00Z'), serviceTypeId: 'svc-yoga', serviceName: 'Yoga' },
+    ]
+
+    it('a pivot phrase yields NO match (falls through to the pivot path)', () => {
+      // Thursday is not any candidate's weekday → no bind; the dispatcher routes this to
+      // rebuildOnSlotPivot for fresh handling instead of mis-binding it as a pick.
+      expect(matchBookingSelection('actually Thursday instead', cands, TZ)).toBeNull()
+      expect(matchBookingSelection('כן אבל ביום חמישי', cands, TZ)).toBeNull()
+    })
+
+    it('a clean number DOES bind (verified deterministic pick preserved)', () => {
+      expect(matchBookingSelection('2', cands, TZ)).toEqual({ id: 'b-massage' })
+    })
+
+    it('a unique service/day reference DOES bind', () => {
+      expect(matchBookingSelection('the yoga one', cands, TZ)).toEqual({ id: 'b-yoga' })
+      expect(matchBookingSelection('the Monday one', cands, TZ)).toEqual({ id: 'b-pilates' })
+    })
   })
 })
 

@@ -122,6 +122,17 @@ export interface BookingFlowContext {
   // against re-asking every booking turn — the request is appended at most once per session.
   nameAsked?: boolean
   awaitingConfirmationFor?: 'hold' | 'cancellation' | 'cancellation_selection' | 'retention_offer'
+  // WS3-T3.2: typed binding for a customer's answer to a PA list-question, so the reply
+  // binds to THAT question's options BEFORE fresh intent re-extraction. `candidateIds` are
+  // the booking ids offered (sorted order); `isRescheduling` distinguishes the reschedule
+  // selection from the cancellation selection (same path, one flag). Set in PARALLEL with
+  // the legacy fields (cancellationCandidates / awaitingConfirmationFor / isReschedulingFlow)
+  // which remain the source of truth for the confirm/reschedule callers.
+  pendingDecision?: {
+    kind: 'booking_selection'
+    candidateIds: string[]
+    isRescheduling: boolean
+  }
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'
   cancellationCandidates?: string[]

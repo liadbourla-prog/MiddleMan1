@@ -12,7 +12,7 @@ import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { assertsBookingConfirmed } from './reply-guard.js'
 import { extractClockTimes, extractMentionedTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability, extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
-import { matchCancelBookings } from './cancellation-match.js'
+import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
@@ -962,9 +962,20 @@ export async function handleBookingFlow(
     }
   }
 
-  // ── Branch: cancellation_selection (multi-booking numbered pick) ──────────
-  if (session.state === 'waiting_clarification' && ctx.awaitingConfirmationFor === 'cancellation_selection') {
-    return handleCancellationSelection(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply)
+  // ── Branch: booking_selection (multi-booking pick — cancel or reschedule) ──
+  // WS3-T3.2: a customer's answer binds to THE asked list-question's options first
+  // (deterministic pick), with a C-PIVOT escape-hatch — a mid-flow revision ("actually
+  // Thursday instead") falls through to fresh handling instead of mis-binding as an answer.
+  if (session.state === 'waiting_clarification' &&
+      (ctx.pendingDecision?.kind === 'booking_selection' ||
+       ctx.awaitingConfirmationFor === 'cancellation_selection')) {
+    const sel = await handleBookingSelection(db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business)
+    if (!sel.redispatch) return sel
+    // Pivot/redirect → the handler (via rebuildOnSlotPivot) already cleared pending state in
+    // the DB; mirror that in-memory and fall through to fresh intent (mirrors the hold branch).
+    const { pendingDecision: _pd, cancellationCandidates: _cc, awaitingConfirmationFor: _a, isReschedulingFlow: _r, ...cleared } = ctx
+    ctx = cleared as BookingFlowContext
+    session = { ...session, state: 'active', context: ctx }
   }
 
   // ── Branch: waiting for hold confirmation ────────────────────────────────
@@ -1505,7 +1516,9 @@ async function rebuildOnSlotPivot(
 
   const ps = ctx.pendingSlot
   const seededDraft = ps ? slotDraftFromPending(ps, businessTimezone) : ctx.slotDraft
-  const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, ...rest } = ctx
+  // WS3-T3.2: also drop pendingDecision (and its legacy twins) so a redirect can't leave
+  // stale booking-selection state that would re-bind the redirected reply next turn.
+  const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, pendingDecision: _pd, cancellationCandidates: _cc, isReschedulingFlow: _ir, ...rest } = ctx
   // Negotiation memory: the customer just moved OFF the slot that was awaiting
   // confirmation — record it as rejected so we never re-offer that exact instant later
   // this session. (The new slot they pivoted to is pursued explicitly below, which
@@ -2585,6 +2598,35 @@ async function handleCancellationIntent(
   return enterCancellationSelection(db, session, ctx, activeBookings, businessTimezone, businessName, transcript, genReply, lang, false)
 }
 
+/**
+ * WS3-T3.2 — deterministically resolve a customer's answer to the "which booking?"
+ * list-question against the offered candidates. Lifted VERBATIM from the inline match
+ * that used to live in handleBookingSelection so the bind path has a pure regression net:
+ *
+ *   • a bare number in range → that candidate by SORTED position (candidates arrive sorted)
+ *   • else a UNIQUE matchCancelBookings hit (service/weekday/time) → that candidate
+ *   • else null (ambiguous / no usable criterion / out of range)
+ *
+ * Returns ONLY the id so the caller stays in control of the row it confirms. This runs
+ * FIRST in the handler, before the pivot escape-hatch — so a confident pick never reaches
+ * an LLM call (zero added latency on the verified path), and a mid-flow revision
+ * ("actually Thursday instead") yields null here and falls through to the pivot.
+ */
+export function matchBookingSelection(
+  messageText: string,
+  candidates: CancelBooking[],
+  tz: string,
+): { id: string } | null {
+  const n = parseInt(messageText.trim(), 10)
+  if (!isNaN(n) && n >= 1 && n <= candidates.length) {
+    const byPos = candidates[n - 1]
+    return byPos ? { id: byPos.id } : null
+  }
+  const matches = matchCancelBookings(messageText, candidates, tz)
+  if (matches.length === 1) return { id: matches[0]!.id }
+  return null
+}
+
 async function enterCancellationSelection(
   db: Db,
   session: ActiveSession,
@@ -2610,6 +2652,9 @@ async function enterCancellationSelection(
 
   const newCtx: BookingFlowContext = {
     ...ctx,
+    // WS3-T3.2: typed binding set IN PARALLEL with the legacy fields below (kept as the
+    // source of truth for the confirm/reschedule callers, untouched this task).
+    pendingDecision: { kind: 'booking_selection', candidateIds: candidates, isRescheduling },
     cancellationCandidates: candidates,
     awaitingConfirmationFor: 'cancellation_selection',
     isReschedulingFlow: isRescheduling,
@@ -2628,7 +2673,7 @@ async function enterCancellationSelection(
   return { reply, sessionComplete: false }
 }
 
-async function handleCancellationSelection(
+async function handleBookingSelection(
   db: Db,
   calendar: CalendarClient,
   identity: ResolvedIdentity,
@@ -2639,9 +2684,11 @@ async function handleCancellationSelection(
   businessName: string,
   transcript: TranscriptTurn[],
   genReply: GenReply,
+  business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
-  const candidates = ctx.cancellationCandidates ?? []
+  const candidates = ctx.pendingDecision?.candidateIds ?? ctx.cancellationCandidates ?? []
+  const isRescheduling = ctx.pendingDecision?.isRescheduling ?? ctx.isReschedulingFlow ?? false
 
   // Candidate bookings with service names, so we can resolve a natural-language
   // pick and name the chosen slot back in the confirmation.
@@ -2653,19 +2700,25 @@ async function handleCancellationSelection(
         .where(and(inArray(bookings.id, candidates), or(eq(bookings.state, 'confirmed'), eq(bookings.state, 'held'))))
     : []
 
-  // A bare number picks by position; otherwise resolve the customer's words
-  // ("Friday at 12", "the yoga one") against the candidates deterministically. Only
-  // a UNIQUE match auto-selects — anything ambiguous falls through to a re-ask.
-  const n = parseInt(messageText.trim(), 10)
-  let selected: (typeof rows)[number] | null = null
-  if (!isNaN(n) && n >= 1 && n <= candidates.length) {
-    selected = rows.find((r) => r.id === candidates[n - 1]) ?? null
-  } else {
-    const matches = matchCancelBookings(messageText, rows, businessTimezone)
-    if (matches.length === 1) selected = matches[0]!
-  }
+  // DETERMINISTIC BIND FIRST (verified-solid, lifted verbatim into matchBookingSelection):
+  // a bare number picks by position; otherwise a UNIQUE service/weekday/time reference
+  // auto-selects. Runs BEFORE the pivot escape so a confident pick NEVER reaches an LLM
+  // call (zero added latency on the verified path).
+  const pick = matchBookingSelection(messageText, rows, businessTimezone)
+  const selected: (typeof rows)[number] | null = pick ? rows.find((r) => r.id === pick.id) ?? null : null
 
   if (!selected) {
+    // No confident bind. Before re-asking, give the C-PIVOT escape-hatch a chance: the
+    // reply may be a mid-flow revision ("actually Thursday instead") rather than an answer
+    // to the asked question. rebuildOnSlotPivot re-extracts intent and either rebuilds the
+    // booking (returns the result) or redirects (returns { redispatch:true }); only when it
+    // returns null does the warm re-ask run. The deterministic bind above already consumed
+    // every confident pick, so a clean number/reference never lands here.
+    const pivoted = await rebuildOnSlotPivot(
+      db, calendar, identity, session, ctx, messageText, businessTimezone, businessName, transcript, genReply, business,
+    )
+    if (pivoted) return pivoted
+
     const reply = await genReply({
       businessTimezone,
       businessName,
@@ -2688,7 +2741,7 @@ async function handleCancellationSelection(
   // Ask for explicit confirmation before acting — do NOT auto-confirm. Name the
   // exact slot so the customer confirms the right one with a single yes.
   const slotLabel = `${selected.serviceName} on ${formatSlotDate(selected.slotStart, businessTimezone)} at ${formatSlotTime(selected.slotStart, businessTimezone)}`
-  const situation = ctx.isReschedulingFlow
+  const situation = isRescheduling
     ? `Customer chose ${slotLabel} as the one to move. Confirm that's the booking they want to reschedule — naturally, no menu. (It stays booked until the new time is set.)`
     : `Customer wants to cancel ${slotLabel}. Ask them to confirm the cancellation — naturally, no menu.`
   const reply = await genReply({
@@ -2770,7 +2823,7 @@ async function handleCancellationConfirmation(
   // path via the `rescheduledFrom` guard in the intent dispatch, so the still-active
   // original does not bounce us back into booking selection.
   if (ctx.isReschedulingFlow) {
-    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, ...rest } = ctx
+    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, pendingDecision: _pd, ...rest } = ctx
     const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: bookingId }
 
     // If the customer already gave the new slot up front ("move my yoga to Sunday
@@ -3013,7 +3066,7 @@ async function handleRetentionResponse(
 
   // parsed.kind === 'accept' — convert the cancel into a reschedule (deferred-cancel).
   const chosen = offered[parsed.index]!
-  const { targetBookingId: _t, awaitingConfirmationFor: _a, retentionOfferedSlots: _r, cancellationCandidates: _c, isReschedulingFlow: _i, ...rest } = ctx
+  const { targetBookingId: _t, awaitingConfirmationFor: _a, retentionOfferedSlots: _r, cancellationCandidates: _c, isReschedulingFlow: _i, pendingDecision: _pd, ...rest } = ctx
   const lp = localParts(new Date(chosen.start), businessTimezone)
   const slotDraft = {
     serviceTypeId: chosen.serviceTypeId,

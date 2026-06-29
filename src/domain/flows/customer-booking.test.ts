@@ -98,6 +98,23 @@ describe('name-capture invariant — every extractCustomerIntent is paired with 
   })
 })
 
+// WS3-T3.2 escape-hatch guard: when a booking-selection answer turns out to be a PIVOT
+// (handleBookingSelection returns redispatch), the dispatcher MUST clear the pending
+// decision in-memory before falling through to fresh intent — otherwise the next turn
+// would re-enter the selection branch and re-bind the pivot. This reads the source so a
+// future edit that drops `pendingDecision` from the redispatch fall-through fails loudly.
+describe('pendingDecision escape-hatch — dispatcher strips pending state on redispatch', () => {
+  it('the booking-selection redispatch fall-through destructures pendingDecision out of ctx', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    // The dispatcher branch that calls handleBookingSelection must, on the redispatch path,
+    // strip pendingDecision (mirroring the hold branch's pendingSlot strip).
+    expect(src).toMatch(/const \{[^}]*pendingDecision:[^}]*\}\s*=\s*ctx/)
+    // And the handler is wired into the dispatcher under the booking_selection guard.
+    expect(src).toMatch(/handleBookingSelection\(/)
+    expect(src).toMatch(/pendingDecision\?\.kind === 'booking_selection'/)
+  })
+})
+
 describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
   it('this-turn day wins over draft and lastInquiry', () => {
     expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')
