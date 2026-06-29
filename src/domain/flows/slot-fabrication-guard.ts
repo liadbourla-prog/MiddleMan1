@@ -98,12 +98,27 @@ export function extractFullTimes(text: string): string[] {
 // (no open signal) is never touched. Targets sweeping claims, not a specific-time
 // negative ("no class at 19:00"), which the gate further protects via the
 // reply-restates-an-open-time check.
+// NOTE: this detector is intentionally WINDOWED / context-aware, not bare tokens.
+// Bare מלא ("full") and אזל ("ran out") collide with legitimate positive phrases —
+// "היום מלא בשיעורים" (full OF classes = busy/positive) and "אזל הזמן שלי" (my time ran
+// out) are NOT no-availability claims. Matching them would launder a correct "full of
+// classes" reply into a false "no availability" verdict. Each broadened pattern below
+// requires adjacency to a capacity noun (or the "full of …" exclusion) for that reason.
 const NO_AVAILABILITY_RE: RegExp[] = [
   /fully\s*booked/i, /completely\s*full/i, /\ball\s*booked\b/i, /no\s*availability/i,
   /no\s*(?:open\s*)?spots?\b/i, /no\s*openings?\b/i, /nothing\s*(?:is\s*)?available/i,
   /sold\s*out/i, /no\s*slots?\s*(?:left|available)/i, /\ball\s*(?:full|taken|booked)\b/i,
+  /no\s+more\s+(?:spots?|slots?)\b/i,
   /התמלא/, /מלא\s*לגמרי/, /מלא\s*לחלוטין/, /הכל\s*מלא/, /הכול\s*מלא/, /כבר\s*מלא/,
   /אין\s*מקום/, /אין\s*מקומות/, /אין\s*זמינות/, /אין\s*שיעורים\s*פנויים/, /נתפסו\s*כל/, /הכל\s*תפוס/,
+  // "[day] full" / "everything full" — but NOT "מלא ב<…>" (full OF something).
+  /(?:^|\s|[א-ת])מלא(?!\s*ב)/,
+  // "spots ran out" — אזל must be adjacent to a capacity noun (not "אזל הזמן").
+  /אזל(?:ו)?\s+(?:ה)?(?:מקומות|מקום|תורים)/,
+  // "spots taken/full" — נתפסו/תפוסים adjacent to מקומות, either order.
+  /(?:ה)?מקומות\s+(?:כבר\s+)?(?:נתפסו|תפוסים)/, /(?:נתפסו|תפוסים)\s+(?:כל\s+)?(?:ה)?מקומות/,
+  // "no spots left" — windowed so מקומ stays near the negation.
+  /לא\s+נשארו\s[^.]{0,20}מקומ/,
 ]
 export function assertsNoAvailability(text: string): boolean {
   return !!text && NO_AVAILABILITY_RE.some((re) => re.test(text))

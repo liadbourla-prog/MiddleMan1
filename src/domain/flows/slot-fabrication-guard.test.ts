@@ -104,6 +104,37 @@ describe('assertsNoAvailability — blanket fullness claim', () => {
   it('does NOT flag a specific-time negative', () => {
     expect(assertsNoAvailability('ב-19:00 אין לנו שיעור, אבל יש ב-18:00.')).toBe(false)
   })
+
+  describe('windowed "no spots" family (T2.2 Hole A)', () => {
+    it('flags "no seats left" Hebrew phrasings', () => {
+      expect(assertsNoAvailability('לא נשארו מקומות')).toBe(true)
+      expect(assertsNoAvailability('לא נשארו עוד מקומות')).toBe(true)
+    })
+    it('flags bare "[day] full"', () => {
+      expect(assertsNoAvailability('יום ראשון מלא')).toBe(true)
+    })
+    it('flags "the spots ran out" / "spots taken"', () => {
+      expect(assertsNoAvailability('אזלו המקומות')).toBe(true)
+      expect(assertsNoAvailability('המקומות נתפסו')).toBe(true)
+      expect(assertsNoAvailability('כל המקומות תפוסים')).toBe(true)
+    })
+    it('flags English "no more spots/slots"', () => {
+      expect(assertsNoAvailability('no more spots')).toBe(true)
+      expect(assertsNoAvailability('no more slots')).toBe(true)
+    })
+
+    // False-positive guards — the whole point of windowing. "full OF classes" is
+    // positive/busy, "my time ran out" is irrelevant; neither is no-availability.
+    it('does NOT flag "full of classes" (busy, positive)', () => {
+      expect(assertsNoAvailability('היום מלא בשיעורים')).toBe(false)
+    })
+    it('does NOT flag "my time ran out"', () => {
+      expect(assertsNoAvailability('אזל הזמן שלי')).toBe(false)
+    })
+    it('does NOT flag a reply that offers open times (English)', () => {
+      expect(assertsNoAvailability('we have 10:00 and 12:00 open')).toBe(false)
+    })
+  })
 })
 
 describe('extractDayScopedTimes', () => {

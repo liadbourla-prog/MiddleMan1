@@ -156,6 +156,21 @@ export function looksLikeGreetingOrSocial(text: string): boolean {
   return GREETING_SOCIAL_RE.test(cleaned)
 }
 
+/**
+ * Which day's spine a continuation turn should re-read (T2.2 Hole B). Precedence:
+ * the day the customer named THIS turn → the in-flight draft day → the day the prior
+ * availability inquiry focused on. The this-turn day winning is exactly the day-change
+ * scoping: if they name a different day, the stale inquiry focus is naturally dropped.
+ * Pure.
+ */
+export function resolveContinuationFocusDay(
+  thisTurnDateStr: string | undefined,
+  draftDateStr: string | undefined,
+  lastInquiryDateStr: string | undefined,
+): string | undefined {
+  return thisTurnDateStr ?? draftDateStr ?? lastInquiryDateStr
+}
+
 function formatSlotDate(date: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, weekday: 'long', day: 'numeric', month: 'long',
@@ -1112,6 +1127,11 @@ export async function handleBookingFlow(
           // inquiry path is otherwise read-only and wouldn't carry this forward.
           let inquiryCtx = withConstraints(updatedCtx, ctx.negotiationConstraints ?? {})
           if (inquiryOffered.length > 0) inquiryCtx = { ...inquiryCtx, lastOfferedSlots: inquiryOffered }
+          // Persist the focused day so a bare continuation ("I want to join") re-reads the
+          // SAME day's fresh spine and corrects a stale "full" (T2.2 Hole B).
+          if (resolvedDay && resolvedDay.ok) {
+            inquiryCtx = { ...inquiryCtx, lastInquiryFocus: { dateStr: resolvedDay.dateStr, ...(inquiryService ? { serviceTypeId: inquiryService.id } : {}) } }
+          }
           await updateSessionContext(db, session.id, inquiryCtx, 'active')
         }
         const hoursSummary = business ? await loadHoursSummary(db, business.id) : null
@@ -1200,8 +1220,8 @@ export async function handleBookingFlow(
           const dp = intent.slotRequest && (intent.slotRequest.relativeDay || intent.slotRequest.weekday != null || intent.slotRequest.explicitDate)
             ? resolveRequestedDate({ relativeDay: intent.slotRequest.relativeDay ?? null, weekday: intent.slotRequest.weekday ?? null, explicitDate: intent.slotRequest.explicitDate ?? null }, businessTimezone, new Date())
             : null
-          const focusDateStr = (dp?.ok ? dp.dateStr : undefined) ?? updatedCtx.slotDraft?.dateStr
-          const focusSvc = resolveService(intent.serviceTypeHint, activeServices)?.id ?? updatedCtx.slotDraft?.serviceTypeId
+          const focusDateStr = resolveContinuationFocusDay(dp?.ok ? dp.dateStr : undefined, updatedCtx.slotDraft?.dateStr, updatedCtx.lastInquiryFocus?.dateStr)
+          const focusSvc = resolveService(intent.serviceTypeHint, activeServices)?.id ?? updatedCtx.slotDraft?.serviceTypeId ?? updatedCtx.lastInquiryFocus?.serviceTypeId
           if (focusDateStr) {
             const r = await buildDayOptionsText(db, business, focusDateStr, businessTimezone, focusSvc, updatedCtx.negotiationConstraints)
             unknownDayText = r.text

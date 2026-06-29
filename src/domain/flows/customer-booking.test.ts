@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -95,6 +95,24 @@ describe('name-capture invariant — every extractCustomerIntent is paired with 
     const captures = (src.match(/await persistCapturedName\(/g) ?? []).length
     expect(extractions).toBeGreaterThan(0)
     expect(captures).toBeGreaterThanOrEqual(extractions)
+  })
+})
+
+describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
+  it('this-turn day wins over draft and lastInquiry', () => {
+    expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')
+  })
+  it('draft wins over lastInquiry when no this-turn day', () => {
+    expect(resolveContinuationFocusDay(undefined, '2026-07-01', '2026-06-28')).toBe('2026-07-01')
+  })
+  it('falls back to lastInquiry on a bare continuation (no this-turn day, no draft)', () => {
+    expect(resolveContinuationFocusDay(undefined, undefined, '2026-06-28')).toBe('2026-06-28')
+  })
+  it('a DIFFERENT this-turn day overrides a stale lastInquiry (day-change scoping)', () => {
+    expect(resolveContinuationFocusDay('2026-07-10', undefined, '2026-06-28')).toBe('2026-07-10')
+  })
+  it('returns undefined when all empty', () => {
+    expect(resolveContinuationFocusDay(undefined, undefined, undefined)).toBeUndefined()
   })
 })
 

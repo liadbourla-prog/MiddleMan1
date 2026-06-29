@@ -148,6 +148,11 @@ export interface BookingFlowContext {
   // book one of them, they're promoted to rejectedSlots (batch rejection — "none of
   // those work"). Transient: consumed/cleared at the start of each turn.
   lastOfferedSlots?: import('./negotiation-constraints.js').RejectedSlot[]
+  // The day an availability INQUIRY focused on, persisted so a bare continuation turn
+  // ("I want to join") after the inquiry re-reads the SAME day's fresh spine — Gate 3's
+  // strongest signal — and corrects a stale "full". Naturally dropped when the next turn
+  // names a different day (that day wins). See resolveContinuationFocusDay.
+  lastInquiryFocus?: { dateStr: string; serviceTypeId?: string }
   [key: string]: unknown
 }
 
