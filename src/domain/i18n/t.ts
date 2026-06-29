@@ -331,6 +331,12 @@ const strings = {
     he: (biz: string) => `שאלה טובה — אין לי את המידע הזה כרגע, אז העברתי אותה ל${biz}. נחזור אליך עם תשובה בהקדם.`,
     en: (biz: string) => `Good question — I don't have that on hand, so I've passed it to ${biz}. We'll get back to you with an answer shortly.`,
   },
+  // T2c.1 — a re-ask of a question already waiting with the owner: reference the OPEN thread,
+  // never a fresh "I don't have that" (that reads as the PA forgetting it already escalated).
+  question_still_pending: {
+    he: (biz: string) => `עוד מחכה לתשובה מ${biz} בנוגע לזה — ברגע שהם יחזרו אליי אעביר לך מיד. בינתיים אפשר לעזור בעוד משהו?`,
+    en: (biz: string) => `Still waiting to hear back from ${biz} on that — the moment they reply I'll pass it straight to you. Anything else I can help with meanwhile?`,
+  },
   owner_answer_relay: {
     he: (biz: string, answer: string) => `חזרו אליי מ${biz} בקשר לשאלה ששאלת:\n${answer}`,
     en: (biz: string, answer: string) => `${biz} got back to me about your question:\n${answer}`,

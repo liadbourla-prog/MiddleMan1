@@ -238,6 +238,20 @@ describe('ASK_STUDIO escape hatch on explanation + default paths (T2b.2, H15 mid
   })
 })
 
+describe('owner-question relay is NON-BLOCKING (T2c.1 / constraint #3b)', () => {
+  const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+  it('never installs an "owner_question" session lock — the relay is DB state only', () => {
+    // The customer must keep booking/asking with a question outstanding; no awaiting-owner mode.
+    expect(src).not.toContain("awaitingConfirmationFor: 'owner_question'")
+    expect(src).not.toContain('awaitingConfirmationFor: "owner_question"')
+  })
+  it('every relay return keeps the session open (sessionComplete: false)', () => {
+    // Each `const relay = await relayUnansweredToOwner(...)` is immediately returned non-terminally.
+    const relayReturns = src.match(/const relay = await relayUnansweredToOwner[\s\S]{0,160}?return \{ reply: relay, sessionComplete: false \}/g) ?? []
+    expect(relayReturns.length).toBeGreaterThanOrEqual(3) // inquiry + system_explanation + default
+  })
+})
+
 describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
   it('this-turn day wins over draft and lastInquiry', () => {
     expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')

@@ -25,6 +25,7 @@ import {
   hasDeadEnd,
   hasBilingualLeak,
 } from './voice-guard.js'
+import { i18n } from '../i18n/t.js'
 
 // ── Shape helpers ───────────────────────────────────────────────────────────
 
@@ -160,6 +161,24 @@ describe('golden GOOD replies — the quality bar (detectBotTells === [], one qu
       expectGoldenGood(he)
       expect(hasDeadEnd(he)).toBe(false)
       expect(hasBilingualLeak(he)).toBe(false)
+    })
+  })
+
+  // ── Path 6: suppressed-re-ask "still waiting" reply (T2c.1 / P5) — the real shipped string ──
+  describe('path 6 — owner-question re-ask references the open thread (still waiting, not a fresh don\'t-know)', () => {
+    const en = i18n.question_still_pending.en('the studio')
+    const he = i18n.question_still_pending.he('הסטודיו')
+
+    it('EN reads warm, references the open thread, and keeps moving (no grovel/dead-end)', () => {
+      expectGoldenGood(en)
+      expect(hasGrovel(en)).toBe(false)
+      expect(hasDeadEnd(en)).toBe(false)
+      expect(/still waiting/i.test(en)).toBe(true) // references the OPEN thread, not a fresh "I don't have that"
+    })
+    it('HE reads warm and references the open thread (no bilingual leak, no dead-end)', () => {
+      expectGoldenGood(he)
+      expect(hasBilingualLeak(he)).toBe(false)
+      expect(hasDeadEnd(he)).toBe(false)
     })
   })
 })

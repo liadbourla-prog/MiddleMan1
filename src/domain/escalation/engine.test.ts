@@ -104,3 +104,97 @@ describe('expireStaleOwnerQuestions', () => {
     expect(await expireStaleOwnerQuestions(db, new Date())).toBe(0)
   })
 })
+
+// ── T2c.1 — owner-ping throttle (dedup / substance / rate) + non-blocking + still-waiting ──
+import { escalateCustomerQuestion, isSubstantiveQuestion } from './engine.js'
+import { pendingOwnerQuestions } from '../../db/schema.js'
+import { i18n } from '../i18n/t.js'
+
+// Mock db that supports: manager lookup (.limit), the two pendingOwnerQuestions throttle reads
+// (dedup .limit, rate .then), and the insert(...).values(...).returning(...) chain.
+function makeQDb(opts: { manager?: boolean; dedup?: unknown[]; rate?: unknown[] } = {}) {
+  const inserts: Array<{ table: unknown; values: Record<string, unknown> }> = []
+  const q = new Map<unknown, unknown[][]>()
+  const push = (tbl: unknown, rows: unknown[]) => { if (!q.has(tbl)) q.set(tbl, []); q.get(tbl)!.push(rows) }
+  push(identities, opts.manager === false ? [] : [{ id: 'mgr-1', phoneNumber: MANAGER_PHONE }])
+  push(pendingOwnerQuestions, opts.dedup ?? [])   // dedup read (per-customer pending)
+  push(pendingOwnerQuestions, opts.rate ?? [])    // rate read (per-business pending)
+  const db = {
+    select: () => ({
+      from: (tbl: unknown) => {
+        const next = () => q.get(tbl)?.shift() ?? []
+        const chain: Record<string, unknown> = {
+          where: () => chain, orderBy: () => chain,
+          limit: async () => next(),
+          then: (r: (v: unknown) => unknown) => r(next()),
+        }
+        return chain
+      },
+    }),
+    insert: (table: unknown) => ({
+      values: (values: Record<string, unknown>) => ({
+        returning: async () => { inserts.push({ table, values }); return [{ id: 'q-new' }] },
+      }),
+    }),
+  }
+  return { db: db as unknown as Db, inserts }
+}
+
+const customer = { id: 'cust-1', phoneNumber: '+972546372400' }
+
+describe('isSubstantiveQuestion — owner-ping substance gate (pure)', () => {
+  it('rejects greetings/social and trivially short noise', () => {
+    expect(isSubstantiveQuestion('hi', 8)).toBe(false)
+    expect(isSubstantiveQuestion('שלום', 8)).toBe(false)
+    expect(isSubstantiveQuestion('???', 8)).toBe(false)
+    expect(isSubstantiveQuestion('   ', 8)).toBe(false)
+  })
+  it('accepts a real question', () => {
+    expect(isSubstantiveQuestion('Do you have parking near the studio?', 8)).toBe(true)
+  })
+})
+
+describe('escalateCustomerQuestion — throttle + non-blocking + still-waiting (T2c.1)', () => {
+  it('happy path: a fresh substantive question records + pings the owner once', async () => {
+    const { db, inserts } = makeQDb()
+    const res = await escalateCustomerQuestion(db, business, customer, 'Do you offer reformer pilates for beginners?', 'en')
+    expect(inserts.find((i) => i.table === pendingOwnerQuestions)).toBeTruthy()
+    expect(dispatchSpy).toHaveBeenCalledTimes(1)
+    expect(res.escalated).toBe(true)
+    expect(res.customerReply).toBe(i18n.question_passed_to_studio.en(business.name))
+  })
+
+  it('DEDUP: a re-ask while a question is already pending does NOT re-ping — returns the "still waiting" reply', async () => {
+    const { db, inserts } = makeQDb({ dedup: [{ id: 'p-open' }] })
+    const res = await escalateCustomerQuestion(db, business, customer, 'and what about the reformer classes?', 'en')
+    expect(inserts.find((i) => i.table === pendingOwnerQuestions)).toBeFalsy() // no new row
+    expect(dispatchSpy).not.toHaveBeenCalled()                                  // no new ping
+    expect(res.customerReply).toBe(i18n.question_still_pending.en(business.name))  // references the open thread
+    expect(res.escalated).toBe(true)                                            // the question IS in the owner's hands
+  })
+
+  it('SUBSTANCE: a greeting never pings the owner', async () => {
+    const { db, inserts } = makeQDb()
+    const res = await escalateCustomerQuestion(db, business, customer, 'good morning', 'en')
+    expect(inserts.length).toBe(0)
+    expect(dispatchSpy).not.toHaveBeenCalled()
+    expect(res.escalated).toBe(false)
+  })
+
+  it('RATE: when the business is at its pending cap, a new question is suppressed (no ping, honest no-promise)', async () => {
+    const atCap = Array.from({ length: 5 }, (_, i) => ({ id: `p${i}` }))
+    const { db, inserts } = makeQDb({ rate: atCap })
+    const res = await escalateCustomerQuestion(db, business, customer, 'Is there a student discount available?', 'en')
+    expect(inserts.find((i) => i.table === pendingOwnerQuestions)).toBeFalsy()
+    expect(dispatchSpy).not.toHaveBeenCalled()
+    expect(res.escalated).toBe(false)
+  })
+
+  it('NON-BLOCKING: the return carries no session-lock signal (DB state only)', async () => {
+    const { db } = makeQDb()
+    const res = await escalateCustomerQuestion(db, business, customer, 'Do you have parking on site?', 'en')
+    expect(res).not.toHaveProperty('awaitingConfirmationFor')
+    expect(res).not.toHaveProperty('sessionLock')
+    expect(Object.keys(res).sort()).toEqual(['customerReply', 'escalated'])
+  })
+})

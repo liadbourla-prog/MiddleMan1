@@ -20,6 +20,7 @@ import { i18n, type Lang } from '../i18n/t.js'
 import { generateProactiveCustomerMessage } from '../../adapters/llm/client.js'
 import { dispatchInitiation } from '../initiations/dispatch.js'
 import { getInitiator } from '../initiations/registry.js'
+import { looksLikeGreetingOrSocial } from '../flows/social-text.js'
 
 export type EscalationCheckResult =
   | { escalated: false }
@@ -166,6 +167,40 @@ export async function escalateUnfulfillableRequest(
  * customer-facing reply ONLY when an owner exists and the question was recorded — the caller
  * must fall back to a non-committal reply (never claim an escalation) when `escalated` is false.
  */
+// ── Owner-ping throttle (T2c.1) ───────────────────────────────────────────────
+// Constraint #2: the owner must NOT be over-pinged. Before recording/sending a relay we run
+// three deterministic gates: substance (don't ping on greetings/noise), dedup (one open
+// question per customer at a time — a rephrase doesn't re-ping), and rate (cap the live
+// pending load per business). Numbers are env-tunable with sane defaults; "defer to business
+// hours" is intentionally OFF for now (design §4, owner decision). All gates use data already
+// in scope (the (businessId,customerId,status) + (businessId,status) indexes, schema.ts:1119).
+
+const OWNER_PING_MIN_CHARS_DEFAULT = 8
+
+/**
+ * Substance gate (pure, exported for tests): a question worth pinging the owner over is neither
+ * a greeting/social pleasantry nor trivially short. The model only emits the ASK_STUDIO sentinel
+ * for genuine questions, so this is a defensive floor against it mis-firing on noise.
+ */
+export function isSubstantiveQuestion(text: string, minChars: number = OWNER_PING_MIN_CHARS_DEFAULT): boolean {
+  const trimmed = text.trim()
+  if (trimmed.length < minChars) return false
+  if (looksLikeGreetingOrSocial(trimmed)) return false
+  return true
+}
+
+function ownerPingLimits(): { perCustomer: number; perBusiness: number; minChars: number } {
+  const num = (key: string, def: number): number => {
+    const v = Number(process.env[key])
+    return Number.isFinite(v) && v > 0 ? v : def
+  }
+  return {
+    perCustomer: num('OWNER_PING_MAX_PENDING_PER_CUSTOMER', 1),
+    perBusiness: num('OWNER_PING_MAX_PENDING_PER_BUSINESS', 5),
+    minChars: num('OWNER_PING_MIN_CHARS', OWNER_PING_MIN_CHARS_DEFAULT),
+  }
+}
+
 export async function escalateCustomerQuestion(
   db: Db,
   business: Business,
@@ -173,6 +208,14 @@ export async function escalateCustomerQuestion(
   questionText: string,
   customerLang: Lang = 'he',
 ): Promise<{ customerReply: string | null; escalated: boolean }> {
+  const limits = ownerPingLimits()
+
+  // Substance gate (cheapest, no DB): a greeting/noise must never ping the owner. Honest
+  // no-promise so the caller gives a truthful steer, never a fabricated "I asked them".
+  if (!isSubstantiveQuestion(questionText, limits.minChars)) {
+    return { customerReply: null, escalated: false }
+  }
+
   const [managerIdentity] = await db
     .select({ id: identities.id, phoneNumber: identities.phoneNumber })
     .from(identities)
@@ -181,6 +224,29 @@ export async function escalateCustomerQuestion(
   // No reachable owner → we cannot honestly promise a follow-up. Signal not-escalated so the
   // caller gives a truthful "I don't have that" without claiming it asked anyone.
   if (!managerIdentity) return { customerReply: null, escalated: false }
+
+  // Dedup gate: this customer already has an open question with the owner. Do NOT re-ping on a
+  // rephrase — reference the OPEN thread (P5/#3b). A fresh "I don't have that" here would read
+  // as the PA forgetting it already escalated (a trust regression / soft re-open of S3). This
+  // is DB state only — it sets NO session lock; the customer keeps booking/asking normally.
+  const customerPending = await db
+    .select({ id: pendingOwnerQuestions.id })
+    .from(pendingOwnerQuestions)
+    .where(and(eq(pendingOwnerQuestions.businessId, business.id), eq(pendingOwnerQuestions.customerId, customer.id), eq(pendingOwnerQuestions.status, 'pending')))
+    .limit(limits.perCustomer)
+  if (customerPending.length >= limits.perCustomer) {
+    return { customerReply: i18n.question_still_pending[customerLang](business.name), escalated: true }
+  }
+
+  // Rate gate: cap the live pending load per business so a burst of distinct customers can't
+  // flood the owner. Over the cap → honest no-promise (never a fabricated escalation).
+  const businessPending = await db
+    .select({ id: pendingOwnerQuestions.id })
+    .from(pendingOwnerQuestions)
+    .where(and(eq(pendingOwnerQuestions.businessId, business.id), eq(pendingOwnerQuestions.status, 'pending')))
+  if (businessPending.length >= limits.perBusiness) {
+    return { customerReply: null, escalated: false }
+  }
 
   const trimmed = questionText.slice(0, 1000)
   const [row] = await db

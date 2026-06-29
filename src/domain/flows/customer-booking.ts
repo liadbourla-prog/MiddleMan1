@@ -32,6 +32,7 @@ import { listDayOptions, type ClassSession, type DayOptions } from '../availabil
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
+import { looksLikeGreetingOrSocial } from './social-text.js'
 import { validateSlotTiming } from '../booking/engine.js'
 import {
   pruneConstraints,
@@ -140,22 +141,10 @@ export function parseProviderUnavailable(reason: string, lang: 'he' | 'en'): { n
 // dedicated greeting intent) but must NOT count toward unknown-intent escalation.
 // A message qualifies only when it is SHORT and essentially just a pleasantry —
 // "hi can I book tomorrow?" classifies as booking and never reaches this check.
-const GREETING_SOCIAL_RE =
-  /^(?:hi+|hey+|hello+|yo|sup|hiya|good\s*(?:morning|afternoon|evening|night)|how\s*(?:are|r)\s*(?:you|u)|how's\s*it\s*going|what'?s\s*up|thanks?|thank\s*you|thx|ty|ok(?:ay)?|cool|nice|great|bye+|goodbye|see\s*you|cheers|שלום|היי+|הי|הלו|אהלן|אהל[ןן]|בוקר\s*טוב|צהריים\s*טובים|ערב\s*טוב|לילה\s*טוב|מה\s*נשמע|מה\s*קורה|מה\s*שלומ(?:ך|ך)|תודה(?:\s*רבה)?|סבבה|אוקיי?|יופי|מגניב|ביי+|להתראות|כל\s*טוב)$/iu
-
-export function looksLikeGreetingOrSocial(text: string): boolean {
-  // Strip emoji, punctuation, and collapse whitespace, then bound the length so a
-  // genuine request that merely opens with "hi" is never swallowed here.
-  const cleaned = text
-    .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, '')
-    .replace(/['’]/g, '') // strip apostrophes so "what's" → "whats" (not "what s")
-    .replace(/[!?.,;:"()\-–—]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  if (cleaned.length === 0) return false
-  if (cleaned.split(' ').length > 4) return false
-  return GREETING_SOCIAL_RE.test(cleaned)
-}
+// looksLikeGreetingOrSocial now lives in ./social-text.ts (pure, shared with the owner-ping
+// throttle in escalation/engine.ts without a customer-booking ↔ engine import cycle).
+// Imported at the top of the file; re-exported here so existing importers/tests keep their entry point.
+export { looksLikeGreetingOrSocial }
 
 /**
  * Which day's spine a continuation turn should re-read (T2.2 Hole B). Precedence:
