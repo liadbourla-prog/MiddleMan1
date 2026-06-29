@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -133,6 +133,23 @@ describe('already-booked reassurance — duplicate result short-circuits the re-
   it('the engine tags the class duplicate guard with code: already_booked', () => {
     const src = readFileSync(new URL('../booking/engine.ts', import.meta.url), 'utf8')
     expect(src).toMatch(/already booked into this class".*code: 'already_booked'/s)
+  })
+})
+
+// F1e/S1 — the top-of-turn "batch reject everything offered last turn" promotion must NOT
+// promote the slot the customer is actively confirming; otherwise that slot is suppressed
+// from a later re-resolution and the booking silently drifts to a different date (the July-5
+// drift). The pending slot is excluded; all other offered slots still promote.
+describe('promotableOfferedSlots — never reject the slot under active confirmation (F1e)', () => {
+  const s = (start: string) => ({ start, end: start, serviceTypeId: 'svc' })
+  it('excludes the pending slot from promotion', () => {
+    const offered = [s('2026-06-29T13:00:00.000Z'), s('2026-07-05T13:00:00.000Z')]
+    const out = promotableOfferedSlots(offered, '2026-06-29T13:00:00.000Z')
+    expect(out.map((o) => o.start)).toEqual(['2026-07-05T13:00:00.000Z'])
+  })
+  it('promotes everything when there is no pending slot', () => {
+    const offered = [s('2026-06-29T13:00:00.000Z'), s('2026-07-05T13:00:00.000Z')]
+    expect(promotableOfferedSlots(offered, undefined)).toHaveLength(2)
   })
 })
 

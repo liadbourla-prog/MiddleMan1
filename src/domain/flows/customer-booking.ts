@@ -914,6 +914,17 @@ export function buildBusinessFacts(
   return lines.join('\n')
 }
 
+// F1e/S1 — which of last turn's offered slots may be batch-rejected this turn. Everything
+// offered is off the table EXCEPT the slot currently awaiting confirmation: rejecting that
+// one suppresses it from a later re-resolution and drifts the booking to a different date.
+// Pure + exported for unit testing.
+export function promotableOfferedSlots(
+  lastOffered: RejectedSlot[],
+  pendingStart: string | undefined,
+): RejectedSlot[] {
+  return pendingStart ? lastOffered.filter((s) => s.start !== pendingStart) : lastOffered
+}
+
 export async function handleBookingFlow(
   db: Db,
   calendar: CalendarClient,
@@ -945,7 +956,11 @@ export async function handleBookingFlow(
   // re-suggest won't surface them again. If the customer is actually pursuing one, the
   // explicit-pursuit un-suppress (booking/inquiry paths below) pulls it back out.
   if (ctx.lastOfferedSlots && ctx.lastOfferedSlots.length > 0) {
-    const promoted = addRejectedSlots(ctx.negotiationConstraints, ctx.lastOfferedSlots)
+    // F1e/S1: never promote the slot the customer is actively confirming — promoting it
+    // suppresses it from any later re-resolution and silently drifts the booking to a
+    // different date (the July-5 drift). The explicit-pursuit un-suppress still pulls back
+    // any other offered slot the customer concretely chases.
+    const promoted = addRejectedSlots(ctx.negotiationConstraints, promotableOfferedSlots(ctx.lastOfferedSlots, ctx.pendingSlot?.start))
     const { lastOfferedSlots: _consumed, ...rest } = ctx
     ctx = withConstraints(rest, promoted)
   }
