@@ -504,6 +504,36 @@ export async function suggestNextClassesText(
   return { text: `Upcoming scheduled classes (these are the real options — there are no others): ${items.join('; ')}.`, offered }
 }
 
+// PURE situation-string builder for the three class-offer sites (day-known/time-missing,
+// classInstanceMissing gate, taken-at-confirm class miss). It is the testable seam for
+// "never dead-end a lead": given the requested day's offerable options and the next-real-class
+// substitute, it returns the LLM instruction for whichever of the three states holds.
+//
+//   1. sameDayText present              → offer the real same-day class times.
+//   2. sameDayText null, substituteText → no more that day; offer the next REAL classes
+//                                         (a later day) so the lead is never dead-ended.
+//   3. both null                        → genuinely nothing on the horizon; an honest, warm,
+//                                         forward-moving close (check another day OR let the
+//                                         studio know) — never a bare dead-end, never a menu.
+//
+// VOICE GATE: every branch yields a first-person, single-question, no-IVR-menu, no-grovel
+// reply that ALWAYS carries a concrete next step. Branches 2/3 must never instruct offering a
+// "(full)" class — the offerable inputs have already dropped those.
+export function classOfferSituation(
+  serviceName: string,
+  dayLabel: string,
+  sameDayText: string | null,
+  substituteText: string | null,
+): string {
+  if (sameDayText) {
+    return `Booking ${serviceName} on ${dayLabel}. These are the only real class times that day: ${sameDayText} Offer ONLY these and ask which they'd like — do NOT re-ask the day or service, and never invent a time.`
+  }
+  if (substituteText) {
+    return `There are no more ${serviceName} classes on ${dayLabel}. The next real classes are: ${substituteText} Offer these and ask which they'd like — never invent a time.`
+  }
+  return `There are no more ${serviceName} classes on ${dayLabel}, and nothing else is scheduled in the period ahead. Warmly let them know, and in a single question ask whether they'd like you to check another day or to let the studio know they're after this — never invent a time, and keep the conversation moving.`
+}
+
 /**
  * Schedule-driven gate decision: is the requested slot off-schedule for a class service?
  *
@@ -1129,7 +1159,7 @@ export async function handleBookingFlow(
             ctx = withConstraints(ctx, removeRejectedSlot(ctx.negotiationConstraints, askedStart.toISOString()))
           }
           if (resolvedDay && resolvedDay.ok) {
-            const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null)
+            const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null, true)
             availabilityText = r.text
             inquiryOffered.push(...r.offered)
           }
@@ -1764,13 +1794,16 @@ async function handleBookingIntent(
       // recalling them from the transcript (which the guard strips → unhelpful "which
       // day?" fallback) or, worse, asserting the day is full.
       const dayOpts = business
-        ? await buildDayOptionsText(db, business, draft.dateStr, businessTimezone, draft.serviceTypeId, ctx.negotiationConstraints)
+        ? await buildDayOptionsText(db, business, draft.dateStr, businessTimezone, draft.serviceTypeId, ctx.negotiationConstraints, null, true)
         : NO_SUGGESTION
-      offeredSlots = dayOpts.offered
       const dayLabel = formatLocalDate(draft.dateStr, businessTimezone)
-      ask = dayOpts.text
-        ? `Booking ${draft.serviceName} on ${dayLabel}. These are the only real times that day: ${dayOpts.text} Offer ONLY these and ask which they'd like — do NOT re-ask the day or service, and do NOT invent any other time.`
-        : `Booking ${draft.serviceName} on ${dayLabel}, but there is nothing available that day. Say so plainly and offer to check another day — do NOT invent a time.`
+      // Same-day empty/all-full → substitute the next REAL class on a later day so the lead
+      // is never dead-ended; bind the pick to whichever set actually carries options.
+      const substitute = dayOpts.text || !business
+        ? NO_SUGGESTION
+        : await suggestNextClassesText(db, business, draft.serviceTypeId, businessTimezone, ctx.negotiationConstraints)
+      offeredSlots = dayOpts.text ? dayOpts.offered : substitute.offered
+      ask = classOfferSituation(draft.serviceName ?? 'this', dayLabel, dayOpts.text, substitute.text)
     }
     await updateSessionContext(db, session.id, {
       ...ctx, slotDraft: draft, clarificationAttempts: newAttempts,
@@ -1886,23 +1919,26 @@ async function handleBookingIntent(
   // confirmation step, so the PA never asserts a class that isn't on the schedule.
   if (business && await classInstanceMissing(db, business.id, svc, slotStart)) {
     const { time: _dropTime, ...draftKeep } = draft
-    const suggestion = await buildDayOptionsText(db, business, localParts(slotStart, businessTimezone).dateStr, businessTimezone, svc.id, ctx.negotiationConstraints)
+    const missDateStr = localParts(slotStart, businessTimezone).dateStr
+    const suggestion = await buildDayOptionsText(db, business, missDateStr, businessTimezone, svc.id, ctx.negotiationConstraints, null, true)
+    // Same-day empty/all-full → substitute the next REAL class so we never dead-end the lead.
+    const substitute = suggestion.text
+      ? NO_SUGGESTION
+      : await suggestNextClassesText(db, business, svc.id, businessTimezone, ctx.negotiationConstraints)
+    const offeredAlts = suggestion.text ? suggestion.offered : substitute.offered
     await updateSessionContext(db, session.id, {
       ...ctx, slotDraft: draftKeep, clarificationAttempts: 0,
-      ...(suggestion.offered.length > 0 ? { lastOfferedSlots: suggestion.offered } : {}),
+      ...(offeredAlts.length > 0 ? { lastOfferedSlots: offeredAlts } : {}),
     }, 'waiting_clarification')
-    const classTimesText = suggestion.text
     const situation = [
       `${svc.name} doesn't run at the time the customer asked — it only runs at set class times, so that exact time can't be booked.`,
-      classTimesText
-        ? `Offer these actual scheduled times and ask which they'd like: ${classTimesText}.`
-        : `There are no more ${svc.name} classes on that day. Don't invent a time — offer to check another day.`,
+      classOfferSituation(svc.name, formatLocalDate(missDateStr, businessTimezone), suggestion.text, substitute.text),
     ].filter(Boolean).join(' ')
     const reply = await genReply({
       businessTimezone,
       businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
       situation,
-    }, { focusDay: { dateStr: localParts(slotStart, businessTimezone).dateStr, serviceTypeId: svc.id } })
+    }, { focusDay: { dateStr: missDateStr, serviceTypeId: svc.id } })
     return { reply, sessionComplete: false }
   }
 
@@ -2250,10 +2286,17 @@ async function handleHoldConfirmation(
     const openSuggestion = !classModeMiss && business
       ? await suggestOpenSlotsText(db, business, pendingSlot.serviceTypeId, new Date(pendingSlot.start), new Date(pendingSlot.end), businessTimezone, ctx.negotiationConstraints)
       : NO_SUGGESTION
+    const classDateStr = localParts(new Date(pendingSlot.start), businessTimezone).dateStr
     const classSuggestion = classModeMiss && business
-      ? await buildDayOptionsText(db, business, localParts(new Date(pendingSlot.start), businessTimezone).dateStr, businessTimezone, pendingSlot.serviceTypeId, ctx.negotiationConstraints)
+      ? await buildDayOptionsText(db, business, classDateStr, businessTimezone, pendingSlot.serviceTypeId, ctx.negotiationConstraints, null, true)
       : NO_SUGGESTION
-    const offeredAlternatives = classModeMiss ? classSuggestion.offered : openSuggestion.offered
+    // Class same-day empty/all-full → substitute the next REAL class on a later day.
+    const classSubstitute = classModeMiss && business && !classSuggestion.text
+      ? await suggestNextClassesText(db, business, pendingSlot.serviceTypeId, businessTimezone, ctx.negotiationConstraints)
+      : NO_SUGGESTION
+    const offeredAlternatives = classModeMiss
+      ? (classSuggestion.text ? classSuggestion.offered : classSubstitute.offered)
+      : openSuggestion.offered
     await updateSessionContext(
       db,
       session.id,
@@ -2275,9 +2318,7 @@ async function handleHoldConfirmation(
       : classModeMiss
         ? [
             `${pendingSlot.serviceName} doesn't run at the time the customer asked — it only runs at set class times, so that time can't be booked.`,
-            classTimesText
-              ? `Offer these actual scheduled times and ask which they'd like: ${classTimesText}.`
-              : `There are no more ${pendingSlot.serviceName} classes on that day. Don't invent a time — offer to check another day.`,
+            classOfferSituation(pendingSlot.serviceName, formatLocalDate(classDateStr, businessTimezone), classTimesText, classSubstitute.text),
           ].filter(Boolean).join(' ')
       : [
           `The requested slot is unavailable because ${sanitiseReason(result.reason)}.`,
