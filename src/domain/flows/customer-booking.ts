@@ -172,6 +172,38 @@ export function resolveContinuationFocusDay(
   return thisTurnDateStr ?? draftDateStr ?? lastInquiryDateStr
 }
 
+/**
+ * H19 (T2b.3) — every Branch-4 inquiry hands the occupancy gate a focus day, even when the
+ * customer scoped none. Without one, Gate-3 signal-a (the fresh-spine backstop) never runs, so
+ * an unscoped "nothing available" answer built on a TRANSIENT-empty availability load is trusted
+ * blindly. Best-effort precedence: the day the customer scoped → the soonest day we actually
+ * surfaced an open option for this turn (genuinely open) → today as a floor. The gate only ever
+ * acts on this when the reply itself asserts no availability AND names no concrete time, so a
+ * broad floor cannot misfire on an ordinary answer. Pure. Always returns a focus (never undefined).
+ */
+export function bestEffortInquiryFocusDay(
+  resolvedDay: { ok: boolean; dateStr?: string } | null,
+  offered: ReadonlyArray<{ start: string; serviceTypeId?: string }>,
+  inquiryServiceId: string | undefined,
+  tz: string,
+  now: Date,
+): { dateStr: string; serviceTypeId?: string } {
+  const withSvc = (dateStr: string, svc: string | undefined): { dateStr: string; serviceTypeId?: string } =>
+    svc ? { dateStr, serviceTypeId: svc } : { dateStr }
+  if (resolvedDay && resolvedDay.ok && resolvedDay.dateStr) {
+    return withSvc(resolvedDay.dateStr, inquiryServiceId)
+  }
+  // Soonest genuinely-open day surfaced this turn (ISO strings sort chronologically).
+  const earliest = offered.map((o) => o.start).sort()[0]
+  if (earliest) {
+    const svc = offered.find((o) => o.start === earliest)?.serviceTypeId ?? inquiryServiceId
+    return withSvc(localParts(new Date(earliest), tz).dateStr, svc)
+  }
+  // Floor: today. A transient-empty load must not let an unscoped "nothing available" stand
+  // unchecked — the gate re-reads today's fresh spine and corrects if it is genuinely open.
+  return withSvc(localParts(now, tz).dateStr, inquiryServiceId)
+}
+
 function formatSlotDate(date: Date, tz: string): string {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, weekday: 'long', day: 'numeric', month: 'long',
@@ -1381,7 +1413,7 @@ export async function handleBookingFlow(
           transcript,
           customerMemory: extractMemory(updatedCtx),
           ...knowledgeFields,
-        }, (resolvedDay && resolvedDay.ok) ? { focusDay: { dateStr: resolvedDay.dateStr, ...(inquiryService ? { serviceTypeId: inquiryService.id } : {}) } } : undefined)
+        }, { focusDay: bestEffortInquiryFocusDay(resolvedDay, inquiryOffered, inquiryService?.id, businessTimezone, new Date()) })
         // F3a/S3: the model signalled it can't answer → relay the question to the owner FOR
         // REAL and reply honestly, instead of fabricating "I'll check with the studio".
         if (isAskStudioSentinel(inquiryReply)) {

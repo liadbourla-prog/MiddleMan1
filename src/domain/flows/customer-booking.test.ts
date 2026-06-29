@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -253,6 +253,39 @@ describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day
   })
   it('returns undefined when all empty', () => {
     expect(resolveContinuationFocusDay(undefined, undefined, undefined)).toBeUndefined()
+  })
+})
+
+describe('bestEffortInquiryFocusDay — H19 (T2b.3): unscoped inquiries still get an occupancy focus', () => {
+  const tz = 'Asia/Jerusalem'
+  const now = new Date('2026-06-30T09:00:00.000Z') // 12:00 local → 2026-06-30
+
+  it('uses the customer-scoped day when one resolved', () => {
+    const f = bestEffortInquiryFocusDay({ ok: true, dateStr: '2026-07-05' }, [], 'svc-yoga', tz, now)
+    expect(f).toEqual({ dateStr: '2026-07-05', serviceTypeId: 'svc-yoga' })
+  })
+
+  it('unscoped: anchors on the SOONEST genuinely-open day we surfaced this turn', () => {
+    const offered = [
+      { start: '2026-07-04T07:00:00.000Z', end: '2026-07-04T08:00:00.000Z', serviceTypeId: 'svc-pil' },
+      { start: '2026-07-02T07:00:00.000Z', end: '2026-07-02T08:00:00.000Z', serviceTypeId: 'svc-yoga' },
+    ]
+    const f = bestEffortInquiryFocusDay(null, offered, undefined, tz, now)
+    expect(f).toEqual({ dateStr: '2026-07-02', serviceTypeId: 'svc-yoga' })
+  })
+
+  it('unscoped + transient-empty availability (no offered slots): floors to TODAY so the gate can re-read a genuinely-open spine', () => {
+    const f = bestEffortInquiryFocusDay(null, [], 'svc-yoga', tz, now)
+    expect(f).toEqual({ dateStr: '2026-06-30', serviceTypeId: 'svc-yoga' })
+  })
+
+  it('unscoped, no offered, no inferred service: still floors to TODAY (no service scope)', () => {
+    const f = bestEffortInquiryFocusDay(null, [], undefined, tz, now)
+    expect(f).toEqual({ dateStr: '2026-06-30' })
+  })
+
+  it('never returns undefined — every inquiry hands the gate a focus day', () => {
+    expect(bestEffortInquiryFocusDay({ ok: false } as never, [], undefined, tz, now)).toBeDefined()
   })
 })
 
