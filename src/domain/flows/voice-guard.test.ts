@@ -126,10 +126,11 @@ describe('hasGrovel', () => {
 })
 
 describe('hasDeadEnd', () => {
-  it('flags a flat negative with no forward step (En + He)', () => {
+  it('flags a real unavailability assertion with no forward step (En + He)', () => {
     expect(hasDeadEnd('That time is not available.')).toBe(true)
     expect(hasDeadEnd('אין מקום בשיעור הזה.')).toBe(true)
     expect(hasDeadEnd("We're fully booked.")).toBe(true)
+    expect(hasDeadEnd('Sunday is fully booked.')).toBe(true)
   })
 
   it('does NOT flag a negative paired with a forward step (offered time / question / next)', () => {
@@ -137,6 +138,14 @@ describe('hasDeadEnd', () => {
     expect(hasDeadEnd('אין מקום מחר, אבל יש יום אחר פנוי')).toBe(false)
     expect(hasDeadEnd('That slot is not available — want another day?')).toBe(false)
     expect(hasDeadEnd('אין מקום, אעביר לסטודיו שיחזרו אליך')).toBe(false)
+  })
+
+  it('does NOT flag bare negation that is not an unavailability assertion (calibration)', () => {
+    // "No problem." / "אין בעיה." are negation, not unavailability. They must stay
+    // false, or monitor-mode floods with benign replies and loses calibration value.
+    expect(hasDeadEnd('No problem.')).toBe(false)
+    expect(hasDeadEnd('אין בעיה.')).toBe(false)
+    expect(hasDeadEnd('No worries, talk soon')).toBe(false)
   })
 
   it('does NOT flag a clean positive reply', () => {

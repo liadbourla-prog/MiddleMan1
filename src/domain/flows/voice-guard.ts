@@ -130,13 +130,17 @@ export function hasGrovel(text: string): boolean {
 }
 
 // ── 7. Dead end ────────────────────────────────────────────────────────────
-// A negative/unavailability statement with NO forward step. Conservative: fires
+// A genuine UNAVAILABILITY assertion with NO forward step. Conservative: fires
 // only when the text asserts unavailability AND contains NEITHER a question NOR
 // any forward-step marker (an offered time, "another day", "next", "instead",
-// "check", a handoff). Monitor-only, high-recall within those bounds.
+// "check", a handoff). Monitor-only — but unavailability is the gate, NOT bare
+// negation. The unavailability signal is `assertsNoAvailability` (shared with the
+// slot-fabrication guard), supplemented only by the two genuine-unavailability
+// phrasings it happens to miss ("not available" / "unavailable"). Bare negations
+// like "No problem." / "אין בעיה." are deliberately NOT triggers — they are
+// negation, not unavailability, and would flood the monitor log with benign replies.
 const LOCAL_NO_AVAIL_RE: RegExp[] = [
-  /\bnot\s+available\b/i, /\bcan'?t\b/i, /\bcannot\b/i, /\bunavailable\b/i,
-  /\bno\b/i, /אין\b/, /\bfully\s+booked\b/i,
+  /\bnot\s+available\b/i, /\bunavailable\b/i,
 ]
 const FORWARD_STEP_RE: RegExp[] = [
   /\d{1,2}:\d{2}/, // an offered clock time
