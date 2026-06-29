@@ -4,6 +4,8 @@ import type { CustomerIntentOutput, ManagerInstructionOutput, OperatorActionOutp
 import { middlemanExplainBlock } from './middleman-identity.js'
 import { buildVoiceCore } from './voice.js'
 import { MODELS } from './models.js'
+import { detectActionClaims, type ActionClaim } from '../../domain/flows/reply-guard.js'
+import { findUnbackedTimes } from '../../domain/flows/slot-fabrication-guard.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
@@ -1271,16 +1273,83 @@ function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T
   })
 }
 
+/**
+ * The proactive seam's output gate (Unified Anti-Fabrication Gate — Seam C, T2a.1).
+ *
+ * The ~29 worker/initiation sends share this one door. The gate ENFORCES the ACTION class
+ * only when the caller supplies a structured `backedActions` set (swap to the caller's
+ * `fallback` template on an unbacked completed-action claim) — so the existing callers, which
+ * pass no truth set, are unchanged and only MONITOR-logged. Time is enforced ONLY where a
+ * caller supplies `allowedTimes` (RED-TEAM D3 — most workers have no allowlist, so blanket
+ * time-enforcement here would be inert or over-fire; waitlist truthfulness is T2a.2's
+ * fresh-spine re-validate, not this gate). The gate fires only on its narrow spans (a
+ * completed-action verb, a clock time) — warmth/glue is never touched, and the `fallback`
+ * (e.g. dunning's pay-link-bearing template) is returned verbatim on a swap, link intact.
+ */
+export function gateProactiveBody(body: string, opts: {
+  language: 'he' | 'en'
+  fallback: string
+  backedActions?: ReadonlySet<ActionClaim> | undefined
+  allowedTimes?: Iterable<string> | undefined
+  businessId?: string | undefined
+}): { body: string; swapped: boolean } {
+  const claims = detectActionClaims(body, opts.language)
+  const unbackedTimes = opts.allowedTimes ? findUnbackedTimes(body, opts.allowedTimes) : []
+
+  // ENFORCE action: a structured truth set was supplied, so an unbacked completed-action claim
+  // is a fabrication → swap to the safe template.
+  if (opts.backedActions) {
+    const unbacked = claims.filter((c) => !opts.backedActions!.has(c))
+    if (unbacked.length > 0 || unbackedTimes.length > 0) {
+      console.warn('[proactive-gate] unbacked claim — swapped to template', {
+        gate: 'proactive', businessId: opts.businessId, claims: unbacked, times: unbackedTimes,
+      })
+      return { body: opts.fallback, swapped: true }
+    }
+    return { body, swapped: false }
+  }
+
+  // ENFORCE time where an allowlist was supplied even without backedActions (D3 — opt-in).
+  if (unbackedTimes.length > 0) {
+    console.warn('[proactive-gate] unbacked time — swapped to template', {
+      gate: 'proactive', businessId: opts.businessId, times: unbackedTimes,
+    })
+    return { body: opts.fallback, swapped: true }
+  }
+
+  // MONITOR: no truth set → observe the softer classes (H8/H12 are monitored, not closed).
+  if (claims.length > 0) {
+    console.warn('[proactive-gate] unverified claim (monitor-only)', {
+      gate: 'proactive', businessId: opts.businessId, claims,
+    })
+  }
+  return { body, swapped: false }
+}
+
 export async function generateProactiveCustomerMessage(input: {
   businessName: string
   language: 'he' | 'en'
   situation: string
   fallback: string
   timeoutMs?: number
+  // Optional structured truth (T2a.1). When `backedActions` is supplied the gate ENFORCES the
+  // action class (swap to `fallback`); otherwise it monitor-logs. `allowedTimes` opts into time
+  // enforcement (D3). Most callers pass neither — they get the structural chokepoint + monitor.
+  backedActions?: ReadonlySet<ActionClaim>
+  allowedTimes?: Iterable<string>
+  businessId?: string
 }): Promise<string> {
   const systemPrompt = PROACTIVE_PERSONA
     .replace('{businessName}', input.businessName)
     .replace('{language}', input.language === 'he' ? 'he (Hebrew)' : 'en (English)')
+
+  const gate = (body: string): string => gateProactiveBody(body, {
+    language: input.language,
+    fallback: input.fallback,
+    backedActions: input.backedActions,
+    allowedTimes: input.allowedTimes,
+    businessId: input.businessId,
+  }).body
 
   const call = (async (): Promise<string> => {
     try {
@@ -1288,7 +1357,9 @@ export async function generateProactiveCustomerMessage(input: {
         contents: `Situation: ${input.situation}`,
         config: { systemInstruction: systemPrompt, maxOutputTokens: 512, temperature: 0.3 },
       })
-      return result.text?.trim() || input.fallback
+      const text = result.text?.trim()
+      // The fallback is already safe (template) — only the LLM-generated body needs gating.
+      return text ? gate(text) : input.fallback
     } catch {
       return input.fallback
     }
