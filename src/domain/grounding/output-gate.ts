@@ -31,26 +31,28 @@ import { buildAllowedTimes, type TurnLedger } from './turn-ledger.js'
 // ── Safe fallbacks (assert nothing false) + correctives. Owned by the gate now. ──────
 
 // Safe clarification when the LLM keeps asserting a booking that was never made
-// (cardinal "said done, didn't do" backstop — see reply-guard.ts).
+// (cardinal "said done, didn't do" backstop — see reply-guard.ts). Warm, claims nothing,
+// moves forward with one question (owner #3a: honest is never robotic).
 export const BOOKING_NOT_CONFIRMED_FALLBACK: Record<'he' | 'en', string> = {
-  he: 'רגע, עוד לא סגרנו את זה — לאיזה יום ושעה בא לך?',
-  en: "Hang on — that's not booked yet. What day and time works for you?",
+  he: 'רגע, עדיין לא קבעתי כלום — לאיזה יום ושעה בא לך, ואני אסדר?',
+  en: "Hang on — I haven't booked anything yet. What day and time works for you and I'll sort it?",
 }
 
 // Safe reply when the model keeps stating times the spine never offered (a fabricated-
 // availability claim that survived one regeneration). States no time at all — better to
-// ask than to offer a slot that does not exist / is blocked.
+// ask than to offer a slot that does not exist / is blocked. Owner D1 wording: steer with
+// "open / available" framing, NEVER "real time" (that implies the customer asked for a fake one).
 export const FABRICATED_TIME_FALLBACK: Record<'he' | 'en', string> = {
-  he: 'בוא נמצא לך זמן שמתאים — לאיזה יום שאבדוק עבורך?',
-  en: "Let's find a time that works for you — which day should I check?",
+  he: 'בוא נמצא לך שעה פנויה שמתאימה — איזה יום הכי נוח לך?',
+  en: "Let's get you into an open slot that works — which day suits you best?",
 }
 
 // Safe reply when the model insists a day/class is full while the spine surfaced real
 // open options this turn (occupancy fabrication, survived one regeneration). Asserts NO
-// fullness and invents no time — invites the customer to pick a time.
+// fullness and invents no time — surfaces that the day is open and invites a time.
 export const OCCUPANCY_FALLBACK: Record<'he' | 'en', string> = {
-  he: 'יש עדיין מקומות פנויים באותו יום — איזו שעה מתאימה לך?',
-  en: 'There are still open spots that day — which time works for you?',
+  he: 'יש עדיין מקומות פנויים באותו יום — איזו שעה הכי מתאימה לך?',
+  en: 'That day actually still has open spots — which time works best for you?',
 }
 
 // Appended to the situation when the first draft falsely claimed the day/class is full
