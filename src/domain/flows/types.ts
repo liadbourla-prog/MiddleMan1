@@ -164,6 +164,11 @@ export interface BookingFlowContext {
   // strongest signal — and corrects a stale "full". Naturally dropped when the next turn
   // names a different day (that day wins). See resolveContinuationFocusDay.
   lastInquiryFocus?: { dateStr: string; serviceTypeId?: string }
+  // WS3-T3.5: a bare same-day weekday ("Sunday" when today IS Sunday) is ambiguous —
+  // the customer may mean today or the same day next week. When today still has open
+  // sessions we ask one warm question and stash the two candidate dates here so the
+  // next turn binds the answer ("today" / "next week") without re-resolving.
+  pendingWeekdayClarification?: { weekday: number; todayStr: string; nextWeekStr: string; serviceTypeId?: string }
   [key: string]: unknown
 }
 

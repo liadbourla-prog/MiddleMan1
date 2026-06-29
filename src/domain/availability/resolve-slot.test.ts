@@ -39,12 +39,36 @@ describe('resolveRequestedDate — relative days', () => {
 
 describe('resolveRequestedDate — weekday', () => {
   it('resolves the nearest future occurrence (Tuesday from a Sunday → +2)', () => {
-    // Tuesday = 2; today Sun = 0 → 2026-06-09
+    // Tuesday = 2; today Sun = 0 → 2026-06-09. Non-today weekday keeps the BARE shape
+    // (no ambiguousToday / nextWeekStr leak — G4 safety).
     expect(resolveRequestedDate({ ...empty, weekday: 2 }, TZ, NOW)).toEqual({ ok: true, dateStr: '2026-06-09' })
+    expect(resolveRequestedDate({ ...empty, weekday: 2 }, TZ, NOW)).not.toHaveProperty('ambiguousToday')
   })
 
-  it('weekday === today resolves to today (time gate handles past-time separately)', () => {
-    expect(resolveRequestedDate({ ...empty, weekday: 0 }, TZ, NOW)).toEqual({ ok: true, dateStr: '2026-06-07' })
+  // WS3-T3.5: a BARE same-day weekday (no proximity word, no relativeDay) is now flagged
+  // ambiguousToday — it could mean today or the same day next week. (Rewrites the old
+  // silent-today contract this task changes.)
+  it('bare weekday === today is flagged ambiguousToday with the next-week candidate', () => {
+    expect(resolveRequestedDate({ ...empty, weekday: 0 }, TZ, NOW)).toEqual({
+      ok: true,
+      dateStr: '2026-06-07',
+      ambiguousToday: true,
+      nextWeekStr: '2026-06-14',
+    })
+  })
+
+  it("weekdayAnchor 'this' on a same-day weekday resolves to today, no ambiguity", () => {
+    expect(resolveRequestedDate({ ...empty, weekday: 0, weekdayAnchor: 'this' }, TZ, NOW)).toEqual({
+      ok: true,
+      dateStr: '2026-06-07',
+    })
+  })
+
+  it("weekdayAnchor 'next' on a same-day weekday rolls a week out", () => {
+    expect(resolveRequestedDate({ ...empty, weekday: 0, weekdayAnchor: 'next' }, TZ, NOW)).toEqual({
+      ok: true,
+      dateStr: '2026-06-14',
+    })
   })
 
   it('next_week modifier pushes the occurrence a week out', () => {

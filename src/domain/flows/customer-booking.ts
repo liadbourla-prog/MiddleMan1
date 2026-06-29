@@ -534,6 +534,28 @@ export function classOfferSituation(
   return `There are no more ${serviceName} classes on ${dayLabel}, and nothing else is scheduled in the period ahead. Warmly let them know, and in a single question ask whether they'd like you to check another day or to let the studio know they're after this — never invent a time, and keep the conversation moving.`
 }
 
+// WS3-T3.5: a bare same-day weekday ("Sunday" when today IS Sunday) is ambiguous — the
+// customer may mean today or the same day next week. PURE 3-state decision over today's
+// sessions that have NOT yet started (the rest of the day):
+//   'ask'  → some today-session is still bookable → ask "today or next week?"
+//   'full' → sessions remain today but every one is full → say so + offer next real classes
+//   'roll' → every session already started → silently roll to next week
+export function decideAmbiguousTodayWeekday(
+  liveClasses: { spotsLeft: number }[], // today's sessions that have NOT yet started
+  livePrivateOpen: boolean, // any open private slot still to come today
+): 'ask' | 'roll' | 'full' {
+  if (liveClasses.some((c) => c.spotsLeft > 0) || livePrivateOpen) return 'ask'
+  if (liveClasses.length > 0) return 'full' // sessions remain today but all full
+  return 'roll' // every session already started → next week
+}
+
+// WS3-T3.5 VOICE-GATE: the "today or next week?" ask. English-neutral situation instruction;
+// the LLM emits in the detected language. One warm first-person question — no numbered menu,
+// no yes/no — naming the service and "next week" to keep it moving toward booking.
+export function ambiguousTodayWeekdayAsk(serviceName: string, weekdayLabel: string): string {
+  return `The customer asked to book ${serviceName} on ${weekdayLabel}, and that weekday is in fact TODAY — they may have meant today or the same day next week. There are still open ${serviceName} sessions today. In ONE warm, first-person question, check whether they'd like one of today's remaining sessions or the same day next week — do not present a numbered menu, do not ask a yes/no, and keep it moving toward booking.`
+}
+
 /**
  * Schedule-driven gate decision: is the requested slot off-schedule for a class service?
  *
@@ -1705,17 +1727,39 @@ async function handleBookingIntent(
   // We never re-ask something already captured. Internal state only (G2).
   const draft: NonNullable<BookingFlowContext['slotDraft']> = { ...(ctx.slotDraft ?? {}) }
 
+  // WS3-T3.5: consume a pending "today or next week?" clarification FIRST. Last turn we
+  // asked because a bare same-day weekday was ambiguous; bind this turn's answer to one of
+  // the two stashed dates, then clear the pending marker (whatever the answer was — a
+  // different concrete day falls through to normal resolution below, which wins).
+  if (ctx.pendingWeekdayClarification) {
+    const pending = ctx.pendingWeekdayClarification
+    const a = slot?.weekdayAnchor ?? null
+    if (slot?.relativeDay === 'today' || a === 'this') draft.dateStr = pending.todayStr
+    else if (slot?.relativeDay === 'next_week' || a === 'next') draft.dateStr = pending.nextWeekStr
+    // else: a different concrete day this turn → normal resolution below wins.
+    const { pendingWeekdayClarification: _clearedPending, ...restCtx } = ctx
+    ctx = restCtx as BookingFlowContext
+  }
+
   // Date — resolved DETERMINISTICALLY from structured pieces; LLM never computes.
   let dateProblem: string | null = null
+  let ambiguousTodayWeekday: { weekday: number; todayStr: string; nextWeekStr: string } | null = null
   if (slot && (slot.relativeDay || slot.weekday != null || slot.explicitDate)) {
     const parts: RequestedDateParts = {
       relativeDay: slot.relativeDay ?? null,
       weekday: slot.weekday ?? null,
+      weekdayAnchor: slot.weekdayAnchor ?? null,
       explicitDate: slot.explicitDate ?? null,
     }
     const resolved = resolveRequestedDate(parts, businessTimezone, now)
-    if (resolved.ok) draft.dateStr = resolved.dateStr
-    else if (resolved.reason !== 'no_date') dateProblem = resolved.reason
+    if (resolved.ok) {
+      draft.dateStr = resolved.dateStr
+      // WS3-T3.5: bare same-day weekday — the resolver flags it; the actual ask/roll/full
+      // decision needs the resolved SERVICE, so we defer it to AFTER service resolution.
+      if (resolved.ambiguousToday && resolved.nextWeekStr && slot.weekday != null) {
+        ambiguousTodayWeekday = { weekday: slot.weekday, todayStr: resolved.dateStr, nextWeekStr: resolved.nextWeekStr }
+      }
+    } else if (resolved.reason !== 'no_date') dateProblem = resolved.reason
   }
   if (slot?.time) draft.time = { hour: slot.time.hour, minute: slot.time.minute }
 
@@ -1788,6 +1832,55 @@ async function handleBookingIntent(
       situation: 'The customer has struggled to land on a workable date/time after several tries, and there are genuinely no upcoming openings to offer. Warmly suggest it might be quickest to sort out by phone with the business — but stay open: invite them to name another day and you will keep trying. Do NOT end the conversation or say goodbye.',
     })
     return { reply, sessionComplete: false }
+  }
+
+  // ── WS3-T3.5: bare same-day weekday — today or same day next week? ──────────
+  // The resolver flagged ambiguity; the decision needs the resolved SERVICE, so it runs
+  // HERE (after service resolution). If no service is known yet, skip — the missing-pieces
+  // gate below asks for the service first and next turn re-runs this branch.
+  if (ambiguousTodayWeekday && draft.serviceTypeId && business) {
+    const serviceTypeId = draft.serviceTypeId
+    const serviceName = draft.serviceName ?? 'this'
+    const todayStr = ambiguousTodayWeekday.todayStr // == business-local today
+    // Single DB fetch with now=midnight disables past-filtering → ALL of today's sessions.
+    const dayMidnight = resolveSlotStart(todayStr, { hour: 0, minute: 0 }, businessTimezone)
+    const fullDay = await listDayOptions(db, business, todayStr, businessTimezone, { serviceTypeId, now: dayMidnight })
+    // Split in memory against the REAL now: only sessions still to come today are "live".
+    const liveClasses = fullDay.classes.filter((c) => c.start.getTime() >= now.getTime())
+    const livePrivateOpen = fullDay.privateOpenings.some((p) => p.slots.some((s) => s.getTime() >= now.getTime()))
+    const decision = decideAmbiguousTodayWeekday(liveClasses, livePrivateOpen)
+
+    if (decision === 'roll') {
+      // Every session already started → silently roll to next week; fall through to normal flow.
+      draft.dateStr = ambiguousTodayWeekday.nextWeekStr
+    } else if (decision === 'ask') {
+      const weekdayLabel = formatLocalDate(todayStr, businessTimezone)
+      await updateSessionContext(db, session.id, {
+        ...ctx,
+        slotDraft: draft,
+        pendingWeekdayClarification: { weekday: ambiguousTodayWeekday.weekday, todayStr, nextWeekStr: ambiguousTodayWeekday.nextWeekStr, serviceTypeId },
+      }, 'waiting_clarification')
+      const reply = await genReply({
+        businessTimezone,
+        businessName, language: lang, transcript, ...persona, customerMemory: memoryForActiveService(ctx, serviceName),
+        situation: `${firstMsgPrefix}${ambiguousTodayWeekdayAsk(serviceName, weekdayLabel)}`,
+      })
+      return { reply, sessionComplete: false }
+    } else {
+      // 'full': sessions remain today but all full → say so + offer the next real classes.
+      const substitute = await suggestNextClassesText(db, business, serviceTypeId, businessTimezone, ctx.negotiationConstraints)
+      await updateSessionContext(db, session.id, {
+        ...ctx,
+        slotDraft: draft,
+        ...(substitute.offered.length > 0 ? { lastOfferedSlots: substitute.offered } : {}),
+      }, 'waiting_clarification')
+      const reply = await genReply({
+        businessTimezone,
+        businessName, language: lang, transcript, ...persona, customerMemory: memoryForActiveService(ctx, serviceName),
+        situation: `${firstMsgPrefix}${classOfferSituation(serviceName, formatLocalDate(todayStr, businessTimezone), null, substitute.text)}`,
+      })
+      return { reply, sessionComplete: false }
+    }
   }
 
   // ── A bad date (past / impossible / ambiguous): clarify, don't echo it back ─

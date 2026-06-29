@@ -59,6 +59,7 @@ export const customerIntentSchema = z.object({
       hasSpecificTime: z.boolean().catch(false),
       relativeDay: z.enum(['today', 'tomorrow', 'day_after_tomorrow', 'this_week', 'next_week']).nullable().catch(null),
       weekday: z.number().int().min(0).max(6).nullable().catch(null),
+      weekdayAnchor: z.enum(['this', 'next']).nullable().catch(null),
       explicitDate: z
         .object({
           year: z.number().int().nullable().catch(null),
@@ -154,6 +155,7 @@ Return a JSON object with EXACTLY this structure (all fields required):
     "hasSpecificTime": boolean,
     "relativeDay": "today" | "tomorrow" | "day_after_tomorrow" | "this_week" | "next_week" | null,
     "weekday": 0-6 | null,
+    "weekdayAnchor": "this" | "next" | null,
     "explicitDate": { "year": number|null, "month": 1-12|null, "day": 1-31|null } | null,
     "time": { "hour": 0-23, "minute": 0-59 } | null,
     "timeOfDay": "morning" | "afternoon" | "evening" | null,
@@ -186,6 +188,7 @@ Rules:
   - hasSpecificDate: true if any concrete day is identifiable (relativeDay other than this_week/next_week, a weekday, or an explicitDate with day+month). false for vague ("sometime next week").
   - hasSpecificTime: true only when "time" is filled. false for vague ("morning").
   - dateAmbiguous: true ONLY for "this_week"/"next_week" with no weekday. Explicit day+month dates and named weekdays are NEVER ambiguous — set false.
+  - weekdayAnchor: 'this' when the customer points at the imminent occurrence of a named weekday ('today', 'this Sunday', 'coming Sunday', 'ראשון הקרוב', 'היום'); 'next' for an explicit next-week occurrence ('next Sunday', 'ראשון הבא'); null for a BARE weekday with no proximity word ('Sunday', 'ביום ראשון'). Only meaningful when weekday is set.
 - avoidConstraints: capture time windows or days the customer RULES OUT — what they do NOT want, not what they want. Set to null unless the customer states an exclusion.
   - "no mornings"/"בלי בוקר"/"לא בבוקר" → beforeHour 12. "nothing before 4"/"לא לפני 16:00" → beforeHour 16. "no evenings"/"בלי ערב" → afterHour 17. "nothing after 6pm"/"לא אחרי 18:00" → afterHour 18. "not Thursdays"/"לא בימי חמישי" → weekdays [4]; combine multiple days. Null fields that aren't stated; combine fields when several exclusions appear in one message.
   - This is ONLY for excluded windows used to FIND a slot. The specific time the customer is asking to book goes in slotRequest.time, NEVER here.

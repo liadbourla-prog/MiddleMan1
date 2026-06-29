@@ -9,6 +9,7 @@ export interface CustomerIntentOutput {
     // for back-compat only and are IGNORED by Branch 4.)
     relativeDay: 'today' | 'tomorrow' | 'day_after_tomorrow' | 'this_week' | 'next_week' | null
     weekday: number | null // 0=Sun … 6=Sat
+    weekdayAnchor?: 'this' | 'next' | null
     explicitDate: { year: number | null; month: number | null; day: number | null } | null
     time: { hour: number; minute: number } | null
     timeOfDay: 'morning' | 'afternoon' | 'evening' | null
