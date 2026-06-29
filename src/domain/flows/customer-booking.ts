@@ -10,10 +10,9 @@ import { requestBooking, confirmBooking, cancelBooking } from '../booking/engine
 import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
-import { assertsBookingConfirmed } from './reply-guard.js'
-import { observeVoiceTells } from './voice-guard.js'
-import { extractClockTimes, findUnbackedTimes, canonicalTime, extractFullTimes, assertsNoAvailability, extractDayScopedTimes, daysShareOpenTime } from './slot-fabrication-guard.js'
-import { buildAllowedTimes } from '../grounding/turn-ledger.js'
+import { canonicalTime } from './slot-fabrication-guard.js'
+import { buildTurnLedger } from '../grounding/turn-ledger.js'
+import { gateReply } from '../grounding/output-gate.js'
 import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
@@ -705,36 +704,8 @@ export function memoryForActiveService(ctx: BookingFlowContext, activeServiceNam
 // customer hits 3 quickly, so allow a little more patience before nudging.
 const MAX_CLARIFICATION_ATTEMPTS = 4
 
-const BOOKING_NOT_CONFIRMED_FALLBACK: Record<'he' | 'en', string> = {
-  he: 'רגע, עוד לא סגרנו את זה — לאיזה יום ושעה בא לך?',
-  en: "Hang on — that's not booked yet. What day and time works for you?",
-}
-
-// Safe reply when the model keeps stating times the spine never offered (a
-// fabricated-availability claim that survived one regeneration). States no time at
-// all — better to ask than to offer a slot that does not exist / is blocked.
-const FABRICATED_TIME_FALLBACK: Record<'he' | 'en', string> = {
-  he: 'בוא נמצא לך זמן שמתאים — לאיזה יום שאבדוק עבורך?',
-  en: "Let's find a time that works for you — which day should I check?",
-}
-
-// Safe reply when the model insists a day/class is full while the spine surfaced
-// real open options this turn (occupancy fabrication, survived one regeneration).
-// Asserts NO fullness and invents no time — invites the customer to pick a time.
-const OCCUPANCY_FALLBACK: Record<'he' | 'en', string> = {
-  he: 'יש עדיין מקומות פנויים באותו יום — איזו שעה מתאימה לך?',
-  en: 'There are still open spots that day — which time works for you?',
-}
-
-// Appended to the situation when the first draft falsely claimed the day/class is
-// full despite real open options being listed. Forces the model back onto them.
-const OCCUPANCY_GUARD_INSTRUCTION =
-  'CRITICAL: There ARE open, bookable options this turn — the times listed above as open / with spots left are real and available right now. Do NOT tell the customer the day, class, or slot is full, fully booked, or that nothing is available. Offer the real open times listed above and ask which one they would like.'
-
-// Appended to the situation when the first draft offered an unbacked time. Forces
-// the model back onto the deterministic, block-aware times already in the situation.
-const TIME_GUARD_INSTRUCTION =
-  'CRITICAL: Your draft offered a time that is NOT available. The ONLY bookable times are those explicitly listed as open times / classes in the context above. Business hours describe when the studio is open, NOT bookable slots — never present a time as available just because it falls within opening hours or between classes. If nothing listed fits what the customer asked, say plainly there is nothing available for that and invite them to pick from the listed options or choose another day. Do NOT state any other clock time as available.'
+// The safe fallbacks + corrective instructions now live in `../grounding/output-gate.ts`
+// (the gate owns them, reused by every seam). makeGenReply delegates to `gateReply`.
 
 // Bound reply function: built once per request with the business's authoritative
 // facts so every customer reply is grounded in real config (no invented services,
@@ -744,126 +715,46 @@ type GenReply = (
   opts?: { bookingConfirmed?: boolean; focusDay?: { dateStr: string; serviceTypeId?: string } },
 ) => Promise<string>
 
-// Reply-vs-state binding guard. Every customer reply goes through here. When the
-// caller has NOT actually persisted a booking this turn (bookingConfirmed falsy)
-// and the drafted reply nonetheless CLAIMS one was made, regenerate once forbidding
-// the claim, then fall back to a safe clarification. Confirmation sites pass
-// bookingConfirmed:true to allow the legitimate "you're booked" wording.
-//
-// `businessFacts` is closed over here and merged into every reply so the LLM is
-// grounded in the real, exhaustive config on EVERY path — not just inquiries.
-// The time-allowlist assembly now lives in `../grounding/turn-ledger.ts` (branch-agnostic,
-// reused by every seam). It is still called PER-CALL here (D1): the ledger holds only the
-// per-turn base (boundary ∪ booking); buildAllowedTimes merges this call's situation +
-// customer-raised times on top. See turn-ledger.ts for the rationale.
-
-// Reply-vs-state binding guard. Every customer reply goes through here. Two output
-// gates run unless the caller asserted a real persisted booking (bookingConfirmed):
-//   1. phantom "booking confirmed" claim (assertsBookingConfirmed) — said-done/didn't,
-//   2. fabricated availability — a clock time the deterministic spine never offered
-//      (the recurring Branch-4 bug: the model interpolating bookable times from open
-//      hours / the class cadence). Each gate regenerates once, then falls back to a
-//      deterministic, time-free reply. This is the single intent-path-agnostic seam.
-//
-// `businessFacts` is closed over here and merged into every reply so the LLM is
-// grounded in the real, exhaustive config on EVERY path — not just inquiries.
-function makeGenReply(
+// Reply-vs-state binding guard — the single intent-path-agnostic Branch-4 seam. Every
+// customer reply funnels through here: a draft is generated, then run through the unified
+// output gate (`gateReply`, ../grounding/output-gate.ts), which enforces the booking, time,
+// and occupancy claim-classes (detect → regenerate-once → safe fallback) and monitors the
+// rest. `businessFacts`/`actionLedger` are closed over and merged into every reply so the
+// LLM is grounded in real, exhaustive config on EVERY path — not just inquiries. The
+// per-turn truth ledger holds only the stable base; the gate rebuilds the time allowlist
+// PER-CALL from this call's situation + customer-raised times (D1).
+export function makeGenReply(
   businessFacts: string,
   actionLedger: string,
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
   dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
   businessId?: string,
 ): GenReply {
+  const ledger = buildTurnLedger({
+    businessFacts,
+    actionLedger,
+    baseAllowedTimes: timeGuard,
+    occupancySpine: dayHasOpenOptions,
+    businessId,
+  })
   return async (input, opts = {}) => {
     const grounded = {
       ...input,
       ...(businessFacts ? { businessFacts } : {}),
       ...(actionLedger ? { actionLedger } : {}),
     }
-    let reply = await generateCustomerReply(grounded)
-    const replySurfacesAnyTime = (text: string): boolean => extractClockTimes(text).length > 0
-    if (opts.bookingConfirmed) return observeVoiceTells(reply, { businessId, language: input.language })
-
-    // Gate 1 — phantom booking-confirmed claim.
-    if (assertsBookingConfirmed(reply, input.language)) {
-      const corrected = await generateCustomerReply({
-        ...grounded,
-        situation: `${input.situation}\n\nCRITICAL: No booking has been made or confirmed. Do NOT state or imply the appointment is booked, reserved, registered, or done. If a decision is needed, ask for it plainly.`,
-      })
-      reply = assertsBookingConfirmed(corrected, input.language)
-        ? BOOKING_NOT_CONFIRMED_FALLBACK[input.language]
-        : corrected
-    }
-
-    // Gate 2 — fabricated availability (a clock time the spine never offered).
-    const allowed = buildAllowedTimes(input, timeGuard)
-    if (findUnbackedTimes(reply, allowed).length > 0) {
-      const corrected = await generateCustomerReply({
-        ...grounded,
-        situation: `${input.situation}\n\n${TIME_GUARD_INSTRUCTION}`,
-      })
-      reply = findUnbackedTimes(corrected, allowed).length > 0
-        ? FABRICATED_TIME_FALLBACK[input.language]
-        : corrected
-    }
-
-    // Gate 3 — fabricated unavailability (occupancy). Two signals, strongest first:
-    //  (a) Fresh-spine backstop: if a focusDay is in play and the reply asserts blanket
-    //      fullness, RE-READ that day from the spine. If it has open options, the claim
-    //      is a laundered lie regardless of what the situation text held — regenerate
-    //      with the real options, then OCCUPANCY_FALLBACK. (Kills cross-turn laundering.)
-    //      Signal (a) returns early when a focusDay exists and the spine read fires, so
-    //      signal (b) only runs when there is no focusDay or the spine read was clean.
-    //  (b) Situation signal (back-compat): open interior times present in the situation
-    //      that the reply hides, now compared DAY-SCOPED so a cross-day HH:MM coincidence
-    //      no longer spares a specific-slot false-full.
-    if (assertsNoAvailability(reply)) {
-      // (a) spine backstop. Skip when the reply ALREADY surfaces a concrete time — a
-      // time-scoped negative that lists same-day alternatives ("no class at 15:00; there
-      // are 10:00/12:00/16:00") is correct and must not be regenerated (F2b: the broadened
-      // schedule-empty detector now matches "אין שיעור יוגה ב-15:00", so without this guard
-      // a correct same-day-alternatives reply would be needlessly re-rolled). Signal (b)
-      // still day-scopes such replies. The blanket bug ("no classes that day", no time
-      // surfaced) has no time, so it still regenerates here.
-      if (opts.focusDay && !replySurfacesAnyTime(reply)) {
-        const spine = await dayHasOpenOptions(opts.focusDay.dateStr, opts.focusDay.serviceTypeId)
-        if (spine.open) {
-          const corrected = await generateCustomerReply({
-            ...grounded,
-            situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}${spine.text ? ` Real open options: ${spine.text}` : ''}`,
-          })
-          const out = assertsNoAvailability(corrected) && !replySurfacesAnyTime(corrected)
-            ? OCCUPANCY_FALLBACK[input.language]
-            : corrected
-          return observeVoiceTells(out, { businessId, language: input.language }, { isSafeFallback: out === OCCUPANCY_FALLBACK[input.language] })
-        }
-      }
-      // (b) situation signal, day-scoped
-      const situationOpen = extractDayScopedTimes(input.situation ?? '')
-      for (const set of situationOpen.values()) {
-        for (const t of timeGuard.boundaryTimes) set.delete(t)
-        for (const t of timeGuard.bookingTimes) set.delete(t)
-      }
-      for (const t of extractFullTimes(input.situation ?? '')) {
-        for (const set of situationOpen.values()) set.delete(t)
-      }
-      const anyOpen = [...situationOpen.values()].some((s) => s.size > 0)
-      if (anyOpen && !daysShareOpenTime(situationOpen, extractDayScopedTimes(reply))) {
-        const corrected = await generateCustomerReply({
-          ...grounded,
-          situation: `${input.situation}\n\n${OCCUPANCY_GUARD_INSTRUCTION}`,
-        })
-        reply = assertsNoAvailability(corrected) && !daysShareOpenTime(situationOpen, extractDayScopedTimes(corrected))
-          ? OCCUPANCY_FALLBACK[input.language]
-          : corrected
-      }
-    }
-
-    return observeVoiceTells(reply, { businessId, language: input.language }, {
-      isSafeFallback: reply === FABRICATED_TIME_FALLBACK[input.language]
-        || reply === OCCUPANCY_FALLBACK[input.language]
-        || reply === BOOKING_NOT_CONFIRMED_FALLBACK[input.language],
+    const reply = await generateCustomerReply(grounded)
+    // Regenerate once, appending the gate's corrective to THIS call's situation — exactly
+    // the `${situation}\n\n${instruction}` shape the inline gates used.
+    const regen = (instruction: string): Promise<string> =>
+      generateCustomerReply({ ...grounded, situation: `${input.situation}\n\n${instruction}` })
+    const result = await gateReply(reply, {
+      ledger,
+      input: { language: input.language, situation: input.situation, transcript: input.transcript },
+      opts,
+      regen,
     })
+    return result.reply
   }
 }
 

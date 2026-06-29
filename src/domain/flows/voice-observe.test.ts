@@ -74,32 +74,25 @@ describe('observeVoiceTells — MONITOR-ONLY (detect + log, never mutate)', () =
 })
 
 // Source-introspection guard (mirrors customer-booking.test.ts readFileSync pattern):
-// the three makeGenReply return points must each be wrapped in observeVoiceTells so a
-// future edit can't silently bypass the deterministic Gate 7 (non-bypass invariant).
-describe('non-bypass invariant — makeGenReply returns are wrapped in observeVoiceTells', () => {
-  it('every makeGenReply return point routes through observeVoiceTells', () => {
-    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
-    // Isolate the makeGenReply body so we count ITS returns, not other functions'.
-    const fnStart = src.indexOf('function makeGenReply(')
+// every gateReply return point must be wrapped in observeVoiceTells so a future edit
+// can't silently bypass the deterministic Gate 7 (non-bypass invariant). The Branch-4
+// voice monitor moved into the unified gate (grounding/output-gate.ts); makeGenReply
+// delegates every reply to it.
+describe('non-bypass invariant — gateReply returns are wrapped in observeVoiceTells', () => {
+  it('every gateReply return point routes through observeVoiceTells', () => {
+    const src = readFileSync(new URL('../grounding/output-gate.ts', import.meta.url), 'utf8')
+    const fnStart = src.indexOf('export async function gateReply(')
     expect(fnStart).toBeGreaterThan(-1)
-    // Scope to the INNER async reply function — the factory's `return async (...) => {`
-    // is itself a return we must not count (it yields the function, not a reply).
-    const innerStart = src.indexOf('return async (input, opts', fnStart)
-    expect(innerStart).toBeGreaterThan(-1)
-    const after = src.slice(innerStart)
-    // The body ends at the next top-level function/export declaration.
-    const endRel = after.indexOf('\nexport function buildBusinessFacts(')
-    expect(endRel).toBeGreaterThan(-1)
-    const body = after.slice('return async (input, opts'.length, endRel)
+    const body = src.slice(fnStart) // gateReply is the last symbol in the file
 
-    // Every `return ` inside the inner reply function must hand its value to observeVoiceTells.
-    const returns = (body.match(/\breturn\s+/g) ?? []).length
-    const observed = (body.match(/return observeVoiceTells\(/g) ?? []).length
+    // Every value-returning `return {` inside gateReply must hand its reply to observeVoiceTells.
+    const returns = (body.match(/\breturn\s+\{/g) ?? []).length
+    const observed = (body.match(/reply: observeVoiceTells\(/g) ?? []).length
     expect(returns).toBeGreaterThanOrEqual(3)
     expect(observed).toBe(returns)
 
     // And the safe-fallback exemption is wired on the occupancy + final exits.
-    expect(body).toMatch(/isSafeFallback: out === OCCUPANCY_FALLBACK\[input\.language\]/)
-    expect(body).toMatch(/isSafeFallback: reply === FABRICATED_TIME_FALLBACK\[input\.language\]/)
+    expect(body).toMatch(/isSafeFallback: out === OCCUPANCY_FALLBACK\[language\]/)
+    expect(body).toMatch(/isSafeFallback: reply === FABRICATED_TIME_FALLBACK\[language\]/)
   })
 })

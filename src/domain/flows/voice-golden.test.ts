@@ -221,30 +221,35 @@ describe('golden BAD replies — the gate flags real bot-tells', () => {
 // This file is the CANONICAL home of the invariant for BOTH branches.
 // ════════════════════════════════════════════════════════════════════════════
 
-describe('non-bypass invariant — Branch-4: every makeGenReply return is wrapped in observeVoiceTells', () => {
-  it('every reply-exit of makeGenReply routes through observeVoiceTells', () => {
-    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+describe('non-bypass invariant — Branch-4: every gateReply return is wrapped in observeVoiceTells', () => {
+  it('every reply-exit of the unified gate routes through observeVoiceTells', () => {
+    // The Branch-4 voice monitor now lives in the unified gate (grounding/output-gate.ts).
+    // makeGenReply delegates every reply to gateReply, whose every exit wraps observeVoiceTells.
+    const src = readFileSync(new URL('../grounding/output-gate.ts', import.meta.url), 'utf8')
 
-    const fnStart = src.indexOf('function makeGenReply(')
+    const fnStart = src.indexOf('export async function gateReply(')
     expect(fnStart).toBeGreaterThan(-1)
+    const body = src.slice(fnStart) // gateReply is the last symbol in the file
 
-    // Scope to the INNER async reply function: the factory's `return async (...) =>` is
-    // itself a `return` that yields the function (not a reply) and must not be counted.
-    const innerStart = src.indexOf('return async (input, opts', fnStart)
-    expect(innerStart).toBeGreaterThan(-1)
-    const after = src.slice(innerStart)
-    const endRel = after.indexOf('\nexport function buildBusinessFacts(')
-    expect(endRel).toBeGreaterThan(-1)
-    const body = after.slice('return async (input, opts'.length, endRel)
-
-    // Every `return ` inside the inner reply function must hand its value to observeVoiceTells.
-    const returns = (body.match(/\breturn\s+/g) ?? []).length
-    const observed = (body.match(/return observeVoiceTells\(/g) ?? []).length
+    // Every value-returning `return {` in gateReply must hand its reply to observeVoiceTells.
+    const returns = (body.match(/\breturn\s+\{/g) ?? []).length
+    const observed = (body.match(/reply: observeVoiceTells\(/g) ?? []).length
     expect(returns).toBeGreaterThanOrEqual(3)
     expect(observed).toBe(returns)
 
     // The import is present so the wrapper is the real Gate-7 observer, not a shadow.
-    expect(src).toMatch(/import\s+\{\s*observeVoiceTells\s*\}\s+from\s+'\.\/voice-guard\.js'/)
+    expect(src).toMatch(/import\s+\{\s*observeVoiceTells\s*\}\s+from\s+'\.\.\/flows\/voice-guard\.js'/)
+  })
+
+  it('makeGenReply delegates to gateReply — it cannot produce a reply that bypasses the gate', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    const fnStart = src.indexOf('export function makeGenReply(')
+    expect(fnStart).toBeGreaterThan(-1)
+    const body = src.slice(fnStart, src.indexOf('\nexport function buildBusinessFacts('))
+    // Its ONLY reply-producing return is gateReply's result — no inline reply path remains.
+    expect(body).toMatch(/await gateReply\(/)
+    expect(body).toMatch(/return result\.reply/)
+    expect(body).not.toMatch(/return observeVoiceTells\(/)
   })
 })
 
