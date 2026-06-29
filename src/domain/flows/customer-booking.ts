@@ -2562,6 +2562,27 @@ async function handleHoldConfirmation(
   })
 
   if (!result.ok) {
+    // F1d/S1 — the customer ALREADY holds this exact class. That is a POSITIVE state, not a
+    // dead slot: reassure them their spot is confirmed. Routing it through the generic
+    // re-offer below laundered "you're already booked" into "that's unavailable, here's
+    // another date" — the July-5 drift. Short-circuit BEFORE the substitute path. The
+    // booking genuinely exists, so the confirm-claim is true (bookingConfirmed-exempt).
+    if (result.code === 'already_booked') {
+      await completeSession(db, session.id)
+      const bookedDate = formatSlotDate(new Date(pendingSlot.start), businessTimezone)
+      const bookedTime = formatSlotTime(new Date(pendingSlot.start), businessTimezone)
+      const reply = await genReply({
+        businessTimezone,
+        businessName,
+        language: lang,
+        situation: `The customer is ALREADY booked for ${pendingSlot.serviceName} on ${bookedDate} at ${bookedTime}. Warmly reassure them their spot is confirmed and they're on the list — do NOT offer a different time or day, and do NOT imply anything is unavailable.`,
+        transcript,
+        ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}),
+        customerMemory: extractMemory(ctx),
+      }, { bookingConfirmed: true })
+      return { reply, sessionComplete: true }
+    }
+
     // Reshuffle engine entry (decision X2 / A5): a reschedule onto a taken slot, with the
     // feature enabled, becomes a proactive swap campaign instead of a dead-end. The
     // customer keeps their current booking (deferred-cancel) until an approved plan applies.

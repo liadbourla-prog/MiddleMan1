@@ -115,6 +115,27 @@ describe('pendingDecision escape-hatch — dispatcher strips pending state on re
   })
 })
 
+// F1d/S1 — a duplicate "already booked into this class" engine result must reassure the
+// customer (their spot is confirmed), NEVER fall through to the generic re-offer/substitute
+// path that laundered it into a different-date offer (the July-5 drift). This reads the
+// source so a future edit that drops the early reassurance branch fails loudly.
+describe('already-booked reassurance — duplicate result short-circuits the re-offer (F1d)', () => {
+  it('the !result.ok handler branches on code === already_booked BEFORE the substitute path', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    const idxAlready = src.indexOf("result.code === 'already_booked'")
+    const idxReshuffle = src.indexOf('openReshuffleCampaign')
+    expect(idxAlready).toBeGreaterThan(-1)
+    // The reassurance branch precedes the re-offer block (reshuffle entry → class substitute).
+    expect(idxAlready).toBeLessThan(idxReshuffle)
+    // It reassures (ALREADY booked) and does not re-offer a different time.
+    expect(src).toMatch(/ALREADY booked for \$\{pendingSlot\.serviceName\}/)
+  })
+  it('the engine tags the class duplicate guard with code: already_booked', () => {
+    const src = readFileSync(new URL('../booking/engine.ts', import.meta.url), 'utf8')
+    expect(src).toMatch(/already booked into this class".*code: 'already_booked'/s)
+  })
+})
+
 describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
   it('this-turn day wins over draft and lastInquiry', () => {
     expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')

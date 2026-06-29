@@ -25,9 +25,15 @@ import type { CalendarBlockType, Booking } from '../../db/schema.js'
 
 const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15', 10)
 
+// Structured failure discriminator so callers branch deterministically instead of
+// string-matching `reason`. `already_booked`: the customer already holds an active
+// booking for this exact (service, slot) — a POSITIVE state to reassure on, never a
+// re-offer of a different time (F1d/S1: the duplicate guard was being laundered into a
+// "that's unavailable, here's another date" substitute).
+export type BookingFailureCode = 'already_booked'
 export type BookingEngineResult =
   | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean; pendingPayment?: boolean; pendingApproval?: boolean }
-  | { ok: false; reason: string }
+  | { ok: false; reason: string; code?: BookingFailureCode }
 
 // Temporal policy gate: past-slot, min-buffer, max-days-ahead. Returns a human
 // English sentence (sanitised into customer wording downstream) or null when OK.
@@ -637,7 +643,7 @@ async function requestGroupClassBooking(
         .limit(1)
 
       if (duplicate) {
-        return { ok: false as const, reason: "You're already booked into this class" }
+        return { ok: false as const, reason: "You're already booked into this class", code: 'already_booked' as const }
       }
 
       const [newBooking] = await tx
