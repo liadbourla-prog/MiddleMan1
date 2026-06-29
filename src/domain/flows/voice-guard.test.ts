@@ -52,6 +52,11 @@ describe('hasYesNoMenu', () => {
     expect(hasYesNoMenu('Sound good?')).toBe(false)
     expect(hasYesNoMenu('מתאים לך מחר בבוקר?')).toBe(false)
   })
+
+  it('does NOT flag a benign "לא הצלחתי…" clarifying reply (only a real yes/no MENU fires)', () => {
+    expect(hasYesNoMenu('לא הצלחתי להבין')).toBe(false)
+    expect(hasYesNoMenu('מתאים לך? (כן/לא)')).toBe(true)
+  })
 })
 
 describe('hasBilingualLeak', () => {

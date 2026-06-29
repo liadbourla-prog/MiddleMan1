@@ -54,7 +54,9 @@ export function hasNumberedMenu(text: string): boolean {
 // Reuses the BOT_TELLS yes/no entries plus structural regexes.
 const YES_NO_PHRASES: string[] = [
   ...BOT_TELLS.en.filter((p) => /yes|no/.test(p)),
-  ...BOT_TELLS.he.filter((p) => p.includes('כן') || p.includes('לא')),
+  // A yes/no MENU contains BOTH כן and לא — requiring both drops failure phrases
+  // like "לא הצלחתי…" that merely contain לא, while keeping "(כן/לא)".
+  ...BOT_TELLS.he.filter((p) => p.includes('כן') && p.includes('לא')),
 ]
 const YES_NO_MENU_RE: RegExp[] = [
   /\(\s*(?:yes|כן)\s*\/\s*(?:no|לא)\s*\)/i,
