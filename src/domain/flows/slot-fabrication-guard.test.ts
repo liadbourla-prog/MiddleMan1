@@ -128,6 +128,14 @@ describe('assertsNoAvailability — blanket fullness claim', () => {
     it('does NOT flag "full of classes" (busy, positive)', () => {
       expect(assertsNoAvailability('היום מלא בשיעורים')).toBe(false)
     })
+    it('does NOT flag "full of/and X" positive phrasings (bare-מלא followed by Hebrew word)', () => {
+      expect(assertsNoAvailability('השבוע מלא ומגוון')).toBe(false)
+      expect(assertsNoAvailability('מלא אנשים מרוצים')).toBe(false)
+    })
+    it('still flags clause-end "[day]/everything is full" and completely-full compounds', () => {
+      expect(assertsNoAvailability('הכל מלא')).toBe(true)
+      expect(assertsNoAvailability('מלא לגמרי')).toBe(true)
+    })
     it('does NOT flag "my time ran out"', () => {
       expect(assertsNoAvailability('אזל הזמן שלי')).toBe(false)
     })

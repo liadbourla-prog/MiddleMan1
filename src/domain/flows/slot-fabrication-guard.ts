@@ -111,8 +111,10 @@ const NO_AVAILABILITY_RE: RegExp[] = [
   /no\s+more\s+(?:spots?|slots?)\b/i,
   /התמלא/, /מלא\s*לגמרי/, /מלא\s*לחלוטין/, /הכל\s*מלא/, /הכול\s*מלא/, /כבר\s*מלא/,
   /אין\s*מקום/, /אין\s*מקומות/, /אין\s*זמינות/, /אין\s*שיעורים\s*פנויים/, /נתפסו\s*כל/, /הכל\s*תפוס/,
-  // "[day] full" / "everything full" — but NOT "מלא ב<…>" (full OF something).
-  /(?:^|\s|[א-ת])מלא(?!\s*ב)/,
+  // "[day] full" / "everything full" — clause-end predicate only, NOT "מלא <Hebrew word>"
+  // ("מלא ב…" full OF, "מלא ומגוון" full AND varied, "מלא אנשים" full of people). The
+  // completely-full compounds "מלא לגמרי"/"מלא לחלוטין" still fire via their own patterns above.
+  /(?:^|\s|[א-ת])מלא(?!\s*[א-ת])/,
   // "spots ran out" — אזל must be adjacent to a capacity noun (not "אזל הזמן").
   /אזל(?:ו)?\s+(?:ה)?(?:מקומות|מקום|תורים)/,
   // "spots taken/full" — נתפסו/תפוסים adjacent to מקומות, either order.
