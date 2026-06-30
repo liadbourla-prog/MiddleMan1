@@ -197,6 +197,12 @@ export interface BookingFlowContext {
         serviceTypeId: string
         slotStart: string
       }
+  // WL-3: a pending "keep my place on the waitlist?" offer for a full requested slot, surfaced
+  // by the lead-protection (full-slot) path alongside the later-session substitute. Carried
+  // across the turn so a follow-up "yes" joins THAT exact slot via handleWaitlistJoinRequest
+  // instead of being re-parsed as a fresh booking. ISO strings (matching pendingSlot). Cleared
+  // on the paths that clear other pending state.
+  pendingWaitlistJoin?: { serviceTypeId: string; slotStart: string; slotEnd: string }
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'
   cancellationCandidates?: string[]

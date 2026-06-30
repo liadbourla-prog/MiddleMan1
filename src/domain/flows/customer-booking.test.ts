@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -569,5 +569,96 @@ describe('explicit joinWaitlist wiring (WL-4)', () => {
     const idxSwitch = src.indexOf("case 'booking':")
     expect(idxWire).toBeGreaterThan(-1)
     expect(idxWire).toBeLessThan(idxSwitch)
+  })
+})
+
+// WL-3 — when the customer asks for a SPECIFIC concrete class that EXISTS but is FULL, the
+// offerable renderer (which DROPS full classes so they're never presented as bookable) must
+// SURFACE that exact dropped slot up to the caller so the lead-protection site can ADD a
+// waitlist offer alongside the later-session substitute (never a dead-end).
+describe('renderDayOptions — surfaces the FULL requested slot (WL-3)', () => {
+  const tz = 'Asia/Jerusalem'
+  const dateStr = '2026-07-05'
+  const fullStart = new Date('2026-07-05T07:00:00.000Z') // 10:00 local
+  const fullEnd = new Date('2026-07-05T08:00:00.000Z')
+  const openStart = new Date('2026-07-05T13:00:00.000Z') // 16:00 local
+  const openEnd = new Date('2026-07-05T14:00:00.000Z')
+  const mkDay = () => ({
+    dateStr,
+    classes: [
+      { serviceTypeId: 'svc-yoga', serviceName: 'Yoga', start: fullStart, end: fullEnd, spotsTotal: 8, spotsLeft: 0 },
+      { serviceTypeId: 'svc-yoga', serviceName: 'Yoga', start: openStart, end: openEnd, spotsTotal: 8, spotsLeft: 3 },
+    ],
+    privateOpenings: [],
+  })
+
+  it('offerable=true + requestedStart on the FULL class → sets fullRequestedSlot, drops it from offered', () => {
+    const r = renderDayOptions(mkDay(), dateStr, tz, { offerable: true, requestedStart: fullStart })
+    expect(r.fullRequestedSlot).toBeDefined()
+    expect(r.fullRequestedSlot!.serviceTypeId).toBe('svc-yoga')
+    expect(r.fullRequestedSlot!.slotStart).toBe(fullStart.toISOString())
+    expect(r.fullRequestedSlot!.slotEnd).toBe(fullEnd.toISOString())
+    // The full class is never presented as bookable; the open 16:00 still is.
+    expect(r.offered.some((o) => o.start === fullStart.toISOString())).toBe(false)
+    expect(r.offered.some((o) => o.start === openStart.toISOString())).toBe(true)
+  })
+
+  it('requestedStart on an OPEN class → no fullRequestedSlot (normal booking proceeds)', () => {
+    const r = renderDayOptions(mkDay(), dateStr, tz, { offerable: true, requestedStart: openStart })
+    expect(r.fullRequestedSlot).toBeUndefined()
+  })
+
+  it('no requestedStart → backward-compatible, never sets fullRequestedSlot', () => {
+    const r = renderDayOptions(mkDay(), dateStr, tz, { offerable: true })
+    expect(r.fullRequestedSlot).toBeUndefined()
+  })
+})
+
+// WL-3 — the lead-protection (full-slot) site ADDS a waitlist offer as an ADDITIONAL branch:
+// it offers BOTH "keep your place" for the full requested slot AND the later-session substitute
+// in ONE message, stores the offered slot in pendingWaitlistJoin, and a follow-up "yes" reuses
+// handleWaitlistJoinRequest (NOT a fresh booking). These read the source so a future edit that
+// drops the wiring fails loudly.
+describe('full-slot waitlist offer + follow-up binding (WL-3)', () => {
+  const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+
+  it('detects the full requested slot via renderDayOptions/buildDayOptionsText requestedStart', () => {
+    // The full-slot site passes the resolved slotStart through to the offerable renderer.
+    expect(src).toMatch(/requestedStart/)
+    expect(src).toMatch(/fullRequestedSlot/)
+  })
+
+  it('surfaces BOTH the waitlist offer AND the later-session substitute (never a dead-end)', () => {
+    // The substitute (suggestNextClassesText) is still computed at the full-slot site so the
+    // offer never replaces the substitute — both go in one message.
+    const idxFull = src.indexOf('fullRequestedSlot')
+    expect(idxFull).toBeGreaterThan(-1)
+    // A waitlist-offer situation string mentions keeping their place + messaging when a spot opens.
+    expect(src).toMatch(/keep their place[\s\S]*spot opens|the moment a spot opens/)
+    // It must NOT instruct a YES/NO menu (voice gate).
+    expect(src).not.toMatch(/reply YES\/NO|reply 'yes' or 'no'/i)
+  })
+
+  it('stores the offered slot in pendingWaitlistJoin so a follow-up yes can act on it', () => {
+    expect(src).toMatch(/pendingWaitlistJoin:\s*dayOpts\.fullRequestedSlot/)
+  })
+
+  it("binds a follow-up 'yes' to handleWaitlistJoinRequest (NOT a fresh booking) and clears the field", () => {
+    // The binding guards on the pending offer, parses a confirmation, and reuses the WL-4 helper.
+    expect(src).toMatch(/updatedCtx\.pendingWaitlistJoin/)
+    expect(src).toMatch(/pendingWaitlistJoin[\s\S]*parseConfirmation\(messageText\)/)
+    expect(src).toMatch(/pendingWaitlistJoin[\s\S]*handleWaitlistJoinRequest\(/)
+  })
+
+  it('is placed before fresh intent extraction so the yes is not re-parsed as a new booking', () => {
+    const idxBind = src.indexOf('updatedCtx.pendingWaitlistJoin')
+    const idxSwitch = src.indexOf("case 'booking':")
+    expect(idxBind).toBeGreaterThan(-1)
+    expect(idxBind).toBeLessThan(idxSwitch)
+  })
+
+  it('clears pendingWaitlistJoin on the paths that clear other pending state', () => {
+    // The redirect/clear destructure that strips pendingSlot/pendingDecision also drops pendingWaitlistJoin.
+    expect(src).toMatch(/const \{[^}]*pendingWaitlistJoin:[^}]*\}\s*=\s*ctx/)
   })
 })
