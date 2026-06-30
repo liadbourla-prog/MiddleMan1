@@ -1401,7 +1401,7 @@ These apply to all four branches:
 
 1. **The LLM never directly mutates state.** In every branch, state changes go through the deterministic pipeline. The LLM proposes, informs, and phrases — it never applies.
 2. **Situation strings passed to the LLM must be customer/operator-safe.** No internal field names, error codes, or engine messages.
-3. **Language is always resolved before the LLM is called.** The branch resolves the reply language; the LLM enforces it strictly.
+3. **Language — and Hebrew addressee gender — are always resolved before the LLM is called.** The branch resolves the reply language; the LLM enforces it strictly. Hebrew **addressee gender** (how the PA addresses the person in the 2nd person — masculine/feminine/unknown) is a sibling of language: resolved pre-LLM by `resolveAddresseeGender` and threaded into the single voice chokepoint `buildVoiceCore(channel, addresseeGender)`, never decided while the model writes. Unknown → masculine floor; never split-gender. This is orthogonal to `botPersona` (the PA's self-voice). See `CHAT_LEVEL_LAWBOOK.md §3.5`.
 4. **Every LLM call has a defined fallback.** Schema validation failures and API errors always fall back gracefully — never to a blank reply or an exposed error.
 
 ---
