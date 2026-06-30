@@ -152,7 +152,7 @@ async function handleStep(
 
     case 'timezone': {
       if (detectsQuestion(text)) {
-        const explanation = await explainOnboardingConcept({ concept: 'timezone', userMessage: text, step: 'timezone', lang })
+        const explanation = await explainOnboardingConcept({ concept: 'timezone', userMessage: text, step: 'timezone', lang, ...(ownerGender ? { addresseeGender: ownerGender } : {}) })
         if (explanation) return { reply: explanation }
       }
       const tz = resolveTimezone(text)
@@ -182,7 +182,7 @@ async function handleStep(
     case 'calendar': {
       if (!data.calendarMode) {
         if (detectsQuestion(text)) {
-          const explanation = await explainOnboardingConcept({ concept: 'calendar', userMessage: text, step: 'calendar', lang })
+          const explanation = await explainOnboardingConcept({ concept: 'calendar', userMessage: text, step: 'calendar', lang, ...(ownerGender ? { addresseeGender: ownerGender } : {}) })
           if (explanation) return { reply: explanation }
         }
         // Parse natural language: does the user want Google or internal?
@@ -249,7 +249,7 @@ async function handleStep(
 
     case 'services': {
       if (detectsQuestion(text)) {
-        const explanation = await explainOnboardingConcept({ concept: 'services', userMessage: text, step: 'services', lang })
+        const explanation = await explainOnboardingConcept({ concept: 'services', userMessage: text, step: 'services', lang, ...(ownerGender ? { addresseeGender: ownerGender } : {}) })
         if (explanation) return { reply: explanation }
       }
       const parsed = parseService(text)
@@ -373,7 +373,7 @@ async function handleStep(
         }
         // Confused (includes plain "כן"/"yes" to an either/or, or a question) — rephrase
         if (detectsQuestion(text)) {
-          const explanation = await explainOnboardingConcept({ concept: 'waba_type', userMessage: text, step: 'waba_guide', lang })
+          const explanation = await explainOnboardingConcept({ concept: 'waba_type', userMessage: text, step: 'waba_guide', lang, ...(ownerGender ? { addresseeGender: ownerGender } : {}) })
           if (explanation) return { reply: explanation }
         }
         const guideTypeRetryReply = await generateProviderOnboardingReply({

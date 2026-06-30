@@ -27,7 +27,7 @@ import { parseConfirmation, type ManagerFlowContext } from '../domain/flows/type
 import { resolveTurnLanguage } from '../domain/flows/language-switch.js'
 import { handleOnboardingMessage } from '../domain/flows/manager-onboarding.js'
 import { handleProviderOnboarding } from '../domain/flows/provider-onboarding.js'
-import { runManagerOrchestratorLoop } from '../adapters/llm/orchestrator.js'
+import { runManagerOrchestratorLoop, resolveOwnerAddresseeGender } from '../adapters/llm/orchestrator.js'
 import { loadDelegatedPermissions } from '../domain/authorization/permissions.js'
 import { logAudit } from '../domain/audit/logger.js'
 import { createCalendarClient } from '../adapters/calendar/client.js'
@@ -1038,6 +1038,16 @@ async function routeManagerMessage(
   const defaultLang: Lang = (business.defaultLanguage as Lang | null | undefined) ?? 'he'
   const lang: Lang = identity.preferredLanguage ?? defaultLang
 
+  // How to address the owner in Hebrew (decision 1) for the keyword-command replies below:
+  // the manager identity's stored value ▸ name ▸ this message's self-morphology. Resolve-only
+  // (the conversational orchestrator path owns persistence); null → masculine floor.
+  const ownerAddresseeGender = resolveOwnerAddresseeGender({
+    stored: identity.addresseeGender ?? null,
+    storedSource: identity.addresseeGenderSource ?? null,
+    ownerName: identity.displayName,
+    message: msg.body,
+  })?.gender ?? null
+
   // The requester just messaged us — their WhatsApp window is open. Flush any outreach-reply
   // notifications that were deferred because the window was previously closed (worker no-ops
   // when there are none). Fire-and-forget; never blocks the manager's own message.
@@ -1048,6 +1058,7 @@ async function routeManagerMessage(
     const rawReport = await buildStatusReport(db, business.id, lang)
     const report = await generateManagerCommandReply({
       businessName: business.name,
+      addresseeGender: ownerAddresseeGender,
       language: lang,
       situation: 'Manager requested the PA status report.',
       dataBlock: rawReport,
@@ -1061,6 +1072,7 @@ async function routeManagerMessage(
     await pausePA(db, business.id, lang)
     const reply = await generateManagerCommandReply({
       businessName: business.name,
+      addresseeGender: ownerAddresseeGender,
       language: lang,
       situation: 'Manager paused the PA. It will no longer respond to customer messages until resumed. Confirm this and tell them to send RESUME to reactivate.',
       fallback: i18n.pause_confirm[lang],
@@ -1073,6 +1085,7 @@ async function routeManagerMessage(
     await resumePA(db, business.id, lang)
     const reply = await generateManagerCommandReply({
       businessName: business.name,
+      addresseeGender: ownerAddresseeGender,
       language: lang,
       situation: 'Manager reactivated the PA. It will now respond to customer messages normally again. Confirm this briefly.',
       fallback: i18n.resume_confirm[lang],
@@ -1085,6 +1098,7 @@ async function routeManagerMessage(
     const rawReport = await buildUpcomingReport(db, business.id, undefined, lang)
     const report = await generateManagerCommandReply({
       businessName: business.name,
+      addresseeGender: ownerAddresseeGender,
       language: lang,
       situation: 'Manager requested the list of upcoming confirmed bookings.',
       dataBlock: rawReport,
@@ -1099,6 +1113,7 @@ async function routeManagerMessage(
     const rawReport = await buildUpcomingReport(db, business.id, datePart, lang)
     const report = await generateManagerCommandReply({
       businessName: business.name,
+      addresseeGender: ownerAddresseeGender,
       language: lang,
       situation: `Manager requested bookings for date: ${datePart}.`,
       dataBlock: rawReport,
@@ -1126,6 +1141,7 @@ async function routeManagerMessage(
       : `Could not confirm payment for customer ${customerPhone}: ${payResult.reason}. Let the manager know briefly.`
     const reply = await generateManagerCommandReply({
       businessName: business.name,
+      addresseeGender: ownerAddresseeGender,
       language: lang,
       situation,
       fallback: paidFallback,
@@ -1139,6 +1155,7 @@ async function routeManagerMessage(
     await markEscalationHandled(db, business.id, customerPhone, lang)
     const reply = await generateManagerCommandReply({
       businessName: business.name,
+      addresseeGender: ownerAddresseeGender,
       language: lang,
       situation: `Manager marked the escalation from ${customerPhone} as handled/resolved. Confirm briefly.`,
       fallback: i18n.escalation_handled[lang](customerPhone),
@@ -1245,6 +1262,7 @@ async function routeManagerMessage(
       await updateSessionContext(db, mgSession.id, { ...mgCtx, languageOverride: chosen, languageSwitchOfferPending: false }, undefined, SESSION_EXPIRY.manager)
       const ack = await generateManagerCommandReply({
         businessName: business.name,
+        addresseeGender: ownerAddresseeGender,
         language: chosen,
         situation: 'The manager confirmed switching the conversation language. Acknowledge briefly in the new language and ask how you can help — do not re-introduce yourself.',
         fallback: chosen === 'he' ? 'מעולה, ממשיכים בעברית. במה אפשר לעזור?' : 'Great, switching to English. How can I help?',

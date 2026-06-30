@@ -644,6 +644,8 @@ export function buildOnboardingSystemPrompt(input: {
   collectedSummary?: string
   extraContext?: string
   transcript?: TranscriptTurn[]
+  // How to address the owner in Hebrew (resolved per-identity). null/undefined → masculine floor.
+  addresseeGender?: 'male' | 'female' | null
 }): string {
   const stepGoal = STEP_GOALS[input.step]?.[input.lang] ?? STEP_GOALS[input.step]?.en ?? 'Ask for the next required piece of information.'
 
@@ -665,7 +667,7 @@ export function buildOnboardingSystemPrompt(input: {
 
   return `You are helping "${input.businessName}" set up their WhatsApp PA, texting them as the service.
 
-${buildVoiceCore('onboarding')}
+${buildVoiceCore('onboarding', input.addresseeGender ?? null)}
 
 Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
 Rules:
@@ -692,6 +694,8 @@ export async function generateOnboardingReply(input: {
   lang: 'he' | 'en'
   extraContext?: string
   transcript?: TranscriptTurn[]
+  // Threaded straight through to buildOnboardingSystemPrompt. null/undefined → masculine floor.
+  addresseeGender?: 'male' | 'female' | null
 }): Promise<string> {
   const systemPrompt = buildOnboardingSystemPrompt(input)
 
@@ -940,12 +944,14 @@ export async function explainOnboardingConcept(input: {
   userMessage: string
   step: string
   lang: 'he' | 'en'
+  // How to address the owner in Hebrew. null/undefined → masculine floor.
+  addresseeGender?: 'male' | 'female' | null
 }): Promise<string> {
   const context = CONCEPT_CONTEXT[input.step] ?? input.concept
 
   const systemPrompt = `You are helping a business owner set up their WhatsApp PA, texting them as the service. They seem confused or are asking a question at the "${input.step}" step.
 
-${buildVoiceCore('onboarding')}
+${buildVoiceCore('onboarding', input.addresseeGender ?? null)}
 
 Language: Write ENTIRELY in ${input.lang === 'he' ? 'Hebrew' : 'English'}.
 Extra rules:
@@ -1578,10 +1584,12 @@ export async function generateManagerCommandReply(input: {
   situation: string
   dataBlock?: string
   fallback: string
+  // How to address the owner in Hebrew. null/undefined → masculine floor.
+  addresseeGender?: 'male' | 'female' | null
 }): Promise<string> {
   const systemPrompt = `You are the PA admin assistant for "${input.businessName}", texting the business owner as the business. They just ran a command and you're responding on WhatsApp.
 
-${buildVoiceCore('manager')}
+${buildVoiceCore('manager', input.addresseeGender ?? null)}
 
 LANGUAGE: reply ENTIRELY in ${input.language === 'he' ? 'Hebrew (עברית)' : 'English'}.
 

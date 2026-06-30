@@ -57,6 +57,18 @@ describe('onboarding infers + threads owner gender', () => {
     await handleProviderOnboarding(sessionDb(session) as never, '+972500000000', 'jerusalem zone please')
     expect(lastGender()).toBeFalsy()
   })
+
+  it('a female owner asking a question reaches explainOnboardingConcept with addresseeGender=female', async () => {
+    const session = {
+      managerPhone: '+972500000000', step: 'timezone', completedAt: null,
+      collectedData: { businessName: 'הסטודיו', language: 'he' },
+    }
+    // Question (has "?") + feminine self-morphology ("אני מעוניינת") → the explainer fires gendered.
+    await handleProviderOnboarding(sessionDb(session) as never, '+972500000000', 'אני מעוניינת, מה זה אזור זמן?')
+    expect(explainOnboardingConcept).toHaveBeenCalled()
+    const call = (explainOnboardingConcept as Mock).mock.calls.at(-1)
+    expect((call?.[0] as { addresseeGender?: unknown } | undefined)?.addresseeGender).toBe('female')
+  })
 })
 
 describe('provisionBusiness persists the captured owner gender', () => {

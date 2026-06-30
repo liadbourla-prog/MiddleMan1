@@ -13,9 +13,24 @@ import { i18n, t, type Lang } from '../i18n/t.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
 import { createPaymentConnectToken, buildPaymentConnectUrl } from '../payments/credentials.js'
 import type { TranscriptTurn } from '../../adapters/llm/types.js'
+import { resolveAddresseeGender, type AddresseeGender } from '../identity/addressee-gender.js'
+import { genderFromName } from '../identity/hebrew-name-gender.js'
+import { inferSelfGenderFromHebrew } from '../identity/hebrew-self-morphology.js'
 
 export interface OnboardingResult {
   reply: string
+}
+
+// How to address the owner in Hebrew (decision 1) for the whole onboarding turn: the manager
+// identity's stored value ▸ name ▸ this message's self-morphology. Resolve-only (the conversational
+// orchestrator owns persistence); null → masculine floor (byte-identical).
+function resolveOwnerGender(identity: ResolvedIdentity, body: string): AddresseeGender | null {
+  return resolveAddresseeGender({
+    stored: identity.addresseeGender ?? null,
+    storedSource: identity.addresseeGenderSource ?? null,
+    nameSignal: genderFromName(identity.displayName),
+    morphologySignal: inferSelfGenderFromHebrew(body),
+  })?.gender ?? null
 }
 
 export async function handleOnboardingMessage(
@@ -29,6 +44,7 @@ export async function handleOnboardingMessage(
   transcript: TranscriptTurn[] = [],
 ): Promise<OnboardingResult> {
   const step = (business.onboardingStep ?? 'business_name') as OnboardingStep
+  const addresseeGender = resolveOwnerGender(identity, msg.body)
 
   // ── Amend a previously-given answer ─────────────────────────────────────────
   // Onboarding steps collect free-form answers, so we DON'T triage every message
@@ -37,29 +53,29 @@ export async function handleOnboardingMessage(
   // e.g. correcting a business-name typo at a later step. The business name is
   // amended in place (no progress lost); other fields re-open their step.
   const amendResult = business.name
-    ? await maybeAmendPriorAnswer(db, msg, business, step, lang, log, transcript)
+    ? await maybeAmendPriorAnswer(db, msg, business, step, lang, log, transcript, addresseeGender)
     : null
   if (amendResult) return amendResult
 
   switch (step) {
     case 'business_name':
-      return handleBusinessNameStep(db, msg, business, lang, log, transcript)
+      return handleBusinessNameStep(db, msg, business, lang, log, transcript, addresseeGender)
     case 'services':
-      return handleServiceStep(db, msg, identity, business, lang, log, transcript)
+      return handleServiceStep(db, msg, identity, business, lang, log, transcript, addresseeGender)
     case 'hours':
-      return handleHoursStep(db, msg, identity, business, lang, log, transcript)
+      return handleHoursStep(db, msg, identity, business, lang, log, transcript, addresseeGender)
     case 'cancellation_policy':
-      return handleCancellationPolicyStep(db, msg, business, lang, log, transcript)
+      return handleCancellationPolicyStep(db, msg, business, lang, log, transcript, addresseeGender)
     case 'payment':
-      return handlePaymentStep(db, msg, business, baseUrl, lang, log, transcript)
+      return handlePaymentStep(db, msg, business, baseUrl, lang, log, transcript, addresseeGender)
     case 'escalation_policy':
-      return handleEscalationPolicyStep(db, msg, business, baseUrl, lang, log, transcript)
+      return handleEscalationPolicyStep(db, msg, business, baseUrl, lang, log, transcript, addresseeGender)
     case 'calendar':
-      return handleCalendarStepWithBody(db, business, baseUrl, msg.body, lang, transcript)
+      return handleCalendarStepWithBody(db, business, baseUrl, msg.body, lang, transcript, addresseeGender)
     case 'customer_import':
-      return handleCustomerImportStep(db, msg, business, baseUrl, lang, log, transcript)
+      return handleCustomerImportStep(db, msg, business, baseUrl, lang, log, transcript, addresseeGender)
     case 'verify':
-      return handleVerifyStep(db, msg, identity, business, lang, log, transcript)
+      return handleVerifyStep(db, msg, identity, business, lang, log, transcript, addresseeGender)
   }
 }
 
@@ -87,6 +103,7 @@ async function maybeAmendPriorAnswer(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult | null> {
   if (!CORRECTION_CUE.test(msg.body)) return null
 
@@ -100,7 +117,7 @@ async function maybeAmendPriorAnswer(
     await db.update(businesses).set({ name: newName }).where(eq(businesses.id, business.id))
     log.info({ businessId: business.id, newName }, 'Onboarding: business name amended')
     const ack = lang === 'he' ? `עדכנתי את שם העסק ל-${newName}.` : `Updated the business name to ${newName}.`
-    const q = await onboardingQuestion(step, newName, lang, { transcript })
+    const q = await onboardingQuestion(step, newName, lang, { transcript, addresseeGender })
     return { reply: `${ack}\n\n${q}` }
   }
 
@@ -110,7 +127,7 @@ async function maybeAmendPriorAnswer(
     await db.update(businesses).set({ onboardingStep: targetStep }).where(eq(businesses.id, business.id))
     log.info({ businessId: business.id, field, targetStep }, 'Onboarding: re-opening step to amend')
     const ack = lang === 'he' ? 'בסדר, בוא נתקן את זה.' : "Sure — let's fix that."
-    const q = await onboardingQuestion(targetStep, business.name ?? '', lang, { isRetry: true, transcript })
+    const q = await onboardingQuestion(targetStep, business.name ?? '', lang, { isRetry: true, transcript, addresseeGender })
     return { reply: `${ack}\n\n${q}` }
   }
 
@@ -126,7 +143,7 @@ async function onboardingQuestion(
   step: string,
   businessName: string,
   lang: Lang,
-  opts: { justConfirmed?: string; collectedSummary?: string; isRetry?: boolean; extraContext?: string; transcript?: TranscriptTurn[] } = {},
+  opts: { justConfirmed?: string; collectedSummary?: string; isRetry?: boolean; extraContext?: string; transcript?: TranscriptTurn[]; addresseeGender?: AddresseeGender | null } = {},
 ): Promise<string> {
   const q = await generateOnboardingReply({
     step,
@@ -137,6 +154,7 @@ async function onboardingQuestion(
     ...(opts.collectedSummary !== undefined ? { collectedSummary: opts.collectedSummary } : {}),
     ...(opts.extraContext !== undefined ? { extraContext: opts.extraContext } : {}),
     ...(opts.transcript !== undefined ? { transcript: opts.transcript } : {}),
+    ...(opts.addresseeGender ? { addresseeGender: opts.addresseeGender } : {}),
   })
   return q || getPrompt(step as OnboardingStep, lang)
 }
@@ -151,8 +169,9 @@ async function notAnswerReply(
   lang: Lang,
   guidance: string,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
-  return { reply: await onboardingQuestion(step, businessName, lang, { isRetry: true, extraContext: guidance, transcript }) }
+  return { reply: await onboardingQuestion(step, businessName, lang, { isRetry: true, extraContext: guidance, transcript, addresseeGender }) }
 }
 
 // ── Step handlers ─────────────────────────────────────────────────────────────
@@ -164,6 +183,7 @@ async function handleBusinessNameStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const parsed = await parseBusinessName(msg.body, lang)
   const displayName = parsed.ok && parsed.data.isBusinessName && parsed.data.name?.trim()
@@ -177,6 +197,7 @@ async function handleBusinessNameStep(
       isRetry: true,
       extraContext: 'The manager replied with a greeting or question instead of a business name. Briefly reassure them (yes, you are set up and listening), then ask again for the name customers should see.',
       transcript,
+      addresseeGender,
     })
     return { reply: retryQ }
   }
@@ -190,6 +211,7 @@ async function handleBusinessNameStep(
   const nextQ = await onboardingQuestion('services', displayName, lang, {
     justConfirmed: displayName,
     transcript,
+    addresseeGender,
   })
   return { reply: nextQ }
 }
@@ -202,8 +224,9 @@ async function handleServiceStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
-  const retryPrompt = await onboardingQuestion('services', business.name, lang, { isRetry: true, transcript })
+  const retryPrompt = await onboardingQuestion('services', business.name, lang, { isRetry: true, transcript, addresseeGender })
 
   // The manager may list several services in one message. Parse them all, then
   // apply each through the deterministic core (applyInstruction → applyServiceChange).
@@ -213,7 +236,7 @@ async function handleServiceStep(
     // of repeating the same prompt.
     return notAnswerReply('services', business.name, lang,
       'The manager did not list any services — they asked a question or seem unsure what counts. In one or two sentences explain that a service is anything a customer can book (e.g. a haircut, a 60-minute yoga class, a consultation), that they can list several at once with rough durations, then ask again what they offer.',
-      transcript)
+      transcript, addresseeGender)
   }
   if (!parsed.ok || !parsed.data.understood || parsed.data.services.length === 0) {
     return { reply: retryPrompt }
@@ -266,6 +289,7 @@ async function handleServiceStep(
   const nextQ = await onboardingQuestion('hours', business.name, lang, {
     justConfirmed: confirmation,
     transcript,
+    addresseeGender,
   })
   return { reply: nextQ }
 }
@@ -278,6 +302,7 @@ async function handleHoursStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const body = msg.body.trim().toLowerCase()
   const is247 = body === '24/7' || body === 'always open' || body === 'always' || body.includes('24/7')
@@ -292,11 +317,12 @@ async function handleHoursStep(
     const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, {
       justConfirmed: lang === 'he' ? '24/7' : '24/7',
       transcript,
+      addresseeGender,
     })
     return { reply: nextQ }
   }
 
-  const retryPrompt = await onboardingQuestion('hours', business.name, lang, { isRetry: true, transcript })
+  const retryPrompt = await onboardingQuestion('hours', business.name, lang, { isRetry: true, transcript, addresseeGender })
 
   // A weekly schedule spans several days; the single-day availability_change
   // schema can't hold it. Parse the whole week, then apply set_hours per day.
@@ -307,7 +333,7 @@ async function handleHoursStep(
       .set({ onboardingStep: 'cancellation_policy', available247: true })
       .where(eq(businesses.id, business.id))
     log.info({ businessId: business.id }, 'Onboarding: hours step complete (24/7 via parser)')
-    const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, { justConfirmed: '24/7', transcript })
+    const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, { justConfirmed: '24/7', transcript, addresseeGender })
     return { reply: nextQ }
   }
 
@@ -316,7 +342,7 @@ async function handleHoursStep(
     // with no concrete hours. Explain rather than repeating the same prompt.
     return notAnswerReply('hours', business.name, lang,
       'The manager did not give usable opening hours — they asked a question, expressed confusion, or said something like "by appointment only" / "flexible". In one or two sentences explain that the PA needs general weekly hours to know when customers may book (e.g. "Sun–Thu 9:00–18:00"), and that they can simply say "24/7" if always available, then ask again. If they work strictly by appointment with no fixed hours, ask for the broad window they are typically reachable.',
-      transcript)
+      transcript, addresseeGender)
   }
 
   if (!parsed.ok || !parsed.data.understood || parsed.data.days.length === 0) {
@@ -374,6 +400,7 @@ async function handleHoursStep(
   const nextQ = await onboardingQuestion('cancellation_policy', business.name, lang, {
     justConfirmed: confirmation,
     transcript,
+    addresseeGender,
   })
   return { reply: nextQ }
 }
@@ -385,6 +412,7 @@ async function handleCancellationPolicyStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
 
@@ -396,7 +424,7 @@ async function handleCancellationPolicyStep(
       // Counter-question / confusion / deferral — don't fabricate a cutoff.
       return notAnswerReply('cancellation_policy', business.name, lang,
         'The manager did not answer the cancellation-cutoff question — they asked what it means, expressed confusion, or deferred. In one or two sentences explain plainly that this is the latest a customer can cancel before their appointment without penalty (e.g. "up to 2 hours before"), then ask again. Note they can say "any time" if they allow cancellations with no restriction.',
-        transcript)
+        transcript, addresseeGender)
     }
     hours = parsed.data.hours
   } else {
@@ -405,7 +433,7 @@ async function handleCancellationPolicyStep(
   }
 
   if (hours === null) {
-    const retryQ = await onboardingQuestion('cancellation_policy', business.name, lang, { isRetry: true, transcript })
+    const retryQ = await onboardingQuestion('cancellation_policy', business.name, lang, { isRetry: true, transcript, addresseeGender })
     return { reply: retryQ }
   }
 
@@ -421,6 +449,7 @@ async function handleCancellationPolicyStep(
   const nextQ = await onboardingQuestion('payment', business.name, lang, {
     justConfirmed: confirmation,
     transcript,
+    addresseeGender,
   })
   return { reply: nextQ }
 }
@@ -454,6 +483,7 @@ async function handlePaymentStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
 
@@ -471,6 +501,7 @@ async function handlePaymentStep(
       const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
         justConfirmed: i18n.ob_payment_immediate[lang],
         transcript,
+        addresseeGender,
       })
       return { reply: nextQ }
     }
@@ -480,7 +511,7 @@ async function handlePaymentStep(
     if (p && !p.isAnswer && !p.paymentMethod) {
       return notAnswerReply('payment_method', business.name, lang,
         'The manager was asked which payment method they accept but replied with a question or unclear text rather than a method. Briefly answer or clarify, then ask again which method they accept, listing examples (bank transfer, Bit, credit card, cash).',
-        transcript)
+        transcript, addresseeGender)
     }
 
     const method = (p?.paymentMethod ?? body.trim()).slice(0, 100)
@@ -491,6 +522,7 @@ async function handlePaymentStep(
     const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
       justConfirmed: i18n.ob_payment_method_confirm[lang](method),
       transcript,
+      addresseeGender,
     })
     const offer = await paymentConnectOffer(db, business.id, msg.fromNumber, baseUrl, lang)
     return { reply: nextQ + offer }
@@ -506,7 +538,7 @@ async function handlePaymentStep(
       // Counter-question / confusion / deferral — don't fabricate a payment gate.
       return notAnswerReply('payment', business.name, lang,
         'The manager did not answer the prepayment question — they asked a question back, expressed confusion, or deferred. In one or two sentences explain plainly that this is about whether a customer must pay before their booking is confirmed (vs. confirming immediately and paying later/in person), then ask again. If they ask which method to use, briefly mention common options (Bit, bank transfer, credit card, cash) but still ask whether prepayment is required.',
-        transcript)
+        transcript, addresseeGender)
     }
     requiresPayment = parsed.data.requiresPayment
     paymentMethod = parsed.data.paymentMethod
@@ -517,7 +549,7 @@ async function handlePaymentStep(
   }
 
   if (requiresPayment === null) {
-    const retryQ = await onboardingQuestion('payment', business.name, lang, { isRetry: true, transcript })
+    const retryQ = await onboardingQuestion('payment', business.name, lang, { isRetry: true, transcript, addresseeGender })
     return { reply: retryQ }
   }
 
@@ -529,6 +561,7 @@ async function handlePaymentStep(
     const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
       justConfirmed: i18n.ob_payment_immediate[lang],
       transcript,
+      addresseeGender,
     })
     return { reply: nextQ }
   }
@@ -542,6 +575,7 @@ async function handlePaymentStep(
     const nextQ = await onboardingQuestion('escalation_policy', business.name, lang, {
       justConfirmed: i18n.ob_payment_method_confirm[lang](paymentMethod),
       transcript,
+      addresseeGender,
     })
     const offer = await paymentConnectOffer(db, business.id, msg.fromNumber, baseUrl, lang)
     return { reply: nextQ + offer }
@@ -554,7 +588,7 @@ async function handlePaymentStep(
   const methodFallback = lang === 'he'
     ? 'מעולה! איזו שיטת תשלום אתם מקבלים? (לדוגמה: העברה בנקאית, ביט, פייבוקס, מזומן)'
     : 'Great! What payment method do you accept? (e.g. bank transfer, PayPal, credit card, cash)'
-  const methodQ = await onboardingQuestion('payment_method', business.name, lang, { transcript })
+  const methodQ = await onboardingQuestion('payment_method', business.name, lang, { transcript, addresseeGender })
   return { reply: methodQ || methodFallback }
 }
 
@@ -566,6 +600,7 @@ async function handleEscalationPolicyStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
 
@@ -578,7 +613,7 @@ async function handleEscalationPolicyStep(
     // escalation rules and silently advance. Explain and re-ask.
     return notAnswerReply('escalation_policy', business.name, lang,
       'The manager did not answer the escalation question — they asked what it means, expressed confusion, or deferred. In one or two sentences explain plainly that escalation means handing the conversation to the owner for things the PA should not handle (e.g. complaints, refunds, or anything it does not understand), give a concrete example, then ask again what should trigger a hand-off. You may note they can simply say "only things you don\'t understand" for a minimal setup.',
-      transcript)
+      transcript, addresseeGender)
   }
 
   if (parsed.ok && parsed.data.step === 'escalation_policy') {
@@ -622,6 +657,7 @@ async function handleEscalationPolicyStep(
     justConfirmed: summary,
     extraContext: `OAuth link for Google Calendar: ${calendarLink}`,
     transcript,
+    addresseeGender,
   })
 
   // Calendar step must include the actual clickable link — append it if LLM didn't include it
@@ -639,6 +675,7 @@ export async function handleCalendarStepWithBody(
   body: string,
   lang: Lang = 'he',
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const lower = body.trim().toLowerCase()
   let wantsInternal = lower === 'internal' || body.trim() === 'פנימי'
@@ -661,6 +698,7 @@ export async function handleCalendarStepWithBody(
     const nextQ = await onboardingQuestion('customer_import', business.name, lang, {
       justConfirmed: i18n.ob_calendar_internal[lang],
       transcript,
+      addresseeGender,
     })
     return { reply: nextQ }
   }
@@ -680,6 +718,7 @@ export async function handleCalendarStepWithBody(
     isRetry: false,
     extraContext: calWaitContext,
     transcript,
+    addresseeGender,
   })
   const calWaitReply = calWaitQ || calWaitFallback
   const calWaitWithUrl = calWaitReply.includes(calendarLink) ? calWaitReply : `${calWaitReply}\n${calendarLink}`
@@ -694,6 +733,7 @@ async function handleCustomerImportStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const choiceResult = await parseImportChoice(msg.body, lang)
   const choice = choiceResult.ok ? choiceResult.data.choice : 'unclear'
@@ -715,6 +755,7 @@ async function handleCustomerImportStep(
       isRetry: false,
       extraContext: `Manager agreed to import. The secure upload link (valid 30 min) is: ${uploadUrl}. It MUST appear on its own line in the reply. Accepted formats: CSV of contacts (name, phone), booking history (name, phone, date, service), or service catalog (name, duration_minutes, price).`,
       transcript,
+      addresseeGender,
     })
     const importLinkReply = importLinkQ || importLinkFallback
     const importLinkWithUrl = importLinkReply.includes(uploadUrl) ? importLinkReply : `${importLinkReply}\n${uploadUrl}`
@@ -727,13 +768,13 @@ async function handleCustomerImportStep(
   if (choice === 'unclear') {
     return notAnswerReply('customer_import', business.name, lang,
       'The manager neither clearly accepted nor declined importing their existing customers — they asked a question or seem unsure. In one or two sentences explain that you can bulk-import their existing customer list or booking history from a CSV/Excel file so people are recognized from day one, that it is optional, then ask again whether they want to import now or skip. If they asked about the file format, mention it accepts a contacts CSV (name, phone) or booking history (name, phone, date, service).',
-      transcript)
+      transcript, addresseeGender)
   }
 
   // choice === 'skip' — they have no list or want to move on.
   await db.update(businesses).set({ onboardingStep: 'verify' }).where(eq(businesses.id, business.id))
   log.info({ businessId: business.id }, 'Onboarding: customer import skipped')
-  const summary = await buildVerifySummary(db, business, lang)
+  const summary = await buildVerifySummary(db, business, lang, addresseeGender)
   const importSkipFallback = `${i18n.ob_import_skip[lang]}\n\n${summary}`
   const importSkipQ = await generateOnboardingReply({
     step: 'verify',
@@ -743,6 +784,7 @@ async function handleCustomerImportStep(
     justConfirmed: lang === 'he' ? 'דילגו על הייבוא' : 'Skipped import',
     extraContext: `Here is the full setup summary to show the manager:\n${summary}`,
     transcript,
+    addresseeGender,
   })
   const importSkipReply = importSkipQ || importSkipFallback
   return { reply: importSkipReply }
@@ -756,6 +798,7 @@ async function handleVerifyStep(
   lang: Lang,
   log: FastifyBaseLogger,
   transcript: TranscriptTurn[] = [],
+  addresseeGender: AddresseeGender | null = null,
 ): Promise<OnboardingResult> {
   const body = msg.body.trim()
 
@@ -788,6 +831,7 @@ async function handleVerifyStep(
       justConfirmed: lang === 'he' ? `ה-PA שלכם פעיל! מספר ה-PA: ${business.whatsappNumber}` : `Your PA is now live! PA number: ${business.whatsappNumber}`,
       extraContext: `Setup is complete. Congratulate them warmly, mention their customers can now text ${business.whatsappNumber}, briefly mention STATUS/UPCOMING/PAUSE commands, then transition to asking about their business brand and voice for the knowledge setup.`,
       transcript,
+      addresseeGender,
     })
     return { reply: completionQ || completionFallback }
   }
@@ -804,7 +848,7 @@ async function handleVerifyStep(
     // Answer it by re-showing the saved setup instead of trying to apply it as a
     // correction (or silently dropping an "unknown" instruction).
     const clarification = classifyResult.ok ? classifyResult.data.clarificationNeeded : null
-    const summary = await buildVerifySummary(db, business, lang)
+    const summary = await buildVerifySummary(db, business, lang, addresseeGender)
     const reply = await generateOnboardingReply({
       step: 'verify',
       businessName: business.name,
@@ -812,6 +856,7 @@ async function handleVerifyStep(
       isRetry: false,
       extraContext: `The manager replied with something that is not a clear change instruction — most likely a question about their setup or about what happens next, not a correction. ${clarification ? `If relevant, address this: ${clarification}. ` : ''}Briefly reassure them their setup is saved, then show this summary and ask them to reply GO to launch, or tell you what to change:\n${summary}`,
       transcript,
+      addresseeGender,
     })
     return { reply: reply || `${summary}\n\n${t('ob_verify_go_prompt', lang)}` }
   }
@@ -856,13 +901,14 @@ async function handleVerifyStep(
     justConfirmed: applyResult.confirmationMessage,
     extraContext: 'A correction was applied. Acknowledge it briefly and tell them to reply GO when they are ready to launch, or send another correction.',
     transcript,
+    addresseeGender,
   })
   return { reply: correctionQ || correctionFallback }
 }
 
 // ── Verify summary builder (exported for import.ts and oauth.ts) ──────────────
 
-export async function buildVerifySummary(db: Db, business: Business, lang: Lang): Promise<string> {
+export async function buildVerifySummary(db: Db, business: Business, lang: Lang, addresseeGender: AddresseeGender | null = null): Promise<string> {
   const services = await db
     .select({ name: serviceTypes.name, durationMinutes: serviceTypes.durationMinutes, maxParticipants: serviceTypes.maxParticipants })
     .from(serviceTypes)
@@ -932,6 +978,7 @@ export async function buildVerifySummary(db: Db, business: Business, lang: Lang)
     situation: 'Show the manager a summary of their PA setup for review. Ask them to reply GO to launch or tell you what to change.',
     dataBlock: rawSummary,
     fallback: rawSummary,
+    ...(addresseeGender ? { addresseeGender } : {}),
   })
   return formattedSummary
 }
