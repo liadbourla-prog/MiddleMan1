@@ -26,6 +26,21 @@ const NO_PATTERNS =
 const NEG_TOKEN =
   /\b(no|not|don'?t|cancel|stop|nope|never)\b|(^|\s)(לא|אל|בטל|עצור|ביטול)(\s|$)/i
 
+// T1.1 — DECLINE/RELEASE token appearing ANYWHERE. A semantic-decline verb ("release the spot",
+// "drop it", "never mind", "let it go") is a refusal of the pending slot that the negation list
+// (NEG_TOKEN) did not enumerate — so "כן תשחרר" (yes, release it) slipped past as an embedded yes
+// and BOOKED against the decline (the live bug). When a decline token co-occurs with an embedded
+// affirmative, the DECLINE WINS. Closed lexical class, mirroring NEG_TOKEN.
+//   • Hebrew: the שחרר family (שחרר/תשחרר/לשחרר/אשחרר — all share the root substring שחרר) + the
+//     noun שחרור (the vav breaks the שחרר substring, so it is listed explicitly).
+//   • English (UNAMBIGUOUS only): release, "free it up", "let it go", "drop it", "never mind", and
+//     "pass" — but NOT "pass by/through/over/along/round" ("pass by" means COME BY, not decline).
+// CONSERVATIVE on purpose: ambiguous tokens (עזוב / ותר / אין צורך) are DEFERRED to a follow-up
+// behind their own tests — "עזוב, כן" can mean "never mind [that], yes". The full 'yes' corpus in
+// types.test.ts:79-160 was verified to contain NONE of these tokens, so this flips nothing there.
+const DECLINE_TOKEN =
+  /(שחרר|שחרור)|\b(release[ds]?|free\s+it\s+up|let\s+it\s+go|drop\s+it|never\s*mind)\b|\bpass\b(?!\s+(by|through|over|along|round))/i
+
 // A reply that OPENS with one of these is an affirmative even when followed by extra
 // words. Single-token forms only (multi-word affirmatives like "go ahead" / "בוא נעשה"
 // are already covered by the strict whole-message YES_PATTERNS above). Includes the
@@ -58,6 +73,11 @@ const INTERROGATIVE_WORDS = new Set([
 
 export function parseConfirmation(text: string): ConfirmationParse {
   if (NO_PATTERNS.test(text)) return 'no'
+  // T1.1 — decline/release precedence. Checked BEFORE the affirmative paths so a release verb
+  // vetoes any embedded "yes": "כן תשחרר" (yes, release it) is a DECLINE of the pending slot, not
+  // a confirmation. Returns 'no' (the hold-confirm handler's decline path makes no booking and
+  // offers another time) — never 'yes'.
+  if (DECLINE_TOKEN.test(text)) return 'no'
   if (YES_PATTERNS.test(text)) return 'yes'
   if (NEG_TOKEN.test(text)) return 'unclear'
   const words = confirmationWords(text)
@@ -134,6 +154,11 @@ export function classifyConfirmWithQuestion(
   messageText: string,
   heldWeekday: number | null,
 ): 'confirm' | 'revise' {
+  // T1.1 (red-team catch) — apply the SAME decline/release precedence here. Without it,
+  // "כן תשחרר, מתי עוד יש?" (yes release it, when else is there?) — a same-HELD-day side question —
+  // collapses to 'confirm' and books against the decline. A decline verb vetoes the confirm even on
+  // a same-day question → 'revise' (route to the pivot, never a silent book).
+  if (DECLINE_TOKEN.test(messageText)) return 'revise'
   if (RELATIVE_DAY_RE.test(messageText)) return 'revise'
   const mentioned = CONFIRM_WEEKDAY_TOKENS.filter(([re]) => re.test(messageText)).map(([, dow]) => dow)
   if (mentioned.length === 0) return 'confirm' // no resolvable weekday → a plain side question

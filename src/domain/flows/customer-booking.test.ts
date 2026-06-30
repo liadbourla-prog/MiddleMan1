@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions, buildHoldConfirmSituation } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -660,5 +660,36 @@ describe('full-slot waitlist offer + follow-up binding (WL-3)', () => {
   it('clears pendingWaitlistJoin on the paths that clear other pending state', () => {
     // The redirect/clear destructure that strips pendingSlot/pendingDecision also drops pendingWaitlistJoin.
     expect(src).toMatch(/const \{[^}]*pendingWaitlistJoin:[^}]*\}\s*=\s*ctx/)
+  })
+})
+
+// T1.2 (live P1 bug): the hold-confirm prompt was LLM-authored as an either/or
+// ("release the spot … OR take it?"), which made a bare "כן" semantically void and let the
+// system book against a decline. The prompt situation must now constrain the model to a SINGLE
+// yes/no confirmation of the exact slot — no stacked second question, no either/or — which also
+// satisfies the Voice-Bible one-question rule. Pure shape test on buildHoldConfirmSituation.
+describe('buildHoldConfirmSituation — single yes/no confirm, no either/or (T1.2)', () => {
+  const s = buildHoldConfirmSituation('Do NOT greet. ', 'פילאטיס', 'Sunday, 5 Jul', '18:00')
+
+  it('restates the exact slot (service, day, time) and carries the first-message prefix', () => {
+    expect(s).toContain('פילאטיס')
+    expect(s).toContain('Sunday, 5 Jul')
+    expect(s).toContain('18:00')
+    expect(s.startsWith('Do NOT greet. ')).toBe(true)
+  })
+
+  it('directs a SINGLE yes/no confirmation', () => {
+    expect(s).toMatch(/\bONE\b[^.]*yes\/no/i)
+    expect(s).toMatch(/single[^.]*yes\/no/i)
+  })
+
+  it('explicitly forbids stacking a second question or offering an either/or', () => {
+    expect(s).toMatch(/do NOT stack/i)
+    expect(s).toMatch(/either\/or/i) // the directive names and forbids the either/or shape
+  })
+
+  it('stays warm + first-person (no robotic menu tell)', () => {
+    expect(s).toMatch(/first-person/i)
+    expect(s).not.toMatch(/numbered|menu|press \d/i)
   })
 })

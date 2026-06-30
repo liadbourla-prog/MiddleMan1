@@ -2635,9 +2635,19 @@ async function handleBookingIntent(
   const reply = await genReply({
     businessTimezone,
     businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
-    situation: `${firstMsgPrefix}Customer wants to book ${svc.name} on ${displayDate} at ${displayTime}. Restate the service, day, date and time clearly, then ask them to confirm.`,
+    situation: buildHoldConfirmSituation(firstMsgPrefix, svc.name, displayDate, displayTime),
   })
   return { reply, sessionComplete: false }
+}
+
+// T1.2 — the hold-confirm prompt. The confirm question MUST be a SINGLE yes/no on the exact slot:
+// the live P1 bug was an LLM-authored EITHER/OR ("release the spot … OR take it?"), which made a
+// bare "כן" semantically void and let the system book against a decline. Constraining the shape at
+// the source removes the ambiguity AND satisfies the Voice-Bible one-question rule (T1.1 remains
+// the deterministic catch when a customer declines with an embedded yes regardless of shape). Pure
+// + exported so the shape is unit-tested; kept warm/first-person (no Voice regression).
+export function buildHoldConfirmSituation(prefix: string, serviceName: string, displayDate: string, displayTime: string): string {
+  return `${prefix}Customer wants to book ${serviceName} on ${displayDate} at ${displayTime}. Restate the service, day, date and time clearly, then ask ONE clear yes/no question to confirm this exact slot. Do NOT stack a second question, and do NOT offer an either/or or any alternative in the same breath — a single, warm, first-person yes/no confirmation only.`
 }
 
 /**
