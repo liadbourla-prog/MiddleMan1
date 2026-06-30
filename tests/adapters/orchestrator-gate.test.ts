@@ -196,10 +196,7 @@ describe('actionsFromToolResult — extended backed-action coverage (T1.3)', () 
     expect(actionsFromToolResult('broadcastAnnouncement', {}, { ok: false, reason: 'missing_detail' })).toEqual([])
   })
 
-  it('backs a settings change (and cancellation) on manageBusinessSettings success; clarification backs nothing', () => {
-    const ok = actionsFromToolResult('manageBusinessSettings', { instruction: 'set price 300' }, { success: true, fact: 'price set' })
-    expect(ok).toContain('settings_changed')
-    expect(ok).toContain('cancelled')
+  it('manageBusinessSettings clarification backs nothing', () => {
     // clarificationNeeded → success:false → nothing backed (the "set the price" repro).
     expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'change price' }, { success: false, clarificationNeeded: 'which service?' })).toEqual([])
   })
@@ -220,5 +217,51 @@ describe('actionsFromToolResult — extended backed-action coverage (T1.3)', () 
 
   it('a partial result never backs (global partial≠backed rule)', () => {
     expect(actionsFromToolResult('messageCustomer', {}, { ok: true, partial: true })).toEqual([])
+  })
+})
+
+describe('actionsFromToolResult — manageBusinessSettings backs the ACTUAL outcome only (T3.4 / F-rev1)', () => {
+  // manageBusinessSettings is ONE tool with two legitimate outcomes: it either CHANGES
+  // business config (price/hours/capacity/colour/policy/staff) OR CANCELS a customer
+  // booking. The real discriminator is the classifier's instructionType, surfaced on the
+  // success result (the same value persisted as `classifiedAs`). Only 'booking_cancellation'
+  // is a cancellation; every other type is a settings change. Backing BOTH on every call
+  // (the F-rev1 carry-forward bug) would let a price-change turn back a phantom "I cancelled X".
+
+  it('a settings/config change backs ONLY settings_changed (never a phantom cancellation)', () => {
+    // service_change (price). Result carries the real instructionType discriminator.
+    const priced = actionsFromToolResult(
+      'manageBusinessSettings',
+      { instruction: 'set the price of haircut to 300' },
+      { success: true, instructionType: 'service_change', fact: '{"price":300}' },
+    )
+    expect(priced).toEqual(['settings_changed'])
+    expect(priced).not.toContain('cancelled')
+
+    // availability_change (hours) — also settings only.
+    const hours = actionsFromToolResult(
+      'manageBusinessSettings',
+      { instruction: 'open Mondays 9 to 5' },
+      { success: true, instructionType: 'availability_change', fact: '{}' },
+    )
+    expect(hours).toEqual(['settings_changed'])
+    expect(hours).not.toContain('cancelled')
+  })
+
+  it('a customer-booking cancellation backs ONLY cancelled (never a phantom settings_changed)', () => {
+    const cancelled = actionsFromToolResult(
+      'manageBusinessSettings',
+      { instruction: "cancel Dana's 3pm booking tomorrow" },
+      { success: true, instructionType: 'booking_cancellation', fact: '{"cancelled":1}' },
+    )
+    expect(cancelled).toEqual(['cancelled'])
+    expect(cancelled).not.toContain('settings_changed')
+  })
+
+  it('failed-guard cases still back nothing (apply_failed / save_failed / unclear / clarification)', () => {
+    expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'x' }, { success: false, reason: 'apply_failed', detail: 'no such booking' })).toEqual([])
+    expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'x' }, { success: false, reason: 'save_failed' })).toEqual([])
+    expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'x' }, { success: false, reason: 'unclear_instruction' })).toEqual([])
+    expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'x' }, { success: false, clarificationNeeded: 'which service?' })).toEqual([])
   })
 })

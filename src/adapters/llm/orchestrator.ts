@@ -1116,10 +1116,13 @@ export function actionsFromToolResult(name: string, args: Record<string, unknown
     case 'deleteCalendarEvent':
       return ['cancelled']
     case 'manageBusinessSettings':
-      // One tool, two legitimate outcomes: it cancels a customer booking OR changes config.
-      // The result doesn't distinguish, so a success backs BOTH classes (keeps the prior
-      // cancellation backing; adds settings-change backing — H9/H10/H11).
-      return ['cancelled', 'settings_changed']
+      // One tool, two MUTUALLY-EXCLUSIVE outcomes per call: it either CANCELS a customer
+      // booking OR CHANGES config (price/hours/capacity/colour/policy/staff). The handler
+      // surfaces the classifier's `instructionType` on success (the same value persisted as
+      // `classifiedAs`); only 'booking_cancellation' is a cancellation, every other type is a
+      // settings write. Back ONLY the outcome that actually happened — backing BOTH on every
+      // call would let a price-change turn back a phantom "I cancelled X" (T3.4 / F-rev1).
+      return r['instructionType'] === 'booking_cancellation' ? ['cancelled'] : ['settings_changed']
     case 'refundTransaction':
       // ok:true ⇒ the processor actually issued the refund (H5/H20).
       return ['refunded']

@@ -1251,7 +1251,11 @@ export async function executeManageBusinessSettings(
     return { success: false, reason: 'apply_failed', detail: result.reason, guidance: 'The change did not apply. Tell the manager plainly and offer to retry. detail is raw — phrase it naturally, never echo it verbatim.' }
   }
 
-  return { success: true, fact: result.confirmationMessage, guidance: 'The change is live. fact is raw data describing what changed — confirm it to the manager in your own words, never quote it. After a customer-facing change, offer to notify customers.' }
+  // instructionType is the real outcome discriminator (same value persisted as
+  // `classifiedAs`): 'booking_cancellation' is a customer-booking cancellation, every other
+  // type is a config/settings write. The anti-fabrication action auditor reads this to back
+  // ONLY the outcome that actually happened — never both (T3.4 / F-rev1).
+  return { success: true, instructionType: classified.data.instructionType, fact: result.confirmationMessage, guidance: 'The change is live. fact is raw data describing what changed — confirm it to the manager in your own words, never quote it. After a customer-facing change, offer to notify customers.' }
 }
 
 // ── searchWeb ─────────────────────────────────────────────────────────────────
