@@ -414,7 +414,7 @@ export async function processJob(job: { data: WaitlistJob }) {
   }
 
   const [customer] = await db
-    .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage, displayName: identities.displayName })
+    .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage, displayName: identities.displayName, addresseeGender: identities.addresseeGender })
     .from(identities)
     .where(eq(identities.id, next.customerId))
     .limit(1)
@@ -520,7 +520,7 @@ export async function processJob(job: { data: WaitlistJob }) {
       // will be released if they don't reply in time. Voice-compliant: warm, ONE question, a
       // clear next step, never a "reply YES/NO" menu.
       const situation = `Great news for them: a spot just opened for "${serviceName}" at ${biz.name} on ${dateStr}, and you've placed a hold so it's being kept just for them for the next ${OFFER_TTL_MINUTES} minutes. Share it warmly, in ONE short message, and ask whether they'd like to take it. Make clear that if they don't reply within those ${OFFER_TTL_MINUTES} minutes the hold is released. Never say "reply YES/NO" and never use a menu.`
-      const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: offerBody, timeoutMs: 2500 })
+      const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: offerBody, timeoutMs: 2500, addresseeGender: customer.addresseeGender })
       await enqueueMessage(businessId, customer.phoneNumber, llmBody)
     } else {
       // Template path: sendTemplateMessage is NOT wrapped in catch — a failure propagates

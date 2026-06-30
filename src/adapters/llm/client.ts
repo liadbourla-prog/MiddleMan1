@@ -1291,7 +1291,7 @@ Return JSON: { "intent": "propose_time"|"decline"|"unclear", "relativeDay": ...|
 
 const PROACTIVE_PERSONA = `You are sending a WhatsApp message on behalf of {businessName}, speaking as the business itself.
 
-${buildVoiceCore('proactive')}
+{voiceCore}
 
 LANGUAGE: write ENTIRELY in {language}. Never mix languages.
 
@@ -1395,8 +1395,13 @@ export async function generateProactiveCustomerMessage(input: {
   backedActions?: ReadonlySet<ActionClaim>
   allowedTimes?: Iterable<string>
   businessId?: string
+  // How to address the recipient in Hebrew (read from identities.addresseeGender by the caller).
+  // null/undefined → masculine floor. Meta TEMPLATE bodies are NOT generated here and stay
+  // neutral (decision 4); only this free-form path carries gender.
+  addresseeGender?: 'male' | 'female' | null
 }): Promise<string> {
   const systemPrompt = PROACTIVE_PERSONA
+    .replace('{voiceCore}', buildVoiceCore('proactive', input.addresseeGender ?? null))
     .replace('{businessName}', input.businessName)
     .replace('{language}', input.language === 'he' ? 'he (Hebrew)' : 'en (English)')
 

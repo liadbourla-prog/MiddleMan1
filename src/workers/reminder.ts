@@ -111,7 +111,7 @@ async function processReminder(job: { data: ReminderJob }) {
   if (!booking || booking.state !== 'confirmed') return
 
   const [customer] = await db
-    .select({ phoneNumber: identities.phoneNumber, displayName: identities.displayName, preferredLanguage: identities.preferredLanguage })
+    .select({ phoneNumber: identities.phoneNumber, displayName: identities.displayName, preferredLanguage: identities.preferredLanguage, addresseeGender: identities.addresseeGender })
     .from(identities)
     .where(eq(identities.id, customerId))
     .limit(1)
@@ -190,7 +190,7 @@ async function processReminder(job: { data: ReminderJob }) {
     { businessId, recipientId: customerId, dedupKey: `reminder.${type}:${bookingId}` },
     {
       sendFreeForm: async () => {
-        const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: body, timeoutMs: 2500 })
+        const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: body, timeoutMs: 2500, addresseeGender: customer.addresseeGender })
         await enqueueMessage(businessId, customer.phoneNumber, llmBody)
       },
       sendTemplate: async (templateName) => {
