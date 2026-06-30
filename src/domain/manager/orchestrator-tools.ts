@@ -1459,11 +1459,13 @@ export async function executeSaveContactNote(
   ctx: ToolContext,
 ): Promise<object> {
   if (args.targetType === 'customer') {
-    // identifier is identityId
+    // identifier is identityId. Scope BOTH the read and the update by ctx.businessId so a
+    // foreign identityId (e.g. one that leaked into the model's context on the shared central
+    // number, or via injection) can never read or poison another tenant's profile notes.
     const existing = await ctx.db
       .select({ id: customerProfiles.id, notes: customerProfiles.notes })
       .from(customerProfiles)
-      .where(eq(customerProfiles.identityId, args.identifier))
+      .where(and(eq(customerProfiles.identityId, args.identifier), eq(customerProfiles.businessId, ctx.businessId)))
       .limit(1)
 
     if (existing.length > 0) {
@@ -1471,7 +1473,7 @@ export async function executeSaveContactNote(
       await ctx.db
         .update(customerProfiles)
         .set({ notes: appended })
-        .where(eq(customerProfiles.id, existing[0]!.id))
+        .where(and(eq(customerProfiles.id, existing[0]!.id), eq(customerProfiles.businessId, ctx.businessId)))
     } else {
       await ctx.db.insert(customerProfiles).values({
         identityId: args.identifier,

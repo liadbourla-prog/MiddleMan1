@@ -392,6 +392,30 @@ describe('answerCustomerQuestion — guards + wiring (F3a/S3)', () => {
   })
 })
 
+describe('saveContactNote — tenant isolation (D1 IDOR guard)', () => {
+  // The customer branch resolves customer_profiles by an LLM-supplied identityId. Both the
+  // SELECT and the UPDATE MUST be scoped by ctx.businessId, or a foreign identityId (e.g. one
+  // that leaked into the model's context on the shared central number) could read or poison
+  // another tenant's profile notes. A behavioral test can't assert this against the opaque
+  // Drizzle conditions used in the unit mocks, so we guard the source directly (same idiom as
+  // the orchestrator wiring test above).
+  it('scopes both the read and the write of customer_profiles by businessId', () => {
+    const src = readFileSync(new URL('./orchestrator-tools.ts', import.meta.url), 'utf8')
+    const customerBranch = src.slice(
+      src.indexOf("args.targetType === 'customer'"),
+      src.indexOf("args.targetType === 'business_contact'"),
+    )
+    expect(customerBranch.length).toBeGreaterThan(0)
+    // SELECT must filter by both identityId and businessId.
+    expect(customerBranch).toMatch(
+      /eq\(customerProfiles\.identityId, args\.identifier\), eq\(customerProfiles\.businessId, ctx\.businessId\)/,
+    )
+    // Both the read and the update carry the businessId scope (>= 2 occurrences).
+    const scoped = customerBranch.match(/eq\(customerProfiles\.businessId, ctx\.businessId\)/g) ?? []
+    expect(scoped.length).toBeGreaterThanOrEqual(2)
+  })
+})
+
 describe('messageCustomer — disambiguation', () => {
   it('two same-name customers → ambiguous, no send, candidates returned', async () => {
     const res = await executeMessageCustomer({ name: 'Guy', message: 'Hi' }, twoGuysCtx()) as {
