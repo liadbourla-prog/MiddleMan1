@@ -199,19 +199,19 @@ Thread `addresseeGender` to all 13 call sites. For `generateCustomerReply` (whic
 
 # PHASE 2 — Polish & docs
 
-- [ ] **T2.1 — Lawbook §3.5 + gender-aware §3.4.** Add `CHAT_LEVEL_LAWBOOK.md §3.5` (addressee-gender rules: resolve before reply, single correct form, unknown→masculine, never split-gender) and rewrite the §3.4 switch-offer so that once gender is known it is single-gender (removes the existing `כתוב/י כן` split-gender debt — coordinate with WS9-T9.5 F4). Commit: `docs(lawbook): §3.5 addressee gender + gender-aware switch offer`.
+- [x] **T2.1 — Lawbook §3.5 + gender-aware §3.4.** Add `CHAT_LEVEL_LAWBOOK.md §3.5` (addressee-gender rules: resolve before reply, single correct form, unknown→masculine, never split-gender) and rewrite the §3.4 switch-offer so that once gender is known it is single-gender (removes the existing `כתוב/י כן` split-gender debt — coordinate with WS9-T9.5 F4). Commit: `docs(lawbook): §3.5 addressee gender + gender-aware switch offer`.
 
-- [ ] **T2.2 — `voice-i18n-lint` female-awareness.** Extend the lint so the female addressing path is asserted to use a single feminine form (still no split-gender), and keep templates gender-neutral. Flip any pending allowlist entries this plan resolves. **TEST-FIRST.** Commit: `test(voice): female-aware addressing lint; templates stay neutral`.
+- [x] **T2.2 — `voice-i18n-lint` female-awareness.** Extend the lint so the female addressing path is asserted to use a single feminine form (still no split-gender), and keep templates gender-neutral. Flip any pending allowlist entries this plan resolves. **TEST-FIRST.** Commit: `test(voice): female-aware addressing lint; templates stay neutral`.
 
-- [ ] **T2.3 — Precedence/correction edge tests + golden breadth.** Adversarial He goldens: name-says-male but morphology-says-female (morphology wins, persists, reply flips next turn); owner explicit override sticks against later signals; mid-session gender flip is handled warmly without re-introducing split-gender. Commit: `test(gender): precedence, correction, and mid-session-flip goldens`.
+- [x] **T2.3 — Precedence/correction edge tests + golden breadth.** Adversarial He goldens: name-says-male but morphology-says-female (morphology wins, persists, reply flips next turn); owner explicit override sticks against later signals; mid-session gender flip is handled warmly without re-introducing split-gender. Commit: `test(gender): precedence, correction, and mid-session-flip goldens`.
 
 ---
 
 ## Cross-cutting deliverables
 
-- [ ] **Non-bypass invariant test:** no addressing reply path builds the masculine line by hand — all go through `buildVoiceCore(channel, addresseeGender)`.
-- [ ] **DO-NOT-REGRESS gate:** G1/G4/G5/C-PIVOT + the masculine-default floor stay green on every PR; `hasSplitGender` never trips on the female path.
-- [ ] **Docs:** `ARCHITECTURE.md` note that addressee gender is resolved pre-LLM (sibling of language, cross-branch invariant); `CLAUDE.md` one-liner on the two gender axes.
+- [x] **Non-bypass invariant test:** no addressing reply path builds the masculine line by hand — all go through `buildVoiceCore(channel, addresseeGender)`. (`tests/regression/addressing-non-bypass.test.ts`)
+- [x] **DO-NOT-REGRESS gate:** G1/G4/G5/C-PIVOT + the masculine-default floor stay green on every PR; `hasSplitGender` never trips on the female path.
+- [x] **Docs:** `ARCHITECTURE.md` note that addressee gender is resolved pre-LLM (sibling of language, cross-branch invariant); `CLAUDE.md` one-liner on the two gender axes.
 
 ## Out of scope
 - Branching Meta-approved WhatsApp **template** bodies into male/female variants (decision 4 — templates stay neutral).
