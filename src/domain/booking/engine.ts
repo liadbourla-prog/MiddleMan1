@@ -875,6 +875,69 @@ async function requestGroupClassBooking(
   }
 }
 
+// Shared-class calendar event find-or-create — used by BOTH the group direct-confirm path
+// (requestGroupClassBooking) at booking time and the group ACCEPT path (confirmBooking, WL-7)
+// at hold-confirm time. Reuses an existing event from another `confirmed` participant of the
+// same class slot, else creates one (placeHold skipping the freebusy probe — the class instance
+// is its own mirrored event — then confirmHold). Returns the eventId/etag to pin on the row.
+async function attachGroupClassEvent(
+  db: Db,
+  calendar: CalendarClient,
+  args: {
+    businessId: string
+    serviceTypeId: string
+    slotStart: Date
+    slotEnd: Date
+    bookingId: string
+    serviceName: string
+    providerDisplayName?: string | null
+  },
+): Promise<{ ok: true; calendarEventId: string; googleEtag: string | null } | { ok: false; reason: string }> {
+  const [existingParticipant] = await db
+    .select({ calendarEventId: bookings.calendarEventId })
+    .from(bookings)
+    .where(
+      and(
+        eq(bookings.businessId, args.businessId),
+        eq(bookings.serviceTypeId, args.serviceTypeId),
+        eq(bookings.slotStart, args.slotStart),
+        eq(bookings.state, 'confirmed'),
+        isNotNull(bookings.calendarEventId),
+        ne(bookings.id, args.bookingId),
+      ),
+    )
+    .limit(1)
+
+  if (existingParticipant?.calendarEventId) {
+    return { ok: true, calendarEventId: existingParticipant.calendarEventId, googleEtag: null }
+  }
+
+  // First participant — create the shared calendar event.
+  const groupEventTitle = args.providerDisplayName ? `${args.serviceName} — ${args.providerDisplayName}` : args.serviceName
+  const holdResult = await calendar.placeHold(
+    { start: args.slotStart, end: args.slotEnd },
+    args.bookingId,
+    groupEventTitle,
+    new Date(Date.now() + 60 * 60 * 1000), // dummy expiry; we confirm immediately
+    // Skip the freebusy probe: the class instance is its own mirrored Google event, so the
+    // probe would report this slot busy and falsely reject the first booking into the class.
+    { skipConflictCheck: true },
+  )
+  if (holdResult.status !== 'held') {
+    const reason = holdResult.status === 'error' ? holdResult.reason : 'Calendar slot conflict'
+    return { ok: false, reason }
+  }
+
+  // Seed with the service name; refreshGroupEventRoster (by the caller) immediately overwrites
+  // title + description with the live roster.
+  const confirmResult = await calendar.confirmHold(holdResult.eventId, args.serviceName, '')
+  if (confirmResult.status === 'error') {
+    return { ok: false, reason: 'Calendar confirm failed' }
+  }
+
+  return { ok: true, calendarEventId: confirmResult.eventId, googleEtag: confirmResult.etag ?? null }
+}
+
 export async function confirmBooking(
   db: Db,
   calendar: CalendarClient,
@@ -923,13 +986,19 @@ export async function confirmBooking(
   }
 
   const [service] = await db
-    .select({ name: serviceTypes.name })
+    .select({ name: serviceTypes.name, maxParticipants: serviceTypes.maxParticipants })
     .from(serviceTypes)
     .where(eq(serviceTypes.id, booking.serviceTypeId))
     .limit(1)
 
+  // A GROUP-class booking (maxParticipants > 1) shares one calendar event across all
+  // participants; a WL-5 waitlist hold deliberately leaves calendarEventId null until accept
+  // (the shared event is found/created here on confirm). The 1-on-1 path keeps its dedicated event.
+  const isGroupClass = (service?.maxParticipants ?? 1) > 1
+
   const eventId = booking.calendarEventId
-  if (!eventId) return { ok: false, reason: 'Booking has no calendar event' }
+  // GROUP path legitimately has no event yet — the bail is PRIVATE-only.
+  if (!isGroupClass && !eventId) return { ok: false, reason: 'Booking has no calendar event' }
 
   // ── A4: Re-validate blocks created during the hold ────────────────────────
   // Load the business row (needed by isSlotBookable for timezone + available247).
@@ -960,6 +1029,100 @@ export async function confirmBooking(
       reason: "That time is no longer available — the studio blocked it. Let's find another.",
     }
   }
+
+  // ── GROUP-class accept (WL-7) ─────────────────────────────────────────────
+  // A held group seat (placed by WL-5) has NO calendar event yet and shares one event with
+  // the rest of the class. It uses the SAME CAS arbiter as the private path, but its winner
+  // tail mirrors requestGroupClassBooking's shared-event find-or-create + roster refresh
+  // (NOT buildOneOnOneEventContent / a per-booking confirmHold). The private path below is
+  // left byte-identical for maxParticipants <= 1.
+  if (isGroupClass) {
+    // CAS flip — identical atomic arbiter + loser semantics as the private path.
+    const [flipped] = await db
+      .update(bookings)
+      .set({ state: 'confirmed', holdExpiresAt: null, updatedAt: new Date() })
+      .where(and(eq(bookings.id, bookingId), eq(bookings.state, 'held')))
+      .returning({ id: bookings.id })
+
+    if (!flipped) {
+      const [current] = await db
+        .select({ state: bookings.state })
+        .from(bookings)
+        .where(eq(bookings.id, bookingId))
+        .limit(1)
+      if (current?.state === 'confirmed') {
+        // A concurrent confirm won — idempotent success, no side effects.
+        return { ok: true, bookingId, message: 'Booking confirmed.' }
+      }
+      // Hold expired or was cancelled (e.g. the expire_offer releaser) while we were in flight.
+      return { ok: false, reason: 'Hold has expired — please start a new booking' }
+    }
+
+    // CAS winner: attach the shared class event (find-or-create) + refresh the roster. A
+    // calendar failure AFTER the flip does NOT roll back — the row is already confirmed
+    // (contract step 5); we log and still return ok:true.
+    const attached = await attachGroupClassEvent(db, calendar, {
+      businessId: actor.businessId,
+      serviceTypeId: booking.serviceTypeId,
+      slotStart: booking.slotStart,
+      slotEnd: booking.slotEnd,
+      bookingId,
+      serviceName: service?.name ?? 'Class',
+    })
+
+    if (attached.ok) {
+      await db
+        .update(bookings)
+        .set({ calendarEventId: attached.calendarEventId, googleEtag: attached.googleEtag, updatedAt: new Date() })
+        .where(eq(bookings.id, bookingId))
+
+      // Best-effort roster refresh so the owner sees the live headcount + attendee list.
+      await refreshGroupEventRoster(db, calendar, actor.businessId, booking.serviceTypeId, booking.slotStart)
+    } else {
+      console.error('[engine] group class event attach failed after state flip — booking confirmed in DB, calendar event not set (id:', bookingId, ')')
+    }
+
+    await logAudit(db, {
+      businessId: actor.businessId,
+      actorId: actor.id,
+      action: 'booking.confirmed',
+      entityType: 'booking',
+      entityId: bookingId,
+      beforeState: { state: 'held' },
+      afterState: { state: 'confirmed', calendarEventId: attached.ok ? attached.calendarEventId : null, groupClass: true },
+      metadata: await buildBookingAuditMeta(db, {
+        customerId: booking.customerId,
+        serviceTypeId: booking.serviceTypeId,
+        slotStart: booking.slotStart,
+        slotEnd: booking.slotEnd,
+        initiator: initiatorFromActor(actor),
+        customerName,
+        serviceName: service?.name ?? null,
+      }),
+    })
+
+    await recordCompletedBooking(db, actor.businessId, actor.id, bookingId, booking.serviceTypeId)
+      .catch((err: unknown) => console.error('[engine] recordCompletedBooking failed (group confirm):', err))
+    await scheduleReminders(actor.businessId, actor.id, bookingId, booking.serviceTypeId, booking.slotStart).catch(() => { /* non-fatal */ })
+
+    // Owner new-booking notice — gated exactly like the group path: only on a customer self-commit
+    // and not when the caller suppresses it (e.g. a reschedule replacement).
+    if (initiatorFromActor(actor) === 'customer_self' && !(opts?.suppressOwnerNewBookingNotice ?? false)) {
+      await notifyOwnerNewBooking(db, actor.businessId, {
+        bookingId,
+        customerId: booking.customerId,
+        serviceTypeId: booking.serviceTypeId,
+        slotStart: booking.slotStart,
+      }).catch(() => { /* non-fatal */ })
+    }
+
+    return { ok: true, bookingId, message: 'Booking confirmed.' }
+  }
+
+  // ── PRIVATE (1-on-1) path — unchanged ─────────────────────────────────────
+  // The PRIVATE-only bail above guarantees a non-null eventId here; this assertion just
+  // re-narrows the type for TS now that the group branch shares the `eventId` declaration.
+  if (!eventId) return { ok: false, reason: 'Booking has no calendar event' }
 
   // ── Prepare calendar event content (before CAS so render errors bail early) ─
   const rendered = await buildOneOnOneEventContent(db, actor.businessId, {
