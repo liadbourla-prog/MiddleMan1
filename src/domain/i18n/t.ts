@@ -820,6 +820,13 @@ const strings = {
     he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
     en: `Your booking hold has expired because it wasn't confirmed in time. Feel free to book again whenever you're ready.`,
   },
+  // WL-7 (Path C): the waitlist offer window passed without a reply, so the held seat was
+  // released. Warm, one sentence, invites them to ask again — no menu, no "reply YES/NO", no
+  // bot-tells. Voice-compliant (CHAT_LEVEL_LAWBOOK §9-14).
+  waitlist_window_passed: {
+    he: (service: string) => `חבל, חלון הזמן לתפוס את המקום ל${service} עבר והמקום שוחרר. אם עדיין מתאים לך, רק תכתבו לי ואחזיר אתכם לרשימה.`,
+    en: (service: string) => `That spot for ${service} slipped away — the time to grab it passed and it's been released. If you'd still like it, just say the word and I'll keep an eye out for the next one.`,
+  },
   // Inbound sync (Phase 3): we applied an owner-originated Google Calendar change.
   calendar_owner_reconcile_applied: {
     he: (n: number) => `סנכרנתי שינוי שביצעת ביומן Google: ${n === 1 ? 'הזמנה אחת בוטלה' : `${n} הזמנות בוטלו`} בהתאם. הלקוחות שהושפעו עודכנו.`,
