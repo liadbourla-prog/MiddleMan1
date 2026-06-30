@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -8,6 +8,11 @@ vi.mock('../identity/customer-resolver.js', () => ({
   deriveLastName: (n: string | null) => (n && n.trim().split(/\s+/).length >= 2 ? n.trim().split(/\s+/).pop()! : null),
 }))
 import { setCustomerName } from '../identity/customer-resolver.js'
+
+vi.mock('../waitlist/join.js', () => ({
+  joinWaitlist: vi.fn(),
+}))
+import { joinWaitlist } from '../waitlist/join.js'
 
 vi.mock('../availability/blocks.js', () => ({
   findClassBlockProviderForSlot: vi.fn(),
@@ -442,5 +447,127 @@ describe('buildActiveServicesBlock — Branch-3 narrative parity (T2b.1)', () =>
     const src = readFileSync(new URL('../../adapters/llm/orchestrator.ts', import.meta.url), 'utf8')
     // The Branch-3 services block must consume narrative so the two grounders do not diverge.
     expect(src).toMatch(/buildActiveServicesBlock[\s\S]{0,400}narrative/)
+  })
+})
+
+// WL-4 — explicit join-the-waitlist request, mapped to a voice-compliant reply. The flow-local
+// helper calls the WL-2 domain op (joinWaitlist) and turns its typed outcome into a sanitized
+// situation string (joined/already_on_list) or a routing/name signal (slot_has_space/needs_name).
+// It MUST reuse joinWaitlist (no re-implemented insert) and never phrase a YES/NO menu.
+describe('handleWaitlistJoinRequest — maps the WL-2 outcome to a voice-compliant reply (WL-4)', () => {
+  const identity = { id: 'c1', businessId: 'biz1', phoneNumber: '+10000000000', displayName: 'Dana' } as never
+  const slot = { serviceTypeId: 'svc-yoga', slotStart: new Date('2026-07-05T07:00:00.000Z'), slotEnd: new Date('2026-07-05T08:00:00.000Z') }
+  // The reply generator is stubbed to echo the situation string so we can assert on what the
+  // PA is INSTRUCTED to say (the deterministic, gate-checked situation), not the LLM wording.
+  const genReply = vi.fn(async (input: { situation: string }) => input.situation)
+  const deps = {
+    lang: 'en' as const,
+    businessTimezone: 'Asia/Jerusalem',
+    businessName: 'Studio',
+    transcript: [],
+    genReply: genReply as never,
+    ctx: {} as never,
+  }
+  const db = {} as never
+
+  it('joined → confirms on the list AND states the FIFO position (Q3), session complete', async () => {
+    vi.mocked(joinWaitlist).mockResolvedValue({ kind: 'joined', waitlistId: 'w1', position: 2 })
+    const res = await handleWaitlistJoinRequest(db, identity, slot, deps)
+    expect(joinWaitlist).toHaveBeenCalledWith(db, {
+      businessId: 'biz1', customerId: 'c1', serviceTypeId: 'svc-yoga',
+      slotStart: slot.slotStart, slotEnd: slot.slotEnd,
+    })
+    expect(res.sessionComplete).toBe(true)
+    expect(res.routeToBooking).not.toBe(true)
+    // States position (2 / "2nd") and promises a message when a spot opens — never that the
+    // position is FIXED.
+    expect(res.reply).toMatch(/2/)
+    expect(res.reply.toLowerCase()).toMatch(/spot opens|opens up|message/)
+    expect(res.reply.toLowerCase()).not.toMatch(/guarantee|fixed|won't change/)
+  })
+
+  it('slot_has_space → routes to normal booking (does NOT dead-end on a waitlist message)', async () => {
+    vi.mocked(joinWaitlist).mockResolvedValue({ kind: 'slot_has_space' })
+    const res = await handleWaitlistJoinRequest(db, identity, slot, deps)
+    expect(res.routeToBooking).toBe(true)
+  })
+
+  it('already_on_list → warm "already on it" with no duplicate, session complete', async () => {
+    vi.mocked(joinWaitlist).mockResolvedValue({ kind: 'already_on_list', waitlistId: 'w1', position: 1 })
+    const res = await handleWaitlistJoinRequest(db, identity, slot, deps)
+    expect(res.sessionComplete).toBe(true)
+    expect(res.routeToBooking).not.toBe(true)
+    expect(res.reply.toLowerCase()).toMatch(/already/)
+  })
+
+  it('needs_name → asks for the name and does NOT insert / does NOT route to booking', async () => {
+    vi.mocked(joinWaitlist).mockResolvedValue({ kind: 'needs_name' })
+    const res = await handleWaitlistJoinRequest(db, identity, slot, deps)
+    expect(res.routeToBooking).not.toBe(true)
+    expect(res.sessionComplete).not.toBe(true)
+    // Reuses the existing name-ask copy so the owner gets a name on file.
+    expect(res.reply).toContain(t('ask_customer_name', 'en'))
+  })
+})
+
+// WL-4 — concrete-slot resolution reuses the booking path's deterministic resolver
+// (resolveRequestedDate → resolveSlotStart, never hand-rolled date math). Returns the concrete
+// (serviceTypeId, slotStart, slotEnd) only when service + a resolvable day + a time are all
+// present; otherwise null → the flow falls back to the normal "which session?" clarification.
+describe('resolveConcreteWaitlistSlot — concrete slot or null (WL-4)', () => {
+  const services = [
+    { id: 'svc-yoga', name: 'Yoga', durationMinutes: 60, maxParticipants: 8, category: null, schedulingMode: 'class' as const },
+  ]
+  const tz = 'Asia/Jerusalem'
+  const now = new Date('2026-06-30T09:00:00.000Z') // 12:00 local
+
+  it('resolves a fully-specified slot to (serviceTypeId, slotStart, slotEnd)', () => {
+    const intent = { serviceTypeHint: 'Yoga', slotRequest: { explicitDate: { year: 2026, month: 7, day: 5 }, time: { hour: 10, minute: 0 } } } as never
+    const out = resolveConcreteWaitlistSlot(intent, services, tz, now)
+    expect(out).not.toBeNull()
+    expect(out!.serviceTypeId).toBe('svc-yoga')
+    expect(out!.slotEnd.getTime() - out!.slotStart.getTime()).toBe(60 * 60_000)
+  })
+
+  it('returns null when no time is named (fuzzy) → flow asks which session', () => {
+    const intent = { serviceTypeHint: 'Yoga', slotRequest: { explicitDate: { year: 2026, month: 7, day: 5 }, time: null } } as never
+    expect(resolveConcreteWaitlistSlot(intent, services, tz, now)).toBeNull()
+  })
+
+  it('returns null when no day can be resolved', () => {
+    const intent = { serviceTypeHint: 'Yoga', slotRequest: { time: { hour: 10, minute: 0 } } } as never
+    expect(resolveConcreteWaitlistSlot(intent, services, tz, now)).toBeNull()
+  })
+})
+
+// WL-4 — the explicit joinWaitlist intent is wired into the dispatch BEFORE fresh booking
+// handling, branches on === true (omitted/undefined never fires it), reuses the WL-2 domain op
+// (no re-implemented insert), and is guarded so it never hijacks an in-progress confirmation/
+// selection. This reads the source so a future edit that drops the wiring fails loudly.
+describe('explicit joinWaitlist wiring (WL-4)', () => {
+  const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+
+  it('branches on === true, never on a truthy/omitted value', () => {
+    expect(src).toMatch(/intent\.joinWaitlist === true/)
+    // The omitted/undefined value must NOT trigger it (no bare truthy check on the flag).
+    expect(src).not.toMatch(/if \(intent\.joinWaitlist\)/)
+  })
+
+  it('reuses the WL-2 domain op via the shared helper — no re-implemented waitlist insert', () => {
+    // The helper calls joinWaitlist; there is no hand-rolled insert(waitlist) anywhere in the flow.
+    expect(src).toMatch(/await joinWaitlist\(/)
+    expect(src).not.toMatch(/\.insert\(waitlist\)/)
+  })
+
+  it('routes to normal booking when the slot turns out to have space (slot_has_space)', () => {
+    // The wired branch honours routeToBooking by falling through to handleBookingIntent.
+    expect(src).toMatch(/routeToBooking/)
+  })
+
+  it('is placed before fresh intent extraction so it binds the explicit ask first', () => {
+    const idxWire = src.indexOf('intent.joinWaitlist === true')
+    const idxSwitch = src.indexOf("case 'booking':")
+    expect(idxWire).toBeGreaterThan(-1)
+    expect(idxWire).toBeLessThan(idxSwitch)
   })
 })

@@ -47,6 +47,7 @@ import {
   type RejectedSlot,
 } from './negotiation-constraints.js'
 import { acceptWaitlistOffer, declineWaitlistOffer } from '../waitlist/accept.js'
+import { joinWaitlist } from '../waitlist/join.js'
 
 /** Set or remove negotiationConstraints on a context — omits the key when empty so the
  *  stored jsonb stays minimal (and satisfies exactOptionalPropertyTypes). */
@@ -84,6 +85,108 @@ export function appendNameRequest(
     return { reply, nameAsked: opts.nameAsked }
   }
   return { reply: `${reply}\n\n${t('ask_customer_name', opts.lang)}`, nameAsked: true }
+}
+
+/**
+ * WL-4 — resolve an explicit join-the-waitlist request into ONE concrete
+ * (serviceTypeId, slotStart, slotEnd), reusing the booking path's DETERMINISTIC resolver
+ * (resolveRequestedDate → resolveSlotStart; the LLM never computes calendar arithmetic).
+ * Returns null when service, a resolvable day, or a time is missing — the flow then falls
+ * back to the normal "which session?" clarification instead of inserting a fuzzy row (plan
+ * §3.1: "If no concrete full slot is named, the PA asks which session"). Pure + exported for
+ * tests. Capacity (full vs. open) is NOT decided here — joinWaitlist re-checks it on a fresh
+ * spine and routes an open slot back to booking.
+ */
+export function resolveConcreteWaitlistSlot(
+  intent: CustomerIntentOutput,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; schedulingMode?: 'appointment' | 'class' | null }>,
+  businessTimezone: string,
+  now: Date,
+): { serviceTypeId: string; slotStart: Date; slotEnd: Date } | null {
+  const service = resolveService(intent.serviceTypeHint, activeServices)
+  if (!service) return null
+  const slot = intent.slotRequest
+  if (!slot || !slot.time) return null
+  const hasDay = Boolean(slot.relativeDay || slot.weekday != null || slot.explicitDate)
+  if (!hasDay) return null
+  const resolved = resolveRequestedDate(
+    {
+      relativeDay: slot.relativeDay ?? null,
+      weekday: slot.weekday ?? null,
+      weekdayAnchor: slot.weekdayAnchor ?? null,
+      explicitDate: slot.explicitDate ?? null,
+    },
+    businessTimezone,
+    now,
+  )
+  if (!resolved.ok || resolved.ambiguousToday) return null
+  const slotStart = resolveSlotStart(resolved.dateStr, { hour: slot.time.hour, minute: slot.time.minute }, businessTimezone)
+  if (isNaN(slotStart.getTime())) return null
+  const slotEnd = new Date(slotStart.getTime() + service.durationMinutes * 60_000)
+  return { serviceTypeId: service.id, slotStart, slotEnd }
+}
+
+/**
+ * WL-4 — shared join handler (WL-3 reuses it). Calls the WL-2 domain op (joinWaitlist) for a
+ * single concrete slot and maps its typed outcome to a voice-compliant reply (no YES/NO menu,
+ * ≤1 question, warm, clear next step — CHAT_LEVEL_LAWBOOK §9-14). It does NOT decide capacity
+ * itself and NEVER re-implements the insert: joinWaitlist re-checks the fresh spine, inserts
+ * idempotently, and returns the FIFO position.
+ *  • joined        → confirm on the list + state position (Q3: stated, never promised fixed); done.
+ *  • already_on_list→ warm "already on it" (no duplicate); done.
+ *  • slot_has_space → signal routeToBooking (the slot isn't actually full → book it normally).
+ *  • needs_name     → ask for the name (reuse the existing name-ask copy); no insert.
+ */
+export async function handleWaitlistJoinRequest(
+  db: Db,
+  identity: ResolvedIdentity,
+  slot: { serviceTypeId: string; slotStart: Date; slotEnd: Date },
+  deps: {
+    lang: 'he' | 'en'
+    businessTimezone: string
+    businessName: string
+    transcript: TranscriptTurn[]
+    genReply: GenReply
+    ctx: BookingFlowContext
+  },
+): Promise<{ reply: string; sessionComplete?: boolean; routeToBooking?: boolean }> {
+  const { lang, businessTimezone, businessName, transcript, genReply, ctx } = deps
+  const persona = ctx.botPersona ? { botPersona: ctx.botPersona } : {}
+  const res = await joinWaitlist(db, {
+    businessId: identity.businessId,
+    customerId: identity.id,
+    serviceTypeId: slot.serviceTypeId,
+    slotStart: slot.slotStart,
+    slotEnd: slot.slotEnd,
+  })
+
+  if (res.kind === 'slot_has_space') {
+    // The slot is not actually full — let the caller route to the normal booking path.
+    return { reply: '', routeToBooking: true }
+  }
+
+  if (res.kind === 'needs_name') {
+    // Owner needs a name; reuse the existing soft name-ask copy. No insert happened — the
+    // offer is re-attempted next turn once a name is on file. Session stays open.
+    return { reply: t('ask_customer_name', lang), sessionComplete: false }
+  }
+
+  const dateLabel = formatSlotDate(slot.slotStart, businessTimezone)
+  const timeLabel = formatSlotTime(slot.slotStart, businessTimezone)
+  if (res.kind === 'already_on_list') {
+    const reply = await genReply({
+      businessTimezone, businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `The customer is already on the waitlist for the ${dateLabel} at ${timeLabel} session (their place is currently ${res.position}). Warmly reassure them they're already on the list — do NOT add them again — and tell them you'll message them the moment a spot opens.`,
+    })
+    return { reply, sessionComplete: true }
+  }
+
+  // res.kind === 'joined' — Q3: state the position, never promise it stays fixed.
+  const reply = await genReply({
+    businessTimezone, businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+    situation: `The customer is now on the waitlist for the full ${dateLabel} at ${timeLabel} session — their place is ${res.position} in line. Confirm warmly that you've kept their place and state their position (${res.position}), without promising that position will stay the same; tell them you'll message them the moment a spot opens.`,
+  })
+  return { reply, sessionComplete: true }
 }
 
 type CustomerMemoryInput = {
@@ -1308,6 +1411,29 @@ export async function handleBookingFlow(
     : 'Do NOT greet or re-introduce yourself — continue the conversation directly. '
 
   const intentResult2 = await (async (): Promise<FlowResult> => {
+    // WL-4 — explicit "put me on the waitlist" / "תכניס אותי לרשימת המתנה". Branch on === true
+    // so an omitted/undefined flag (the model never spoke) NEVER fires this. The guards mirror
+    // the waitlist-offer binding (~the offer branch above): never engage when a booking step is
+    // already in flight, so it can't hijack an in-progress confirmation/selection. The
+    // in-progress branches already returned earlier this turn; the guard makes that explicit.
+    if (intent.joinWaitlist === true && !updatedCtx.pendingSlot && !updatedCtx.pendingDecision && !updatedCtx.awaitingConfirmationFor) {
+      // Resolve the concrete full slot the SAME deterministic way the booking path does.
+      const concrete = resolveConcreteWaitlistSlot(intent, activeServices, businessTimezone, new Date())
+      if (concrete) {
+        const join = await handleWaitlistJoinRequest(db, identity, concrete, {
+          lang: detectedLanguage, businessTimezone, businessName, transcript, genReply, ctx: updatedCtx,
+        })
+        // slot_has_space → fall through to normal booking for that slot (NOT a dead-end).
+        if (!join.routeToBooking) {
+          if (join.sessionComplete) await completeSession(db, session.id)
+          else await updateSessionContext(db, session.id, updatedCtx, 'active')
+          return { reply: join.reply, ...(join.sessionComplete ? { sessionComplete: true } : { sessionComplete: false }) }
+        }
+        // routeToBooking → fall through to the normal booking handling below for this slot.
+      }
+      // No concrete full slot named → fall through to the normal booking path, which reuses the
+      // existing day/slot clarification ("which session?") instead of inserting a fuzzy row.
+    }
     // P4: "give me back the class we cancelled" → re-offer the exact cancelled slot from
     // the snapshot. Falls through to normal handling when there's nothing fresh to restore.
     if (intent.restorePrevious === true) {
