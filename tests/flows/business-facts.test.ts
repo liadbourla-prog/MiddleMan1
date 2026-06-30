@@ -56,6 +56,41 @@ describe('buildBusinessFacts — closed-world grounding', () => {
     expect(facts.toLowerCase()).toContain('not open yet')
   })
 
+  it('surfaces the business address verbatim so Branch 4 can answer "where are you?"', () => {
+    const facts = buildBusinessFacts(
+      STUDIOGA_SERVICES,
+      undefined,
+      { address: 'הרצל 1, תל אביב' } as never,
+    )
+    expect(facts).toContain('הרצל 1, תל אביב')
+    expect(facts.toLowerCase()).toContain('address')
+  })
+
+  it('surfaces a derived Google Maps link alongside the address', () => {
+    const facts = buildBusinessFacts(
+      STUDIOGA_SERVICES,
+      undefined,
+      { address: 'Herzl 1, Tel Aviv' } as never,
+    )
+    expect(facts).toContain('https://www.google.com/maps/search/')
+  })
+
+  it('uses the owner-pasted map link over a derived one when present', () => {
+    const facts = buildBusinessFacts(
+      STUDIOGA_SERVICES,
+      undefined,
+      { address: 'Herzl 1', googleMapsUrl: 'https://g.page/studio' } as never,
+    )
+    expect(facts).toContain('https://g.page/studio')
+    expect(facts).not.toContain('maps/search')
+  })
+
+  it('guards against inventing an address when none is on record', () => {
+    const facts = buildBusinessFacts(STUDIOGA_SERVICES, undefined, undefined)
+    expect(facts.toLowerCase()).toContain('none on record')
+    expect(facts.toLowerCase()).toContain('do not invent')
+  })
+
   it('refuses to offer anything when no services are configured', () => {
     const facts = buildBusinessFacts([], undefined, undefined)
     expect(facts).toContain('NO bookable services')

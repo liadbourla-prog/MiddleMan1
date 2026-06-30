@@ -31,6 +31,7 @@ import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
 import { listDayOptions, type ClassSession, type DayOptions } from '../availability/day-options.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
+import { resolveGoogleMapsUrl } from '../location/maps.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
 import { looksLikeGreetingOrSocial } from './social-text.js'
@@ -848,6 +849,17 @@ export function buildBusinessFacts(
   }
   if (business?.maxBookingDaysAhead != null) {
     lines.push(`Bookings can be made up to ${business.maxBookingDaysAhead} days ahead — never claim a date within that window is "not open yet".`)
+  }
+  // The business's physical address — the ONLY source for "where are you?" / location questions.
+  // Give it verbatim when asked, with the map link when available; when absent, there is no address
+  // on record (do NOT invent one or promise to find out — the honest route is the ask-the-owner relay).
+  const address = business?.address?.trim()
+  if (address) {
+    lines.push(`Business address (give this verbatim if the customer asks where you are located): ${address}`)
+    const mapsUrl = business ? resolveGoogleMapsUrl(business) : null
+    if (mapsUrl) lines.push(`Map link for the address (share it alongside the address when the customer asks where you are): ${mapsUrl}`)
+  } else {
+    lines.push('Business address: none on record — if the customer asks where you are located, do NOT invent or guess an address or a map link.')
   }
   return lines.join('\n')
 }

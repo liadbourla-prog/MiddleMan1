@@ -75,6 +75,9 @@ export function requiredActionForInstruction(instructionType: string): Action | 
     case 'service_change':
       return 'service.modify'
     case 'policy_change':
+    // Setting the business address is a business-config change — gate it like other policy
+    // edits so a delegated user needs the same grant; managers always pass.
+    case 'business_profile':
       return 'policy.change'
     case 'permission_change':
       return 'permission.manage'

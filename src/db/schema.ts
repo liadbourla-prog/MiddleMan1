@@ -14,6 +14,7 @@ import {
   check,
 } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
+import type { AddressComponents } from '../shared/skill-types.js'
 
 export const businesses = pgTable('businesses', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -29,6 +30,17 @@ export const businesses = pgTable('businesses', {
   googleCalendarId: text('google_calendar_id').notNull(),
   googleRefreshToken: text('google_refresh_token'),
   timezone: text('timezone').notNull().default('UTC'),
+  // Physical business location. The single canonical home for the address; before this it only
+  // existed transiently (GMB skill input) or buried in websiteJson. Set/changed conversationally
+  // by the owner in Branch 3 (manageBusinessSettings → business_profile); surfaced to customers in
+  // Branch 4 (buildBusinessFacts) and to the website/GMB skills via SkillBusiness. All null until
+  // the owner provides an address.
+  //   address           — canonical free-text display string, owner's language (e.g. "הרצל 1, תל אביב").
+  //   addressComponents — structured { streetAddress, city, region, country, postalCode } for websites/GMB.
+  //   googleMapsUrl     — the owner's pasted Maps/g.page link; when null a search URL is derived from address.
+  address: text('address'),
+  addressComponents: jsonb('address_components').$type<AddressComponents>(),
+  googleMapsUrl: text('google_maps_url'),
   minBookingBufferMinutes: integer('min_booking_buffer_minutes').notNull().default(30),
   maxBookingDaysAhead: integer('max_booking_days_ahead').notNull().default(365),
   cancellationCutoffMinutes: integer('cancellation_cutoff_minutes').notNull().default(0),
