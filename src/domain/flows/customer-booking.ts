@@ -13,6 +13,7 @@ import { setCustomerName, deriveLastName } from '../identity/customer-resolver.j
 import { canonicalTime } from './slot-fabrication-guard.js'
 import { buildTurnLedger } from '../grounding/turn-ledger.js'
 import { gateReply, makeRegenBudget, SAFE_AUDIT_FALLBACK } from '../grounding/output-gate.js'
+import { logGateDecision } from '../grounding/gate-telemetry.js'
 import type { ActionClaim } from './reply-guard.js'
 import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
@@ -886,6 +887,10 @@ export function makeGenReply(
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
   dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
   businessId?: string,
+  // Phase 0 (X1): per-turn identity for the gate-decision line. Mutable so handleBookingFlow can
+  // set `intent` once it is extracted (genReply is built before intent resolution). Optional so
+  // the existing unit callers stay 5-arg; production always threads it.
+  telemetryCtx?: { identityId?: string | null; sessionId?: string | null; intent?: string | null },
 ): GenReply {
   const ledger = buildTurnLedger({
     businessFacts,
@@ -929,8 +934,35 @@ export function makeGenReply(
         regen,
         budget,
       })
+      // Phase 0 (X1) — one gate-decision line per gated reply at the Branch-4 door.
+      logGateDecision({
+        door: 'branch4',
+        businessId: businessId ?? null,
+        identityId: telemetryCtx?.identityId ?? null,
+        sessionId: telemetryCtx?.sessionId ?? null,
+        intent: telemetryCtx?.intent ?? null,
+        focusDay: opts.focusDay?.dateStr ?? null,
+        ...result.telemetry,
+      })
       return result.reply
     } catch {
+      // The draft pipeline threw — the door still fell to a safe template; record it so a turn
+      // that dropped to fallback is never invisible (no gates fired, no grounding observed).
+      logGateDecision({
+        door: 'branch4',
+        businessId: businessId ?? null,
+        identityId: telemetryCtx?.identityId ?? null,
+        sessionId: telemetryCtx?.sessionId ?? null,
+        intent: telemetryCtx?.intent ?? null,
+        focusDay: opts.focusDay?.dateStr ?? null,
+        gatesFired: [],
+        regenCount: 0,
+        fellToTemplate: true,
+        situationHadOpenTimes: false,
+        occupancyAsserted: false,
+        occupancySpineConsulted: false,
+        occupancyOutcome: 'not_applicable',
+      })
       return SAFE_AUDIT_FALLBACK[input.language]
     }
   }
@@ -1174,7 +1206,15 @@ export async function handleBookingFlow(
       return { open: false, text: null }
     }
   }
-  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id)
+  // Phase 0 (X1): per-turn identity for the gate-decision telemetry line. `intent` is filled in
+  // below once the customer intent is extracted (genReply is built before intent resolution);
+  // the few pre-intent genReply paths (rebook/greeting) emit with intent:null, which is correct.
+  const gateTelemetryCtx: { identityId: string | null; sessionId: string | null; intent: string | null } = {
+    identityId: identity.id,
+    sessionId: session.id,
+    intent: null,
+  }
+  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id, gateTelemetryCtx)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
@@ -1401,6 +1441,7 @@ export async function handleBookingFlow(
   }
 
   const intent = intentResult.data
+  gateTelemetryCtx.intent = intent.intent // Phase 0 (X1): tag the gate-decision line with the resolved intent class.
   // Capture the customer's name the first time they state it (non-blocking, never clobbers).
   await persistCapturedName(db, identity.businessId, identity.id, identity.displayName ?? null, intent.customerNameHint ?? null)
   const detectedLanguage = intent.detectedLanguage

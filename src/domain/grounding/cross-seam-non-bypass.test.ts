@@ -63,8 +63,12 @@ describe('Seam 1 — Branch 4 (makeGenReply): every reply traverses gateReply, n
   })
 
   it('on a thrown pipeline returns the gate-owned SAFE_AUDIT_FALLBACK, never the ungated draft (F-rev4, customer-booking.ts:806-807)', () => {
-    // The catch sits at the bottom of the try that wraps draft-gen + gateReply.
-    expect(body).toMatch(/}\s*catch\s*{\s*return SAFE_AUDIT_FALLBACK\[input\.language\]\s*}/)
+    // The catch sits at the bottom of the try that wraps draft-gen + gateReply. As of Phase 0 (X1)
+    // it MAY emit one gate-decision telemetry line (ids/booleans only — never the draft) before
+    // returning the safe fallback, so allow statements between `catch {` and the return. The
+    // non-leak guarantee is independently pinned by the `return` inventory (=3) + the no-`return
+    // reply`/`return observeVoiceTells` assertions below.
+    expect(body).toMatch(/}\s*catch\s*{[\s\S]*?return SAFE_AUDIT_FALLBACK\[input\.language\]\s*}/)
   })
 
   it('has NO inline reply path that bypasses gateReply (no `return reply` / `return observeVoiceTells(`)', () => {

@@ -72,6 +72,7 @@ import { observeVoiceTells } from '../../domain/flows/voice-guard.js'
 import { logAudit } from '../../domain/audit/logger.js'
 import { buildTurnLedger, type OccupancySpine, type TurnLedger } from '../../domain/grounding/turn-ledger.js'
 import { gateReply, makeRegenBudget, tryConsumeRegen, type RegenBudget } from '../../domain/grounding/output-gate.js'
+import { logGateDecision, type GateTelemetrySignals } from '../../domain/grounding/gate-telemetry.js'
 import { listDayOptions, type DayOptions } from '../../domain/availability/day-options.js'
 import { resolveRequestedDate, type RequestedDateParts, type RelativeDay } from '../../domain/availability/resolve-slot.js'
 
@@ -1266,9 +1267,10 @@ export async function gateAndAuditBranch3Reply(params: {
   systemPrompt: string
   businessId: string
   actorId: string
+  sessionId?: string | undefined
   budget?: RegenBudget | undefined
 }): Promise<string> {
-  const { draft, ledger, lang, focusDay, bookingConfirmed, succeededActions, calendarConnected, contents, systemPrompt, businessId, actorId, budget } = params
+  const { draft, ledger, lang, focusDay, bookingConfirmed, succeededActions, calendarConnected, contents, systemPrompt, businessId, actorId, sessionId, budget } = params
 
   // Text-only corrective regeneration: re-run the orchestrator over the same contents + the
   // draft + the gate's instruction (mirrors auditReplyClaims). No tools — wording only.
@@ -1282,16 +1284,33 @@ export async function gateAndAuditBranch3Reply(params: {
     return r.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text ?? ''
   }
 
+  let gateTelemetry: GateTelemetrySignals | null = null
   const gated = await gateReply(draft, {
     ledger,
     input: { language: lang },
     opts: { bookingConfirmed, ...(focusDay ? { focusDay } : {}) },
     regen: gateRegen,
     budget,
-  }).then((g) => g.reply)
+  }).then((g) => { gateTelemetry = g.telemetry; return g.reply })
     // F-rev4: a thrown gate must NOT leak the ungated `draft` (potentially the very fabrication
     // the gate exists to catch). Fail to the safe audit template instead.
     .catch(() => SAFE_AUDIT_FALLBACK[lang])
+
+  // Phase 0 (X1) — one gate-decision line per turn at the Branch-3 door. Branch 3 has no single
+  // "intent" (function-calling), so `intent` is null. A thrown gate (null telemetry) is recorded
+  // as a fell-to-template line so a dropped turn is never invisible.
+  logGateDecision({
+    door: 'branch3',
+    businessId,
+    identityId: actorId,
+    sessionId: sessionId ?? null,
+    intent: null,
+    focusDay: focusDay?.dateStr ?? null,
+    ...(gateTelemetry ?? {
+      gatesFired: [], regenCount: 0, fellToTemplate: true, situationHadOpenTimes: false,
+      occupancyAsserted: false, occupancySpineConsulted: false, occupancyOutcome: 'not_applicable' as const,
+    }),
+  })
 
   return auditReplyClaims({
     draft: gated,
@@ -1589,6 +1608,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
         systemPrompt,
         businessId,
         actorId: identityId,
+        sessionId,
         budget: regenBudget,
       })
         // F-rev4: never let a thrown gate/auditor leak the ungated `textPart` (raw model draft).

@@ -29,6 +29,7 @@ import {
   daysShareOpenTime,
 } from '../flows/slot-fabrication-guard.js'
 import { buildAllowedTimes, type TurnLedger } from './turn-ledger.js'
+import type { GateTelemetrySignals, OccupancyGateOutcome } from './gate-telemetry.js'
 
 // ── Safe fallbacks (assert nothing false) + correctives. Owned by the gate now. ──────
 
@@ -201,6 +202,12 @@ export interface GateContext {
 export interface GateResult {
   reply: string
   interventions: GateIntervention[]
+  /**
+   * Phase 0 (X1) gate-decision telemetry for this pass — the door-agnostic signals the caller
+   * emits as one structured line. `gatesFired` mirrors `interventions`; the rest expose the
+   * grounding-empty vs gate-skipped distinction (see gate-telemetry.ts). Booleans/counts only.
+   */
+  telemetry: GateTelemetrySignals
 }
 
 /**
@@ -214,6 +221,12 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
   const businessId = ledger.businessId
   const interventions: GateIntervention[] = []
   const replySurfacesAnyTime = (text: string): boolean => extractClockTimes(text).length > 0
+  // ── Phase 0 (X1) telemetry accumulators ───────────────────────────────────────────────
+  // Counted/derived as the gate runs so the caller can emit one structured line. No bodies.
+  let regenCount = 0
+  let occupancyAsserted = false
+  let occupancySpineConsulted = false
+  let occupancyOutcome: OccupancyGateOutcome = 'not_applicable'
 
   // The set of safe-fallback strings any gate may terminate at — the post-regen re-check
   // never re-trips one of these (they are terminal by construction), and the voice monitor
@@ -237,6 +250,7 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
   ): Promise<string> => {
     if (!tryConsumeRegen(budget)) return fallback
     try {
+      regenCount += 1
       const corrected = await regen(instruction)
       return stillTrips(corrected) ? fallback : corrected
     } catch {
@@ -244,10 +258,22 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
     }
   }
 
+  // Build the telemetry signal bundle for a return — situationHasOpen is computed below the
+  // booking early-return, so this is called with whatever is known at the return point.
+  const telemetryAt = (situationHadOpenTimes: boolean, finalReply: string): GateTelemetrySignals => ({
+    gatesFired: [...interventions],
+    regenCount,
+    fellToTemplate: TERMINALS.has(finalReply),
+    situationHadOpenTimes,
+    occupancyAsserted,
+    occupancySpineConsulted,
+    occupancyOutcome,
+  })
+
   // Exit path 1 — caller asserted a real persisted booking; the slot is real, so trust
   // the wording and skip every gate (only the voice monitor runs).
   if (opts.bookingConfirmed) {
-    return { reply: observeVoiceTells(reply, { businessId, language }), interventions }
+    return { reply: observeVoiceTells(reply, { businessId, language }), interventions, telemetry: telemetryAt(false, reply) }
   }
 
   // Gate 1 — phantom booking-confirmed claim.
@@ -284,9 +310,11 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
   }
   const situationHasOpen = [...situationOpen.values()].some((s) => s.size > 0)
   if (assertsNoAvailability(reply)) {
+    occupancyAsserted = true
     // (a) Fresh-spine backstop. Skip when the reply already surfaces a concrete time — a
     // time-scoped negative that lists same-day alternatives is correct and must not regen.
     if (opts.focusDay && !replySurfacesAnyTime(reply)) {
+      occupancySpineConsulted = true
       const spine = await ledger.occupancySpine(opts.focusDay.dateStr, opts.focusDay.serviceTypeId)
       if (spine.open) {
         // The spine's open times are authoritatively backed this turn (a fresh DB read of the
@@ -295,6 +323,7 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
         // below (that would fallback a legitimately-offered open slot: a G1/G5 regression).
         for (const t of extractClockTimes(spine.text ?? '')) allowed.add(t)
         interventions.push('occupancy')
+        occupancyOutcome = 'fired'
         const out = await regenOrFallback(
           `${OCCUPANCY_GUARD_INSTRUCTION}${spine.text ? ` Real open options: ${spine.text}` : ''}`,
           OCCUPANCY_FALLBACK[language],
@@ -304,16 +333,35 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
         // return so a spine-regen that re-introduces an earlier-gate lie (e.g. an unbacked time)
         // is still caught (D6 no-oscillation). out is either the clean correction or the terminal.
         reply = out
+      } else {
+        // The fresh spine confirmed the focused day genuinely has no open capacity — an HONEST
+        // "full". No intervention; recorded distinctly so an honest full never reads as a skip.
+        occupancyOutcome = 'passed_spine_closed'
       }
     } else {
       // (b) Situation signal, day-scoped (back-compat).
       if (situationHasOpen && !daysShareOpenTime(situationOpen, extractDayScopedTimes(reply))) {
         interventions.push('occupancy')
+        occupancyOutcome = 'fired'
         reply = await regenOrFallback(
           OCCUPANCY_GUARD_INSTRUCTION,
           OCCUPANCY_FALLBACK[language],
           (c) => assertsNoAvailability(c) && !daysShareOpenTime(situationOpen, extractDayScopedTimes(c)),
         )
+      } else if (situationHasOpen) {
+        // The situation carried open times and the reply surfaced the SAME day's open time(s):
+        // a correct same-day negative ("no 12, but 14:00 that day") — not a fabrication.
+        occupancyOutcome = 'passed_shares_open_time'
+      } else if (opts.focusDay) {
+        // GATE SKIPPED: we are in (b) despite a focusDay only because the reply surfaced a clock
+        // time, so the day-blind backstop short-circuited (the P2 hole). Read with
+        // situationHadOpenTimes:false this is the exact P2 shape — a no-availability claim that
+        // went unchallenged because the surfaced time may be the WRONG day.
+        occupancyOutcome = 'skipped_reply_surfaced_time'
+      } else {
+        // GROUNDING EMPTY: a no-availability claim, no focus-day spine path, and the situation
+        // carried no open times to contradict it. Nothing could verify the claim.
+        occupancyOutcome = 'skipped_grounding_empty'
       }
     }
   }
@@ -379,5 +427,6 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
       isSafeFallback: TERMINALS.has(reply),
     }),
     interventions,
+    telemetry: telemetryAt(situationHasOpen, reply),
   }
 }
