@@ -168,24 +168,43 @@ describe('single-confirm appointment path — no double-confirm (F1b)', () => {
   })
 })
 
-// F1c/S1 — the "a spot opened" waitlist offer must be bindable on the inbound side: a "yes"
-// books the offered slot, a "no" releases it. Previously it set no session state and had no
-// consumer, so the reply fell through to fresh intent (the loop's primary trigger). This
-// reads the source so a future edit that drops the consumer fails loudly.
-describe('waitlist offer acceptance — inbound consumer binds the reply (F1c)', () => {
-  it('the consumer loads an open offer and books on yes / releases on no, before the dispatch', () => {
-    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+// F1c/S1 (WL-6) — the "a spot opened" waitlist offer must be bindable on the inbound side via
+// the GENUINE-HOLD path: WL-5 placed a real hold at offer time, so a "yes" CONFIRMS that held
+// booking (acceptWaitlistOffer → confirmBooking), and a "no" RELEASES it and cascades to the
+// next in line (declineWaitlistOffer). This is the inbound consumer; previously it re-ran a
+// first-come requestBooking and hand-flipped the row. This reads the source so a future edit
+// that drops the consumer — or reverts to the old first-come behaviour — fails loudly.
+describe('waitlist offer acceptance — inbound consumer binds the reply via the genuine-hold path (WL-6)', () => {
+  const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+
+  it('the consumer loads an open offer before the normal dispatch branches', () => {
     const idxConsumer = src.indexOf('loadOpenWaitlistOffer(db, identity.businessId, identity.id')
     const idxBookingSelection = src.indexOf("pendingDecision?.kind === 'booking_selection'")
     expect(idxConsumer).toBeGreaterThan(-1)
-    // Runs before the normal dispatch branches.
     expect(idxConsumer).toBeLessThan(idxBookingSelection)
-    // yes → books the offered slot and marks it accepted; no → releases it.
-    expect(src).toMatch(/decision === 'yes'[\s\S]*requestBooking\(db, calendar, identity, \{ serviceTypeId: offer\.serviceTypeId/)
-    expect(src).toMatch(/status: 'accepted'/)
-    expect(src).toMatch(/decision === 'no'[\s\S]*status: 'expired'/)
     // Only engages when no booking step is already in flight (never hijacks a confirmation).
     expect(src).toMatch(/!ctx\.pendingSlot && !ctx\.pendingDecision && !ctx\.awaitingConfirmationFor/)
+  })
+
+  it("'yes' confirms the WL-5 hold via acceptWaitlistOffer — NOT a fresh requestBooking", () => {
+    // The yes arm calls the WL-AX domain op, passing the loaded offer + the customer name.
+    expect(src).toMatch(/decision === 'yes'[\s\S]*acceptWaitlistOffer\(db, calendar, identity,[\s\S]*offer\)/)
+    // It must NOT re-run a first-come requestBooking inside the yes arm.
+    expect(src).not.toMatch(/decision === 'yes'[\s\S]*requestBooking\(db, calendar, identity, \{ serviceTypeId: offer\.serviceTypeId/)
+    // accepted → confirmed reply (bookingConfirmed) + session complete.
+    expect(src).toMatch(/res\.kind === 'accepted'[\s\S]*bookingConfirmed: true/)
+    // just_went → warm fallback, NEVER a dead-end (keep on waitlist / find another time).
+    expect(src).toMatch(/res\.kind === 'just_went'/)
+  })
+
+  it("'no' releases the hold + cascades via declineWaitlistOffer — no manual waitlist write", () => {
+    expect(src).toMatch(/decision === 'no'[\s\S]*declineWaitlistOffer\(db, calendar, \{[\s\S]*id: offer\.id/)
+  })
+
+  it('does NOT hand-write the waitlist row status from this block (the domain ops own that)', () => {
+    // The old first-come block manually flipped the row; WL-AX owns all waitlist status writes.
+    expect(src).not.toMatch(/db\.update\(waitlist\)\.set\(\{ status: 'accepted' \}\)/)
+    expect(src).not.toMatch(/db\.update\(waitlist\)\.set\(\{ status: 'expired' \}\)\.where\(eq\(waitlist\.id, offer\.id\)\)/)
   })
 })
 

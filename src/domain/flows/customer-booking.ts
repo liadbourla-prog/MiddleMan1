@@ -46,6 +46,7 @@ import {
   type AvoidConstraint,
   type RejectedSlot,
 } from './negotiation-constraints.js'
+import { acceptWaitlistOffer, declineWaitlistOffer } from '../waitlist/accept.js'
 
 /** Set or remove negotiationConstraints on a context — omits the key when empty so the
  *  stored jsonb stays minimal (and satisfies exactOptionalPropertyTypes). */
@@ -1126,7 +1127,17 @@ export async function handleBookingFlow(
       const offerServiceName = activeServices.find((s) => s.id === offer.serviceTypeId)?.name ?? (lang === 'he' ? 'התור' : 'the appointment')
       const decision = parseConfirmation(messageText)
       if (decision === 'no') {
-        await db.update(waitlist).set({ status: 'expired' }).where(eq(waitlist.id, offer.id))
+        // WL-6: explicit decline. declineWaitlistOffer releases the WL-5 hold, CAS-flips the row
+        // offered→expired, and cascades to the next in line — it owns ALL waitlist status writes,
+        // so no manual db.update(waitlist) here (that would double-write).
+        await declineWaitlistOffer(db, calendar, {
+          id: offer.id,
+          businessId: identity.businessId,
+          customerId: identity.id,
+          serviceTypeId: offer.serviceTypeId,
+          slotStart: offer.slotStart,
+          slotEnd: offer.slotEnd,
+        })
         await completeSession(db, session.id)
         const reply = await genReply({
           businessTimezone, businessName, language: lang,
@@ -1136,27 +1147,28 @@ export async function handleBookingFlow(
         return { reply, sessionComplete: true }
       }
       if (decision === 'yes') {
-        const result = await requestBooking(db, calendar, identity, { serviceTypeId: offer.serviceTypeId, slotStart: offer.slotStart, slotEnd: offer.slotEnd })
+        // WL-6: confirm the GENUINE WL-5 hold (acceptWaitlistOffer → confirmBooking + CAS-flip
+        // offered→accepted, both-or-neither). NOT a fresh first-come requestBooking. The domain op
+        // owns the waitlist status write.
+        const res = await acceptWaitlistOffer(db, calendar, identity, identity.displayName ?? identity.phoneNumber, offer)
         const offerDate = formatSlotDate(offer.slotStart, businessTimezone)
         const offerTime = formatSlotTime(offer.slotStart, businessTimezone)
-        if (result.ok || (!result.ok && result.code === 'already_booked')) {
-          await db.update(waitlist).set({ status: 'accepted' }).where(eq(waitlist.id, offer.id))
+        if (res.kind === 'accepted') {
           await completeSession(db, session.id)
           const reply = await genReply({
             businessTimezone, businessName, language: lang,
-            situation: result.ok
-              ? `Booking confirmed for ${offerServiceName} on ${offerDate} at ${offerTime} — the spot that opened up is now theirs.`
-              : `The customer is ALREADY booked for ${offerServiceName} on ${offerDate} at ${offerTime}. Warmly reassure them their spot is confirmed; do NOT offer another time.`,
+            situation: `Booking confirmed for ${offerServiceName} on ${offerDate} at ${offerTime} — the spot that opened up is now theirs.`,
             transcript, ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}), customerMemory: extractMemory(ctx),
           }, { bookingConfirmed: true })
           return { reply, sessionComplete: true }
         }
-        // The freed spot was taken before we could lock it in — honest, never a fabricated hold.
-        await db.update(waitlist).set({ status: 'expired' }).where(eq(waitlist.id, offer.id))
+        // res.kind === 'just_went' — lost the race; the held spot slipped away just now. Warm
+        // fallback, NEVER a dead-end: apologise and offer to keep them on the waitlist / find
+        // another time.
         await completeSession(db, session.id)
         const reply = await genReply({
           businessTimezone, businessName, language: lang,
-          situation: `Unfortunately the ${offerServiceName} spot on ${offerDate} at ${offerTime} was taken before it could be locked in. Apologise warmly and offer to keep them on the waitlist or find another time.`,
+          situation: `Unfortunately the ${offerServiceName} spot on ${offerDate} at ${offerTime} slipped away just now. Apologise warmly and offer to keep them on the waitlist or find another time.`,
           transcript, ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}), customerMemory: extractMemory(ctx),
         })
         return { reply, sessionComplete: true }
@@ -3166,8 +3178,11 @@ async function handleBookingSelection(
   business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
-  const candidates = ctx.pendingDecision?.candidateIds ?? ctx.cancellationCandidates ?? []
-  const isRescheduling = ctx.pendingDecision?.isRescheduling ?? ctx.isReschedulingFlow ?? false
+  // Only the booking_selection variant carries candidateIds/isRescheduling (this handler is
+  // entered solely on that kind); narrow to keep the widened pendingDecision union typesafe.
+  const selection = ctx.pendingDecision?.kind === 'booking_selection' ? ctx.pendingDecision : undefined
+  const candidates = selection?.candidateIds ?? ctx.cancellationCandidates ?? []
+  const isRescheduling = selection?.isRescheduling ?? ctx.isReschedulingFlow ?? false
 
   // Candidate bookings with service names, so we can resolve a natural-language
   // pick and name the chosen slot back in the confirmation.
