@@ -11,6 +11,9 @@ import { managerMemory, identities, businesses as businessesTable, serviceTypes,
 import type { IdentityRole } from '../../db/schema.js'
 import type { Action } from '../../domain/authorization/check.js'
 import { buildInstructorRosterBlock, buildTeachingScheduleBlock, type InstructorRosterEntry, type TeachingSlot } from '../../domain/provider/roster.js'
+import { resolveAddresseeGender, shouldPersist, type AddresseeGender, type GenderSource, type ResolvedGender } from '../../domain/identity/addressee-gender.js'
+import { genderFromName } from '../../domain/identity/hebrew-name-gender.js'
+import { inferSelfGenderFromHebrew } from '../../domain/identity/hebrew-self-morphology.js'
 import type { CalendarClient } from '../calendar/client.js'
 import type { TranscriptTurn } from './types.js'
 import type { Lang } from '../../domain/i18n/t.js'
@@ -763,7 +766,24 @@ function buildBusinessKnowledgeBlock(bk: BusinessKnowledge | null): string {
   return lines.join('\n')
 }
 
-function buildSystemPrompt(params: {
+// Resolve how the PA addresses the OWNER in Hebrew (Branch 3, decision 1): their stored value,
+// their first-name guess, and the self-morphology of their own inbound — by the shared precedence
+// resolver. null → unknown → masculine floor. Exported for unit testing the composition.
+export function resolveOwnerAddresseeGender(params: {
+  stored: AddresseeGender | null
+  storedSource: GenderSource | null
+  ownerName: string | null
+  message: string
+}): ResolvedGender | null {
+  return resolveAddresseeGender({
+    stored: params.stored,
+    storedSource: params.storedSource,
+    nameSignal: genderFromName(params.ownerName),
+    morphologySignal: inferSelfGenderFromHebrew(params.message),
+  })
+}
+
+export function buildSystemPrompt(params: {
   businessName: string
   timezone: string
   lang: Lang
@@ -778,8 +798,10 @@ function buildSystemPrompt(params: {
   outreachIdentity: string
   bookingAuthority: 'auto' | 'owner_approval'
   conversationHistory: TranscriptTurn[]
+  // How to address the OWNER in Hebrew (resolved per-identity). null/undefined → masculine floor.
+  addresseeGender?: AddresseeGender | null
 }): string {
-  const { businessName, timezone, lang, businessKnowledge, activeServices, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, openQuestions, outreachIdentity, bookingAuthority, conversationHistory } = params
+  const { businessName, timezone, lang, businessKnowledge, activeServices, instructorRoster, teachingSchedule, managerMemorySummaries, actionLedger, activeCoordinations, openQuestions, outreachIdentity, bookingAuthority, conversationHistory, addresseeGender } = params
   const now = new Date()
   const locale = lang === 'he' ? 'he-IL' : 'en-GB'
   const currentDateTime = now.toLocaleString(locale, {
@@ -808,7 +830,7 @@ function buildSystemPrompt(params: {
 
   return `You are the PA admin assistant for ${businessName}, texting the business owner as the business. Today is ${currentDateTime} in ${timezone}.
 
-${buildVoiceCore('manager')}
+${buildVoiceCore('manager', addresseeGender ?? null)}
 
 The manager is texting you on WhatsApp. You have access to tools. Use them when the manager needs information or action. For straightforward questions you can answer from context, reply directly without calling any tool.
 
@@ -1403,11 +1425,28 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     : ''
 
   const [mgrName] = await db
-    .select({ name: identities.displayName })
+    .select({ id: identities.id, name: identities.displayName, addresseeGender: identities.addresseeGender, addresseeGenderSource: identities.addresseeGenderSource })
     .from(identities)
     .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager')))
     .limit(1)
-    .catch(() => [undefined as { name: string | null } | undefined])
+    .catch(() => [undefined as { id: string; name: string | null; addresseeGender: AddresseeGender | null; addresseeGenderSource: GenderSource | null } | undefined])
+
+  // Resolve how the PA addresses the OWNER in Hebrew (decision 1): stored ▸ name ▸ the
+  // self-morphology of this inbound. Persist on a genuine rank gain (never a downgrade) so a
+  // female owner's own Hebrew sticks; null → masculine floor. Best-effort — never drop a turn.
+  const ownerResolved = resolveOwnerAddresseeGender({
+    stored: mgrName?.addresseeGender ?? null,
+    storedSource: mgrName?.addresseeGenderSource ?? null,
+    ownerName: mgrName?.name ?? null,
+    message,
+  })
+  if (mgrName?.id && shouldPersist(mgrName.addresseeGender ?? null, mgrName.addresseeGenderSource ?? null, ownerResolved) && ownerResolved) {
+    await db.update(identities)
+      .set({ addresseeGender: ownerResolved.gender, addresseeGenderSource: ownerResolved.source })
+      .where(eq(identities.id, mgrName.id))
+      .catch(() => { /* non-fatal — re-resolves next turn */ })
+  }
+  const ownerAddresseeGender: AddresseeGender | null = ownerResolved?.gender ?? null
   const [bizRow] = await db
     .select({ mode: businessesTable.outreachIdentityMode, bookingAuthority: businessesTable.bookingAuthority })
     .from(businessesTable)
@@ -1446,6 +1485,7 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
     outreachIdentity,
     bookingAuthority,
     conversationHistory: transcript.slice(-20),
+    addresseeGender: ownerAddresseeGender,
   })
 
   const ctx: ToolContext = {
