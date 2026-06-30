@@ -1,5 +1,5 @@
 import { Worker, Queue } from 'bullmq'
-import { eq, and, asc } from 'drizzle-orm'
+import { eq, and, asc, gte, lt, inArray } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { waitlist, identities, businesses, serviceTypes, bookings } from '../db/schema.js'
 import { canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
@@ -10,6 +10,7 @@ import { logAudit } from '../domain/audit/logger.js'
 import { i18n, type Lang } from '../domain/i18n/t.js'
 import { generateProactiveCustomerMessage } from '../adapters/llm/client.js'
 import { revalidateWaitlistSlotOpen } from './waitlist-revalidate.js'
+import { rankWaitlistCandidates, waitlistTier } from '../domain/waitlist/priority.js'
 import { queryCustomerSegment } from '../domain/crm/segment-repository.js'
 import { selectColdFillCandidates } from '../domain/crm/cold-fill.js'
 import { dispatchInitiation } from '../domain/initiations/dispatch.js'
@@ -233,8 +234,13 @@ export async function processJob(job: { data: WaitlistJob }) {
     return
   }
 
-  // offer_slot: find the first pending waitlist entry FIFO and send them an offer
-  const [next] = await db
+  // offer_slot: rank ALL pending entries by the fairness tier (WL-2a §3.2) then CAS-flip the
+  // top survivor. Tier 1 (offered first) = no active booking in [now, now+7d]; tier 2 = has one.
+  // FIFO within each tier. The single now anchors the 7-day commitment window for this run.
+  const now = new Date()
+  const windowEnd = new Date(now.getTime() + 7 * 86_400_000)
+
+  const pending = await db
     .select()
     .from(waitlist)
     .where(
@@ -246,30 +252,60 @@ export async function processJob(job: { data: WaitlistJob }) {
       ),
     )
     .orderBy(asc(waitlist.createdAt))
-    .limit(1)
 
-  if (!next) {
+  if (pending.length === 0) {
     // Waitlist FIFO exhausted → fall through to the cold-fill rung of the cascade.
     await attemptColdFill(db, { businessId, serviceTypeId, slotStart: new Date(slotStart) })
     return
   }
 
+  // Per-candidate commitment flag: does this customer have an active booking (any service) at
+  // this business within [now, now+7d]? Active states match ACTIVE_BOOKING_STATES (integrity.ts).
+  const commitmentByEntryId = new Map<string, boolean>()
+  for (const entry of pending) {
+    const active = await db
+      .select({ id: bookings.id })
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.businessId, businessId),
+          eq(bookings.customerId, entry.customerId),
+          inArray(bookings.state, ['held', 'pending_payment', 'confirmed']),
+          gte(bookings.slotStart, now),
+          lt(bookings.slotStart, windowEnd),
+        ),
+      )
+      .limit(1)
+    commitmentByEntryId.set(entry.id, active.length > 0)
+  }
+
+  const ranked = rankWaitlistCandidates(pending, (entry) => commitmentByEntryId.get(entry.id) === true)
+
   const offerExpiresAt = new Date(Date.now() + OFFER_TTL_MINUTES * 60_000)
 
-  // CAS promotion (E1/P1): include `status = 'pending'` in the WHERE so that two
-  // concurrent offer_slot jobs racing on the same entry only ONE flips the row.
-  // The loser gets 0 rows back and must NOT send — return immediately without sending.
-  // CONTRACT: send the offer only when flippedRows.length === 1.
-  const flippedRows = await db
-    .update(waitlist)
-    .set({ status: 'offered', offeredAt: new Date(), offerExpiresAt })
-    .where(and(eq(waitlist.id, next.id), eq(waitlist.status, 'pending')))
-    .returning({ id: waitlist.id })
+  // CAS promotion (E1/P1): include `status = 'pending'` in the WHERE so that two concurrent
+  // offer_slot jobs racing on the same entry only ONE flips the row. Walk the ranked order:
+  // a 0-row CAS means a concurrent job already took that entry — drop it and try the next.
+  // CONTRACT: send the offer only for the entry whose CAS returned exactly 1 row.
+  let next: (typeof ranked)[number] | undefined
+  for (const candidate of ranked) {
+    const flippedRows = await db
+      .update(waitlist)
+      .set({ status: 'offered', offeredAt: new Date(), offerExpiresAt })
+      .where(and(eq(waitlist.id, candidate.id), eq(waitlist.status, 'pending')))
+      .returning({ id: waitlist.id })
+    if (flippedRows.length > 0) {
+      next = candidate
+      break
+    }
+  }
 
-  if (flippedRows.length === 0) {
-    // A concurrent job already promoted this entry — this job is the loser; do nothing.
+  if (!next) {
+    // Every ranked entry was taken by a concurrent job — this job is the loser; do nothing.
     return
   }
+
+  const winnerTier = waitlistTier(commitmentByEntryId.get(next.id) === true)
 
   // Fresh-spine re-validation (T2a.2 / H3/H18): between the freeing cancellation and now the
   // slot can be retaken. Never send a "spot opened" offer for a slot that is gone. Fail-open on
@@ -369,7 +405,7 @@ export async function processJob(job: { data: WaitlistJob }) {
     action: 'waitlist.offer_sent',
     entityType: 'waitlist',
     entityId: next.id,
-    metadata: { slotStart, offerExpiresAt },
+    metadata: { slotStart, offerExpiresAt, tier: winnerTier },
   })
 }
 
