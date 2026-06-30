@@ -228,6 +228,9 @@ The PA must never state a state-changing action as completed unless the determin
 - **Claim auditor:** a reply asserting an unbacked action is regenerated, then replaced with a safe honest fallback (`reply-guard.ts`).
 - **Tool contract:** every state-changing tool MUST write an `audit_log` action recording what it did (or explicitly did not do, and why). A tool with no ledger write is a grounding gap — close it when adding the tool, not later.
 
+### 7.5 Voice-quality fallback rule — honest is never robotic
+The anti-fabrication gate (`grounding/output-gate.ts`, run at all three doors) removes the *false claim*, not the *personality*. When it suppresses a fabrication it regenerates once and, if that still fails, emits a terminal **safe fallback** (`FABRICATED_TIME_FALLBACK`, `OCCUPANCY_FALLBACK`, `BOOKING_NOT_CONFIRMED_FALLBACK`, `SAFE_AUDIT_FALLBACK`). Those fallbacks are held to the **full Voice Bible bar** — first-person, warm, exactly one question, always a next step, no IVR/menu, no grovel, no bilingual leak — and must **assert nothing false** (a time-fabrication fallback names no time; the gate-owned `SAFE_AUDIT_FALLBACK` promises no "I'll check / get back to you", so it can never re-trip the action gate). A fabrication fix that ships a terse or robotic reply is a regression. Two test suites lock this in: `grounding/gate-fallback-voice.test.ts` and the cross-seam `grounding/cross-seam-voice-golden.test.ts` (He+En shape assertions over every fallback). Steer with **"available / open"** framing, never "a real time" (that implies the customer asked for a fake one).
+
 ---
 
 ## 8. Character and Encoding Notes

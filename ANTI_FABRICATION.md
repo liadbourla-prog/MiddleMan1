@@ -57,22 +57,35 @@ The same two levers address all of them; which lever leads depends on whether th
 
 ## 4. The output gate (the anti-fabrication mechanism)
 
-### 4.1 Where it lives — the single chokepoint
+### 4.1 Where it lives — one ledger, one gate, three doors
 
-Every Branch-4 customer reply is produced through **`makeGenReply`** (`src/domain/flows/customer-booking.ts`). It is the one seam every path funnels through, so guards added here are universal. It runs two gates unless the caller asserted a real persisted booking (`opts.bookingConfirmed` → exempt, because the booked slot is real):
+As of the **Unified Anti-Fabrication Gate** (2026-06-30) the mechanism is a single object run at every output door, not a per-branch checker:
 
-- **Gate 1 — phantom booking-claim** (`assertsBookingConfirmed`, `reply-guard.ts`): the reply claims a booking is done when none was written.
-- **Gate 2 — fabricated time** (`findUnbackedTimes`, `slot-fabrication-guard.ts`): the reply states a clock time the core never offered.
+- **One per-turn truth ledger** — `TurnLedger` (`src/domain/grounding/turn-ledger.ts`): the deterministic core fills it *before* any reply is gated with everything provably true this turn — `baseAllowedTimes` (the time allowlist base, see §4.2), `occupancySpine` (a fresh-spine reader), `backedActions` (the actions that actually succeeded this turn), `businessFacts`, `calendarConnected`. It is the single source of backing.
+- **One gate** — `gateReply(reply, ctx)` (`src/domain/grounding/output-gate.ts`): branch-agnostic; regeneration is injected via `ctx.regen`. It runs the enumerable claim-class detectors against the ledger.
+- **Three doors** — the same `gateReply` runs at all three seams that reach `sendMessage`: **Branch 4** `makeGenReply` (`customer-booking.ts`), **Branch 3** `gateAndAuditBranch3Reply` (`orchestrator.ts`), and the **proactive** `generateProactiveCustomerMessage`/`gateProactiveBody` (`client.ts`). A cross-seam non-bypass invariant test (`grounding/cross-seam-non-bypass.test.ts`) proves no reply reaches send without traversing it.
 
-Each gate: **detect → regenerate once with a corrective → deterministic fallback** if it still fails. The fallback is time-free / claim-free — when in doubt we ask, never assert.
+The gates `gateReply` enforces (each: **detect → regenerate once with a corrective → deterministic fallback**; the `opts.bookingConfirmed` early-return exempts a real persisted booking):
+
+- **Gate 1 — phantom booking-claim** (`assertsBookingConfirmed`, `reply-guard.ts`): claims a booking is done when none was written.
+- **Gate 2 — fabricated time** (`findUnbackedTimes`, `slot-fabrication-guard.ts`): states a clock time the core never offered (allowlist = ledger base ∪ per-call situation/customer-raised, §4.2).
+- **Gate 3 — fabricated unavailability / occupancy** (`assertsNoAvailability` + fresh-spine, §6): claims a day/class is full while the spine has open capacity.
+- **Gate 3b — fabricated action-claim** (`detectActionClaims`, `reply-guard.ts`; Branch-4 enforced via `opts.enforceActionClaims`): claims a completed cancel / waitlist-add / message / refund / broadcast / settings-change not in `backedActions`. `booking_made` is excluded (Gate 1 owns it). Branch 3 runs the equivalent in its `auditReplyClaims`.
+- **Gate 4 — self-authored action fabrication** (`hasActionFabrication`, `voice-guard.ts`; **enforced** since 2026-06-30): the reply self-authors "I'll check / ask / get back to you / one of our guides will" — phrasings only the LLM produces (honest escalations are code templates that bypass the gate), so unbacked by construction.
 
 ```
 draft = generateCustomerReply(situation)
-if bookingConfirmed: return draft                      // real slot, trusted
+if bookingConfirmed: return observe(draft)             // real slot, trusted
 if assertsBookingConfirmed(draft): draft = regen(forbid-claim) or BOOKING_NOT_CONFIRMED_FALLBACK
 if findUnbackedTimes(draft, allowed): draft = regen(TIME_GUARD_INSTRUCTION) or FABRICATED_TIME_FALLBACK
-return draft
+if assertsNoAvailability(draft) && spine.open: draft = regen(OCCUPANCY_GUARD) or OCCUPANCY_FALLBACK
+if enforceActionClaims && unbackedActionClaims(draft): draft = regen(ACTION_CLAIM_GUARD) or SAFE_AUDIT_FALLBACK
+if hasActionFabrication(draft): draft = regen(ACTION_FABRICATION_GUARD) or SAFE_AUDIT_FALLBACK
+re-check all detectors (NO further regen) → terminal fallback on any persistent trip   // no oscillation
+return observe(draft)
 ```
+
+**Unified regen cap + deadline (D6).** All gates and all seams share ONE per-turn `RegenBudget` (`{ remaining, deadlineMs }`, `output-gate.ts`) so a multi-gate turn cannot stack unbounded LLM round-trips or blow the 60s identity-lock TTL. When the budget is exhausted/expired a tripped gate skips regeneration and goes straight to its safe fallback. After the gate sequence a **post-regen re-check** re-validates every detector once (no further regen) so a later-gate regeneration cannot silently re-introduce an earlier-gate lie. A budget is created per turn by each seam (Branch 4 in `makeGenReply`, Branch 3 in the orchestrator loop — shared with its `auditReplyClaims`); when no budget is threaded each gate regenerates once exactly as before (no behavior change — the cap only bites the worst case). A gate that *throws* fails to a safe template, never the ungated draft (F-rev4).
 
 ### 4.2 The allowlist — assembled with **zero per-path wiring**
 
@@ -180,7 +193,7 @@ A reply asserted something untrue. Ask:
 
 ## 8. Cross-branch note
 
-Branch 3 (manager orchestrator) already generalizes the same idea: `detectActionClaims` (`reply-guard.ts`) + the L2 claim auditor in `src/adapters/llm/orchestrator.ts` cross-check "said-done" claims (message sent, calendar connected, cancelled, booked) against what tools actually succeeded this turn, and regenerate on an unbacked claim. When adding a fabrication guard, check whether the analogous Branch-3 auditor needs the same coverage.
+As of the unified gate, Branch 3 (manager orchestrator) and the proactive seam reuse the **same `gateReply`** over a branch-built `TurnLedger`, so a new claim-class gate is covered at every door by construction. Branch 3 seeds the ledger's `allowedTimes` from its availability **tool results** (`extractAllowedTimesFromToolResult`) and `backedActions` from `actionsFromToolResult` (the L2 accumulation), derives an occupancy focus-day from the calendar tool it resolved this turn (D4), and runs `gateReply` then its own `auditReplyClaims` for the non-booking action classes — sharing the one per-turn regen budget. When adding a fabrication guard, prefer extending `gateReply`/the ledger so all three seams inherit it; only the Branch-3 `auditReplyClaims` action coverage and the 12h/am-pm gap (below) still need per-seam attention.
 
 ---
 
@@ -214,7 +227,8 @@ Branch 3 (manager orchestrator) already generalizes the same idea: `detectAction
 
 ## 11. Change log
 
-- **2026-06-29 — Gate 4: action/escalation fabrication + the ask-the-owner round-trip (S3).** Generalised the doctrine from *availability/booking* lies to **action** lies: a reply must never claim an action the deterministic core didn't perform. The reported case — the PA telling a customer "I asked the owner / a guide will get back to you" with no message ever sent — is closed three ways: (1) **capability** — a real customer→owner question relay (`escalateCustomerQuestion` → `pending_owner_questions` → Branch-3 `answerCustomerQuestion` tool → relay back → expiry worker); (2) **de-fabrication** — the model can no longer self-author "I'll check with the business"; on a genuine knowledge gap it emits a `[[ASK_STUDIO]]` sentinel and CODE performs the real escalation + honest reply (the global `client.ts` prompt + two flow instructions were stripped of the promise); (3) **Gate 4 detector** — `hasActionFabrication` (voice-guard, **monitor-only**, He+En) flags any LLM reply that still claims a check/ask/"get back to you", since the honest escalation replies come from code templates and bypass the gate. The honest "passed it on" wording is only ever produced *after* a successful dispatch.
+- **2026-06-30 — Unified Anti-Fabrication Gate (one ledger, one gate, three doors).** Collapsed the scattered per-branch checkers into a single per-turn `TurnLedger` + one `gateReply` run at all three output doors (Branch 4, Branch 3, proactive). Closes the fabrication-surface audit's holes by construction: **Branch 3 availability gate** (time + occupancy, previously absent — H1, CRITICAL) now reuses `gateReply` seeded from the tool-result allowlist; **backed-action coverage** extended to refund/broadcast/settings/coordination with `partial`≠backed; **`narrative` grounding** surfaces owner-authored service attributes (answer-from-facts, not invention); **owner-ping throttle** (dedup/substance/rate, non-blocking, "still-waiting" re-ask). Phase 3 graduated the last monitors to **enforce**: **Gate 4** (`hasActionFabrication`) now regenerates→`SAFE_AUDIT_FALLBACK` instead of logging; **Gate 3b** wires `detectActionClaims` into Branch 4 over a real `backedActions` ledger (new `waitlist_added` class) so "I cancelled your class"/"added you to the waitlist" off a failed/absent action is caught. **Unified regen cap + per-turn deadline** (D6) across all gates/seams kills round-trip stacking under the 60s identity lock; a **post-regen re-check** kills oscillation; a thrown gate fails to a safe template, never the ungated draft (F-rev4). Cross-seam **non-bypass** + **voice-golden** invariants lock it in. Files: `grounding/turn-ledger.ts`, `grounding/output-gate.ts`. (Owner deploys once; applies migration `0052_pending_owner_questions`.)
+- **2026-06-29 — Gate 4: action/escalation fabrication + the ask-the-owner round-trip (S3).** Generalised the doctrine from *availability/booking* lies to **action** lies: a reply must never claim an action the deterministic core didn't perform. The reported case — the PA telling a customer "I asked the owner / a guide will get back to you" with no message ever sent — is closed three ways: (1) **capability** — a real customer→owner question relay (`escalateCustomerQuestion` → `pending_owner_questions` → Branch-3 `answerCustomerQuestion` tool → relay back → expiry worker); (2) **de-fabrication** — the model can no longer self-author "I'll check with the business"; on a genuine knowledge gap it emits a `[[ASK_STUDIO]]` sentinel and CODE performs the real escalation + honest reply (the global `client.ts` prompt + two flow instructions were stripped of the promise); (3) **Gate 4 detector** — `hasActionFabrication` (voice-guard, He+En) flags any LLM reply that still claims a check/ask/"get back to you", since the honest escalation replies come from code templates and bypass the gate. *(Shipped monitor-only; graduated to **enforce** in the 2026-06-30 unified gate — regenerate→`SAFE_AUDIT_FALLBACK`.)* The honest "passed it on" wording is only ever produced *after* a successful dispatch.
 - **v1.0.96** — Time-fabrication gate (Gate 2) + allowlist + inquiry grounding + part-of-day buckets. Fixes the PA offering internally-blocked times on open-ended inquiries.
 - **(this change)** — `suggestNextClassesText` + class-aware inquiry fallback (Symptom A) + no-time booking injects day options (Symptom B). Fixes the false "fully booked" occupancy claim and the gate's false-positive fallback on under-specified class bookings.
 - **(this change)** — **Occupancy output guard (Gate 3).** Built the §4.6 "future work" guard: `makeGenReply` now regenerates (then safe-falls-back) when a reply asserts a day/class is full while the situation lists ≥1 *open* time it hides. Deterministic signal (`extractFullTimes` excludes `(full)` markers) gates a conservative he/en fullness-phrase check (`assertsNoAvailability`); a specific-time negative that surfaces the open times is spared. Fixes the recurring "Monday is completely full" said right after listing Mon 11/14/18.
