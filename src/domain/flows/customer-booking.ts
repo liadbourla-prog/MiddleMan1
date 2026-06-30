@@ -10,6 +10,9 @@ import { requestBooking, confirmBooking, cancelBooking } from '../booking/engine
 import { notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm/client.js'
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
+import { resolveAddresseeGender, shouldPersist, type AddresseeGender } from '../identity/addressee-gender.js'
+import { genderFromName } from '../identity/hebrew-name-gender.js'
+import { inferSelfGenderFromHebrew } from '../identity/hebrew-self-morphology.js'
 import { canonicalTime } from './slot-fabrication-guard.js'
 import { buildTurnLedger } from '../grounding/turn-ledger.js'
 import { gateReply, makeRegenBudget, SAFE_AUDIT_FALLBACK } from '../grounding/output-gate.js'
@@ -886,6 +889,10 @@ export function makeGenReply(
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
   dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
   businessId?: string,
+  // Resolved addressee gender for THIS conversation, read by-reference at reply time so a
+  // mid-turn refinement (name → self-morphology after intent extraction) reaches every reply.
+  // null = unknown → masculine floor; merged into every generateCustomerReply input.
+  addresseeGenderRef?: { gender: AddresseeGender | null },
 ): GenReply {
   const ledger = buildTurnLedger({
     businessFacts,
@@ -903,6 +910,8 @@ export function makeGenReply(
       ...input,
       ...(businessFacts ? { businessFacts } : {}),
       ...(actionLedger ? { actionLedger } : {}),
+      // Read the ref at call time (mutated post-intent). null → masculine floor, byte-identical.
+      ...(addresseeGenderRef ? { addresseeGender: addresseeGenderRef.gender } : {}),
     }
     // Regenerate once, appending the gate's corrective to THIS call's situation — exactly
     // the `${situation}\n\n${instruction}` shape the inline gates used.
@@ -1174,7 +1183,34 @@ export async function handleBookingFlow(
       return { open: false, text: null }
     }
   }
-  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id)
+  // ── Addressee gender (decision 1): resolve how the PA addresses THIS customer in Hebrew ──
+  // Composes the stored value, the offline name guess, and self-morphology into one winning
+  // (gender, source), persists only on a genuine rank gain (never downgrades), and keeps the
+  // in-memory identity coherent so a later same-turn signal resolves against the fresh value.
+  // null → unknown → masculine floor. Read by-reference in genReply, refined after intent below.
+  const applyGenderSignal = async (morphologySignal: AddresseeGender | null): Promise<AddresseeGender | null> => {
+    const resolved = resolveAddresseeGender({
+      stored: identity.addresseeGender ?? null,
+      storedSource: identity.addresseeGenderSource ?? null,
+      nameSignal: genderFromName(identity.displayName),
+      morphologySignal,
+    })
+    if (shouldPersist(identity.addresseeGender ?? null, identity.addresseeGenderSource ?? null, resolved) && resolved) {
+      identity.addresseeGender = resolved.gender
+      identity.addresseeGenderSource = resolved.source
+      await db.update(identities)
+        .set({ addresseeGender: resolved.gender, addresseeGenderSource: resolved.source })
+        .where(eq(identities.id, identity.id))
+        .catch(() => { /* non-fatal — a missed write just re-resolves next turn */ })
+    }
+    return resolved?.gender ?? null
+  }
+  // First pass: name + deterministic self-morphology from this message (covers pending-state
+  // continuation turns that return before intent extraction). The LLM signal refines it below.
+  const addresseeGenderRef: { gender: AddresseeGender | null } = {
+    gender: await applyGenderSignal(inferSelfGenderFromHebrew(messageText)),
+  }
+  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id, addresseeGenderRef)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
@@ -1404,6 +1440,15 @@ export async function handleBookingFlow(
   // Capture the customer's name the first time they state it (non-blocking, never clobbers).
   await persistCapturedName(db, identity.businessId, identity.id, identity.displayName ?? null, intent.customerNameHint ?? null)
   const detectedLanguage = intent.detectedLanguage
+
+  // Refine addressee gender with the LLM's self-morphology read (rank 3) — primary over the
+  // deterministic backstop. Updates the by-ref value every later genReply call reads. Persisted
+  // by applyGenderSignal on a rank gain (e.g. self-morphology correcting an earlier name guess).
+  addresseeGenderRef.gender = await applyGenderSignal(
+    intent.selfGenderEvidence === 'male' || intent.selfGenderEvidence === 'female'
+      ? intent.selfGenderEvidence
+      : inferSelfGenderFromHebrew(messageText),
+  )
 
   // Negotiation memory: fold any newly-stated categorical exclusion ("no mornings",
   // "not Thursdays") into the session constraints, so every suggestion from this turn
@@ -2106,6 +2151,7 @@ async function handleRestoreCancelled(
   const synthetic: CustomerIntentOutput = {
     intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
     customerNameHint: null, participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+    selfGenderEvidence: 'none',
   }
   return handleBookingIntent(
     db, calendar, identity,
@@ -3578,6 +3624,7 @@ async function handleCancellationConfirmation(
       const synthetic: CustomerIntentOutput = {
         intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
         customerNameHint: null, participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+        selfGenderEvidence: 'none',
       }
       return handleBookingIntent(
         db, calendar, identity,
@@ -3832,6 +3879,7 @@ async function handleRetentionResponse(
   const synthetic: CustomerIntentOutput = {
     intent: 'booking', slotRequest: null, serviceTypeHint: null, providerHint: null,
     customerNameHint: null, participantsHint: null, summary: null, rawEntities: {}, detectedLanguage: lang,
+    selfGenderEvidence: 'none',
   }
   return handleBookingIntent(
     db, calendar, identity,

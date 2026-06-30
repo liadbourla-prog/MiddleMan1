@@ -385,7 +385,7 @@ function sanitizeUserInput(text: string): string {
 
 const PA_PERSONA_TEMPLATE = `You are the booking assistant for {businessName}, speaking as the business itself.
 
-${buildVoiceCore('customer')}
+{voiceCore}
 
 LANGUAGE RULE — strictly enforced: reply ENTIRELY in {language}. If {language} is "he", write only in Hebrew. If {language} is "en", write only in English. Never mix languages in one reply.
 
@@ -486,10 +486,21 @@ ${lines.join('\n')}`
 }
 
 export async function generateCustomerReply(input: GenerateReplyInput): Promise<string> {
+  // botPersona = the PA's SELF-voice (1st person). Untouched, orthogonal axis.
   const personaNotes = input.botPersona === 'female'
     ? 'Write in grammatically feminine form (Hebrew: use feminine verb conjugations and adjectives).'
     : input.botPersona === 'male'
     ? 'Write in grammatically masculine form (Hebrew: use masculine verb conjugations and adjectives).'
+    : ''
+
+  // addresseeGender = how we address the PERSON (2nd person). Separate from botPersona.
+  // Threaded into the voice chokepoint below; this note reinforces it next to the persona
+  // note. Only emitted for a RESOLVED gender — null/unknown adds nothing, so the masculine
+  // floor stays byte-identical to the prior behavior (decision 1).
+  const addresseeNotes = input.addresseeGender === 'female'
+    ? 'Address the customer (second-person "you") in grammatically feminine form. Pick the single feminine form; never split-gender.'
+    : input.addresseeGender === 'male'
+    ? 'Address the customer (second-person "you") in grammatically masculine form. Pick the single masculine form; never split-gender.'
     : ''
 
   const knowledgeAddendum = buildKnowledgeAddendum(input)
@@ -498,9 +509,11 @@ export async function generateCustomerReply(input: GenerateReplyInput): Promise<
   const systemPrompt = (
     PA_PERSONA_TEMPLATE
     + (personaNotes ? `\n\n${personaNotes}` : '')
+    + (addresseeNotes ? `\n\n${addresseeNotes}` : '')
     + (dateFacts ? `\n\n${dateFacts}` : '')
     + (knowledgeAddendum ? `\n\n${knowledgeAddendum}` : '')
   )
+    .replace('{voiceCore}', buildVoiceCore('customer', input.addresseeGender ?? null))
     .replace('{businessName}', input.businessName)
     .replace('{language}', input.language === 'he' ? 'he (Hebrew)' : 'en (English)')
 

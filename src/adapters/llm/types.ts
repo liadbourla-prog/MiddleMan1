@@ -46,6 +46,10 @@ export interface CustomerIntentOutput {
   // kept for a slot or class that is full. Three-state like the flags above: omitted →
   // undefined (model never spoke), never silently false. Consumed by the join flow (WL-4).
   joinWaitlist?: boolean
+  // The SENDER's own grammatical gender, inferred ONLY from their first-person Hebrew
+  // ("מעוניינת"→female, "מעוניין"→male). 'none' when no gendered self-reference appears.
+  // Feeds resolveAddresseeGender (self_morphology signal). Defaults to 'none'.
+  selfGenderEvidence: 'male' | 'female' | 'none'
 }
 
 export interface ManagerInstructionOutput {
@@ -134,6 +138,10 @@ export interface GenerateReplyInput {
   // the transcript merely implies. Built from audit_log by the flow layer.
   actionLedger?: string | undefined
   botPersona?: 'female' | 'male' | 'neutral' | undefined
+  // How to address the PERSON in Hebrew second-person (resolved per-identity, decision 1).
+  // null/undefined → masculine floor (byte-identical to the prior hardcoded rule). Orthogonal
+  // to botPersona (the PA's SELF-voice). Applied at the voice chokepoint AND as a reinforcing note.
+  addresseeGender?: 'male' | 'female' | null | undefined
   customerMemory?: {
     returningCustomer: boolean
     preferredServiceName: string | null

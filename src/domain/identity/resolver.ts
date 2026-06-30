@@ -43,6 +43,8 @@ export async function resolveIdentity(
       messagingOptOut: identity.messagingOptOut,
       preferredLanguage: (identity.preferredLanguage as 'he' | 'en' | null) ?? null,
       conversationPausedUntil: identity.conversationPausedUntil ?? null,
+      addresseeGender: identity.addresseeGender ?? null,
+      addresseeGenderSource: identity.addresseeGenderSource ?? null,
       ...(delegatedPermissions ? { delegatedPermissions } : {}),
     },
   }
