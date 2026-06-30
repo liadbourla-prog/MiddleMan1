@@ -69,6 +69,9 @@ const baseCtx: SkillContext = {
     defaultLanguage: 'en',
     botPersona: 'neutral',
     currency: 'ILS',
+    address: null,
+    addressComponents: null,
+    googleMapsUrl: null,
   },
   caller: {
     id: 'mgr-1',

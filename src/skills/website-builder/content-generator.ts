@@ -49,6 +49,8 @@ export async function generateSiteContent(
     practitionerTitle: string | null
     practitionerBio: string | null
     address: string | null
+    city: string | null
+    googleMapsUrl: string | null
     credentials: string[]
     foundedYear: number | null
     googleBusinessProfileUrl: string | null
@@ -95,11 +97,11 @@ openingHours format: [{ dayOfWeek: ["Monday"], opens: "09:00", closes: "18:00" }
 
   const user = `Business: ${ctx.business.name}
 Category: infer from services
-City: ${requirements.address ? requirements.address.split(',').pop()?.trim() : 'Israel'}
+City: ${requirements.city ?? (requirements.address ? requirements.address.split(',').pop()?.trim() : 'Israel')}
 Address: ${requirements.address ?? 'not provided'}
 Phone (PA WhatsApp): ${ctx.caller.phoneNumber}
 Brand voice: ${bk.brandVoice ?? 'friendly and professional'}
-Google Business Profile URL: ${requirements.googleBusinessProfileUrl ?? 'null'}
+Google Business Profile URL: ${requirements.googleBusinessProfileUrl ?? requirements.googleMapsUrl ?? 'null'}
 Founded year: ${requirements.foundedYear ?? 'null'}
 Practitioner: ${requirements.practitionerName ?? 'null'}
 Practitioner title: ${requirements.practitionerTitle ?? 'null'}

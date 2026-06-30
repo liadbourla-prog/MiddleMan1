@@ -28,6 +28,7 @@ import type {
   ProposeInitiationInput,
 } from '../../shared/skill-types.js'
 import { queryCustomerSegment } from '../crm/segment-repository.js'
+import { resolveGoogleMapsUrl } from '../location/maps.js'
 import { proposeInitiation as proposeInitiationCore } from '../initiations/approvals.js'
 import {
   advanceWorkflow,
@@ -73,6 +74,11 @@ export async function buildSkillContext(params: {
       defaultLanguage: business.defaultLanguage as 'he' | 'en',
       botPersona: business.botPersona as 'female' | 'male' | 'neutral',
       currency: business.currency,
+      // Canonical location for the website/GMB skills: the free-text address, the structured
+      // breakdown, and a ready-to-use Maps link (owner override or derived from the address).
+      address: business.address ?? null,
+      addressComponents: business.addressComponents ?? null,
+      googleMapsUrl: resolveGoogleMapsUrl(business),
     },
     caller: {
       id: identity.id,

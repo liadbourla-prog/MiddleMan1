@@ -130,6 +130,7 @@ const managerInstructionSchema = z.preprocess((value) => {
     'booking_cancellation',
     'recurring_class_change',
     'provider_change',
+    'business_profile',
     'unknown',
   ]),
   structuredParams: z.record(z.unknown()),
@@ -285,11 +286,19 @@ provider_change:
   - action "remove": owner removes an instructor from the team (e.g. "remove Dana", "דנה כבר לא אצלנו"). Fill instructorName.
   - dayOfWeek: 0=Sunday … 6=Saturday. Times are 24-hour "HH:MM".
 
+business_profile:
+  { "field": "address", "value": string, "streetAddress": string|null, "city": string|null, "region": string|null, "country": string|null, "postalCode": string|null, "mapsUrl": string|null }
+  Use when the owner sets, changes, or corrects the business's PHYSICAL ADDRESS / location — where customers physically come (e.g. "our address is Herzl 1, Tel Aviv", "we moved to 5 Dizengoff", "set the address to ...", "הכתובת שלנו היא הרצל 1 תל אביב", "עברנו לדיזנגוף 5", "תעדכן את הכתובת"). This is the customer-facing location the PA gives out — NOT a Google Calendar id, email, phone, or service area. If the owner only asks to ANNOUNCE a new address to customers (a broadcast), that is not this; this is about storing the business's own address.
+  - field: always "address".
+  - value: the full address text exactly as the owner stated it, in their own language — this is what customers are shown.
+  - streetAddress / city / region / country / postalCode: break the SAME address into structured parts for the business's website. Fill each part you can identify from the owner's words; set a part to null if it isn't stated. Do NOT invent a city or country the owner didn't give. country may be a name or code ("Israel"/"IL"). Keep each part in the owner's language.
+  - mapsUrl: a Google Maps / g.page link ONLY if the owner pasted one (e.g. "https://maps.google.com/...", "https://g.page/..."). null otherwise — never fabricate or guess a link.
+
 If the instruction is ambiguous or missing required detail, set ambiguous=true and clarificationNeeded to the exact question to ask back.
 
 Return JSON with EXACTLY these top-level keys, in camelCase (not snake_case):
 {
-  "instructionType": one of [availability_change, policy_change, service_change, permission_change, booking_cancellation, recurring_class_change, provider_change, unknown],
+  "instructionType": one of [availability_change, policy_change, service_change, permission_change, booking_cancellation, recurring_class_change, provider_change, business_profile, unknown],
   "structuredParams": { ...the fields for that instructionType, as specified above... },
   "ambiguous": boolean,
   "clarificationNeeded": string or null

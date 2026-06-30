@@ -22,6 +22,7 @@ import { classifyManagerInstruction, classifyOperatorMessage, answerOperatorQues
 import { applyInstruction } from '../manager/apply.js'
 import { createWorkflow } from '../skills/workflow-helpers.js'
 import { operatorCapabilityRegistry } from './operator-capability-registry.js'
+import { parseManagerChannelCommand } from './operator-commands.js'
 import { detectLang, i18n, type Lang } from '../i18n/t.js'
 import { isPaymentsConnected } from '../payments/credentials.js'
 import { redis } from '../../redis.js'
@@ -156,6 +157,14 @@ async function routeOperatorMessage(
     const skillArg = looksLikeSkillName ? lastToken : null
     const businessArg = looksLikeSkillName ? tokens.slice(0, -1).join(' ') : raw
     return handleRetrigger(db, businessArg, skillArg, lang)
+  }
+
+  // Manager-channel switch — opt a business into (or out of) managing its PA via the central
+  // MiddleMan number. Account-level config, so it lives on the operator channel (not the
+  // manager's conversational surface).
+  const channelCmd = parseManagerChannelCommand(text)
+  if (channelCmd) {
+    return handleSetManagerChannel(db, channelCmd.target, channelCmd.mode, lang)
   }
 
   // ── LLM path: fetch live business data, classify intent, answer smartly ──────
@@ -708,6 +717,53 @@ async function handleRetrigger(db: Db, nameOrNumber: string, skillName: string |
     fallback: rawRetrigger,
   })
   return { reply: formattedRetrigger }
+}
+
+async function handleSetManagerChannel(
+  db: Db,
+  nameOrNumber: string,
+  mode: 'central' | 'own_number',
+  lang: Lang,
+): Promise<OperatorResult> {
+  // Same resolve-by-number-then-fuzzy-name pattern as the other operator business commands.
+  const [biz] = await db
+    .select()
+    .from(businesses)
+    .where(eq(businesses.whatsappNumber, nameOrNumber))
+    .limit(1)
+
+  const found = biz ?? await db
+    .select()
+    .from(businesses)
+    .then((all) => all.find((b) => b.name.toLowerCase().includes(nameOrNumber.toLowerCase())))
+
+  if (!found) {
+    return { reply: i18n.op_status_not_found[lang](nameOrNumber) }
+  }
+
+  await db.update(businesses).set({ managerChannel: mode }).where(eq(businesses.id, found.id))
+
+  // Surface a heads-up if the business has no active manager identity yet — the central channel
+  // only routes once an owner manager exists for the lookup to match.
+  const [manager] = await db
+    .select({ id: identities.id })
+    .from(identities)
+    .where(and(eq(identities.businessId, found.id), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+  const noManagerNote = !manager
+    ? (lang === 'he'
+      ? '\n\n⚠️ אין עדיין מנהל פעיל לעסק הזה — הניתוב המרכזי יתחיל לעבוד רק לאחר שיוגדר מנהל.'
+      : '\n\n⚠️ This business has no active manager yet — central routing only works once an owner manager exists.')
+    : ''
+
+  const reply = mode === 'central'
+    ? (lang === 'he'
+      ? `✅ ${found.name}: ניהול ה-PA יתבצע כעת דרך המספר המרכזי. הלקוחות עדיין פונים למספר העסק עצמו.${noManagerNote}`
+      : `✅ ${found.name}: the PA is now managed via the central number. Customers still reach the business on its own number.${noManagerNote}`)
+    : (lang === 'he'
+      ? `✅ ${found.name}: ניהול ה-PA חזר למספר העסק עצמו.`
+      : `✅ ${found.name}: the PA is back to being managed on the business's own number.`)
+  return { reply }
 }
 
 async function handleTestLink(db: Db, operatorPhone: string, lang: Lang): Promise<OperatorResult> {

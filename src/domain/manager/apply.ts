@@ -251,6 +251,9 @@ export async function applyInstruction(
     case 'provider_change':
       result = await applyProviderChange(db, businessId, actorId, structuredParams, lang)
       break
+    case 'business_profile':
+      result = await applyBusinessProfileChange(db, businessId, actorId, structuredParams, lang)
+      break
     default:
       result = { ok: false, reason: i18n.apply_unknown_type[lang](instructionType) }
   }
@@ -274,6 +277,89 @@ export async function applyInstruction(
   })
 
   return result
+}
+
+// ── Business profile change ───────────────────────────────────────────────────
+
+// Optional structured part of an address — trimmed, empty → undefined so blanks never persist.
+const addressPart = z.preprocess(
+  (v) => (typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined),
+  z.string().max(120).optional(),
+)
+
+export const businessProfileSchema = z.object({
+  field: z.literal('address'),
+  value: z.string().trim().min(1).max(300),
+  streetAddress: addressPart,
+  city: addressPart,
+  region: addressPart,
+  country: addressPart,
+  postalCode: addressPart,
+  // Only an explicit Google Maps / g.page link the owner pasted — anything else is ignored.
+  mapsUrl: z.preprocess(
+    (v) => (typeof v === 'string' && /^https?:\/\/\S+/.test(v.trim()) ? v.trim() : undefined),
+    z.string().url().max(2048).optional(),
+  ),
+})
+
+// Deterministic writer for owner-set business profile fields. Currently the physical address —
+// the customer-facing location surfaced in Branch 4 and shared with the website/GMB skills. We
+// only trim and bound the owner's text; never reformat or geocode. Persists the canonical free
+// text (address), the structured breakdown (addressComponents) when any part was given, and the
+// owner's Maps link (googleMapsUrl) when pasted — resetting a stale override otherwise, so the
+// derived search URL tracks the new address. Audits the change.
+async function applyBusinessProfileChange(
+  db: Db,
+  businessId: string,
+  actorId: string,
+  params: Record<string, unknown>,
+  lang: Lang,
+): Promise<ApplyResult> {
+  const parsed = businessProfileSchema.safeParse(params)
+  if (!parsed.success) {
+    return {
+      ok: false,
+      reason: lang === 'he'
+        ? 'לא הצלחתי לקרוא את הכתובת. בקש/י מהבעלים לכתוב אותה שוב.'
+        : "Could not read the address — ask the owner to state it again.",
+    }
+  }
+
+  const p = parsed.data
+  const address = p.value
+  const components = {
+    streetAddress: p.streetAddress ?? null,
+    city: p.city ?? null,
+    region: p.region ?? null,
+    country: p.country ?? null,
+    postalCode: p.postalCode ?? null,
+  }
+  // null the whole jsonb when no part was identified, rather than store an all-null object.
+  const addressComponents = Object.values(components).some((v) => v !== null) ? components : null
+  // A new address makes any previously-pinned link stale: keep the override only when the owner
+  // re-supplies one in the same instruction, otherwise reset so we derive from the new address.
+  const googleMapsUrl = p.mapsUrl ?? null
+
+  await db
+    .update(businesses)
+    .set({ address, addressComponents, googleMapsUrl })
+    .where(eq(businesses.id, businessId))
+
+  await logAudit(db, {
+    businessId,
+    actorId,
+    action: 'business.address_updated',
+    entityType: 'business',
+    entityId: businessId,
+    metadata: { address, addressComponents, googleMapsUrl },
+  })
+
+  return {
+    ok: true,
+    confirmationMessage: lang === 'he'
+      ? `✅ הכתובת עודכנה ל: ${address}`
+      : `✅ Address updated to: ${address}`,
+  }
 }
 
 // ── Availability change ───────────────────────────────────────────────────────

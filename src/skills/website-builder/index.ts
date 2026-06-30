@@ -655,7 +655,11 @@ async function runContentGenerate(ctx: SkillContext, state: WbsState, skillName:
       practitionerName: state.practitionerName ?? null,
       practitionerTitle: state.practitionerTitle ?? null,
       practitionerBio: state.practitionerBio ?? null,
-      address: state.address ?? null,
+      // Prefer what the owner gave in this flow; fall back to the canonical business address
+      // (and its structured city / Maps link) now stored on the business itself.
+      address: state.address ?? ctx.business.address ?? null,
+      city: ctx.business.addressComponents?.city ?? null,
+      googleMapsUrl: ctx.business.googleMapsUrl ?? null,
       credentials: state.credentials ?? [],
       foundedYear: state.foundedYear ?? null,
       googleBusinessProfileUrl: state.googleBusinessProfileUrl ?? null,

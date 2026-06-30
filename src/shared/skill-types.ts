@@ -1,6 +1,17 @@
 // Typed contract between the core engine (Developer A) and skills (Developer B).
 // Developer A owns this file. Skills may only import from src/shared/.
 
+// Structured breakdown of the business's physical address, for surfaces that need parts
+// rather than the free-text blob (websites, GMB listings). Every part is optional — the owner
+// may give only a street + city. The canonical free-text address stays on SkillBusiness.address.
+export interface AddressComponents {
+  streetAddress: string | null
+  city: string | null
+  region: string | null
+  country: string | null
+  postalCode: string | null
+}
+
 export interface SkillBusiness {
   id: string
   name: string
@@ -8,6 +19,12 @@ export interface SkillBusiness {
   defaultLanguage: 'he' | 'en'
   botPersona: 'female' | 'male' | 'neutral'
   currency: string
+  // Physical location. `address` is the canonical free-text display string; `addressComponents`
+  // is the structured breakdown for websites/GMB; `googleMapsUrl` is a ready-to-use link (the
+  // owner's pasted Maps/g.page link, or a derived search URL). All null until the owner sets it.
+  address: string | null
+  addressComponents: AddressComponents | null
+  googleMapsUrl: string | null
 }
 
 export interface SkillCaller {

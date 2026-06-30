@@ -12,7 +12,7 @@ const makeWorkflow = (overrides: Partial<WorkflowState> = {}): WorkflowState => 
 })
 
 const baseCtx: SkillContext = {
-  business: { id: 'biz-1', name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en', botPersona: 'neutral', currency: 'ILS' },
+  business: { id: 'biz-1', name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en', botPersona: 'neutral', currency: 'ILS', address: null, addressComponents: null, googleMapsUrl: null },
   caller: { id: 'mgr-1', phoneNumber: '+972500000001', role: 'manager', displayName: 'Dana', preferredLanguage: null },
   message: { text: '', receivedAt: new Date() },
   conversationHistory: [],

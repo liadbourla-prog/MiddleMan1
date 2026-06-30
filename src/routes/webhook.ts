@@ -12,6 +12,7 @@ import { db } from '../db/client.js'
 import { processedMessages, businesses, identities, managerMemory } from '../db/schema.js'
 import type { Business } from '../db/schema.js'
 import { resolveIdentity, registerCustomer } from '../domain/identity/resolver.js'
+import { findCentralManagedBusinessForOwner } from '../domain/identity/central-manager.js'
 import type { ResolvedIdentity } from '../domain/identity/types.js'
 import {
   loadActiveSession,
@@ -214,49 +215,84 @@ async function handleFailedDelivery(
 }
 
 const PROVIDER_WA_NUMBER = process.env['PROVIDER_WA_NUMBER'] ?? ''
+const OPERATOR_PHONE = process.env['OPERATOR_PHONE'] ?? ''
+
+// Outbound credentials for the central MiddleMan number — used for onboarding replies and,
+// now, for replying to a central-managed owner's Branch 3 turn (so the reply comes FROM the
+// number they messaged). Read at call time to match the rest of the provider path.
+function providerWaCredentials(): { accessToken: string; phoneNumberId: string } {
+  return {
+    accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
+    phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
+  }
+}
+
+// G1 hard-refuse: shown when one owner phone manages MORE THAN ONE central-managed business
+// (the deferred multi-business case). We never silently pick a tenant. Bilingual because the
+// owner's language is not resolved on the shared number before a business is bound.
+const CENTRAL_MULTI_BUSINESS_REPLY =
+  'You manage more than one business on this number. Please reply with the name of the business you mean.\n\n' +
+  'אתה מנהל יותר מעסק אחד במספר הזה. אנא השב עם שם העסק שאליו אתה מתכוון.'
 
 export async function processInboundMessage(msg: InboundMessage, app: FastifyInstance) {
-  // Step 0 — provider onboarding (central number, no business context)
+  // The business this message is about, and (only on the shared central number) the credentials
+  // the reply to the owner must go out with. On a business's own PA number both are derived from
+  // the inbound number; on the central number the business is bound by sender identity instead.
+  let business: Business | undefined
+  let replyCredentials: { accessToken: string; phoneNumberId: string } | undefined
+
+  // Step 0 — central MiddleMan number. Precedence: operator → central-managed owner → onboarding.
   if (PROVIDER_WA_NUMBER && msg.toNumber === PROVIDER_WA_NUMBER) {
-    // There is no image-skill concept on the provider channel, so imageSkillUploadable is always
-    // false. If the image carries a caption, route it as the provider's text (INJ6); only bounce
-    // when there is genuinely no caption — and that bounce stays bilingual by design (Branch 2).
-    if (msg.imageMediaId) {
-      const disposition = classifyImageMessage({
-        hasCaption: !!msg.body?.trim(),
-        imageSkillUploadable: false,
-      })
-      if (disposition === 'bounce_non_text') {
-        const imgFallback = `${i18n.non_text_reply.he}\n\n${i18n.non_text_reply.en}`
-        const imgReply = await generateProviderOnboardingReply({
-          step: 'image_not_supported',
-          lang: 'bilingual',
-          fallback: imgFallback,
-        })
-        await sendMessage(
-          { toNumber: msg.fromNumber, body: imgReply },
-          {
-            accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
-            phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
-          },
-        )
+    // Operator is routed inside handleProviderOnboarding (below); never treat it as an owner.
+    if (msg.fromNumber !== OPERATOR_PHONE) {
+      const central = await findCentralManagedBusinessForOwner(db, msg.fromNumber)
+      if (central.kind === 'multiple') {
+        // G1: one phone manages >1 central business. Never pick a tenant — ask which one.
+        await sendMessage({ toNumber: msg.fromNumber, body: CENTRAL_MULTI_BUSINESS_REPLY }, providerWaCredentials())
+          .catch(() => { /* best-effort */ })
         return
       }
-      // disposition === 'route_caption_as_text': fall through to the normal provider path below,
-      // processing the caption (msg.body) as the provider's text.
+      if (central.kind === 'one') {
+        // Known central owner → Branch 3 on the shared number. Bind the business by identity and
+        // reply FROM the central number; fall through to the normal pipeline below. (The
+        // orchestrator's customer-facing sends still use the business's OWN creds.)
+        business = central.business
+        replyCredentials = providerWaCredentials()
+      }
     }
-    const result = await handleProviderOnboarding(db, msg.fromNumber, msg.body)
-    const providerSendResult = await sendMessage(
-      { toNumber: msg.fromNumber, body: result.reply },
-      {
-        accessToken: process.env['PROVIDER_WA_ACCESS_TOKEN'] ?? '',
-        phoneNumberId: process.env['PROVIDER_WA_PHONE_NUMBER_ID'] ?? '',
-      },
-    )
-    if (!providerSendResult.ok) {
-      app.log.error({ error: providerSendResult.error, toNumber: msg.fromNumber }, 'Provider/operator send failed')
+
+    if (!business) {
+      // Operator or an unknown sender → Branch 2 onboarding (unchanged).
+      // No image-skill concept on the provider channel, so imageSkillUploadable is always false.
+      // If the image carries a caption, route it as the provider's text (INJ6); only bounce when
+      // there is genuinely no caption — and that bounce stays bilingual by design (Branch 2).
+      if (msg.imageMediaId) {
+        const disposition = classifyImageMessage({
+          hasCaption: !!msg.body?.trim(),
+          imageSkillUploadable: false,
+        })
+        if (disposition === 'bounce_non_text') {
+          const imgFallback = `${i18n.non_text_reply.he}\n\n${i18n.non_text_reply.en}`
+          const imgReply = await generateProviderOnboardingReply({
+            step: 'image_not_supported',
+            lang: 'bilingual',
+            fallback: imgFallback,
+          })
+          await sendMessage({ toNumber: msg.fromNumber, body: imgReply }, providerWaCredentials())
+          return
+        }
+        // disposition === 'route_caption_as_text': fall through to the onboarding path below.
+      }
+      const result = await handleProviderOnboarding(db, msg.fromNumber, msg.body)
+      const providerSendResult = await sendMessage(
+        { toNumber: msg.fromNumber, body: result.reply },
+        providerWaCredentials(),
+      )
+      if (!providerSendResult.ok) {
+        app.log.error({ error: providerSendResult.error, toNumber: msg.fromNumber }, 'Provider/operator send failed')
+      }
+      return
     }
-    return
   }
 
   // Deduplication
@@ -268,12 +304,16 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
 
   if (duplicate.length > 0) return
 
-  // Find business by inbound number
-  const [business] = await db
-    .select()
-    .from(businesses)
-    .where(eq(businesses.whatsappNumber, msg.toNumber))
-    .limit(1)
+  // Resolve the business by inbound PA number (Branch 3/4 own-number path). The central path
+  // already bound `business` by sender identity above.
+  if (!business) {
+    const [byNumber] = await db
+      .select()
+      .from(businesses)
+      .where(eq(businesses.whatsappNumber, msg.toNumber))
+      .limit(1)
+    business = byNumber
+  }
 
   if (!business) {
     app.log.warn({ toNumber: msg.toNumber }, 'No business found for inbound number')
@@ -358,19 +398,22 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
   // process the whole burst as a single turn. Contacts and bypass cases (images, manager
   // keyword commands) route immediately. See message-coalescer.ts.
   if (!coalescingEnabled() || identity.role === 'contact' || shouldBypassCoalescing(msg, identity.role)) {
-    await dispatchToRole(msg, identity, business, app)
+    await dispatchToRole(msg, identity, business, app, replyCredentials)
     return
   }
 
+  // Capture as a const so the async (setTimeout) closure sees a non-optional Business — `business`
+  // is a `let` whose flow-narrowing doesn't propagate into the deferred callback.
+  const dispatchBusiness = business
   const seq = await bufferInbound(business.id, identity.id, msg)
   setTimeout(() => {
     void (async () => {
       try {
-        const burst = await flushBurst(business.id, identity.id, seq)
+        const burst = await flushBurst(dispatchBusiness.id, identity.id, seq)
         if (!burst) return // a newer message arrived during the window — it owns the flush
         // Pass identity.role so combineInbound applies Gate-2 sanitize to customer bursts
         // (T4.7/INJ6 — defeats split-across-burst injection).
-        await dispatchToRole(combineInbound(burst, identity.role), identity, business, app)
+        await dispatchToRole(combineInbound(burst, identity.role), identity, dispatchBusiness, app, replyCredentials)
       } catch (err) {
         app.log.error({ err, messageId: msg.messageId }, 'Coalesced burst flush failed')
         await notifyManagerOfError(msg, err instanceof Error ? err.message : String(err), app).catch(() => { /* fire-and-forget */ })
@@ -380,14 +423,17 @@ export async function processInboundMessage(msg: InboundMessage, app: FastifyIns
 }
 
 // Run the per-role handler for a (possibly coalesced) message.
+// `replyCredentials` is set only for a central-managed owner reaching Branch 3 on the shared
+// MiddleMan number; it overrides the business's own creds for the reply TO the owner.
 async function dispatchToRole(
   msg: InboundMessage,
   identity: ResolvedIdentity,
   business: Business,
   app: FastifyInstance,
+  replyCredentials?: { accessToken: string; phoneNumberId: string },
 ) {
   if (identity.role === 'manager' || identity.role === 'delegated_user') {
-    await routeManagerMessage(msg, identity, business, app)
+    await routeManagerMessage(msg, identity, business, app, replyCredentials)
   } else if (identity.role === 'contact') {
     await routeContactMessage(msg, identity, business, app)
   } else {
@@ -893,10 +939,14 @@ async function routeManagerMessage(
   identity: ResolvedIdentity,
   business: Business,
   app: FastifyInstance,
+  replyCredentials?: { accessToken: string; phoneNumberId: string },
 ) {
-  const waCredentials = business.whatsappPhoneNumberId && business.whatsappAccessToken
+  // On the shared central number, reply to the owner FROM the central number (replyCredentials);
+  // otherwise reply from the business's own PA number. This governs ONLY the reply to the owner —
+  // the orchestrator's customer-facing sends build their own creds from the business row.
+  const waCredentials = replyCredentials ?? (business.whatsappPhoneNumberId && business.whatsappAccessToken
     ? { accessToken: business.whatsappAccessToken, phoneNumberId: business.whatsappPhoneNumberId }
-    : undefined
+    : undefined)
 
   // Onboarding gate — intercept all messages until setup is complete. Plugged into
   // the same chat machinery the live manager path uses: a manager session for
