@@ -95,6 +95,21 @@ Key design decisions locked in:
 - **Language switch (Branches 3 & 4):** Reply immediately in detected language, add inline switch-offer at the end. No bilingual interruption. Confirmed preference persists to `identities.preferredLanguage`. Replaces `waiting_language_confirmation` state.
 - **WhatsApp formatting:** All formatting standards are defined in `CHAT_LEVEL_LAWBOOK.md`. Consult it when writing or modifying any LLM prompt.
 
+### Central-number manager channel (Branch 3 on the MiddleMan number)
+
+Some businesses opt to have their owner manage the PA through the **central MiddleMan number** (`PROVIDER_WA_NUMBER`) instead of the business's own PA number, while customers (Branch 4) still reach the business on its own number. This is controlled per-business by `businesses.managerChannel` (`'own_number'` default | `'central'`).
+
+**Hard rule — one manager brain, never forked.** There is exactly one Branch 3: the orchestrator at `src/adapters/llm/orchestrator.ts`. The central number is simply a **second ingress** to it. Branch 3 is a property of **(resolved business + manager-role sender)**, never of the inbound phone number — the number only answers "which business?", and on the central number that answer comes from the **sender's identity** instead of the inbound number.
+
+Consequences that MUST hold:
+- **Never re-implement any Branch 3 capability inside the onboarding flow (Branch 2).** If the central number needs a manager capability, it is because the owner was routed into Branch 3 — which already has it. Branch 2 stays the `else` arm for *unknown* senders only.
+- **Every Branch 3 upgrade is inherited automatically** by central-number businesses, because it is the same code path. Do not "mirror" Branch 3 changes into Branch 2.
+- **Business resolution on the central number returns a SET** of candidate businesses for the sender identity: empty → Branch 2 onboarding; one → Branch 3 bound to it; many (one owner, multiple central-managed businesses) → bind the session's active business. (The many-case is a later additive step; current scope is one central-managed business per owner phone.)
+- **Reply credentials follow the inbound number.** The reply *to the owner* goes from the central number; PA→customer sends (messageCustomer, broadcasts) still go from the business's own PA number. Customers never see the MiddleMan number.
+- **Branch 1 (operator) precedence is preserved**, and sessions/dedup/locks stay isolated because they key off `business.id` / `identity.id`.
+
+Design + plan: `docs/superpowers/specs/2026-06-30-central-number-manager-channel.md`.
+
 ---
 
 ## Current State

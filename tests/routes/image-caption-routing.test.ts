@@ -44,6 +44,11 @@ vi.mock('../../src/adapters/whatsapp/media.js', () => ({
   downloadAndUploadMedia: vi.fn().mockResolvedValue({ ok: false, error: 'should-not-be-called' }),
 }))
 vi.mock('../../src/domain/identity/resolver.js', () => ({ resolveIdentity: vi.fn(), registerCustomer: vi.fn() }))
+// The provider-channel senders in these tests are onboarding prospects, not central-managed
+// owners, so the central lookup resolves to 'none' and the message falls through to onboarding.
+vi.mock('../../src/domain/identity/central-manager.js', () => ({
+  findCentralManagedBusinessForOwner: vi.fn().mockResolvedValue({ kind: 'none' }),
+}))
 vi.mock('../../src/domain/session/manager.js', () => ({
   loadActiveSession: vi.fn().mockResolvedValue(null),
   createSession: vi.fn().mockResolvedValue({ id: 'sess1', context: {} }),

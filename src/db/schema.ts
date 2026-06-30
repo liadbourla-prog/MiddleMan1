@@ -52,6 +52,10 @@ export const businesses = pgTable('businesses', {
   available247: boolean('available_247').notNull().default(true),
   // Calendar backend
   calendarMode: text('calendar_mode', { enum: ['google', 'internal'] }).notNull().default('google'),
+  // Where the owner manages the PA (Branch 3): their own dedicated PA number (default) or the
+  // central MiddleMan number (PROVIDER_WA_NUMBER). 'central' opts the business into the
+  // shared-number manager channel — customers (Branch 4) still reach it on its own PA number.
+  managerChannel: text('manager_channel', { enum: ['own_number', 'central'] }).notNull().default('own_number'),
   // PA state
   paused: boolean('paused').notNull().default(false),
   // Language: default for the business, used when customer language is unknown
