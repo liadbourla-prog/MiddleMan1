@@ -203,6 +203,116 @@ describe('gateReply — Gate 4: self-authored action fabrication (ENFORCED)', ()
   })
 })
 
+// ── T3.1b — action-claim gate (cancel/waitlist/message) over a real backed-action ledger ──
+// Flag-gated (enforceActionClaims): OFF for Branch 3 / Phase 0 (no behavior change); ON for
+// Branch 4 always. A detectActionClaims class (cancelled/waitlist_added/message_sent/…) that is
+// NOT in ledger.backedActions is a fabrication → regen once → SAFE_AUDIT_FALLBACK on persistence.
+// booking_made is excluded here (owned by Gate 1 / opts.bookingConfirmed).
+describe('gateReply — action-claim gate (T3.1b, flag-gated)', () => {
+  function actionCtx(opts: {
+    backed?: string[]
+    regen?: GateContext['regen']
+    input?: Partial<GateContext['input']>
+    enforce?: boolean
+    bookingConfirmed?: boolean
+  }): GateContext {
+    return {
+      ledger: buildTurnLedger({
+        businessFacts: '',
+        actionLedger: '',
+        baseAllowedTimes: { boundaryTimes: [], bookingTimes: [] },
+        occupancySpine: NEVER_SPINE,
+        backedActions: (opts.backed ?? []) as never[],
+        businessId: 'biz-test',
+      }),
+      input: { language: 'he', situation: '', transcript: [], ...opts.input },
+      opts: {
+        ...(opts.enforce ? { enforceActionClaims: true } : {}),
+        ...(opts.bookingConfirmed ? { bookingConfirmed: true } : {}),
+      },
+      regen: opts.regen ?? (async () => { throw new Error('regen should not be called') }),
+    }
+  }
+
+  it('(1) cancel FABRICATION caught (He) → regen persists → SAFE_AUDIT_FALLBACK', async () => {
+    const regen = vi.fn(async () => 'ביטלתי לך את התור') // still a cancel claim
+    const res = await gateReply('ביטלתי לך את התור', actionCtx({ enforce: true, regen }))
+    expect(regen).toHaveBeenCalledOnce()
+    expect(res.reply).toBe(SAFE_AUDIT_FALLBACK.he)
+    expect(res.interventions).toContain('action')
+  })
+
+  it('(1) cancel FABRICATION caught (En) → SAFE_AUDIT_FALLBACK', async () => {
+    const regen = vi.fn(async () => "I've cancelled your class")
+    const res = await gateReply(
+      "I've cancelled your class",
+      actionCtx({ enforce: true, regen, input: { language: 'en' } }),
+    )
+    expect(res.reply).toBe(SAFE_AUDIT_FALLBACK.en)
+    expect(res.interventions).toContain('action')
+  })
+
+  it('(2) REAL cancel passes: backedActions has cancelled → unchanged, no regen, no action', async () => {
+    const regen = vi.fn(async () => { throw new Error('regen should not be called') })
+    const res = await gateReply('ביטלתי לך את התור', actionCtx({ enforce: true, backed: ['cancelled'], regen }))
+    expect(regen).not.toHaveBeenCalled()
+    expect(res.reply).toBe('ביטלתי לך את התור')
+    expect(res.interventions).not.toContain('action')
+  })
+
+  it('(3) waitlist FABRICATION caught (He + En) → SAFE_AUDIT_FALLBACK', async () => {
+    const regenHe = vi.fn(async () => 'הוספתי אותך לרשימת ההמתנה')
+    const resHe = await gateReply('הוספתי אותך לרשימת ההמתנה', actionCtx({ enforce: true, regen: regenHe }))
+    expect(resHe.reply).toBe(SAFE_AUDIT_FALLBACK.he)
+    expect(resHe.interventions).toContain('action')
+
+    const regenEn = vi.fn(async () => "I've added you to the waitlist")
+    const resEn = await gateReply(
+      "I've added you to the waitlist",
+      actionCtx({ enforce: true, regen: regenEn, input: { language: 'en' } }),
+    )
+    expect(resEn.reply).toBe(SAFE_AUDIT_FALLBACK.en)
+  })
+
+  it('(4) REAL waitlist add passes: backedActions has waitlist_added → unchanged', async () => {
+    const regen = vi.fn(async () => { throw new Error('regen should not be called') })
+    const res = await gateReply('הוספתי אותך לרשימת ההמתנה', actionCtx({ enforce: true, backed: ['waitlist_added'], regen }))
+    expect(regen).not.toHaveBeenCalled()
+    expect(res.reply).toBe('הוספתי אותך לרשימת ההמתנה')
+  })
+
+  it('(5) regen FIXES it → corrected reply kept (not fallback); action still recorded', async () => {
+    const regen = vi.fn(async () => 'אשמח לעזור — לאיזה תור התכוונת?')
+    const res = await gateReply('ביטלתי לך את התור', actionCtx({ enforce: true, regen }))
+    expect(regen).toHaveBeenCalledOnce()
+    expect(res.reply).toBe('אשמח לעזור — לאיזה תור התכוונת?')
+    expect(res.reply).not.toBe(SAFE_AUDIT_FALLBACK.he)
+    expect(res.interventions).toContain('action')
+  })
+
+  it('(6) flag OFF = no behavior change: unbacked cancel claim unchanged, regen NOT called', async () => {
+    const regen = vi.fn(async () => { throw new Error('regen should not be called') })
+    // enforce omitted → Branch-3 / Phase-0 default; the action-claim gate never runs.
+    const res = await gateReply('ביטלתי לך את התור', actionCtx({ regen }))
+    expect(regen).not.toHaveBeenCalled()
+    expect(res.reply).toBe('ביטלתי לך את התור')
+    expect(res.interventions).not.toContain('action')
+  })
+
+  it('(7) booking_made excluded: a booked claim is handled by Gate 1, NOT the action gate', async () => {
+    // enforceActionClaims:true, bookingConfirmed:false, empty backed. The booked claim trips
+    // Gate 1 (booking) and routes to BOOKING_NOT_CONFIRMED_FALLBACK; the action gate must NOT
+    // also fire on booking_made (no double-handling).
+    const regen = vi.fn(async () => 'קבעתי לך תור') // persists the booking claim
+    const res = await gateReply('קבעתי לך תור', actionCtx({ enforce: true, regen }))
+    expect(res.reply).toBe(BOOKING_NOT_CONFIRMED_FALLBACK.he)
+    expect(res.interventions).toContain('booking')
+    // Gate 1 regen produced a booking claim, which is NOT a detectActionClaims action class
+    // we enforce (booking_made is filtered out) — so 'action' must not appear from booking_made.
+    expect(res.interventions.filter((i) => i === 'action')).toEqual([])
+  })
+})
+
 // ── VOICE GATE — the gate-owned SAFE_AUDIT_FALLBACK must be promise-free + warm. ──────
 describe('SAFE_AUDIT_FALLBACK — promise-free, warm, one question, forward step', () => {
   for (const lang of ['he', 'en'] as const) {

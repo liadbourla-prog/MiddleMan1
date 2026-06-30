@@ -112,3 +112,25 @@ describe('detectActionClaims — refund / broadcast / settings (T1.3)', () => {
     expect(detectActionClaims('Want me to change the price?', 'en')).not.toContain('settings_changed')
   })
 })
+
+// ── T3.1b — new waitlist_added class (Branch-4 action-claim gate, H7) ──────────────
+describe('detectActionClaims — waitlist_added (T3.1b)', () => {
+  it('flags completed waitlist-ADD claims (He + En)', () => {
+    expect(detectActionClaims('הוספתי אותך לרשימת ההמתנה.', 'he')).toContain('waitlist_added')
+    expect(detectActionClaims('אתה ברשימת ההמתנה עכשיו.', 'he')).toContain('waitlist_added')
+    expect(detectActionClaims("Done — I've added you to the waitlist.", 'en')).toContain('waitlist_added')
+    expect(detectActionClaims("You're on the waitlist now.", 'en')).toContain('waitlist_added')
+  })
+
+  it('does NOT flag waitlist OFFERS / questions (action not yet taken)', () => {
+    expect(detectActionClaims('רוצה שאוסיף אותך לרשימת ההמתנה?', 'he')).not.toContain('waitlist_added')
+    expect(detectActionClaims('להוסיף אותך לרשימת ההמתנה?', 'he')).not.toContain('waitlist_added')
+    expect(detectActionClaims('Want me to add you to the waitlist?', 'en')).not.toContain('waitlist_added')
+    expect(detectActionClaims('Shall I put you on the waitlist?', 'en')).not.toContain('waitlist_added')
+  })
+
+  it('does not collide with the booking class', () => {
+    expect(detectActionClaims('קבעתי לך תור מחר ב-10:00', 'he')).not.toContain('waitlist_added')
+    expect(detectActionClaims("You're booked for Thursday", 'en')).not.toContain('waitlist_added')
+  })
+})

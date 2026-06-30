@@ -63,6 +63,7 @@ export type ActionClaim =
   | 'message_sent'
   | 'calendar_connected'
   | 'cancelled'
+  | 'waitlist_added'
   | 'refunded'
   | 'broadcast_sent'
   | 'settings_changed'
@@ -104,6 +105,27 @@ const EN_CANCELLED = [
   /\bi(?:'| ha)ve\s+cancell?ed\b/i,
   /\bi\s+cancell?ed\b/i,
   /\b(?:booking|appointment|class|session)\s+(?:has\s+been\s+|was\s+|is\s+)?cancell?ed\b/i,
+]
+
+// A completed WAITLIST-ADD claim ("I added you to the waitlist", "you're on the waitlist").
+// COMPLETED claims only — the offer/question forms ("want me to add you?", "להוסיף אותך?")
+// move the action forward and must never be flagged. Today no Branch-4 code path actually
+// adds a customer to the `waitlist` table, so every such COMPLETED claim is a fabrication the
+// gate must catch (there is no backing site to set; see customer-booking.ts note).
+const HE_WAITLIST_ADDED = [
+  /הוספתי\s+אות(?:ך|ו|ה|ם).{0,20}רשימת\s+ה?המתנה/, // I added you/him/her/them to the waitlist
+  /צירפתי\s+אות(?:ך|ו|ה|ם).{0,20}רשימת\s+ה?המתנה/, // I joined you to the waitlist
+  /(?:אתה|את)\s+(?:עכשיו\s+)?ברשימת\s+ה?המתנה/, // you are (now) on the waitlist
+  /(?:הוספת|נוספת|צורפת)\s+לרשימת\s+ה?המתנה/, // you were added to the waitlist
+]
+const EN_WAITLIST_ADDED = [
+  /\bi(?:'| ha)ve\s+added\s+you\s+to\s+(?:the\s+)?wait\s*list\b/i,
+  /\bi\s+added\s+you\s+to\s+(?:the\s+)?wait\s*list\b/i,
+  // "I've / I have put you on the waitlist" — completed only. The bare "I put you on" form is
+  // deliberately excluded: it collides with the offer "Shall I put you on the waitlist?".
+  /\bi(?:'| ha)ve\s+put\s+you\s+on\s+(?:the\s+)?wait\s*list\b/i,
+  /\byou(?:'| a)re\s+(?:now\s+)?on\s+(?:the\s+)?wait\s*list\b/i,
+  /\byou(?:'| ha)ve\s+been\s+added\s+to\s+(?:the\s+)?wait\s*list\b/i,
 ]
 
 // A completed REFUND to a customer ("I refunded ₪300", "the refund was issued"). Excludes
@@ -161,6 +183,7 @@ export function detectActionClaims(text: string, lang: 'he' | 'en'): ActionClaim
   if ((he ? HE_MESSAGE_SENT : EN_MESSAGE_SENT).some((re) => re.test(text))) claims.push('message_sent')
   if ((he ? HE_CALENDAR_CONNECTED : EN_CALENDAR_CONNECTED).some((re) => re.test(text))) claims.push('calendar_connected')
   if ((he ? HE_CANCELLED : EN_CANCELLED).some((re) => re.test(text))) claims.push('cancelled')
+  if ((he ? HE_WAITLIST_ADDED : EN_WAITLIST_ADDED).some((re) => re.test(text))) claims.push('waitlist_added')
   if ((he ? HE_REFUNDED : EN_REFUNDED).some((re) => re.test(text))) claims.push('refunded')
   if ((he ? HE_BROADCAST_SENT : EN_BROADCAST_SENT).some((re) => re.test(text))) claims.push('broadcast_sent')
   if ((he ? HE_SETTINGS_CHANGED : EN_SETTINGS_CHANGED).some((re) => re.test(text))) claims.push('settings_changed')

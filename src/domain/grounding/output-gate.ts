@@ -18,7 +18,7 @@
  * early-return, the three gate exits, the occupancy-spine early-return), and the
  * observeVoiceTells `isSafeFallback` flags are reproduced byte-for-byte from makeGenReply.
  */
-import { assertsBookingConfirmed } from '../flows/reply-guard.js'
+import { assertsBookingConfirmed, detectActionClaims, type ActionClaim } from '../flows/reply-guard.js'
 import { observeVoiceTells, hasActionFabrication } from '../flows/voice-guard.js'
 import {
   extractClockTimes,
@@ -78,6 +78,14 @@ const BOOKING_GUARD_INSTRUCTION =
 const ACTION_FABRICATION_GUARD_INSTRUCTION =
   'CRITICAL: Do NOT promise to check, ask, find out, look into, or get back to the customer, and do NOT claim you reached out, asked, or forwarded anything — you cannot perform any of those actions. Answer ONLY from the facts provided above. If — and only if — you genuinely cannot answer from those facts, output EXACTLY the token [[ASK_STUDIO]] and nothing else; the system relays the question to the business for you. Never self-author a follow-up promise.'
 
+// Corrective appended for the action-CLAIM gate (T3.1b) — the draft states a COMPLETED action
+// (cancelled / added-to-waitlist / messaged-a-customer / …) that the core did NOT perform this
+// turn. Distinct from ACTION_FABRICATION_GUARD_INSTRUCTION (check/ask phrasing): this is a
+// "said done, didn't do" claim about a discrete action. Mirrors the orchestrator's
+// auditReplyClaims correction tone, kept gate-local (must NOT import from customer-booking.ts).
+const ACTION_CLAIM_GUARD_INSTRUCTION =
+  'CRITICAL: Your draft claims a completed action (such as cancelling, adding to the waitlist, or sending a message) that did NOT happen this turn. Do NOT state it as done. Either say plainly what you WILL do or ASK what the customer wants — never claim a completed action that the system did not perform.'
+
 // Promise-free terminal fallback for Gate 4. CRITICAL — the re-trip trap: the orchestrator's
 // own SAFE_AUDIT_FALLBACK ("I'll check and get back to you") ITSELF matches
 // hasActionFabrication, so it cannot be this gate's terminal fallback — it would re-trip the
@@ -104,6 +112,25 @@ export interface GateInput {
 export interface GateOpts {
   bookingConfirmed?: boolean | undefined
   focusDay?: { dateStr: string; serviceTypeId?: string } | undefined
+  /**
+   * Enforce the action-CLAIM gate (T3.1b) — `detectActionClaims` vs `ledger.backedActions`.
+   * Default falsy: Branch 3 (whose `auditReplyClaims` owns its own action audit + logging) and
+   * all Phase-0 callers are UNCHANGED. Branch 4 always passes `true`.
+   */
+  enforceActionClaims?: boolean | undefined
+}
+
+/**
+ * The action classes a reply is allowed to state as completed are those the core actually
+ * backed this turn. Mirrors the orchestrator's `unbackedClaims` (NOT imported — replicated as
+ * a small pure filter): `booking_made` is excluded (Gate 1 / `opts.bookingConfirmed` owns it);
+ * `calendar_connected` is backed when the calendar is connected this turn OR explicitly backed;
+ * every other class is backed only when present in `backedActions`.
+ */
+function unbackedActionClaims(text: string, lang: 'he' | 'en', backed: ReadonlySet<ActionClaim>, calendarConnected: boolean): ActionClaim[] {
+  return detectActionClaims(text, lang)
+    .filter((c) => c !== 'booking_made')
+    .filter((c) => (c === 'calendar_connected' ? !(calendarConnected || backed.has(c)) : !backed.has(c)))
 }
 
 export interface GateContext {
@@ -199,6 +226,20 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
         ? OCCUPANCY_FALLBACK[language]
         : corrected
     }
+  }
+
+  // Gate 3b — action-CLAIM fabrication (cancel / waitlist / message / refund / broadcast /
+  // settings, T3.1b). Flag-gated: ONLY when opts.enforceActionClaims (Branch 4 always; Branch 3
+  // never — its auditReplyClaims owns this). A detectActionClaims class NOT in backedActions is a
+  // "said done, didn't do" claim → regen once → SAFE_AUDIT_FALLBACK on persistence. booking_made
+  // is excluded (Gate 1 owns it). Composes with the T3.1a hasActionFabrication gate below (both
+  // route to SAFE_AUDIT_FALLBACK — fine).
+  if (opts.enforceActionClaims && unbackedActionClaims(reply, language, ledger.backedActions, ledger.calendarConnected).length > 0) {
+    interventions.push('action')
+    const corrected = await regen(ACTION_CLAIM_GUARD_INSTRUCTION)
+    reply = unbackedActionClaims(corrected, language, ledger.backedActions, ledger.calendarConnected).length > 0
+      ? SAFE_AUDIT_FALLBACK[language]
+      : corrected
   }
 
   // Gate 4 — self-authored action fabrication (check / ask / "get back to you" / "one of our

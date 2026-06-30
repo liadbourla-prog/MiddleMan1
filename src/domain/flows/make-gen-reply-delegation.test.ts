@@ -10,7 +10,7 @@ vi.mock('../../adapters/llm/client.js', async (importActual) => ({
 }))
 
 import { makeGenReply } from './customer-booking.js'
-import { BOOKING_NOT_CONFIRMED_FALLBACK, FABRICATED_TIME_FALLBACK } from '../grounding/output-gate.js'
+import { BOOKING_NOT_CONFIRMED_FALLBACK, FABRICATED_TIME_FALLBACK, SAFE_AUDIT_FALLBACK } from '../grounding/output-gate.js'
 
 const noSpine = async () => ({ open: false, text: null })
 const base = { boundaryTimes: [] as string[], bookingTimes: [] as string[] }
@@ -47,6 +47,23 @@ describe('makeGenReply delegates to the unified gate (T0.3)', () => {
     generateCustomerReply.mockResolvedValueOnce('איזה יום מתאים לך?')
     const genReply = makeGenReply('', '', base, noSpine, 'biz')
     expect(await genReply(reqInput)).toBe('איזה יום מתאים לך?')
+    expect(generateCustomerReply).toHaveBeenCalledTimes(1)
+  })
+
+  // T3.1b — Branch 4 ALWAYS enforces the action-claim gate; per-call `backs` supplies the backing.
+  it('an UNbacked cancel claim trips the action gate → SAFE_AUDIT_FALLBACK', async () => {
+    generateCustomerReply
+      .mockResolvedValueOnce('ביטלתי לך את התור') // draft fabricates a cancel
+      .mockResolvedValueOnce('ביטלתי לך את התור') // regen still fabricates
+    const genReply = makeGenReply('', '', base, noSpine, 'biz')
+    expect(await genReply(reqInput)).toBe(SAFE_AUDIT_FALLBACK.he)
+    expect(generateCustomerReply).toHaveBeenCalledTimes(2)
+  })
+
+  it('the cancel-SUCCESS path passes backs:[cancelled] → a "ביטלתי" reply is allowed (no regen)', async () => {
+    generateCustomerReply.mockResolvedValueOnce('ביטלתי לך את התור, נתראה בפעם הבאה!')
+    const genReply = makeGenReply('', '', base, noSpine, 'biz')
+    expect(await genReply(reqInput, { backs: ['cancelled'] })).toBe('ביטלתי לך את התור, נתראה בפעם הבאה!')
     expect(generateCustomerReply).toHaveBeenCalledTimes(1)
   })
 })

@@ -1151,6 +1151,7 @@ const CLAIM_LABEL: Record<ActionClaim, string> = {
   message_sent: 'that a message was sent to a customer',
   calendar_connected: 'that the Google Calendar is connected',
   cancelled: 'that a booking was cancelled',
+  waitlist_added: 'that a customer was added to the waitlist',
   refunded: 'that a refund was issued',
   broadcast_sent: 'that an announcement was sent to customers',
   settings_changed: 'that a business setting was changed',

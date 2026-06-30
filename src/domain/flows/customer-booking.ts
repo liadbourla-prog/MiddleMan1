@@ -13,6 +13,7 @@ import { setCustomerName, deriveLastName } from '../identity/customer-resolver.j
 import { canonicalTime } from './slot-fabrication-guard.js'
 import { buildTurnLedger } from '../grounding/turn-ledger.js'
 import { gateReply } from '../grounding/output-gate.js'
+import type { ActionClaim } from './reply-guard.js'
 import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
 import { middlemanOneLiner } from '../../adapters/llm/middleman-identity.js'
@@ -733,7 +734,15 @@ const MAX_CLARIFICATION_ATTEMPTS = 4
 // instructors, prices, or policies — C3/C4). Callers never pass businessFacts.
 type GenReply = (
   input: Parameters<typeof generateCustomerReply>[0],
-  opts?: { bookingConfirmed?: boolean; focusDay?: { dateStr: string; serviceTypeId?: string } },
+  opts?: {
+    bookingConfirmed?: boolean
+    focusDay?: { dateStr: string; serviceTypeId?: string }
+    // Action classes the deterministic core actually performed for THIS call (T3.1b). The gate
+    // backs them so a legitimate "ביטלתי"/"I cancelled" reply at a real success site is allowed,
+    // while any UNbacked action claim (the fabrication) is caught. `booking_made` is NOT a valid
+    // member — it stays owned by `bookingConfirmed`.
+    backs?: Exclude<ActionClaim, 'booking_made'>[]
+  },
 ) => Promise<string>
 
 // Reply-vs-state binding guard — the single intent-path-agnostic Branch-4 seam. Every
@@ -769,10 +778,17 @@ export function makeGenReply(
     // the `${situation}\n\n${instruction}` shape the inline gates used.
     const regen = (instruction: string): Promise<string> =>
       generateCustomerReply({ ...grounded, situation: `${input.situation}\n\n${instruction}` })
+    // T3.1b — Branch 4 ALWAYS enforces the action-claim gate. The per-turn base ledger holds an
+    // empty backedActions set; per-call `opts.backs` (set at the deterministic success sites)
+    // merges on top, mirroring the time allowlist's base∪per-call pattern. `booking_made` is NOT
+    // here — it stays owned by `opts.bookingConfirmed`.
+    const callLedger = opts.backs?.length
+      ? { ...ledger, backedActions: new Set<ActionClaim>([...ledger.backedActions, ...opts.backs]) }
+      : ledger
     const result = await gateReply(reply, {
-      ledger,
+      ledger: callLedger,
       input: { language: input.language, situation: input.situation, transcript: input.transcript },
-      opts,
+      opts: { ...opts, enforceActionClaims: true },
       regen,
     })
     return result.reply
@@ -1078,6 +1094,14 @@ export async function handleBookingFlow(
   }
 
   // ── Branch: waitlist offer acceptance (F1c/S1) ───────────────────────────
+  // T3.1b NOTE — Branch 4 has NO waitlist-ADD (customer-JOIN) site: there is no `insert(waitlist)`
+  // anywhere in the codebase; this branch only flips an EXISTING offer row's status
+  // (offered → accepted/expired), it does not add a customer to the list. Likewise there is NO
+  // Branch-4 site that sends a message to a third party/customer on the customer's behalf. So no
+  // `backs: ['waitlist_added']` or `backs: ['message_sent']` is wired here — and the action-claim
+  // gate therefore correctly CATCHES any unbacked "added you to the waitlist" / "I messaged him"
+  // claim as a fabrication (no backing is fabricated to suppress it).
+  //
   // The "a spot opened" proactive offer sets no session pending state; bind the reply to the
   // open offer HERE so a "yes" actually books it, instead of falling through to fresh intent
   // (the loop's primary trigger). Only engages when no booking step is already in flight, so
@@ -3346,7 +3370,7 @@ async function handleCancellationConfirmation(
     situation: 'Booking successfully cancelled.',
     transcript,
     customerMemory: extractMemory(ctx),
-  })
+  }, { backs: ['cancelled'] }) // T3.1b — real cancel; back the 'cancelled' claim so "ביטלתי"/"I cancelled" is allowed.
   return { reply, sessionComplete: true }
 }
 
@@ -3506,7 +3530,7 @@ async function handleRetentionResponse(
       situation: 'Booking successfully cancelled.',
       transcript,
       customerMemory: extractMemory(ctx),
-    })
+    }, { backs: ['cancelled'] }) // T3.1b — real cancel (retention-declined path); back the 'cancelled' claim.
     return { reply, sessionComplete: true }
   }
 
