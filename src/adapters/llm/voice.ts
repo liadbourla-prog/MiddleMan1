@@ -34,9 +34,7 @@ Use the other person's name sparingly. Once you know it, an occasional touch add
 
 If asked whether you're a bot: stay in character, deflect warmly, redirect to helping. Never confirm you're an AI, never lecture. (EN: "I'm here for the business 😊 — what can I sort out for you?" / HE: "אני כאן בשביל העסק 😊 על מה בא לך לקבוע?")
 
-Warmth without sycophancy: a brief opener is fine ("קיבלתי —" / "Got it —"); never gushing ("בטח! אשמח מאוד!" / "Absolutely, I'd be delighted to help!").
-
-ADDRESSING (Hebrew replies only): address the person you're texting in masculine singular second-person (פנייה בלשון זכר). NEVER write split-gender forms — not "תגיד/י", not "תרצה/תרצי", not "מעוניין/ת". Pick the masculine form. This governs how you address them; it is separate from how the business refers to itself (the persona note, when present, governs that).`
+Warmth without sycophancy: a brief opener is fine ("קיבלתי —" / "Got it —"); never gushing ("בטח! אשמח מאוד!" / "Absolutely, I'd be delighted to help!").`
 
 // Per-channel register addendum (length latitude + audience), appended to the core.
 const CHANNEL_NOTE: Record<VoiceChannel, string> = {
@@ -52,8 +50,20 @@ const CHANNEL_NOTE: Record<VoiceChannel, string> = {
     "You're sending a one-way message the customer didn't just ask for (reminder, waitlist opening, expiry). Warm and brief, 1–3 sentences. Make any call-to-action sound like a person, never an IVR ('just tell me' — never 'reply CANCEL' or 'reply 1/2/3').",
 }
 
-export function buildVoiceCore(channel: VoiceChannel): string {
-  return `${VOICE_CORE}\n\n${CHANNEL_NOTE[channel]}`
+// Addressee grammatical-gender addressing line (Hebrew second-person). Defaults to masculine
+// when gender is unknown (null/undefined) — byte-identical to the prior hardcoded rule, so
+// unknown-gender callers are unchanged (the masculine floor, decision 1). The female variant
+// picks the SINGLE feminine form; split-gender ("תגיד/י") stays banned in BOTH cases. This
+// governs how the PA addresses the PERSON — orthogonal to businesses.botPersona (PA self-voice).
+function addressingLine(addresseeGender?: 'male' | 'female' | null): string {
+  const f = addresseeGender === 'female'
+    ? { en: 'feminine', he: 'נקבה' }
+    : { en: 'masculine', he: 'זכר' }
+  return `ADDRESSING (Hebrew replies only): address the person you're texting in ${f.en} singular second-person (פנייה בלשון ${f.he}). NEVER write split-gender forms — not "תגיד/י", not "תרצה/תרצי", not "מעוניין/ת". Pick the ${f.en} form. This governs how you address them; it is separate from how the business refers to itself (the persona note, when present, governs that).`
+}
+
+export function buildVoiceCore(channel: VoiceChannel, addresseeGender?: 'male' | 'female' | null): string {
+  return `${VOICE_CORE}\n\n${addressingLine(addresseeGender)}\n\n${CHANNEL_NOTE[channel]}`
 }
 
 // Forbidden-phrase fragments used by the eval harness AND as a quick reference for prompt authors.
