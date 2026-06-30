@@ -15,6 +15,13 @@ if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
 // generateConversational() below.
 const MODEL = MODELS.fast
 
+// Branch 1 operator addressee gender (decision 1): one known human, configured via the
+// OPERATOR_GENDER env, masculine floor by default. Read at call time so a deployment can flip
+// it without a rebuild; any unrecognised value stays masculine.
+export function operatorAddresseeGender(): 'male' | 'female' {
+  return process.env['OPERATOR_GENDER'] === 'female' ? 'female' : 'male'
+}
+
 const ai = new GoogleGenAI({ apiKey: LLM_API_KEY, apiVersion: 'v1beta' })
 
 // Conversational generation on Pro, with a graceful Flash fallback so a slow or
@@ -824,7 +831,7 @@ export async function answerOperatorQuestion(input: {
 
   const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. You have full real-time access to the platform data below.
 
-${buildVoiceCore('operator')}
+${buildVoiceCore('operator', operatorAddresseeGender())}
 
 Platform stats: ${statsLine}
 
@@ -887,7 +894,7 @@ export async function generateOperatorReply(input: {
 
   const systemPrompt = `You are the MiddleMan admin assistant. MiddleMan is a WhatsApp-based PA platform for local businesses. The operator (platform owner) is texting you on WhatsApp.
 
-${buildVoiceCore('operator')}
+${buildVoiceCore('operator', operatorAddresseeGender())}
 ${statsLine ? `\n${statsLine}` : ''}
 Language: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
 
@@ -1609,7 +1616,7 @@ export async function formatOperatorDataReply(input: {
 }): Promise<string> {
   const systemPrompt = `You are the MiddleMan admin assistant. The operator (platform owner) ran a command and you need to present the results clearly on WhatsApp.
 
-${buildVoiceCore('operator')}
+${buildVoiceCore('operator', operatorAddresseeGender())}
 
 LANGUAGE: reply ENTIRELY in ${input.lang === 'he' ? 'Hebrew (עברית)' : 'English'}.
 
