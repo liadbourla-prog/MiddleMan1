@@ -4,9 +4,12 @@ import {
   BOOKING_NOT_CONFIRMED_FALLBACK,
   FABRICATED_TIME_FALLBACK,
   OCCUPANCY_FALLBACK,
+  SAFE_AUDIT_FALLBACK,
   type GateContext,
 } from './output-gate.js'
 import { buildTurnLedger, type OccupancySpine } from './turn-ledger.js'
+import { hasActionFabrication, detectBotTells, hasDeadEnd } from '../flows/voice-guard.js'
+import { assertsBookingConfirmed } from '../flows/reply-guard.js'
 
 // T0.2 golden-PARITY suite. gateReply must reproduce Branch-4 makeGenReply's Gates 1/2/3
 // verdicts EXACTLY — booking/time/occupancy ENFORCED, action monitor-only (no enforce in
@@ -145,4 +148,79 @@ describe('gateReply — exit path 3/4: clean reply passes through', () => {
     expect(res.reply).toBe('איזה יום מתאים לך?')
     expect(res.interventions).toEqual([])
   })
+})
+
+// ── Gate 4 (T3.1a) — self-authored action-fabrication (check/ask/get-back-to-you) ──────
+// hasActionFabrication phrasing reaching gateReply is unbacked BY CONSTRUCTION: the honest
+// escalation replies are code templates that bypass makeGenReply/gateReply entirely. So the
+// gate ENFORCES it (regen once → promise-free fallback on persistence). No backing check.
+describe('gateReply — Gate 4: self-authored action fabrication (ENFORCED)', () => {
+  it('persisting fabrication → promise-free SAFE_AUDIT_FALLBACK (Hebrew)', async () => {
+    // regen ALSO returns an action-fabrication phrasing → terminal fallback.
+    const regen = vi.fn(async () => 'אבדוק מול הסטודיו ואחזור אליך')
+    const res = await gateReply('אבדוק מול הסטודיו ואחזור אליך', ctx({ regen }))
+    expect(regen).toHaveBeenCalledOnce()
+    expect(res.reply).toBe(SAFE_AUDIT_FALLBACK.he)
+    expect(res.interventions).toContain('action')
+  })
+
+  it('persisting fabrication → promise-free SAFE_AUDIT_FALLBACK (English)', async () => {
+    const regen = vi.fn(async () => "I'll check with the studio and get back to you.")
+    const res = await gateReply(
+      "I'll check with the studio and get back to you.",
+      ctx({ input: { language: 'en' }, regen }),
+    )
+    expect(regen).toHaveBeenCalledOnce()
+    expect(res.reply).toBe(SAFE_AUDIT_FALLBACK.en)
+    expect(res.interventions).toContain('action')
+  })
+
+  it('regen fixes it → the clean correction is kept (not the fallback); action still recorded', async () => {
+    const regen = vi.fn(async () => 'אין לי את המידע הזה כרגע — הכי טוב לפנות ישירות לעסק. אפשר לעזור בקביעה?')
+    const res = await gateReply('אבדוק ואחזור אליך', ctx({ regen }))
+    expect(regen).toHaveBeenCalledOnce()
+    expect(res.reply).toBe('אין לי את המידע הזה כרגע — הכי טוב לפנות ישירות לעסק. אפשר לעזור בקביעה?')
+    expect(res.reply).not.toBe(SAFE_AUDIT_FALLBACK.he)
+    expect(res.interventions).toContain('action')
+  })
+
+  it('clean reply (no check/ask phrasing) passes untouched — no action intervention, regen never called', async () => {
+    const regen = vi.fn(async () => { throw new Error('regen should not be called') })
+    const res = await gateReply('איזה יום הכי מתאים לך לשיעור יוגה?', ctx({ regen }))
+    expect(regen).not.toHaveBeenCalled()
+    expect(res.reply).toBe('איזה יום הכי מתאים לך לשיעור יוגה?')
+    expect(res.interventions).not.toContain('action')
+  })
+
+  it('bookingConfirmed early-return still SKIPS the action gate (exit path 1 unchanged)', async () => {
+    // A draft that WOULD trip Gate 4, but bookingConfirmed trusts the wording.
+    const draft = 'קבעתי לך תור, ואחזור אליך עם אישור'
+    const regen = vi.fn(async () => { throw new Error('regen should not be called') })
+    const res = await gateReply(draft, ctx({ gateOpts: { bookingConfirmed: true }, regen }))
+    expect(regen).not.toHaveBeenCalled()
+    expect(res.reply).toBe(draft)
+    expect(res.interventions).toEqual([])
+  })
+})
+
+// ── VOICE GATE — the gate-owned SAFE_AUDIT_FALLBACK must be promise-free + warm. ──────
+describe('SAFE_AUDIT_FALLBACK — promise-free, warm, one question, forward step', () => {
+  for (const lang of ['he', 'en'] as const) {
+    it(`(${lang}) does NOT itself match hasActionFabrication (the re-trip trap)`, () => {
+      expect(hasActionFabrication(SAFE_AUDIT_FALLBACK[lang])).toBe(false)
+    })
+    it(`(${lang}) does NOT assert a booking is confirmed`, () => {
+      expect(assertsBookingConfirmed(SAFE_AUDIT_FALLBACK[lang], lang)).toBe(false)
+    })
+    it(`(${lang}) carries exactly one question (?)`, () => {
+      const count = (SAFE_AUDIT_FALLBACK[lang].match(/[?？]/g) ?? []).length
+      expect(count).toBe(1)
+    })
+    it(`(${lang}) passes the mechanical voice bar (no bot-tells)`, () => {
+      expect(detectBotTells(SAFE_AUDIT_FALLBACK[lang])).toEqual([])
+    })
+    it(`(${lang}) is NOT a dead_end (it carries a forward step)`, () => {
+      expect(hasDeadEnd(SAFE_AUDIT_FALLBACK[lang])).toBe(false)
+    })
+  }
 })

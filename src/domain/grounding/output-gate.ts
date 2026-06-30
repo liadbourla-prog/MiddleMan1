@@ -7,17 +7,19 @@
  * generalized form of Branch-4 `makeGenReply`'s Gates 1/2/3 — extracted verbatim so the
  * same gate can later run at every output door (Branch 3, the proactive seam).
  *
- * Phase-0 scope (RED-TEAM P2 — no behavior change): only booking / time / occupancy are
- * ENFORCED, exactly as Branch 4 enforces them today. The action class stays MONITOR-ONLY
- * (it rides inside observeVoiceTells, as today); enforcing it here would be a behavior
- * change. `ledger.backedActions` is carried for the later phases that graduate the monitor.
+ * Booking / time / occupancy are ENFORCED exactly as Branch 4 enforces them today. As of
+ * T3.1a the self-authored action-fabrication class (check / ask / "get back to you" phrasing,
+ * `hasActionFabrication`) is ALSO ENFORCED here — graduated from the monitor it formerly rode
+ * in observeVoiceTells. Such phrasing is unbacked BY CONSTRUCTION (the honest escalation
+ * replies are code templates that bypass this gate), so it needs no `backedActions` check.
+ * The cancel/waitlist `detectActionClaims` classes remain a separate, later concern (T3.1b).
  *
  * Parity is load-bearing: the regen correctives, the four exit paths (bookingConfirmed
  * early-return, the three gate exits, the occupancy-spine early-return), and the
  * observeVoiceTells `isSafeFallback` flags are reproduced byte-for-byte from makeGenReply.
  */
 import { assertsBookingConfirmed } from '../flows/reply-guard.js'
-import { observeVoiceTells } from '../flows/voice-guard.js'
+import { observeVoiceTells, hasActionFabrication } from '../flows/voice-guard.js'
 import {
   extractClockTimes,
   findUnbackedTimes,
@@ -69,10 +71,29 @@ export const TIME_GUARD_INSTRUCTION =
 const BOOKING_GUARD_INSTRUCTION =
   'CRITICAL: No booking has been made or confirmed. Do NOT state or imply the appointment is booked, reserved, registered, or done. If a decision is needed, ask for it plainly.'
 
+// Corrective appended for Gate 4 — self-authored action fabrication. The model has promised
+// to check / ask / find out / get back to the customer, or claimed it reached out — none of
+// which it can do: the only honest escalation path is a code-emitted relay that bypasses this
+// gate. Gate-local + self-contained (must NOT import from customer-booking.ts).
+const ACTION_FABRICATION_GUARD_INSTRUCTION =
+  'CRITICAL: Do NOT promise to check, ask, find out, look into, or get back to the customer, and do NOT claim you reached out, asked, or forwarded anything — you cannot perform any of those actions. Answer ONLY from the facts provided above. If — and only if — you genuinely cannot answer from those facts, output EXACTLY the token [[ASK_STUDIO]] and nothing else; the system relays the question to the business for you. Never self-author a follow-up promise.'
+
+// Promise-free terminal fallback for Gate 4. CRITICAL — the re-trip trap: the orchestrator's
+// own SAFE_AUDIT_FALLBACK ("I'll check and get back to you") ITSELF matches
+// hasActionFabrication, so it cannot be this gate's terminal fallback — it would re-trip the
+// very detector that fired. This string therefore promises NOTHING (no "I'll check", no "get
+// back to you", no "אבדוק", no "אחזור אליך"), asserts NOTHING done, and steers forward warmly
+// with ONE question and a next step. It must not match hasActionFabrication or
+// assertsBookingConfirmed (a unit test enforces both).
+export const SAFE_AUDIT_FALLBACK: Record<'he' | 'en', string> = {
+  he: 'אשמח לעזור עם זה — מה בא לך לעשות עכשיו, לקבוע, לשנות או לבדוק משהו?',
+  en: 'Happy to help with that — what would you like to do next, book, change, or look at something?',
+}
+
 // ── The gate ─────────────────────────────────────────────────────────────────────────
 
-/** An enforced gate that fired this turn (telemetry; action is monitor-only in Phase 0). */
-export type GateIntervention = 'booking' | 'time' | 'occupancy'
+/** An enforced gate that fired this turn (telemetry). */
+export type GateIntervention = 'booking' | 'time' | 'occupancy' | 'action'
 
 export interface GateInput {
   language: 'he' | 'en'
@@ -180,12 +201,23 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
     }
   }
 
+  // Gate 4 — self-authored action fabrication (check / ask / "get back to you" / "one of our
+  // guides will"). These phrasings are produced ONLY by the LLM — the honest escalation replies
+  // are CODE TEMPLATES that bypass makeGenReply/gateReply entirely. So any such phrasing reaching
+  // here is unbacked BY CONSTRUCTION; it needs NO backedActions check. ENFORCED (T3.1a).
+  if (hasActionFabrication(reply)) {
+    interventions.push('action')
+    const corrected = await regen(ACTION_FABRICATION_GUARD_INSTRUCTION)
+    reply = hasActionFabrication(corrected) ? SAFE_AUDIT_FALLBACK[language] : corrected
+  }
+
   // Exit path 3/4 — final return; flag the safe fallbacks so the voice monitor exempts them.
   return {
     reply: observeVoiceTells(reply, { businessId, language }, {
       isSafeFallback: reply === FABRICATED_TIME_FALLBACK[language]
         || reply === OCCUPANCY_FALLBACK[language]
-        || reply === BOOKING_NOT_CONFIRMED_FALLBACK[language],
+        || reply === BOOKING_NOT_CONFIRMED_FALLBACK[language]
+        || reply === SAFE_AUDIT_FALLBACK[language],
     }),
     interventions,
   }

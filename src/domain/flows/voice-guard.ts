@@ -200,9 +200,12 @@ const DETECTORS: ReadonlyArray<readonly [BotTell, (text: string) => boolean]> = 
 ]
 // NOTE: hasActionFabrication is deliberately NOT in this aggregator. A warm, BACKED escalation
 // hand-off ("passed it to the studio, they'll get back to you") reads great and is honest, so
-// it must not fail the mechanical-voice quality bar (detectBotTells / the golden set). It is a
-// fabrication signal, monitored SEPARATELY in observeVoiceTells (Gate 4) — and only ever sees
-// LLM output there, since the honest escalation replies are code templates that bypass it.
+// it must not fail the mechanical-voice quality bar (detectBotTells / the golden set) — a
+// backed code-template hand-off must still pass the mechanical bar, but it never reaches
+// gateReply. Gate 4 is now ENFORCED in gateReply (grounding/output-gate.ts, T3.1a), not
+// monitored here: hasActionFabrication is exported as that gate's detector. Any such phrasing
+// reaching gateReply is LLM output and unbacked by construction (the honest escalation replies
+// are code templates that bypass the gate).
 
 /** Every bot-tell that fires for `text`. Empty array → clean. */
 export function detectBotTells(text: string): BotTell[] {
@@ -235,14 +238,8 @@ export function observeVoiceTells(
       businessId: ctx.businessId, gate: 'voice', tells, draftExcerpt: reply.slice(0, 200),
     })
   }
-  // Gate 4 (F3a/F3b/S3) — action-fabrication, a SEPARATE signal from the mechanical tells.
-  // Honest escalation hand-offs are code templates that never reach this observer; a reply
-  // here is LLM output, so a check/ask/"get back to you" claim is unbacked. Monitor-only.
-  if (!opts?.isSafeFallback && hasActionFabrication(reply)) {
-    console.warn('[voice-gate] action-fabrication detected (monitor-only)', {
-      businessId: ctx.businessId, gate: 'gate4', tell: 'action_fabrication', draftExcerpt: reply.slice(0, 200),
-    })
-  }
+  // Gate 4 (F3a/F3b/S3) — action-fabrication is now ENFORCED in gateReply (T3.1a), not
+  // monitored here. hasActionFabrication is exported from this module as that gate's detector.
   // MONITOR-ONLY: never mutate the reply here. TODO(voice-regen): when VOICE_REGEN_ENABLED
   // (default OFF) is set AND the Gemini-vs-Claude model decision is made, regenerate once
   // with a corrective instruction citing the violated Voice Bible rule and ship the BETTER

@@ -257,7 +257,8 @@ describe('non-bypass invariant — Branch-4: every gateReply return is wrapped i
     expect(observed).toBe(returns)
 
     // The import is present so the wrapper is the real Gate-7 observer, not a shadow.
-    expect(src).toMatch(/import\s+\{\s*observeVoiceTells\s*\}\s+from\s+'\.\.\/flows\/voice-guard\.js'/)
+    // (hasActionFabrication may also be imported alongside it — it is the Gate-4 detector.)
+    expect(src).toMatch(/import\s+\{[^}]*\bobserveVoiceTells\b[^}]*\}\s+from\s+'\.\.\/flows\/voice-guard\.js'/)
   })
 
   it('makeGenReply delegates to gateReply — it cannot produce a reply that bypasses the gate', () => {
