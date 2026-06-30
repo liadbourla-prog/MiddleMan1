@@ -32,6 +32,15 @@ vi.mock('./waitlist-revalidate.js', () => ({
   revalidateWaitlistSlotOpen: vi.fn(async () => true),
 }))
 
+// WL-5: the offer is preceded by a genuine engine hold. Stub it to succeed so the durable-send
+// path under test is reached; the calendar client is an opaque handle.
+vi.mock('../domain/booking/engine.js', () => ({
+  requestBooking: vi.fn(async () => ({ ok: true, bookingId: 'bk-1', held: true, message: 'held' })),
+}))
+vi.mock('../adapters/calendar/client.js', () => ({
+  createCalendarClient: vi.fn(() => ({})),
+}))
+
 // db singleton — queries return rows from a shared array, consumed in call order.
 let dbQueryIdx = 0
 const dbRows: unknown[][] = []
@@ -132,6 +141,7 @@ import * as sender from '../adapters/whatsapp/sender.js'
 //   4. customer identity (limit 1)
 //   5. service (limit 1)
 //   6. business (limit 1)
+//   7. hold-manager lookup (limit 1) — WL-5, for the calendar client (manager phone)
 function setupOfferRows() {
   dbQueryIdx = 0
   dbRows.length = 0
@@ -143,12 +153,14 @@ function setupOfferRows() {
   }])
   dbRows.push([]) // booking-in-window lookup for the single candidate → none (priority)
   dbRows.push([{ id: 'wl-1' }]) // CAS won
-  dbRows.push([{ phoneNumber: '+972501234567', preferredLanguage: 'en' }])
+  dbRows.push([{ phoneNumber: '+972501234567', preferredLanguage: 'en', displayName: 'Dana' }])
   dbRows.push([{ name: 'Haircut' }])
   dbRows.push([{
     name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en',
     whatsappPhoneNumberId: 'PNID', whatsappAccessToken: 'TOKEN',
+    googleRefreshToken: null, googleCalendarId: null,
   }])
+  dbRows.push([{ phoneNumber: '+972599999999' }]) // WL-5: hold-manager lookup
 }
 
 const JOB = {

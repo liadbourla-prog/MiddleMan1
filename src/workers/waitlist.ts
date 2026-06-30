@@ -1,8 +1,11 @@
 import { Worker, Queue } from 'bullmq'
-import { eq, and, asc, gte, lt, inArray } from 'drizzle-orm'
+import { eq, and, asc, gte, lt, inArray, isNull } from 'drizzle-orm'
 import { db } from '../db/client.js'
 import { waitlist, identities, businesses, serviceTypes, bookings } from '../db/schema.js'
 import { canSendFreeForm, sendTemplateMessage } from '../adapters/whatsapp/sender.js'
+import { createCalendarClient } from '../adapters/calendar/client.js'
+import { requestBooking } from '../domain/booking/engine.js'
+import type { ResolvedIdentity } from '../domain/identity/types.js'
 import { enqueueMessage } from './message-retry.js'
 import { bodyComponents } from '../adapters/whatsapp/templates.js'
 import { redisConnection } from '../redis.js'
@@ -326,7 +329,7 @@ export async function processJob(job: { data: WaitlistJob }) {
   }
 
   const [customer] = await db
-    .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage })
+    .select({ phoneNumber: identities.phoneNumber, preferredLanguage: identities.preferredLanguage, displayName: identities.displayName })
     .from(identities)
     .where(eq(identities.id, next.customerId))
     .limit(1)
@@ -338,10 +341,73 @@ export async function processJob(job: { data: WaitlistJob }) {
     .limit(1)
 
   const [biz] = await db
-    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken })
+    .select({ name: businesses.name, timezone: businesses.timezone, defaultLanguage: businesses.defaultLanguage, whatsappPhoneNumberId: businesses.whatsappPhoneNumberId, whatsappAccessToken: businesses.whatsappAccessToken, googleRefreshToken: businesses.googleRefreshToken, googleCalendarId: businesses.googleCalendarId })
     .from(businesses)
     .where(eq(businesses.id, businessId))
     .limit(1)
+
+  // WL-5 (B2): place a GENUINE hold for the chosen winner BEFORE any offer goes out. Going
+  // through the engine inherits the advisory-lock keying, the is_exclusive overlap constraint,
+  // and correct `held`-state capacity semantics — never a hand-rolled insert. The hold expires
+  // exactly at the offer window (offerExpiresAt). If the hold can't be placed (lost the capacity
+  // race), NO offer is sent: revert this entry pending→pending and let the cascade pick it up.
+  if (!customer || !biz) return
+
+  // Build the calendar client the same way hold-expiry.ts does (lines ~94-112): empty access
+  // token + the business's stored refresh token / calendar id, and the active manager's phone
+  // for any manager-scoped calendar ops. Internal-mode businesses carry no google token and the
+  // client degrades to internal mode (the booking row IS the hold).
+  const [holdManager] = await db
+    .select({ phoneNumber: identities.phoneNumber })
+    .from(identities)
+    .where(and(eq(identities.businessId, businessId), eq(identities.role, 'manager'), isNull(identities.revokedAt)))
+    .limit(1)
+
+  const holdCalendar = createCalendarClient({
+    accessToken: '',
+    refreshToken: biz.googleRefreshToken ?? '',
+    calendarId: biz.googleCalendarId,
+    ...(holdManager ? { managerPhoneNumber: holdManager.phoneNumber } : {}),
+  })
+
+  // The waitlist customer as the booking actor (role:'customer' → the engine self-book path).
+  const customerActor: ResolvedIdentity = {
+    id: next.customerId,
+    businessId,
+    phoneNumber: customer.phoneNumber,
+    role: 'customer',
+    displayName: customer.displayName,
+    messagingOptOut: false,
+    preferredLanguage: (customer.preferredLanguage as 'he' | 'en' | null) ?? null,
+    conversationPausedUntil: null,
+  }
+
+  const holdResult = await requestBooking(
+    db,
+    holdCalendar,
+    customerActor,
+    { serviceTypeId, slotStart: new Date(slotStart), slotEnd: new Date(slotEnd) },
+    { waitlistHold: { holdExpiresAt: offerExpiresAt } },
+  )
+
+  if (!holdResult.ok) {
+    // Lost the capacity race (or the seat was retaken). Revert the row offered→pending via a CAS
+    // so it stays available for the cascade / next run, and do NOT send an offer (the plan: "if
+    // the hold can't be placed, no offer goes out and the row stays pending").
+    await db
+      .update(waitlist)
+      .set({ status: 'pending', offeredAt: null, offerExpiresAt: null })
+      .where(and(eq(waitlist.id, next.id), eq(waitlist.status, 'offered')))
+    await logAudit(db, {
+      businessId,
+      actorId: null,
+      action: 'waitlist.hold_failed',
+      entityType: 'waitlist',
+      entityId: next.id,
+      metadata: { slotStart, slotEnd, reason: holdResult.reason },
+    })
+    return
+  }
 
   if (customer && biz) {
     const lang: Lang = (customer.preferredLanguage as Lang | null | undefined)
@@ -364,9 +430,11 @@ export async function processJob(job: { data: WaitlistJob }) {
     if (freeFormAllowed) {
       // Durable path: enqueueMessage hands off to the message-retry BullMQ queue so a
       // transient WA send failure is re-driven rather than silently lost (E2/P7 fix).
-      // Honest framing (T2a.2): the slot is NOT held/reserved — it goes to whoever replies first
-      // and the offer simply lapses after the TTL. Never claim it's being held for them.
-      const situation = `A slot just opened up at ${biz.name}: "${serviceName}" on ${dateStr}. Share the good news warmly and invite them to reply if they want it — never say "reply YES/NO". It is first-come: tell them the first to reply gets it and the offer is open for the next ${OFFER_TTL_MINUTES} minutes. Do NOT say you are holding, saving, or reserving it for them — it is not reserved; it goes to whoever replies first.`
+      // WL-5 (B2) framing: the seat is now GENUINELY held for THIS customer (a real `held`
+      // booking placed above), so we tell them it's being kept for them for the offer window and
+      // will be released if they don't reply in time. Voice-compliant: warm, ONE question, a
+      // clear next step, never a "reply YES/NO" menu.
+      const situation = `Great news for them: a spot just opened for "${serviceName}" at ${biz.name} on ${dateStr}, and you've placed a hold so it's being kept just for them for the next ${OFFER_TTL_MINUTES} minutes. Share it warmly, in ONE short message, and ask whether they'd like to take it. Make clear that if they don't reply within those ${OFFER_TTL_MINUTES} minutes the hold is released. Never say "reply YES/NO" and never use a menu.`
       const llmBody = await generateProactiveCustomerMessage({ businessName: biz.name, language: lang, situation, fallback: offerBody, timeoutMs: 2500 })
       await enqueueMessage(businessId, customer.phoneNumber, llmBody)
     } else {

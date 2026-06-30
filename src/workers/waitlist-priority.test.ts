@@ -31,6 +31,15 @@ vi.mock('./waitlist-revalidate.js', () => ({
   revalidateWaitlistSlotOpen: vi.fn(async () => true),
 }))
 
+// WL-5: the offer is preceded by a genuine engine hold. Stub it to succeed so the selection
+// path under test still reaches the offer send; the calendar client is an opaque handle.
+vi.mock('../domain/booking/engine.js', () => ({
+  requestBooking: vi.fn(async () => ({ ok: true, bookingId: 'bk-1', held: true, message: 'held' })),
+}))
+vi.mock('../adapters/calendar/client.js', () => ({
+  createCalendarClient: vi.fn(() => ({})),
+}))
+
 // db singleton — select queries return rows from a shared array, consumed in call order;
 // update()...returning() consumes from the SAME array so CAS results stay interleaved.
 let dbQueryIdx = 0
@@ -147,9 +156,10 @@ describe('waitlist offer_slot — priority tiering (WL-2a)', () => {
     dbRows.push([{ id: 'bk-A' }]) // A has a commitment in window
     dbRows.push([]) // B has none → priority
     dbRows.push([{ id: 'wl-B' }]) // CAS won for B
-    dbRows.push([{ phoneNumber: '+972500000002', preferredLanguage: 'en' }]) // cust-B
+    dbRows.push([{ phoneNumber: '+972500000002', preferredLanguage: 'en', displayName: 'Bina' }]) // cust-B
     dbRows.push([{ name: 'Haircut' }])
-    dbRows.push([{ name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en', whatsappPhoneNumberId: 'PNID', whatsappAccessToken: 'TOKEN' }])
+    dbRows.push([{ name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en', whatsappPhoneNumberId: 'PNID', whatsappAccessToken: 'TOKEN', googleRefreshToken: null, googleCalendarId: null }])
+    dbRows.push([{ phoneNumber: '+972599999999' }]) // WL-5: hold-manager lookup
 
     await processJob(JOB)
 
@@ -180,9 +190,10 @@ describe('waitlist offer_slot — priority tiering (WL-2a)', () => {
     dbRows.push([{ id: 'bk-A' }]) // A committed → normal
     dbRows.push([]) // CAS B lost
     dbRows.push([{ id: 'wl-A' }]) // CAS A won
-    dbRows.push([{ phoneNumber: '+972500000001', preferredLanguage: 'en' }]) // cust-A
+    dbRows.push([{ phoneNumber: '+972500000001', preferredLanguage: 'en', displayName: 'Avi' }]) // cust-A
     dbRows.push([{ name: 'Haircut' }])
-    dbRows.push([{ name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en', whatsappPhoneNumberId: 'PNID', whatsappAccessToken: 'TOKEN' }])
+    dbRows.push([{ name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en', whatsappPhoneNumberId: 'PNID', whatsappAccessToken: 'TOKEN', googleRefreshToken: null, googleCalendarId: null }])
+    dbRows.push([{ phoneNumber: '+972599999999' }]) // WL-5: hold-manager lookup
 
     await processJob(JOB)
 

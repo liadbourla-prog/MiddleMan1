@@ -32,8 +32,19 @@ const HOLD_EXPIRY_MINUTES = parseInt(process.env['HOLD_EXPIRY_MINUTES'] ?? '15',
 // "that's unavailable, here's another date" substitute).
 export type BookingFailureCode = 'already_booked'
 export type BookingEngineResult =
-  | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean; pendingPayment?: boolean; pendingApproval?: boolean }
+  | { ok: true; bookingId: string; message: string; directlyConfirmed?: boolean; pendingPayment?: boolean; pendingApproval?: boolean; held?: boolean }
   | { ok: false; reason: string; code?: BookingFailureCode }
+
+// WL-5: an opt-in directive that turns an ordinary booking request into a genuine
+// WAITLIST HOLD. When present, the engine reserves the seat as a `held` booking that
+// occupies capacity for the offer window (`holdExpiresAt`) but does NOT confirm, does
+// NOT charge, does NOT notify the owner, and does NOT message the customer — the
+// waitlist worker owns the comms. Default-OFF: when the directive is absent every
+// existing code path is byte-identical to before. The accept step (WL-7) later finds
+// this hold via `(businessId, customerId, slotStart, state='held')` and confirms it.
+export interface WaitlistHoldDirective {
+  holdExpiresAt: Date
+}
 
 // Temporal policy gate: past-slot, min-buffer, max-days-ahead. Returns a human
 // English sentence (sanitised into customer wording downstream) or null when OK.
@@ -149,8 +160,14 @@ export async function requestBooking(
   calendar: CalendarClient,
   actor: ResolvedIdentity,
   request: BookingSlotRequest,
-  opts?: { suppressOwnerNewBookingNotice?: boolean },
+  opts?: { suppressOwnerNewBookingNotice?: boolean; waitlistHold?: WaitlistHoldDirective },
 ): Promise<BookingEngineResult> {
+  // WL-5: a waitlist hold is the comms-silent reservation path. It forces the owner
+  // new-booking notice off (the waitlist offer message IS the comms) and bypasses the
+  // per-service approval gate (the owner already approved at the freed-slot gate).
+  const waitlistHold = opts?.waitlistHold
+  const suppressOwnerNewBookingNotice = (opts?.suppressOwnerNewBookingNotice ?? false) || waitlistHold !== undefined
+
   const auth = authorize({ role: actor.role, ...(actor.delegatedPermissions ? { delegatedPermissions: actor.delegatedPermissions } : {}) }, 'booking.request')
   if (!auth.allowed) return { ok: false, reason: auth.reason }
 
@@ -282,7 +299,7 @@ export async function requestBooking(
     // mechanics don't compose with the held-for-approval reservation, so a class service keeps
     // today's direct-confirm path even if requires_owner_approval is on (documented limitation;
     // never gated → no behavior change, only "approval not yet honored for classes").
-    return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, instanceCapacity, opts?.suppressOwnerNewBookingNotice ?? false)
+    return requestGroupClassBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, instanceCapacity, suppressOwnerNewBookingNotice, waitlistHold)
   }
 
   // Per-service owner-approval gate (design 2026-06-25, §2). Fires ONLY when the service opted in
@@ -290,10 +307,12 @@ export async function requestBooking(
   // shouldHoldForApproval). PA/owner-initiated bookings never reach with role 'customer', so they
   // are not gated (decision D1). When it fires, the booking is held + pending the owner's decision
   // for the business's approval window instead of confirming/charging now.
-  const requiresApproval = shouldHoldForApproval(service.requiresOwnerApproval, actor.role)
+  // WL-5: a waitlist hold bypasses the per-service approval gate — the owner already
+  // approved at the freed-slot gate, so we never re-trigger an approval request here.
+  const requiresApproval = waitlistHold === undefined && shouldHoldForApproval(service.requiresOwnerApproval, actor.role)
   const approvalWindowHours = business?.bookingApprovalWindowHours ?? 24
 
-  return requestPrivateBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, requiresApproval, approvalWindowHours)
+  return requestPrivateBooking(db, calendar, actor, effectiveRequest, service, businessTz, confirmationGate, paymentMethod, providerDisplayName, requiresApproval, approvalWindowHours, waitlistHold)
 }
 
 // ── Private (1-on-1) booking — hold/confirm two-step flow ────────────────────
@@ -310,12 +329,16 @@ async function requestPrivateBooking(
   providerDisplayName: string | null = null,
   requiresApproval = false,
   approvalWindowHours = 24,
+  waitlistHold?: WaitlistHoldDirective,
 ): Promise<BookingEngineResult> {
   // An approval-gated request reserves the slot for the whole owner-decision window (default 24h),
   // not the short interactive hold TTL — the owner, not a re-prompt, is what releases it.
-  const holdExpiresAt = requiresApproval
-    ? new Date(Date.now() + approvalWindowHours * 60 * 60 * 1000)
-    : new Date(Date.now() + HOLD_EXPIRY_MINUTES * 60 * 1000)
+  // WL-5: a waitlist hold reserves the slot for exactly the offer window (`holdExpiresAt`).
+  const holdExpiresAt = waitlistHold
+    ? waitlistHold.holdExpiresAt
+    : requiresApproval
+      ? new Date(Date.now() + approvalWindowHours * 60 * 60 * 1000)
+      : new Date(Date.now() + HOLD_EXPIRY_MINUTES * 60 * 1000)
 
   // Wrap conflict check + insert in a transaction to prevent race conditions.
   // An advisory transaction lock (acquired at the top of the transaction, before any
@@ -410,6 +433,44 @@ async function requestPrivateBooking(
   if (holdResult.status === 'error') {
     await markFailed(db, actor.businessId, result.bookingId, actor.id, holdResult.reason)
     return { ok: false, reason: 'Could not place hold — please try again' }
+  }
+
+  // WL-5: waitlist-hold branch — runs BEFORE the approval/payment gates. The slot is now
+  // reserved as a plain `held` booking for the offer window; approvalStatus stays null. NO
+  // owner approval request and NO customer message — the waitlist worker owns those comms.
+  // The accept step (WL-7) finds and confirms this hold later.
+  if (waitlistHold) {
+    const toHeld = transition('requested', 'held')
+    if (!toHeld.ok) {
+      await markFailed(db, actor.businessId, result.bookingId, actor.id, toHeld.reason)
+      return { ok: false, reason: 'Internal state error' }
+    }
+
+    const waitlistHeld = await runExclusiveTransition(db, actor.businessId, result.bookingId, actor.id, () =>
+      db
+        .update(bookings)
+        .set({
+          state: 'held',
+          holdExpiresAt,
+          calendarEventId: holdResult.eventId,
+          googleEtag: holdResult.etag ?? null,
+          updatedAt: new Date(),
+        })
+        .where(eq(bookings.id, result.bookingId)),
+    )
+    if (!waitlistHeld.ok) return waitlistHeld
+
+    await logAudit(db, {
+      businessId: actor.businessId,
+      actorId: actor.id,
+      action: 'booking.held_for_waitlist',
+      entityType: 'booking',
+      entityId: result.bookingId,
+      beforeState: { state: 'requested' },
+      afterState: { state: 'held', holdExpiresAt, calendarEventId: holdResult.eventId },
+    })
+
+    return { ok: true, bookingId: result.bookingId, message: 'Slot held for waitlist offer.', held: true }
   }
 
   // Owner-approval gate (design 2026-06-25, §2). Hold the slot + mark it pending the owner's
@@ -567,6 +628,7 @@ async function requestGroupClassBooking(
   providerDisplayName: string | null = null,
   instanceCapacity: number | null = null,
   suppressOwnerNewBookingNotice = false,
+  waitlistHold?: WaitlistHoldDirective,
 ): Promise<BookingEngineResult> {
   // Per-instance capacity wins over the service-type default (CRM_STANDARD.md
   // invariant #2): the scheduled class block decides how many fit in THIS slot.
@@ -609,6 +671,12 @@ async function requestGroupClassBooking(
               eq(bookings.state, 'requested'),
               eq(bookings.state, 'confirmed'),
               eq(bookings.state, 'pending_payment'),
+              // WL-5: a `held` group booking OCCUPIES a class seat so a walk-in is blocked
+              // during the waitlist offer window — this is the linchpin that makes the class
+              // hold genuine and closes hazard H1's transient cap+1. SAFE because today no
+              // group booking is ever `held` (this path direct-confirms), so existing flows
+              // are byte-identical; the state only appears once WL-5's own hold branch runs.
+              eq(bookings.state, 'held'),
             ),
           ),
         )
@@ -637,6 +705,10 @@ async function requestGroupClassBooking(
               eq(bookings.state, 'requested'),
               eq(bookings.state, 'confirmed'),
               eq(bookings.state, 'pending_payment'),
+              // WL-5: mirror the capacity-count set — a customer with a `held` waitlist seat
+              // for this class cannot slip a second seat through. Same safety argument: no
+              // group booking is ever `held` today, so this never changes existing behavior.
+              eq(bookings.state, 'held'),
             ),
           ),
         )
@@ -657,7 +729,10 @@ async function requestGroupClassBooking(
           slotStart: request.slotStart,
           slotEnd: request.slotEnd,
           slotTzAtCreation: businessTz,
-          state: 'requested',
+          // WL-5: a waitlist hold inserts directly as `held` (occupying a seat for the offer
+          // window) instead of `requested`. Otherwise this is an ordinary direct-confirm booking.
+          state: waitlistHold ? 'held' : 'requested',
+          ...(waitlistHold ? { holdExpiresAt: waitlistHold.holdExpiresAt } : {}),
           // T1.1b: a class booking is NON-exclusive — many customers share one class slot
           // up to capacity. is_exclusive=false keeps these rows OUT of the overlap-exclusion
           // constraint so legitimate class co-bookings are never rejected (the G1 trap).
@@ -673,6 +748,25 @@ async function requestGroupClassBooking(
     })
 
   if (!txResult.ok) return txResult
+
+  // WL-5: a waitlist hold stops here. The seat is reserved as a `held`, capacity-occupying
+  // booking for the offer window. We deliberately SKIP the shared-class calendar event
+  // create/confirm, the transition-to-confirmed, roster refresh, completed-booking record,
+  // reminders, and the owner new-booking notice — none of those should fire for a notional
+  // hold. The accept step (WL-7) attaches the shared class event and refreshes the roster on
+  // confirm. calendarEventId stays null until then.
+  if (waitlistHold) {
+    await logAudit(db, {
+      businessId: actor.businessId,
+      actorId: actor.id,
+      action: 'booking.held_for_waitlist',
+      entityType: 'booking',
+      entityId: txResult.bookingId,
+      beforeState: { state: 'requested' },
+      afterState: { state: 'held', holdExpiresAt: waitlistHold.holdExpiresAt, groupClass: true },
+    })
+    return { ok: true, bookingId: txResult.bookingId, message: 'Class seat held for waitlist offer.', held: true }
+  }
 
   // Find if a calendar event already exists for this class slot (from another participant)
   const [existingParticipant] = await db
