@@ -30,7 +30,8 @@
 import { describe, it, expect } from 'vitest'
 import { i18n, managerSwitchOfferSuffix, type Lang } from '../i18n/t.js'
 import { WA_TEMPLATES } from '../../adapters/whatsapp/templates.js'
-import { detectBotTells, type BotTell } from './voice-guard.js'
+import { detectBotTells, hasSplitGender, type BotTell } from './voice-guard.js'
+import { buildVoiceCore, type VoiceChannel } from '../../adapters/llm/voice.js'
 
 const LANGS: readonly Lang[] = ['he', 'en']
 
@@ -220,5 +221,68 @@ describe('voice-i18n-lint — WARN-ONLY bot-tell sweep over templated strings (G
       console.warn('[voice-i18n-lint] ℹ️ stale KNOWN_PENDING entries (no longer flagged — prune when cleaning):', stale)
     }
     expect(Array.isArray(stale)).toBe(true)
+  })
+})
+
+// ── T2.2 — addressee-gender female-awareness (BLOCKING) ───────────────────────
+// Two complementary guarantees the gender feature must hold at the templated/voice-core
+// surface this lint owns:
+//   (1) The FEMALE addressing path (the live runtime instruction in buildVoiceCore) tells the
+//       model to use the SINGLE feminine form and never split-gender — held to the exact same
+//       anti-split-gender bar as the masculine floor.
+//   (2) Meta-approved WhatsApp TEMPLATE bodies stay gender-NEUTRAL (decision 4): they are the
+//       masculine-singular floor and are NOT branched into feminine variants. This block fails
+//       the build if a future change feminine-branches a template body.
+const CHANNELS: readonly VoiceChannel[] = ['customer', 'manager', 'operator', 'onboarding', 'proactive']
+
+// Unambiguous FEMININE second-person / feminine-marked forms that would appear ONLY if a template
+// were branched into a feminine variant. `רוצה` is deliberately excluded — it is identical
+// unvocalized to the masculine (rotzeh/rotza), so it is gender-neutral in a template, not a branch.
+const FEMININE_FORM_RE =
+  /\b(?:תרצי|תוכלי|תצטרכי|תבחרי|תגידי|תכתבי|כתבי|בחרי|השיבי|מעוניינת|צריכה|יכולה|מוזמנת|מעדיפה)\b/
+
+describe('voice-i18n-lint — addressee-gender female-awareness (T2.2)', () => {
+  it('the female addressing path instructs a SINGLE feminine form, never split-gender', () => {
+    for (const ch of CHANNELS) {
+      const core = buildVoiceCore(ch, 'female')
+      // Single feminine form: the feminine instruction is present and the masculine one is NOT —
+      // the path never emits both (which would be split-gender by another name).
+      expect(core, ch).toContain('בלשון נקבה')
+      expect(core, ch).not.toContain('בלשון זכר')
+      // The instruction explicitly bans split-gender hedging.
+      expect(core, ch).toMatch(/NEVER write split-gender/)
+    }
+  })
+
+  it('the masculine/unknown floor instructs a SINGLE masculine form (decision 1)', () => {
+    for (const ch of CHANNELS) {
+      for (const core of [buildVoiceCore(ch), buildVoiceCore(ch, 'male'), buildVoiceCore(ch, null)]) {
+        expect(core, ch).toContain('בלשון זכר')
+        expect(core, ch).not.toContain('בלשון נקבה')
+      }
+    }
+  })
+
+  it('Meta WhatsApp template bodies stay gender-NEUTRAL — not branched feminine (decision 4)', () => {
+    const branched: Array<{ name: string; lang: string; excerpt: string }> = []
+    for (const [name, def] of Object.entries(WA_TEMPLATES)) {
+      const bodies = (def as { bodies: { he: string; en?: string } }).bodies
+      for (const [lang, body] of Object.entries(bodies) as Array<[string, string | undefined]>) {
+        if (body && FEMININE_FORM_RE.test(body)) {
+          branched.push({ name, lang, excerpt: body.slice(0, 80) })
+        }
+      }
+    }
+    expect(branched, 'a WhatsApp template was branched into a feminine variant (decision 4 forbids it)').toEqual([])
+  })
+
+  it('the female addressing path itself carries no LIVE split-gender slash (only quoted negatives)', () => {
+    // The female instruction QUOTES banned forms (…not "תרצה/תרצי"…) as negative examples, so the
+    // raw string trips hasSplitGender. Strip the quoted negatives and assert the remaining live copy
+    // is split-gender-clean — i.e. the directive itself addresses in one feminine form.
+    for (const ch of CHANNELS) {
+      const liveCopy = buildVoiceCore(ch, 'female').replace(/"[^"]*"/g, '')
+      expect(hasSplitGender(liveCopy), ch).toBe(false)
+    }
   })
 })
