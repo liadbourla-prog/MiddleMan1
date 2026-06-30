@@ -103,6 +103,7 @@ export const customerIntentSchema = z.object({
     .catch(null),
   specialArrangementRequest: z.boolean().optional().catch(undefined),
   restorePrevious: z.boolean().optional().catch(undefined),
+  joinWaitlist: z.boolean().optional().catch(undefined),
 })
 
 // Defensive normalization: gemini-2.5-flash sometimes emits snake_case top-level
@@ -175,7 +176,8 @@ Return a JSON object with EXACTLY this structure (all fields required):
   "detectedLanguage": "he" | "en",
   "avoidConstraints": { "beforeHour": 0-23|null, "afterHour": 0-23|null, "weekdays": [0-6]|null } | null,
   "specialArrangementRequest": boolean,
-  "restorePrevious": boolean
+  "restorePrevious": boolean,
+  "joinWaitlist": boolean
 }
 
 Rules:
@@ -200,6 +202,7 @@ Rules:
 - participantsHint: number of people if the customer states a party size ("for 3 people"/"לשלושה אנשים"→3). null if not stated.
 - specialArrangementRequest: true ONLY when the customer asks for something the standard service list can't provide as-is — a PRIVATE/one-off version of a normally-group class, a GROUP/party booking larger than a service allows, an explicitly OUTSIDE-OPENING-HOURS session, or a custom event ("private workshop", "just for my group", "after you close", "סדנה פרטית", "מחוץ לשעות הפעילות", "אירוע פרטי"). false for an ordinary booking, a normal party size, or merely asking about a time that happens to be unavailable. When in doubt, false.
 - restorePrevious: true when the customer asks to UNDO a cancellation or bring back a booking they just cancelled ("restore it", "bring it back", "give me back the class we cancelled", "תחזיר לי את התור שביטלנו", "בוא נחזיר את זה", "תחזיר את השיעור"). false otherwise. A brand-new booking request is NOT a restore.
+- joinWaitlist: true ONLY when the customer explicitly asks to be put on a waitlist or have their place kept for a slot/class that is full ("put me on the waitlist", "keep my place", "let me know if a spot opens", "תכניס אותי לרשימת המתנה", "תשמור לי מקום", "תעדכן אם מתפנה"). false for an ordinary booking request or merely asking whether a time is free. When in doubt, false.
 - detectedLanguage: "he" if message is in Hebrew; "en" for English or any other language.
 - Respond only with valid JSON matching the structure above. No explanation.`
 

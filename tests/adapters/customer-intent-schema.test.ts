@@ -42,6 +42,32 @@ describe('customerIntentSchema — specialArrangementRequest', () => {
   })
 })
 
+describe('customerIntentSchema — joinWaitlist', () => {
+  const base = { intent: 'booking', detectedLanguage: 'he' }
+
+  it('keeps joinWaitlist=true when present', () => {
+    expect(customerIntentSchema.parse({ ...base, joinWaitlist: true }).joinWaitlist).toBe(true)
+  })
+
+  it('keeps joinWaitlist=false when present', () => {
+    expect(customerIntentSchema.parse({ ...base, joinWaitlist: false }).joinWaitlist).toBe(false)
+  })
+
+  it('leaves joinWaitlist undefined when omitted (NOT false)', () => {
+    expect(customerIntentSchema.parse({ ...base }).joinWaitlist).toBeUndefined()
+  })
+
+  it('catches a non-boolean to undefined (NOT false) without failing the whole parse', () => {
+    const r = customerIntentSchema.parse({
+      ...base,
+      joinWaitlist: 'yes' as unknown as boolean,
+    })
+    expect(r.joinWaitlist).toBeUndefined()
+    expect(r.intent).toBe('booking')
+    expect(r.detectedLanguage).toBe('he')
+  })
+})
+
 describe('customerIntentSchema — restorePrevious', () => {
   const base = { intent: 'booking', detectedLanguage: 'he' }
 
