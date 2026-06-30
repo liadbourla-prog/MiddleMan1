@@ -207,6 +207,14 @@ export const identities = pgTable(
     vip: boolean('vip').notNull().default(false),
     // Customer's preferred language for PA replies; null = use business default
     preferredLanguage: text('preferred_language', { enum: ['he', 'en'] }),
+    // Addressee grammatical gender for Hebrew second-person addressing (זכר/נקבה). Distinct
+    // from businesses.botPersona (how the PA refers to ITSELF) — this is how the PA addresses
+    // the PERSON. null = unknown → masculine floor (never a guess written). Resolved/persisted
+    // by src/domain/identity/addressee-gender.ts.
+    addresseeGender: text('addressee_gender', { enum: ['male', 'female'] }),
+    // Provenance of addresseeGender, for precedence on overwrite:
+    // explicit > self_morphology > name > default (a weaker signal never downgrades a stronger one).
+    addresseeGenderSource: text('addressee_gender_source', { enum: ['explicit', 'self_morphology', 'name', 'default'] }),
     // Birthday (Phase 2; design §7.6) — cheap nullable field that unlocks the birthday/holiday
     // initiator. Date only (no year required, but stored as a full date); null = unknown.
     birthday: date('birthday'),
