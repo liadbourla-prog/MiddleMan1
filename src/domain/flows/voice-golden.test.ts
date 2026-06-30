@@ -251,9 +251,12 @@ describe('non-bypass invariant — Branch-4: every gateReply return is wrapped i
     const body = src.slice(fnStart) // gateReply is the last symbol in the file
 
     // Every value-returning `return {` in gateReply must hand its reply to observeVoiceTells.
+    // After T-REGEN the occupancy early-return was folded into the single final exit (the
+    // post-regen re-check needs one place to converge), leaving two object-returns: the
+    // bookingConfirmed early-return and the final exit — both observeVoiceTells-wrapped.
     const returns = (body.match(/\breturn\s+\{/g) ?? []).length
     const observed = (body.match(/reply: observeVoiceTells\(/g) ?? []).length
-    expect(returns).toBeGreaterThanOrEqual(3)
+    expect(returns).toBeGreaterThanOrEqual(2)
     expect(observed).toBe(returns)
 
     // The import is present so the wrapper is the real Gate-7 observer, not a shadow.

@@ -1,11 +1,14 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   gateReply,
+  makeRegenBudget,
+  tryConsumeRegen,
   BOOKING_NOT_CONFIRMED_FALLBACK,
   FABRICATED_TIME_FALLBACK,
   OCCUPANCY_FALLBACK,
   SAFE_AUDIT_FALLBACK,
   type GateContext,
+  type RegenBudget,
 } from './output-gate.js'
 import { buildTurnLedger, type OccupancySpine } from './turn-ledger.js'
 import { hasActionFabrication, detectBotTells, hasDeadEnd } from '../flows/voice-guard.js'
@@ -25,6 +28,7 @@ function ctx(opts: {
   regen?: GateContext['regen']
   spine?: OccupancySpine
   base?: { boundaryTimes: string[]; bookingTimes: string[] }
+  budget?: RegenBudget
 }): GateContext {
   return {
     ledger: buildTurnLedger({
@@ -37,6 +41,7 @@ function ctx(opts: {
     input: { language: 'he', situation: '', transcript: [], ...opts.input },
     opts: opts.gateOpts ?? {},
     regen: opts.regen ?? (async () => { throw new Error('regen should not be called') }),
+    ...(opts.budget ? { budget: opts.budget } : {}),
   }
 }
 
@@ -310,6 +315,135 @@ describe('gateReply — action-claim gate (T3.1b, flag-gated)', () => {
     // Gate 1 regen produced a booking claim, which is NOT a detectActionClaims action class
     // we enforce (booking_made is filtered out) — so 'action' must not appear from booking_made.
     expect(res.interventions.filter((i) => i === 'action')).toEqual([])
+  })
+})
+
+// ── T-REGEN — unified per-turn regen cap + deadline + post-regen re-check ─────────────
+// D6/P6/F-rev4. A turn can trip up to five enforce points (booking/time/occupancy/action-
+// claim/action-fabrication), each regenerating once. A shared per-turn RegenBudget caps the
+// total LLM round-trips so the 60s identity lock cannot expire, and a final re-check kills
+// oscillation (a later-gate regen re-introducing an earlier-gate lie). When NO budget is
+// supplied, every gate regenerates once exactly as before (back-compat — the whole suite above).
+
+describe('makeRegenBudget + tryConsumeRegen', () => {
+  it('undefined budget always consumes true and never throws (back-compat)', () => {
+    expect(tryConsumeRegen(undefined)).toBe(true)
+    expect(tryConsumeRegen(undefined)).toBe(true)
+  })
+
+  it('decrements remaining down to zero, then refuses', () => {
+    const b = makeRegenBudget({ max: 2, deadlineMs: Date.now() + 60_000 })
+    expect(b.remaining).toBe(2)
+    expect(tryConsumeRegen(b)).toBe(true)
+    expect(b.remaining).toBe(1)
+    expect(tryConsumeRegen(b)).toBe(true)
+    expect(b.remaining).toBe(0)
+    expect(tryConsumeRegen(b)).toBe(false)
+    expect(b.remaining).toBe(0)
+  })
+
+  it('refuses (without decrementing) once the deadline has passed', () => {
+    const b = makeRegenBudget({ max: 5, deadlineMs: Date.now() - 1 })
+    expect(tryConsumeRegen(b)).toBe(false)
+    expect(b.remaining).toBe(5)
+  })
+})
+
+describe('gateReply — regen cap bites across multiple gates (D6)', () => {
+  // A draft that trips Gate 1 (booking). The booking-gate regen returns a reply that is clean
+  // for booking but trips Gate 2 (an unbacked time). So WITHOUT a cap, two regens fire
+  // sequentially (booking, then time). WITH {max:1}, only the first (booking) regen fires; the
+  // time gate is starved → goes straight to FABRICATED_TIME_FALLBACK. Same draft both ways —
+  // the cap is the ONLY difference.
+  const draft = 'קבעתי לך תור' // asserts a booking → Gate 1
+  // regen #1 (booking corrective) returns a reply that is booking-clean but has an unbacked time.
+  // regen #2 (time corrective) would return another unbacked time (re-trips) — only reached when
+  // the budget allows a second regen.
+  const makeRegen = () => {
+    let n = 0
+    return vi.fn(async () => {
+      n += 1
+      return n === 1 ? 'יש מקום ב-17:00' : 'אז ב-19:00?'
+    })
+  }
+
+  it('cap=1: regen called at most once; the starved second gate falls back', async () => {
+    const regen = makeRegen()
+    const budget = makeRegenBudget({ max: 1, deadlineMs: Date.now() + 60_000 })
+    const res = await gateReply(draft, ctx({ regen, budget }))
+    expect(regen).toHaveBeenCalledTimes(1)
+    expect(res.interventions).toContain('booking')
+    expect(res.interventions).toContain('time')
+    // Budget spent on the booking regen → time gate cannot regen → its terminal fallback.
+    expect(res.reply).toBe(FABRICATED_TIME_FALLBACK.he)
+  })
+
+  it('no budget: each tripped gate regenerates (the cap is the only difference)', async () => {
+    const regen = makeRegen()
+    const res = await gateReply(draft, ctx({ regen }))
+    expect(regen).toHaveBeenCalledTimes(2) // booking regen, then time regen
+    expect(res.interventions).toContain('booking')
+    expect(res.interventions).toContain('time')
+    // Both regens ran; time regen ('אז ב-19:00?') re-tripped → still the time fallback, but via
+    // two round-trips rather than one — proving cap behaviour differs only in regen COUNT.
+    expect(res.reply).toBe(FABRICATED_TIME_FALLBACK.he)
+  })
+})
+
+describe('gateReply — regen deadline bites (D6)', () => {
+  it('a past deadline → no regen at all; first tripped gate falls back', async () => {
+    const regen = vi.fn(async () => { throw new Error('regen should not be called past the deadline') })
+    const budget = makeRegenBudget({ max: 5, deadlineMs: Date.now() - 1 })
+    const res = await gateReply('יש מקום ב-17:00', ctx({ regen, budget }))
+    expect(regen).not.toHaveBeenCalled()
+    expect(res.reply).toBe(FABRICATED_TIME_FALLBACK.he)
+    expect(res.interventions).toContain('time')
+  })
+})
+
+describe('gateReply — post-regen re-check kills oscillation (D6)', () => {
+  it('occupancy regen that re-introduces an unbacked TIME → terminal time fallback, not the oscillating reply', async () => {
+    // The reply asserts fullness with an open spine → occupancy gate regens. The regen "fixes"
+    // occupancy but re-introduces an unbacked time (19:00 is not in any allowlist) — the re-check
+    // must catch it and route to FABRICATED_TIME_FALLBACK, NOT ship the laundered time.
+    const spine: OccupancySpine = async () => ({ open: true, text: '10:00, 12:00' })
+    const regen = vi.fn(async () => 'יש מקום ב-19:00, רוצה?') // clean occupancy, NEW unbacked time
+    const res = await gateReply(
+      'היום מלא לגמרי',
+      ctx({ gateOpts: { focusDay: { dateStr: '2026-07-01' } }, spine, regen }),
+    )
+    expect(res.reply).toBe(FABRICATED_TIME_FALLBACK.he)
+    expect(res.interventions).toContain('time')
+  })
+
+  it('time regen that re-introduces a no-availability claim → re-checked for occupancy (named plan case)', async () => {
+    // Draft offers an unbacked time → time gate regens. The regen drops the time but now asserts
+    // no-availability while the situation has an open same-day time → occupancy re-check fires →
+    // OCCUPANCY_FALLBACK.
+    const regen = vi.fn(async () => 'יום ראשון מלא לגמרי, אין כלום') // no time now, but asserts full
+    const res = await gateReply(
+      'יש מקום ב-22:00', // unbacked time → time gate
+      ctx({ input: { situation: 'ראשון: 14:00 פנוי' }, regen }),
+    )
+    expect(res.reply).toBe(OCCUPANCY_FALLBACK.he)
+    expect(res.interventions).toContain('occupancy')
+  })
+
+  it('a reply that is already a terminal fallback is NOT re-tripped', async () => {
+    // Time gate regen re-trips → FABRICATED_TIME_FALLBACK (terminal). The re-check must SKIP it.
+    const regen = vi.fn(async () => 'אז ב-19:00?') // still unbacked → fallback
+    const res = await gateReply('יש מקום ב-17:00', ctx({ regen }))
+    expect(res.reply).toBe(FABRICATED_TIME_FALLBACK.he)
+  })
+})
+
+describe('gateReply — gate-exception fail-safe (F-rev4, output-gate level)', () => {
+  it('a regen that THROWS inside a gate still resolves to a safe fallback (never the unbacked draft)', async () => {
+    const regen = vi.fn(async () => { throw new Error('LLM blew up') })
+    const res = await gateReply('יש מקום ב-17:00', ctx({ regen }))
+    // The thrown regen must not surface the original unbacked-time draft.
+    expect(res.reply).not.toBe('יש מקום ב-17:00')
+    expect(res.reply).toBe(FABRICATED_TIME_FALLBACK.he)
   })
 })
 

@@ -86,13 +86,15 @@ describe('non-bypass invariant — gateReply returns are wrapped in observeVoice
     const body = src.slice(fnStart) // gateReply is the last symbol in the file
 
     // Every value-returning `return {` inside gateReply must hand its reply to observeVoiceTells.
+    // After T-REGEN the occupancy early-return folded into the single final exit, leaving two
+    // object-returns (bookingConfirmed early-return + final exit), both observeVoiceTells-wrapped.
     const returns = (body.match(/\breturn\s+\{/g) ?? []).length
     const observed = (body.match(/reply: observeVoiceTells\(/g) ?? []).length
-    expect(returns).toBeGreaterThanOrEqual(3)
+    expect(returns).toBeGreaterThanOrEqual(2)
     expect(observed).toBe(returns)
 
-    // And the safe-fallback exemption is wired on the occupancy + final exits.
-    expect(body).toMatch(/isSafeFallback: out === OCCUPANCY_FALLBACK\[language\]/)
-    expect(body).toMatch(/isSafeFallback: reply === FABRICATED_TIME_FALLBACK\[language\]/)
+    // And the safe-fallback exemption is wired at the final exit via the shared TERMINALS set
+    // (the post-regen re-check converges every gate's terminal fallback here).
+    expect(body).toMatch(/isSafeFallback: TERMINALS\.has\(reply\)/)
   })
 })

@@ -12,7 +12,7 @@ import { extractCustomerIntent, generateCustomerReply } from '../../adapters/llm
 import { setCustomerName, deriveLastName } from '../identity/customer-resolver.js'
 import { canonicalTime } from './slot-fabrication-guard.js'
 import { buildTurnLedger } from '../grounding/turn-ledger.js'
-import { gateReply } from '../grounding/output-gate.js'
+import { gateReply, makeRegenBudget, SAFE_AUDIT_FALLBACK } from '../grounding/output-gate.js'
 import type { ActionClaim } from './reply-guard.js'
 import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
@@ -767,13 +767,16 @@ export function makeGenReply(
     occupancySpine: dayHasOpenOptions,
     businessId,
   })
+  // T-REGEN — ONE shared regen budget per TURN (built at closure-build time so every genReply
+  // call in this turn draws from the same pool). Up to five enforce points each regenerate
+  // once; the budget caps the total LLM round-trips so the 60s identity lock cannot expire.
+  const budget = makeRegenBudget()
   return async (input, opts = {}) => {
     const grounded = {
       ...input,
       ...(businessFacts ? { businessFacts } : {}),
       ...(actionLedger ? { actionLedger } : {}),
     }
-    const reply = await generateCustomerReply(grounded)
     // Regenerate once, appending the gate's corrective to THIS call's situation — exactly
     // the `${situation}\n\n${instruction}` shape the inline gates used.
     const regen = (instruction: string): Promise<string> =>
@@ -785,13 +788,24 @@ export function makeGenReply(
     const callLedger = opts.backs?.length
       ? { ...ledger, backedActions: new Set<ActionClaim>([...ledger.backedActions, ...opts.backs]) }
       : ledger
-    const result = await gateReply(reply, {
-      ledger: callLedger,
-      input: { language: input.language, situation: input.situation, transcript: input.transcript },
-      opts: { ...opts, enforceActionClaims: true },
-      regen,
-    })
-    return result.reply
+    // F-rev4 fail-safe: a throw anywhere in the reply pipeline — the draft generation OR a thrown
+    // gate — is a POTENTIAL FABRICATION LEAK / dropped turn. Fail to a gate-owned safe template,
+    // NEVER the raw ungated draft (which may be the very lie the gate exists to catch) and never
+    // an unhandled exception. gateReply also swallows per-gate regen throws internally; this is
+    // the outer backstop (draft-gen throw, an occupancySpine read that throws, etc.).
+    try {
+      const reply = await generateCustomerReply(grounded)
+      const result = await gateReply(reply, {
+        ledger: callLedger,
+        input: { language: input.language, situation: input.situation, transcript: input.transcript },
+        opts: { ...opts, enforceActionClaims: true },
+        regen,
+        budget,
+      })
+      return result.reply
+    } catch {
+      return SAFE_AUDIT_FALLBACK[input.language]
+    }
   }
 }
 

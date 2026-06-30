@@ -70,7 +70,7 @@ import { extractClockTimes, extractMentionedTimes } from '../../domain/flows/slo
 import { observeVoiceTells } from '../../domain/flows/voice-guard.js'
 import { logAudit } from '../../domain/audit/logger.js'
 import { buildTurnLedger, type OccupancySpine, type TurnLedger } from '../../domain/grounding/turn-ledger.js'
-import { gateReply } from '../../domain/grounding/output-gate.js'
+import { gateReply, makeRegenBudget, tryConsumeRegen, type RegenBudget } from '../../domain/grounding/output-gate.js'
 import { listDayOptions, type DayOptions } from '../../domain/availability/day-options.js'
 import { resolveRequestedDate, type RequestedDateParts, type RelativeDay } from '../../domain/availability/resolve-slot.js'
 
@@ -1157,7 +1157,9 @@ const CLAIM_LABEL: Record<ActionClaim, string> = {
   settings_changed: 'that a business setting was changed',
 }
 
-const SAFE_AUDIT_FALLBACK: Record<Lang, string> = {
+// Exported for tests (T-REGEN F-rev4): the safe template every Branch-3 gate/auditor catch
+// falls to instead of leaking an ungated draft.
+export const SAFE_AUDIT_FALLBACK: Record<Lang, string> = {
   he: 'רגע אחד — אני רוצה לוודא לפני שאני אומר שמשהו בוצע. אבדוק ואחזור אליך.',
   en: "One sec — I want to verify before I say anything's done. I'll check and get back to you.",
 }
@@ -1181,8 +1183,9 @@ async function auditReplyClaims(params: {
   systemPrompt: string
   businessId: string
   actorId: string
+  budget?: RegenBudget | undefined
 }): Promise<string> {
-  const { draft, lang, backed, calendarConnected, contents, systemPrompt, businessId, actorId } = params
+  const { draft, lang, backed, calendarConnected, contents, systemPrompt, businessId, actorId, budget } = params
   const unbacked = unbackedClaims(draft, lang, backed, calendarConnected)
   if (unbacked.length === 0) return draft
 
@@ -1199,6 +1202,14 @@ async function auditReplyClaims(params: {
 
   const list = unbacked.map((c) => CLAIM_LABEL[c]).join('; ')
   const correction = `SYSTEM CHECK — your draft reply implies ${list}, but no such action actually happened this turn and the records do not show it. Rewrite your reply WITHOUT stating it as done. If it still needs doing, say what you will do or ask — never claim a completed action that did not happen. Keep everything else.`
+
+  // T-REGEN — the auditor's regen draws from the SAME per-turn budget as gateReply's gates.
+  // If it is exhausted/expired, skip the round-trip and block to the safe fallback (the cap
+  // biting; the lock cannot expire from a stacked auditor regen).
+  if (!tryConsumeRegen(budget)) {
+    await recordIntervention('blocked')
+    return SAFE_AUDIT_FALLBACK[lang]
+  }
 
   const correctionContents: Content[] = [
     ...contents,
@@ -1228,7 +1239,7 @@ async function auditReplyClaims(params: {
 // round-trips under the identity lock. A unified per-turn regen cap + shared deadline + a
 // post-regen re-check is the separate T-REGEN task; booking is already de-duplicated here
 // (gateReply owns it via bookingConfirmed; the auditor excludes booking_made).
-async function gateAndAuditBranch3Reply(params: {
+export async function gateAndAuditBranch3Reply(params: {
   draft: string
   ledger: TurnLedger
   lang: Lang
@@ -1240,8 +1251,9 @@ async function gateAndAuditBranch3Reply(params: {
   systemPrompt: string
   businessId: string
   actorId: string
+  budget?: RegenBudget | undefined
 }): Promise<string> {
-  const { draft, ledger, lang, focusDay, bookingConfirmed, succeededActions, calendarConnected, contents, systemPrompt, businessId, actorId } = params
+  const { draft, ledger, lang, focusDay, bookingConfirmed, succeededActions, calendarConnected, contents, systemPrompt, businessId, actorId, budget } = params
 
   // Text-only corrective regeneration: re-run the orchestrator over the same contents + the
   // draft + the gate's instruction (mirrors auditReplyClaims). No tools — wording only.
@@ -1260,7 +1272,11 @@ async function gateAndAuditBranch3Reply(params: {
     input: { language: lang },
     opts: { bookingConfirmed, ...(focusDay ? { focusDay } : {}) },
     regen: gateRegen,
-  }).then((g) => g.reply).catch(() => draft)
+    budget,
+  }).then((g) => g.reply)
+    // F-rev4: a thrown gate must NOT leak the ungated `draft` (potentially the very fabrication
+    // the gate exists to catch). Fail to the safe audit template instead.
+    .catch(() => SAFE_AUDIT_FALLBACK[lang])
 
   return auditReplyClaims({
     draft: gated,
@@ -1271,7 +1287,12 @@ async function gateAndAuditBranch3Reply(params: {
     systemPrompt,
     businessId,
     actorId,
-  }).catch(() => gated)
+    budget,
+  })
+    // F-rev4: the action auditor is Branch-3's ONLY non-booking action-claim check (gateReply
+    // runs with enforceActionClaims OFF here), so on a thrown auditor `gated` may still carry an
+    // unbacked action claim — fail safe rather than leak it.
+    .catch(() => SAFE_AUDIT_FALLBACK[lang])
 }
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
@@ -1421,6 +1442,10 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
   // claim). Both best-effort — never let the auditor's bookkeeping drop a turn.
   const succeededActions = new Set<ActionClaim>()
   const calendarAlreadyConnected = await hasCalendarConnected(db, businessId).catch(() => false)
+  // T-REGEN — ONE shared regen budget for this turn, drawn down by BOTH gateReply's gates and
+  // the L2 action auditor (Seam B), so a multi-gate manager turn cannot stack unbounded text
+  // round-trips under the 60s identity lock.
+  const regenBudget = makeRegenBudget()
 
   // ── Unified-gate per-turn state (T1.1/T1.2 — closes H1) ──────────────────────
   // The time allowlist seeded from availability tool RESULTS + the owner's own quoted times
@@ -1549,7 +1574,10 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
         systemPrompt,
         businessId,
         actorId: identityId,
-      }).catch(() => textPart)
+        budget: regenBudget,
+      })
+        // F-rev4: never let a thrown gate/auditor leak the ungated `textPart` (raw model draft).
+        .catch(() => SAFE_AUDIT_FALLBACK[lang])
       logOrchestratorCompletion({
         businessId, sessionId, messageId,
         totalIterations: iterations,

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { extractAllowedTimesFromToolResult, resolvedDaysFromToolArgs } from '../../src/adapters/llm/orchestrator.js'
-import { gateReply } from '../../src/domain/grounding/output-gate.js'
+import { extractAllowedTimesFromToolResult, resolvedDaysFromToolArgs, gateAndAuditBranch3Reply, SAFE_AUDIT_FALLBACK } from '../../src/adapters/llm/orchestrator.js'
+import { gateReply, makeRegenBudget, FABRICATED_TIME_FALLBACK } from '../../src/domain/grounding/output-gate.js'
 import { buildTurnLedger, type OccupancySpine } from '../../src/domain/grounding/turn-ledger.js'
 
 const TZ = 'Asia/Jerusalem'
@@ -263,5 +263,60 @@ describe('actionsFromToolResult — manageBusinessSettings backs the ACTUAL outc
     expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'x' }, { success: false, reason: 'save_failed' })).toEqual([])
     expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'x' }, { success: false, reason: 'unclear_instruction' })).toEqual([])
     expect(actionsFromToolResult('manageBusinessSettings', { instruction: 'x' }, { success: false, clarificationNeeded: 'which service?' })).toEqual([])
+  })
+})
+
+// ── T-REGEN — Branch-3 seam: shared budget threading + F-rev4 fail-safe ──────────────
+// gateAndAuditBranch3Reply is the Branch-3 chokepoint. It threads ONE per-turn RegenBudget
+// into BOTH gateReply and the action auditor, and on any thrown gate/auditor it must fail to
+// the safe audit template — NEVER leak the ungated model draft (F-rev4).
+describe('gateAndAuditBranch3Reply — budget + F-rev4 (T-REGEN)', () => {
+  const baseParams = {
+    lang: 'en' as const,
+    succeededActions: new Set<never>(),
+    calendarConnected: false,
+    contents: [],
+    systemPrompt: 'sys',
+    businessId: 'biz-1',
+    actorId: 'u1',
+  }
+
+  it('a thrown gate (occupancy spine rejects) fails to SAFE_AUDIT_FALLBACK, not the ungated draft (F-rev4)', async () => {
+    const throwingSpine: OccupancySpine = async () => { throw new Error('spine read blew up') }
+    const ledger = buildTurnLedger({
+      businessFacts: '', actionLedger: '',
+      baseAllowedTimes: { boundaryTimes: [], bookingTimes: [] },
+      occupancySpine: throwingSpine, backedActions: [], calendarConnected: false, businessId: 'biz-1',
+    })
+    const draft = 'Wednesday is completely full, sorry.' // asserts no-availability, no time → spine read
+    const out = await gateAndAuditBranch3Reply({
+      ...baseParams, draft, ledger,
+      focusDay: { dateStr: '2026-07-01' },
+      bookingConfirmed: false,
+      // regen must never run — the spine throws first; if it did, this would surface.
+      // (gateReply's regen closure is internal; here the throw precedes any regen.)
+    })
+    expect(out).toBe(SAFE_AUDIT_FALLBACK.en)
+    expect(out).not.toContain('full')
+  })
+
+  it('threads the budget into gateReply: an exhausted budget skips regen and falls back (no LLM call)', async () => {
+    // max:0 ⇒ the time gate cannot regen; it must go straight to the fallback WITHOUT calling
+    // the LLM-backed gateRegen. If the budget were NOT threaded, gateRegen → generateOrchestratorTurn
+    // (a real network call) would run and this test would hang/error.
+    const ledger = buildTurnLedger({
+      businessFacts: '', actionLedger: '',
+      baseAllowedTimes: { boundaryTimes: [], bookingTimes: [] },
+      occupancySpine: async () => ({ open: false, text: null }), backedActions: [], calendarConnected: false, businessId: 'biz-1',
+    })
+    const budget = makeRegenBudget({ max: 0, deadlineMs: Date.now() + 60_000 })
+    const out = await gateAndAuditBranch3Reply({
+      ...baseParams,
+      draft: "You're free Tuesday at 14:00.", // unbacked time, empty allowlist
+      ledger,
+      bookingConfirmed: false,
+      budget,
+    })
+    expect(out).toBe(FABRICATED_TIME_FALLBACK.en)
   })
 })

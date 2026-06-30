@@ -98,6 +98,52 @@ export const SAFE_AUDIT_FALLBACK: Record<'he' | 'en', string> = {
   en: 'Happy to help with that — what would you like to do next, book, change, or look at something?',
 }
 
+// ── Unified per-turn regeneration budget (T-REGEN / D6 / P6) ───────────────────────────
+//
+// With the gate at up to FIVE enforce points (booking / time / occupancy / action-claim /
+// action-fabrication) plus Branch-3's auditReplyClaims, a single turn could stack unbounded
+// regenerate-once LLM round-trips — all inside `withIdentityLock` (60s TTL) — and blow the
+// lock. A single shared budget per turn caps the total round-trips AND a shared deadline keeps
+// the worst case well under the lock. The owner tunes both on deploy via the env vars below.
+//
+// CRITICAL no-behavior-change contract: when no budget is threaded (`undefined`), every gate
+// regenerates exactly as before. The budget only CAPS the worst case — it never changes a
+// single-gate outcome under budget.
+export interface RegenBudget {
+  /** Remaining regenerations allowed this turn. */
+  remaining: number
+  /** Wall-clock ms after which no further regeneration is attempted. */
+  deadlineMs: number
+}
+
+/**
+ * Build a per-turn regen budget. Defaults from env with sane fallbacks:
+ * - `GATE_REGEN_MAX` (default 3) — max LLM regenerations across all gates/seams this turn.
+ * - `GATE_REGEN_DEADLINE_MS` (default 45000) — 45s leaves headroom under the 60s identity lock.
+ * The owner tunes these on deploy.
+ */
+export function makeRegenBudget(opts?: { max?: number; deadlineMs?: number }): RegenBudget {
+  const max = opts?.max ?? (Number(process.env['GATE_REGEN_MAX']) || 3)
+  const deadlineMs = opts?.deadlineMs ?? (Date.now() + (Number(process.env['GATE_REGEN_DEADLINE_MS']) || 45000))
+  return { remaining: max, deadlineMs }
+}
+
+/**
+ * Try to spend one regeneration. Back-compat: `undefined` budget ALWAYS returns true and
+ * decrements nothing (the no-budget callers keep regenerating once per gate as today).
+ * With a budget: true (and decrements) only while `remaining > 0` AND the deadline has not
+ * passed; otherwise false and no decrement. When false, the caller must skip `regen` and go
+ * straight to its safe fallback.
+ */
+export function tryConsumeRegen(budget?: RegenBudget): boolean {
+  if (!budget) return true
+  if (budget.remaining > 0 && Date.now() < budget.deadlineMs) {
+    budget.remaining -= 1
+    return true
+  }
+  return false
+}
+
 // ── The gate ─────────────────────────────────────────────────────────────────────────
 
 /** An enforced gate that fired this turn (telemetry). */
@@ -143,6 +189,13 @@ export interface GateContext {
    * caller closes over the grounded `generateCustomerReply` input.
    */
   regen: (instruction: string) => Promise<string>
+  /**
+   * Shared per-turn regeneration budget (T-REGEN / D6). When omitted, every gate regenerates
+   * once exactly as before (back-compat). When supplied, the SAME budget object is threaded
+   * across all enforce points this turn (Branch 4: every genReply in the turn; Branch 3:
+   * gateReply + auditReplyClaims) so the total LLM round-trips are capped under the lock TTL.
+   */
+  budget?: RegenBudget | undefined
 }
 
 export interface GateResult {
@@ -156,11 +209,40 @@ export interface GateResult {
  * reply (already passed through the voice monitor) + which gates fired.
  */
 export async function gateReply(reply: string, ctx: GateContext): Promise<GateResult> {
-  const { ledger, input, opts, regen } = ctx
+  const { ledger, input, opts, regen, budget } = ctx
   const { language } = input
   const businessId = ledger.businessId
   const interventions: GateIntervention[] = []
   const replySurfacesAnyTime = (text: string): boolean => extractClockTimes(text).length > 0
+
+  // The set of safe-fallback strings any gate may terminate at — the post-regen re-check
+  // never re-trips one of these (they are terminal by construction), and the voice monitor
+  // exempts them from its bot-tell rules.
+  const TERMINALS = new Set<string>([
+    FABRICATED_TIME_FALLBACK[language],
+    OCCUPANCY_FALLBACK[language],
+    BOOKING_NOT_CONFIRMED_FALLBACK[language],
+    SAFE_AUDIT_FALLBACK[language],
+  ])
+
+  // Run a gate's regenerate-once corrective under the shared budget, with two fail-safes:
+  // (1) T-REGEN budget — if the budget is exhausted/expired, SKIP `regen` and go straight to
+  //     `fallback` (the cap biting on the worst case). Under-budget (or no budget) → regen as today.
+  // (2) F-rev4 — a `regen` that THROWS must NEVER surface the unbacked draft; fall to `fallback`.
+  // `stillTrips(corrected)` re-checks the gate's OWN detector on the correction → fallback on persistence.
+  const regenOrFallback = async (
+    instruction: string,
+    fallback: string,
+    stillTrips: (corrected: string) => boolean,
+  ): Promise<string> => {
+    if (!tryConsumeRegen(budget)) return fallback
+    try {
+      const corrected = await regen(instruction)
+      return stillTrips(corrected) ? fallback : corrected
+    } catch {
+      return fallback
+    }
+  }
 
   // Exit path 1 — caller asserted a real persisted booking; the slot is real, so trust
   // the wording and skip every gate (only the voice monitor runs).
@@ -171,10 +253,11 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
   // Gate 1 — phantom booking-confirmed claim.
   if (assertsBookingConfirmed(reply, language)) {
     interventions.push('booking')
-    const corrected = await regen(BOOKING_GUARD_INSTRUCTION)
-    reply = assertsBookingConfirmed(corrected, language)
-      ? BOOKING_NOT_CONFIRMED_FALLBACK[language]
-      : corrected
+    reply = await regenOrFallback(
+      BOOKING_GUARD_INSTRUCTION,
+      BOOKING_NOT_CONFIRMED_FALLBACK[language],
+      (c) => assertsBookingConfirmed(c, language),
+    )
   }
 
   // Gate 2 — fabricated availability (a clock time the spine never offered). The allowlist
@@ -182,49 +265,56 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
   const allowed = buildAllowedTimes(input, ledger.baseAllowedTimes)
   if (findUnbackedTimes(reply, allowed).length > 0) {
     interventions.push('time')
-    const corrected = await regen(TIME_GUARD_INSTRUCTION)
-    reply = findUnbackedTimes(corrected, allowed).length > 0
-      ? FABRICATED_TIME_FALLBACK[language]
-      : corrected
+    reply = await regenOrFallback(
+      TIME_GUARD_INSTRUCTION,
+      FABRICATED_TIME_FALLBACK[language],
+      (c) => findUnbackedTimes(c, allowed).length > 0,
+    )
   }
 
   // Gate 3 — fabricated unavailability (occupancy). Two signals, strongest first.
+  // Day-scoped situation-open set, computed once (reused by signal b AND the re-check).
+  const situationOpen = extractDayScopedTimes(input.situation ?? '')
+  for (const set of situationOpen.values()) {
+    for (const t of ledger.baseAllowedTimes.boundaryTimes) set.delete(t)
+    for (const t of ledger.baseAllowedTimes.bookingTimes) set.delete(t)
+  }
+  for (const t of extractFullTimes(input.situation ?? '')) {
+    for (const set of situationOpen.values()) set.delete(t)
+  }
+  const situationHasOpen = [...situationOpen.values()].some((s) => s.size > 0)
   if (assertsNoAvailability(reply)) {
     // (a) Fresh-spine backstop. Skip when the reply already surfaces a concrete time — a
     // time-scoped negative that lists same-day alternatives is correct and must not regen.
     if (opts.focusDay && !replySurfacesAnyTime(reply)) {
       const spine = await ledger.occupancySpine(opts.focusDay.dateStr, opts.focusDay.serviceTypeId)
       if (spine.open) {
+        // The spine's open times are authoritatively backed this turn (a fresh DB read of the
+        // focused day). Admit them to the time allowlist so the occupancy correction — which
+        // surfaces exactly those times — is not then flagged "unbacked" by the time re-check
+        // below (that would fallback a legitimately-offered open slot: a G1/G5 regression).
+        for (const t of extractClockTimes(spine.text ?? '')) allowed.add(t)
         interventions.push('occupancy')
-        const corrected = await regen(
+        const out = await regenOrFallback(
           `${OCCUPANCY_GUARD_INSTRUCTION}${spine.text ? ` Real open options: ${spine.text}` : ''}`,
+          OCCUPANCY_FALLBACK[language],
+          (c) => assertsNoAvailability(c) && !replySurfacesAnyTime(c),
         )
-        const out = assertsNoAvailability(corrected) && !replySurfacesAnyTime(corrected)
-          ? OCCUPANCY_FALLBACK[language]
-          : corrected
-        // Exit path 2 — occupancy-spine early return.
-        return {
-          reply: observeVoiceTells(out, { businessId, language }, { isSafeFallback: out === OCCUPANCY_FALLBACK[language] }),
-          interventions,
-        }
+        // Spine path no longer short-circuits — fall through to the shared re-check + final
+        // return so a spine-regen that re-introduces an earlier-gate lie (e.g. an unbacked time)
+        // is still caught (D6 no-oscillation). out is either the clean correction or the terminal.
+        reply = out
       }
-    }
-    // (b) Situation signal, day-scoped (back-compat).
-    const situationOpen = extractDayScopedTimes(input.situation ?? '')
-    for (const set of situationOpen.values()) {
-      for (const t of ledger.baseAllowedTimes.boundaryTimes) set.delete(t)
-      for (const t of ledger.baseAllowedTimes.bookingTimes) set.delete(t)
-    }
-    for (const t of extractFullTimes(input.situation ?? '')) {
-      for (const set of situationOpen.values()) set.delete(t)
-    }
-    const anyOpen = [...situationOpen.values()].some((s) => s.size > 0)
-    if (anyOpen && !daysShareOpenTime(situationOpen, extractDayScopedTimes(reply))) {
-      interventions.push('occupancy')
-      const corrected = await regen(OCCUPANCY_GUARD_INSTRUCTION)
-      reply = assertsNoAvailability(corrected) && !daysShareOpenTime(situationOpen, extractDayScopedTimes(corrected))
-        ? OCCUPANCY_FALLBACK[language]
-        : corrected
+    } else {
+      // (b) Situation signal, day-scoped (back-compat).
+      if (situationHasOpen && !daysShareOpenTime(situationOpen, extractDayScopedTimes(reply))) {
+        interventions.push('occupancy')
+        reply = await regenOrFallback(
+          OCCUPANCY_GUARD_INSTRUCTION,
+          OCCUPANCY_FALLBACK[language],
+          (c) => assertsNoAvailability(c) && !daysShareOpenTime(situationOpen, extractDayScopedTimes(c)),
+        )
+      }
     }
   }
 
@@ -236,10 +326,11 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
   // route to SAFE_AUDIT_FALLBACK — fine).
   if (opts.enforceActionClaims && unbackedActionClaims(reply, language, ledger.backedActions, ledger.calendarConnected).length > 0) {
     interventions.push('action')
-    const corrected = await regen(ACTION_CLAIM_GUARD_INSTRUCTION)
-    reply = unbackedActionClaims(corrected, language, ledger.backedActions, ledger.calendarConnected).length > 0
-      ? SAFE_AUDIT_FALLBACK[language]
-      : corrected
+    reply = await regenOrFallback(
+      ACTION_CLAIM_GUARD_INSTRUCTION,
+      SAFE_AUDIT_FALLBACK[language],
+      (c) => unbackedActionClaims(c, language, ledger.backedActions, ledger.calendarConnected).length > 0,
+    )
   }
 
   // Gate 4 — self-authored action fabrication (check / ask / "get back to you" / "one of our
@@ -248,17 +339,44 @@ export async function gateReply(reply: string, ctx: GateContext): Promise<GateRe
   // here is unbacked BY CONSTRUCTION; it needs NO backedActions check. ENFORCED (T3.1a).
   if (hasActionFabrication(reply)) {
     interventions.push('action')
-    const corrected = await regen(ACTION_FABRICATION_GUARD_INSTRUCTION)
-    reply = hasActionFabrication(corrected) ? SAFE_AUDIT_FALLBACK[language] : corrected
+    reply = await regenOrFallback(
+      ACTION_FABRICATION_GUARD_INSTRUCTION,
+      SAFE_AUDIT_FALLBACK[language],
+      (c) => hasActionFabrication(c),
+    )
   }
 
-  // Exit path 3/4 — final return; flag the safe fallbacks so the voice monitor exempts them.
+  // ── Post-regen re-check (T-REGEN / D6 — no oscillation, NO further regen) ────────────
+  // A later-gate regeneration can silently re-introduce an EARLIER-gate lie (e.g. the
+  // occupancy regen offering an unbacked time, or a time regen newly asserting fullness).
+  // Re-validate the final reply against ALL enforced detectors with at most O(detectors)
+  // PURE checks (no LLM, no async). If it trips, route straight to that detector's terminal
+  // fallback (never re-trip a fallback, guaranteeing termination). First match wins; the
+  // ordering mirrors the gate sequence (booking → time → occupancy → action).
+  if (!TERMINALS.has(reply)) {
+    const recheckFallback = ((): string | null => {
+      if (!opts.bookingConfirmed && assertsBookingConfirmed(reply, language)) return BOOKING_NOT_CONFIRMED_FALLBACK[language]
+      if (findUnbackedTimes(reply, allowed).length > 0) return FABRICATED_TIME_FALLBACK[language]
+      if (assertsNoAvailability(reply) && situationHasOpen && !daysShareOpenTime(situationOpen, extractDayScopedTimes(reply))) return OCCUPANCY_FALLBACK[language]
+      if (opts.enforceActionClaims && unbackedActionClaims(reply, language, ledger.backedActions, ledger.calendarConnected).length > 0) return SAFE_AUDIT_FALLBACK[language]
+      if (hasActionFabrication(reply)) return SAFE_AUDIT_FALLBACK[language]
+      return null
+    })()
+    if (recheckFallback) {
+      reply = recheckFallback
+      // Record the re-check's intervention class (telemetry parity with the live gates).
+      const cls: GateIntervention = recheckFallback === BOOKING_NOT_CONFIRMED_FALLBACK[language] ? 'booking'
+        : recheckFallback === FABRICATED_TIME_FALLBACK[language] ? 'time'
+          : recheckFallback === OCCUPANCY_FALLBACK[language] ? 'occupancy'
+            : 'action'
+      if (!interventions.includes(cls)) interventions.push(cls)
+    }
+  }
+
+  // Exit path — final return; flag the safe fallbacks so the voice monitor exempts them.
   return {
     reply: observeVoiceTells(reply, { businessId, language }, {
-      isSafeFallback: reply === FABRICATED_TIME_FALLBACK[language]
-        || reply === OCCUPANCY_FALLBACK[language]
-        || reply === BOOKING_NOT_CONFIRMED_FALLBACK[language]
-        || reply === SAFE_AUDIT_FALLBACK[language],
+      isSafeFallback: TERMINALS.has(reply),
     }),
     interventions,
   }

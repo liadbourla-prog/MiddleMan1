@@ -66,4 +66,13 @@ describe('makeGenReply delegates to the unified gate (T0.3)', () => {
     expect(await genReply(reqInput, { backs: ['cancelled'] })).toBe('ביטלתי לך את התור, נתראה בפעם הבאה!')
     expect(generateCustomerReply).toHaveBeenCalledTimes(1)
   })
+
+  // F-rev4 (T-REGEN) — a thrown gate must NOT leak the ungated draft. Here the very first
+  // generateCustomerReply (the draft) throws; makeGenReply fails to the gate-owned safe template,
+  // never the raw draft.
+  it('a thrown gate fails to SAFE_AUDIT_FALLBACK, never the ungated draft (F-rev4)', async () => {
+    generateCustomerReply.mockRejectedValueOnce(new Error('LLM blew up'))
+    const genReply = makeGenReply('', '', base, noSpine, 'biz')
+    expect(await genReply(reqInput)).toBe(SAFE_AUDIT_FALLBACK.he)
+  })
 })
