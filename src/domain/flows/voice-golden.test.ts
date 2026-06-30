@@ -56,7 +56,15 @@ function hasNextStep(reply: string): boolean {
     reply.includes('אבדוק') ||
     reply.includes('יחזרו') ||
     reply.includes('להודיע')
-  return offeredTime || dayWord || invitingQuestion || handoff
+  // A "come back to me / I'll keep an eye out" re-invitation is also a forward step:
+  // the window-passed reply (WL-7) leaves the door open by inviting the customer to
+  // re-ask and rejoin the list rather than offering a clock time or a hand-off.
+  const reInvite =
+    r.includes('say the word') ||
+    r.includes('keep an eye out') ||
+    reply.includes('תכתבו לי') ||
+    reply.includes('אחזיר אתכם')
+  return offeredTime || dayWord || invitingQuestion || handoff || reInvite
 }
 
 /**
@@ -179,6 +187,44 @@ describe('golden GOOD replies — the quality bar (detectBotTells === [], one qu
       expectGoldenGood(he)
       expect(hasBilingualLeak(he)).toBe(false)
       expect(hasDeadEnd(he)).toBe(false)
+    })
+  })
+
+  // ── Path 7: waitlist offer — a spot opened and is GENUINELY held (WL-5) — the real shipped string ──
+  describe("path 7 — waitlist offer (genuine hold, warm, one question, next step)", () => {
+    // Rendered with representative args (biz, service, date, ttl). HE args are Hebrew so no
+    // Latin run trips bilingual_leak; the held-seat offer asks ONE question ("Want it?") and
+    // the ttl/clock-time keeps it forward.
+    const en = i18n.waitlist_offer.en('Lotus Studio', 'Yoga', 'Sunday at 14:00', 15)
+    const he = i18n.waitlist_offer.he('סטודיו לוטוס', 'יוגה', 'ראשון ב-14:00', 15)
+
+    it('EN offers the held seat warmly with exactly one question and a next step (no yes/no menu)', () => {
+      expectGoldenGood(en)
+      expect(hasYesNoMenu(en)).toBe(false) // "Want it?" — not a "(yes/no)" / "Reply YES" menu
+      expect(hasNumberedMenu(en)).toBe(false)
+    })
+    it('HE offers the held seat (masculine singular, no split-gender, no bilingual leak)', () => {
+      expectGoldenGood(he)
+      expect(hasSplitGender(he)).toBe(false)
+      expect(hasYesNoMenu(he)).toBe(false)
+      expect(hasBilingualLeak(he)).toBe(false)
+    })
+  })
+
+  // ── Path 8: waitlist window passed — the held seat lapsed and was released (WL-7) — the real shipped string ──
+  describe('path 8 — waitlist window passed (warm, re-invites, not a dead-end)', () => {
+    const en = i18n.waitlist_window_passed.en('Yoga')
+    const he = i18n.waitlist_window_passed.he('יוגה')
+
+    it('EN is honest the window lapsed but re-invites (no grovel, no dead-end)', () => {
+      expectGoldenGood(en)
+      expect(hasGrovel(en)).toBe(false)
+      expect(hasDeadEnd(en)).toBe(false) // "released" but re-invites to rejoin → forward, not a dead-end
+    })
+    it('HE is honest the window lapsed but re-invites (no dead-end, no bilingual leak)', () => {
+      expectGoldenGood(he)
+      expect(hasDeadEnd(he)).toBe(false)
+      expect(hasBilingualLeak(he)).toBe(false)
     })
   })
 })

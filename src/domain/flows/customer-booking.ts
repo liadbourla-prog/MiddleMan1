@@ -47,6 +47,8 @@ import {
   type AvoidConstraint,
   type RejectedSlot,
 } from './negotiation-constraints.js'
+import { acceptWaitlistOffer, declineWaitlistOffer } from '../waitlist/accept.js'
+import { joinWaitlist } from '../waitlist/join.js'
 
 /** Set or remove negotiationConstraints on a context — omits the key when empty so the
  *  stored jsonb stays minimal (and satisfies exactOptionalPropertyTypes). */
@@ -84,6 +86,108 @@ export function appendNameRequest(
     return { reply, nameAsked: opts.nameAsked }
   }
   return { reply: `${reply}\n\n${t('ask_customer_name', opts.lang)}`, nameAsked: true }
+}
+
+/**
+ * WL-4 — resolve an explicit join-the-waitlist request into ONE concrete
+ * (serviceTypeId, slotStart, slotEnd), reusing the booking path's DETERMINISTIC resolver
+ * (resolveRequestedDate → resolveSlotStart; the LLM never computes calendar arithmetic).
+ * Returns null when service, a resolvable day, or a time is missing — the flow then falls
+ * back to the normal "which session?" clarification instead of inserting a fuzzy row (plan
+ * §3.1: "If no concrete full slot is named, the PA asks which session"). Pure + exported for
+ * tests. Capacity (full vs. open) is NOT decided here — joinWaitlist re-checks it on a fresh
+ * spine and routes an open slot back to booking.
+ */
+export function resolveConcreteWaitlistSlot(
+  intent: CustomerIntentOutput,
+  activeServices: Array<{ id: string; name: string; durationMinutes: number; schedulingMode?: 'appointment' | 'class' | null }>,
+  businessTimezone: string,
+  now: Date,
+): { serviceTypeId: string; slotStart: Date; slotEnd: Date } | null {
+  const service = resolveService(intent.serviceTypeHint, activeServices)
+  if (!service) return null
+  const slot = intent.slotRequest
+  if (!slot || !slot.time) return null
+  const hasDay = Boolean(slot.relativeDay || slot.weekday != null || slot.explicitDate)
+  if (!hasDay) return null
+  const resolved = resolveRequestedDate(
+    {
+      relativeDay: slot.relativeDay ?? null,
+      weekday: slot.weekday ?? null,
+      weekdayAnchor: slot.weekdayAnchor ?? null,
+      explicitDate: slot.explicitDate ?? null,
+    },
+    businessTimezone,
+    now,
+  )
+  if (!resolved.ok || resolved.ambiguousToday) return null
+  const slotStart = resolveSlotStart(resolved.dateStr, { hour: slot.time.hour, minute: slot.time.minute }, businessTimezone)
+  if (isNaN(slotStart.getTime())) return null
+  const slotEnd = new Date(slotStart.getTime() + service.durationMinutes * 60_000)
+  return { serviceTypeId: service.id, slotStart, slotEnd }
+}
+
+/**
+ * WL-4 — shared join handler (WL-3 reuses it). Calls the WL-2 domain op (joinWaitlist) for a
+ * single concrete slot and maps its typed outcome to a voice-compliant reply (no YES/NO menu,
+ * ≤1 question, warm, clear next step — CHAT_LEVEL_LAWBOOK §9-14). It does NOT decide capacity
+ * itself and NEVER re-implements the insert: joinWaitlist re-checks the fresh spine, inserts
+ * idempotently, and returns the FIFO position.
+ *  • joined        → confirm on the list + state position (Q3: stated, never promised fixed); done.
+ *  • already_on_list→ warm "already on it" (no duplicate); done.
+ *  • slot_has_space → signal routeToBooking (the slot isn't actually full → book it normally).
+ *  • needs_name     → ask for the name (reuse the existing name-ask copy); no insert.
+ */
+export async function handleWaitlistJoinRequest(
+  db: Db,
+  identity: ResolvedIdentity,
+  slot: { serviceTypeId: string; slotStart: Date; slotEnd: Date },
+  deps: {
+    lang: 'he' | 'en'
+    businessTimezone: string
+    businessName: string
+    transcript: TranscriptTurn[]
+    genReply: GenReply
+    ctx: BookingFlowContext
+  },
+): Promise<{ reply: string; sessionComplete?: boolean; routeToBooking?: boolean }> {
+  const { lang, businessTimezone, businessName, transcript, genReply, ctx } = deps
+  const persona = ctx.botPersona ? { botPersona: ctx.botPersona } : {}
+  const res = await joinWaitlist(db, {
+    businessId: identity.businessId,
+    customerId: identity.id,
+    serviceTypeId: slot.serviceTypeId,
+    slotStart: slot.slotStart,
+    slotEnd: slot.slotEnd,
+  })
+
+  if (res.kind === 'slot_has_space') {
+    // The slot is not actually full — let the caller route to the normal booking path.
+    return { reply: '', routeToBooking: true }
+  }
+
+  if (res.kind === 'needs_name') {
+    // Owner needs a name; reuse the existing soft name-ask copy. No insert happened — the
+    // offer is re-attempted next turn once a name is on file. Session stays open.
+    return { reply: t('ask_customer_name', lang), sessionComplete: false }
+  }
+
+  const dateLabel = formatSlotDate(slot.slotStart, businessTimezone)
+  const timeLabel = formatSlotTime(slot.slotStart, businessTimezone)
+  if (res.kind === 'already_on_list') {
+    const reply = await genReply({
+      businessTimezone, businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+      situation: `The customer is already on the waitlist for the ${dateLabel} at ${timeLabel} session (their place is currently ${res.position}). Warmly reassure them they're already on the list — do NOT add them again — and tell them you'll message them the moment a spot opens.`,
+    })
+    return { reply, sessionComplete: true }
+  }
+
+  // res.kind === 'joined' — Q3: state the position, never promise it stays fixed.
+  const reply = await genReply({
+    businessTimezone, businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+    situation: `The customer is now on the waitlist for the full ${dateLabel} at ${timeLabel} session — their place is ${res.position} in line. Confirm warmly that you've kept their place and state their position (${res.position}), without promising that position will stay the same; tell them you'll message them the moment a spot opens.`,
+  })
+  return { reply, sessionComplete: true }
 }
 
 type CustomerMemoryInput = {
@@ -334,6 +438,11 @@ async function loadCustomerBookingTimes(db: Db, customerId: string, tz: string):
 interface SuggestionResult {
   text: string | null
   offered: RejectedSlot[]
+  // WL-3: set ONLY when the SPECIFICALLY-requested concrete class exists but is FULL and was
+  // therefore dropped by offerable mode (so it can never be presented as bookable). Lets the
+  // lead-protection site ADD a waitlist offer for that exact slot alongside the substitute.
+  // Additive + optional — existing callers ignore it.
+  fullRequestedSlot?: { serviceTypeId: string; slotStart: string; slotEnd: string }
 }
 const NO_SUGGESTION: SuggestionResult = { text: null, offered: [] }
 
@@ -466,9 +575,12 @@ async function buildDayOptionsText(
   constraints?: NegotiationConstraints,
   timeOfDay?: TimeOfDay | null,
   offerable = false,
+  // WL-3: the exact concrete slot the customer asked for, so renderDayOptions can flag it as
+  // `fullRequestedSlot` when it exists but is full (and is therefore dropped in offerable mode).
+  requestedStart?: Date,
 ): Promise<SuggestionResult> {
   const day = await listDayOptions(db, business, dateStr, tz, serviceTypeId ? { serviceTypeId } : {})
-  return renderDayOptions(day, dateStr, tz, { offerable, ...(timeOfDay != null ? { timeOfDay } : {}), ...(constraints != null ? { constraints } : {}) })
+  return renderDayOptions(day, dateStr, tz, { offerable, ...(timeOfDay != null ? { timeOfDay } : {}), ...(constraints != null ? { constraints } : {}), ...(requestedStart != null ? { requestedStart } : {}) })
 }
 
 // PURE renderer for an already-fetched DayOptions — the human-facing facts string plus the
@@ -483,12 +595,15 @@ export function renderDayOptions(
   day: DayOptions,
   dateStr: string,
   tz: string,
-  opts: { offerable: boolean; timeOfDay?: TimeOfDay | null; constraints?: NegotiationConstraints },
+  opts: { offerable: boolean; timeOfDay?: TimeOfDay | null; constraints?: NegotiationConstraints; requestedStart?: Date },
 ): SuggestionResult {
-  const { offerable, timeOfDay, constraints } = opts
+  const { offerable, timeOfDay, constraints, requestedStart } = opts
   const dayLabel = formatLocalDate(dateStr, tz)
   const parts: string[] = []
   const offered: RejectedSlot[] = []
+  // WL-3: when offerable mode drops the SPECIFICALLY-requested class because it's full, capture
+  // that exact slot here so the caller can offer the waitlist for it (never a dead-end).
+  let fullRequestedSlot: { serviceTypeId: string; slotStart: string; slotEnd: string } | undefined
 
   // Narrow to the requested part-of-day (real class/slot starts only) so an
   // "evening?" inquiry can never widen back into invented full-day times.
@@ -500,7 +615,17 @@ export function renderDayOptions(
   // Drop class instances and private openings the customer already ruled out this session.
   // In offerable mode, additionally drop FULL classes — they must never be presented.
   let classes = byBucket(filterOpenSlots(day.classes, constraints, tz))
-  if (offerable) classes = classes.filter((c) => c.spotsLeft > 0)
+  if (offerable) {
+    // WL-3: before dropping full classes, flag the exact requested one if it's full — that
+    // concrete slot is real, just unbookable, so the caller can offer to hold their place on it.
+    if (requestedStart) {
+      const req = day.classes.find((c) => c.start.getTime() === requestedStart.getTime())
+      if (req && req.spotsLeft <= 0) {
+        fullRequestedSlot = { serviceTypeId: req.serviceTypeId, slotStart: req.start.toISOString(), slotEnd: req.end.toISOString() }
+      }
+    }
+    classes = classes.filter((c) => c.spotsLeft > 0)
+  }
   if (classes.length > 0) {
     const items = classes.slice(0, 10).map((c) => {
       offered.push({ start: c.start.toISOString(), end: c.end.toISOString(), serviceTypeId: c.serviceTypeId })
@@ -524,7 +649,8 @@ export function renderDayOptions(
     parts.push(`Open private times on ${dayLabel}: ${items.join('; ')}.`)
   }
 
-  if (parts.length > 0) return { text: parts.join(' '), offered }
+  const flag = fullRequestedSlot ? { fullRequestedSlot } : {}
+  if (parts.length > 0) return { text: parts.join(' '), offered, ...flag }
   // A part-of-day was asked but nothing real falls in it.
   if (timeOfDay) {
     // F2a / Symptom-2 — SAME-DAY-FIRST. The asked part is empty, but if the day HAS real
@@ -551,13 +677,13 @@ export function renderDayOptions(
       altItems.push(`${p.serviceName} at ${shown.map((s) => formatSlotTime(s, tz)).join(', ')}`)
     }
     if (altItems.length > 0) {
-      return { text: `No ${timeOfDay} classes or open times on ${dayLabel}, but ${dayLabel} does have: ${altItems.join('; ')}. Offer these same-day times first.`, offered }
+      return { text: `No ${timeOfDay} classes or open times on ${dayLabel}, but ${dayLabel} does have: ${altItems.join('; ')}. Offer these same-day times first.`, offered, ...flag }
     }
     // Genuinely nothing that day — state it explicitly so the caller does NOT fall back to
     // an all-day answer (which reopens the fabrication).
-    return { text: `No ${timeOfDay} classes or open times on ${dayLabel}.`, offered: [] }
+    return { text: `No ${timeOfDay} classes or open times on ${dayLabel}.`, offered: [], ...flag }
   }
-  return NO_SUGGESTION
+  return { ...NO_SUGGESTION, ...flag }
 }
 
 // The class analogue of suggestOpenSlotsText: enumerate the next real CLASS
@@ -1138,7 +1264,17 @@ export async function handleBookingFlow(
       const offerServiceName = activeServices.find((s) => s.id === offer.serviceTypeId)?.name ?? (lang === 'he' ? 'התור' : 'the appointment')
       const decision = parseConfirmation(messageText)
       if (decision === 'no') {
-        await db.update(waitlist).set({ status: 'expired' }).where(eq(waitlist.id, offer.id))
+        // WL-6: explicit decline. declineWaitlistOffer releases the WL-5 hold, CAS-flips the row
+        // offered→expired, and cascades to the next in line — it owns ALL waitlist status writes,
+        // so no manual db.update(waitlist) here (that would double-write).
+        await declineWaitlistOffer(db, calendar, {
+          id: offer.id,
+          businessId: identity.businessId,
+          customerId: identity.id,
+          serviceTypeId: offer.serviceTypeId,
+          slotStart: offer.slotStart,
+          slotEnd: offer.slotEnd,
+        })
         await completeSession(db, session.id)
         const reply = await genReply({
           businessTimezone, businessName, language: lang,
@@ -1148,27 +1284,28 @@ export async function handleBookingFlow(
         return { reply, sessionComplete: true }
       }
       if (decision === 'yes') {
-        const result = await requestBooking(db, calendar, identity, { serviceTypeId: offer.serviceTypeId, slotStart: offer.slotStart, slotEnd: offer.slotEnd })
+        // WL-6: confirm the GENUINE WL-5 hold (acceptWaitlistOffer → confirmBooking + CAS-flip
+        // offered→accepted, both-or-neither). NOT a fresh first-come requestBooking. The domain op
+        // owns the waitlist status write.
+        const res = await acceptWaitlistOffer(db, calendar, identity, identity.displayName ?? identity.phoneNumber, offer)
         const offerDate = formatSlotDate(offer.slotStart, businessTimezone)
         const offerTime = formatSlotTime(offer.slotStart, businessTimezone)
-        if (result.ok || (!result.ok && result.code === 'already_booked')) {
-          await db.update(waitlist).set({ status: 'accepted' }).where(eq(waitlist.id, offer.id))
+        if (res.kind === 'accepted') {
           await completeSession(db, session.id)
           const reply = await genReply({
             businessTimezone, businessName, language: lang,
-            situation: result.ok
-              ? `Booking confirmed for ${offerServiceName} on ${offerDate} at ${offerTime} — the spot that opened up is now theirs.`
-              : `The customer is ALREADY booked for ${offerServiceName} on ${offerDate} at ${offerTime}. Warmly reassure them their spot is confirmed; do NOT offer another time.`,
+            situation: `Booking confirmed for ${offerServiceName} on ${offerDate} at ${offerTime} — the spot that opened up is now theirs.`,
             transcript, ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}), customerMemory: extractMemory(ctx),
           }, { bookingConfirmed: true })
           return { reply, sessionComplete: true }
         }
-        // The freed spot was taken before we could lock it in — honest, never a fabricated hold.
-        await db.update(waitlist).set({ status: 'expired' }).where(eq(waitlist.id, offer.id))
+        // res.kind === 'just_went' — lost the race; the held spot slipped away just now. Warm
+        // fallback, NEVER a dead-end: apologise and offer to keep them on the waitlist / find
+        // another time.
         await completeSession(db, session.id)
         const reply = await genReply({
           businessTimezone, businessName, language: lang,
-          situation: `Unfortunately the ${offerServiceName} spot on ${offerDate} at ${offerTime} was taken before it could be locked in. Apologise warmly and offer to keep them on the waitlist or find another time.`,
+          situation: `Unfortunately the ${offerServiceName} spot on ${offerDate} at ${offerTime} slipped away just now. Apologise warmly and offer to keep them on the waitlist or find another time.`,
           transcript, ...(ctx.botPersona ? { botPersona: ctx.botPersona } : {}), customerMemory: extractMemory(ctx),
         })
         return { reply, sessionComplete: true }
@@ -1188,7 +1325,7 @@ export async function handleBookingFlow(
     if (!sel.redispatch) return sel
     // Pivot/redirect → the handler (via rebuildOnSlotPivot) already cleared pending state in
     // the DB; mirror that in-memory and fall through to fresh intent (mirrors the hold branch).
-    const { pendingDecision: _pd, cancellationCandidates: _cc, awaitingConfirmationFor: _a, isReschedulingFlow: _r, ...cleared } = ctx
+    const { pendingDecision: _pd, cancellationCandidates: _cc, awaitingConfirmationFor: _a, isReschedulingFlow: _r, pendingWaitlistJoin: _pwj, ...cleared } = ctx
     ctx = cleared as BookingFlowContext
     session = { ...session, state: 'active', context: ctx }
   }
@@ -1201,7 +1338,7 @@ export async function handleBookingFlow(
     // handleHoldConfirmation already cleared the hold from the session in the DB; mirror
     // that in-memory and fall through to fresh intent handling so their actual request is
     // answered instead of the stale slot being re-asked.
-    const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, ...clearedCtx } = ctx
+    const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, pendingWaitlistJoin: _pwj, ...clearedCtx } = ctx
     ctx = clearedCtx as BookingFlowContext
     session = { ...session, state: 'active', context: ctx }
   }
@@ -1294,7 +1431,9 @@ export async function handleBookingFlow(
   // Reset the consecutive-unknown tally on any actionable intent so the count
   // tracks UNKNOWNS IN A ROW (a customer who's genuinely stuck), not a lifetime
   // total — handlers receive updatedCtx and persist from it, so the reset sticks.
-  const updatedCtx: BookingFlowContext = {
+  // WL-3: `let` (not const) — the full-slot waitlist follow-up clears pendingWaitlistJoin in-place
+  // before falling through to normal booking on the slot_has_space (re-opened seat) path.
+  let updatedCtx: BookingFlowContext = {
     ...ctx,
     detectedLanguage,
     ...(mayGreet ? { greeted: true } : {}),
@@ -1308,6 +1447,62 @@ export async function handleBookingFlow(
     : 'Do NOT greet or re-introduce yourself — continue the conversation directly. '
 
   const intentResult2 = await (async (): Promise<FlowResult> => {
+    // WL-3 — follow-up to a full-slot waitlist OFFER (set as pendingWaitlistJoin by the
+    // lead-protection site). A "yes" joins THAT exact slot via the shared WL-4 helper — NOT a
+    // fresh booking — so the yes is never re-parsed as a new intent. Placed before fresh
+    // extraction; guarded so it can't hijack an in-progress confirmation/selection.
+    if (updatedCtx.pendingWaitlistJoin && !updatedCtx.pendingSlot && !updatedCtx.pendingDecision && !updatedCtx.awaitingConfirmationFor) {
+      const decision = parseConfirmation(messageText)
+      if (decision === 'yes') {
+        const pending = updatedCtx.pendingWaitlistJoin
+        const { pendingWaitlistJoin: _drop, ...clearedCtx } = updatedCtx
+        const join = await handleWaitlistJoinRequest(
+          db, identity,
+          { serviceTypeId: pending.serviceTypeId, slotStart: new Date(pending.slotStart), slotEnd: new Date(pending.slotEnd) },
+          { lang: detectedLanguage, businessTimezone, businessName, transcript, genReply, ctx: clearedCtx as BookingFlowContext },
+        )
+        // slot_has_space → the seat freed in the meantime; fall through to normal booking (no dead-end).
+        if (!join.routeToBooking) {
+          if (join.sessionComplete) await completeSession(db, session.id)
+          else await updateSessionContext(db, session.id, clearedCtx as BookingFlowContext, 'active')
+          return { reply: join.reply, ...(join.sessionComplete ? { sessionComplete: true } : { sessionComplete: false }) }
+        }
+        updatedCtx = clearedCtx as BookingFlowContext
+      } else if (decision === 'no') {
+        // Warm acknowledgement, clear the offer, fall through (they may say what they'd like next).
+        const { pendingWaitlistJoin: _drop, ...clearedCtx } = updatedCtx
+        await updateSessionContext(db, session.id, clearedCtx as BookingFlowContext, 'active')
+        const reply = await genReply({
+          businessTimezone, businessName, language: detectedLanguage, transcript, ...(updatedCtx.botPersona ? { botPersona: updatedCtx.botPersona } : {}), customerMemory: extractMemory(updatedCtx),
+          situation: `${firstMsgPrefix}The customer doesn't want to be added to the waitlist for the full session. Acknowledge warmly with no pressure, and in one gentle question check whether they'd like you to look at another day instead.`,
+        })
+        return { reply, sessionComplete: false }
+      }
+      // Unclear → fall through; the offer stays pending (pendingWaitlistJoin unchanged).
+    }
+    // WL-4 — explicit "put me on the waitlist" / "תכניס אותי לרשימת המתנה". Branch on === true
+    // so an omitted/undefined flag (the model never spoke) NEVER fires this. The guards mirror
+    // the waitlist-offer binding (~the offer branch above): never engage when a booking step is
+    // already in flight, so it can't hijack an in-progress confirmation/selection. The
+    // in-progress branches already returned earlier this turn; the guard makes that explicit.
+    if (intent.joinWaitlist === true && !updatedCtx.pendingSlot && !updatedCtx.pendingDecision && !updatedCtx.awaitingConfirmationFor) {
+      // Resolve the concrete full slot the SAME deterministic way the booking path does.
+      const concrete = resolveConcreteWaitlistSlot(intent, activeServices, businessTimezone, new Date())
+      if (concrete) {
+        const join = await handleWaitlistJoinRequest(db, identity, concrete, {
+          lang: detectedLanguage, businessTimezone, businessName, transcript, genReply, ctx: updatedCtx,
+        })
+        // slot_has_space → fall through to normal booking for that slot (NOT a dead-end).
+        if (!join.routeToBooking) {
+          if (join.sessionComplete) await completeSession(db, session.id)
+          else await updateSessionContext(db, session.id, updatedCtx, 'active')
+          return { reply: join.reply, ...(join.sessionComplete ? { sessionComplete: true } : { sessionComplete: false }) }
+        }
+        // routeToBooking → fall through to the normal booking handling below for this slot.
+      }
+      // No concrete full slot named → fall through to the normal booking path, which reuses the
+      // existing day/slot clarification ("which session?") instead of inserting a fuzzy row.
+    }
     // P4: "give me back the class we cancelled" → re-offer the exact cancelled slot from
     // the snapshot. Falls through to normal handling when there's nothing fresh to restore.
     if (intent.restorePrevious === true) {
@@ -1773,7 +1968,7 @@ async function rebuildOnSlotPivot(
   const seededDraft = ps ? slotDraftFromPending(ps, businessTimezone) : ctx.slotDraft
   // WS3-T3.2: also drop pendingDecision (and its legacy twins) so a redirect can't leave
   // stale booking-selection state that would re-bind the redirected reply next turn.
-  const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, pendingDecision: _pd, cancellationCandidates: _cc, isReschedulingFlow: _ir, ...rest } = ctx
+  const { pendingSlot: _ps, pendingBookingId: _pb, awaitingConfirmationFor: _a, pendingDecision: _pd, cancellationCandidates: _cc, isReschedulingFlow: _ir, pendingWaitlistJoin: _pwj, ...rest } = ctx
   // Negotiation memory: the customer just moved OFF the slot that was awaiting
   // confirmation — record it as rejected so we never re-offer that exact instant later
   // this session. (The new slot they pivoted to is pursued explicitly below, which
@@ -2336,6 +2531,43 @@ async function handleBookingIntent(
     return { reply, sessionComplete: false }
   }
 
+  // ── WL-3: the requested class EXISTS on the schedule but is FULL ───────────
+  // It passed classInstanceMissing (the block is real), so it's a genuine session with no seats.
+  // ADD a waitlist offer for that exact slot ALONGSIDE the later-session substitute — one warm
+  // message, one question, never a dead-end. We stash the offered slot in pendingWaitlistJoin so a
+  // follow-up "yes" joins THAT slot via handleWaitlistJoinRequest (not a fresh booking). offerable
+  // mode drops the full class and flags it as fullRequestedSlot; an open class never sets it, so
+  // normal booking proceeds untouched.
+  if (business && svc.schedulingMode === 'class') {
+    const reqDateStr = localParts(slotStart, businessTimezone).dateStr
+    const dayOpts = await buildDayOptionsText(db, business, reqDateStr, businessTimezone, svc.id, ctx.negotiationConstraints, null, true, slotStart)
+    if (dayOpts.fullRequestedSlot) {
+      const { time: _dropTime, ...draftKeep } = draft
+      // Substitute the next REAL classes so the lead is never dead-ended — kept SEPARATE from the
+      // waitlist offer (WL-3 ADDS the offer, it does not replace the substitute).
+      const substitute = await suggestNextClassesText(db, business, svc.id, businessTimezone, ctx.negotiationConstraints)
+      const offeredAlts = substitute.offered
+      const newCtx: BookingFlowContext = {
+        ...ctx, slotDraft: draftKeep, clarificationAttempts: 0,
+        pendingWaitlistJoin: dayOpts.fullRequestedSlot,
+        ...(offeredAlts.length > 0 ? { lastOfferedSlots: offeredAlts } : {}),
+      }
+      await updateSessionContext(db, session.id, newCtx, 'waiting_clarification')
+      const dayLabel = formatLocalDate(reqDateStr, businessTimezone)
+      const timeLabel = formatSlotTime(slotStart, businessTimezone)
+      const substituteClause = substitute.text
+        ? ` If they'd rather take a real spot sooner, the next real ${svc.name} classes are: ${substitute.text} — offer those too, in the same breath.`
+        : ''
+      const situation = `The ${svc.name} session on ${dayLabel} at ${timeLabel} is full. In ONE warm, first-person message, offer to keep their place on the waitlist for that exact session and let them know you'll message them the moment a spot opens — phrase it as a single gentle question (no yes/no menu, no numbered list).${substituteClause} Never present the full session as bookable, and never dead-end them.`
+      const reply = await genReply({
+        businessTimezone,
+        businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
+        situation: `${firstMsgPrefix}${situation}`,
+      }, { focusDay: { dateStr: reqDateStr, serviceTypeId: svc.id } })
+      return { reply, sessionComplete: false }
+    }
+  }
+
   // ── Passed every gate: confirmation built from the RESOLVED slot (never the LLM's date) ─
   const displayDate = formatSlotDate(slotStart, businessTimezone)
   const displayTime = formatSlotTime(slotStart, businessTimezone)
@@ -2730,7 +2962,7 @@ async function handleHoldConfirmation(
     // service + date, drop the taken time, and re-enter clarification.
     const reofferDraft = slotDraftFromPending(pendingSlot, businessTimezone)
     const { time: _takenTime, ...keptReofferDraft } = reofferDraft
-    const { pendingSlot: _clearedSlot, awaitingConfirmationFor: _clearedAwait, lastOfferedSlots: _loClear, ...ctxWithoutPending } = ctx
+    const { pendingSlot: _clearedSlot, awaitingConfirmationFor: _clearedAwait, lastOfferedSlots: _loClear, pendingWaitlistJoin: _pwj, ...ctxWithoutPending } = ctx
     // Bug E: a schedule-driven ('class') service asked for at a time with no class.
     // Offer the ACTUAL scheduled class times for that service/day — never arbitrary
     // open slots (this is exactly how a customer got booked into a 17:00 with no class).
@@ -3178,8 +3410,11 @@ async function handleBookingSelection(
   business?: Business,
 ): Promise<FlowResult> {
   const lang = ctx.detectedLanguage ?? 'en'
-  const candidates = ctx.pendingDecision?.candidateIds ?? ctx.cancellationCandidates ?? []
-  const isRescheduling = ctx.pendingDecision?.isRescheduling ?? ctx.isReschedulingFlow ?? false
+  // Only the booking_selection variant carries candidateIds/isRescheduling (this handler is
+  // entered solely on that kind); narrow to keep the widened pendingDecision union typesafe.
+  const selection = ctx.pendingDecision?.kind === 'booking_selection' ? ctx.pendingDecision : undefined
+  const candidates = selection?.candidateIds ?? ctx.cancellationCandidates ?? []
+  const isRescheduling = selection?.isRescheduling ?? ctx.isReschedulingFlow ?? false
 
   // Candidate bookings with service names, so we can resolve a natural-language
   // pick and name the chosen slot back in the confirmation.
@@ -3319,7 +3554,7 @@ async function handleCancellationConfirmation(
   // path via the `rescheduledFrom` guard in the intent dispatch, so the still-active
   // original does not bounce us back into booking selection.
   if (ctx.isReschedulingFlow) {
-    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, pendingDecision: _pd, ...rest } = ctx
+    const { targetBookingId: _t, awaitingConfirmationFor: _a, cancellationCandidates: _c, isReschedulingFlow: _r, pendingDecision: _pd, pendingWaitlistJoin: _pwj, ...rest } = ctx
     const newCtx: BookingFlowContext = { ...rest, rescheduledFrom: bookingId }
 
     // If the customer already gave the new slot up front ("move my yoga to Sunday
@@ -3562,7 +3797,7 @@ async function handleRetentionResponse(
 
   // parsed.kind === 'accept' — convert the cancel into a reschedule (deferred-cancel).
   const chosen = offered[parsed.index]!
-  const { targetBookingId: _t, awaitingConfirmationFor: _a, retentionOfferedSlots: _r, cancellationCandidates: _c, isReschedulingFlow: _i, pendingDecision: _pd, ...rest } = ctx
+  const { targetBookingId: _t, awaitingConfirmationFor: _a, retentionOfferedSlots: _r, cancellationCandidates: _c, isReschedulingFlow: _i, pendingDecision: _pd, pendingWaitlistJoin: _pwj, ...rest } = ctx
   const lp = localParts(new Date(chosen.start), businessTimezone)
   const slotDraft = {
     serviceTypeId: chosen.serviceTypeId,

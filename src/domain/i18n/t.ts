@@ -641,13 +641,15 @@ const strings = {
   },
 
   // ── Waitlist offer ────────────────────────────────────────────────────────────
-  // Honest, no fabricated hold (T2a.2 / H3/H18): the slot is NOT reserved — it goes to whoever
-  // replies first, and the offer simply lapses after the TTL. Never claim "I'm holding it for you".
+  // WL-5 (B2): the seat is now GENUINELY held for this customer for the offer window (a real
+  // `held` booking placed via the engine before this message is sent). Framing reflects that:
+  // the spot opened AND is being kept for them; if they don't reply in time the hold is released.
+  // Still voice-compliant — warm, ONE question, no "reply YES/NO" menu, no bot-tells.
   waitlist_offer: {
     he: (biz: string, service: string, date: string, ttl: number) =>
-      `התפנה מקום! ${service} ב${biz} ב-${date}. רוצים אותו? הוא פנוי עכשיו ומי שכותב ראשון תופס — ההצעה פתוחה ל-${ttl} הדקות הקרובות.`,
+      `התפנה מקום! ${service} ב${biz} ב-${date} — שמרתי אותו עבורך ל-${ttl} הדקות הקרובות. רוצה אותו? אם לא אשמע ממך עד אז, אשחרר אותו.`,
     en: (biz: string, service: string, date: string, ttl: number) =>
-      `A spot just opened — ${service} at ${biz} on ${date}. Want it? It's open now and the first to reply gets it — the offer's open for the next ${ttl} minutes.`,
+      `A spot just opened — ${service} at ${biz} on ${date}. I'm holding it for you for the next ${ttl} minutes. Want it? If I don't hear back by then I'll release it.`,
   },
 
   // ── Freed-slot owner-approval gate (WS-C / #6 / #8) → manager language ─────────
@@ -817,6 +819,13 @@ const strings = {
   hold_expired: {
     he: `ההזמנה שלך לא אושרה בזמן ופג תוקפה. אתם מוזמנים לתזמן שוב בכל עת.`,
     en: `Your booking hold has expired because it wasn't confirmed in time. Feel free to book again whenever you're ready.`,
+  },
+  // WL-7 (Path C): the waitlist offer window passed without a reply, so the held seat was
+  // released. Warm, one sentence, invites them to ask again — no menu, no "reply YES/NO", no
+  // bot-tells. Voice-compliant (CHAT_LEVEL_LAWBOOK §9-14).
+  waitlist_window_passed: {
+    he: (service: string) => `חבל, חלון הזמן לתפוס את המקום ל${service} עבר והמקום שוחרר. אם עדיין מתאים לך, רק תכתבו לי ואחזיר אתכם לרשימה.`,
+    en: (service: string) => `That spot for ${service} slipped away — the time to grab it passed and it's been released. If you'd still like it, just say the word and I'll keep an eye out for the next one.`,
   },
   // Inbound sync (Phase 3): we applied an owner-originated Google Calendar change.
   calendar_owner_reconcile_applied: {

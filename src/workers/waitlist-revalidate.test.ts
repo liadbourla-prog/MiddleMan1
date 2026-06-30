@@ -32,18 +32,21 @@ describe('isSlotStillOpenInDay (T2a.2 — H3/H18)', () => {
   })
 })
 
-// T2a.2 — the offer wording must never claim a hold/reservation (no hold exists; reword to
-// honest "first to reply gets it"). A retaken slot is suppressed upstream; even when sent, the
-// message never says "I'm holding it for you".
-describe('waitlist_offer wording is honest — no fabricated hold (T2a.2)', () => {
-  it('English offer says first-to-reply, never "holding it"', () => {
+// WL-5 (B2): the contract REVERSED. The seat is now genuinely held for this customer for the
+// offer window (a real `held` booking placed via the engine before the offer is sent), so the
+// wording SHOULD reflect a hold and a release-on-timeout — no longer "first to reply gets it".
+describe('waitlist_offer wording reflects a genuine hold (WL-5)', () => {
+  it('English offer says it is being held for them, with a release-on-timeout, and no first-come framing', () => {
     const msg = i18n.waitlist_offer.en('Studio', 'Yoga', 'Mon 1 Jul, 10:00', 15)
-    expect(msg).toMatch(/first/i)
-    expect(msg).not.toMatch(/holding it|i'?m holding|reserv|held for you/i)
+    expect(msg).toMatch(/holding it for you/i)
+    expect(msg).toMatch(/release/i)
+    // No longer a first-come scramble.
+    expect(msg).not.toMatch(/first to reply|first come/i)
   })
 
-  it('Hebrew offer makes no hold/reservation claim (no שמרתי/שריינתי/תופס)', () => {
+  it('Hebrew offer says the spot is kept for them and will be released if no reply', () => {
     const msg = i18n.waitlist_offer.he('סטודיו', 'יוגה', 'שני 1 ביולי, 10:00', 15)
-    expect(msg).not.toMatch(/שמרתי|שריינתי|שומר לך|תופס לכם|תופס לך/)
+    expect(msg).toMatch(/שמרתי/)
+    expect(msg).toMatch(/אשחרר/)
   })
 })

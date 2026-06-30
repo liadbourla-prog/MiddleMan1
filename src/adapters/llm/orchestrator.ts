@@ -57,6 +57,7 @@ import {
   executeSetCustomerName,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
+import { executeViewWaitlist } from '../../domain/manager/waitlist-view.js'
 import { executeCoordinateMeeting, executeResolveMeetingCoordination } from '../../domain/manager/coordination-tools.js'
 import { findActiveByBusiness } from '../../domain/coordination/repository.js'
 import {
@@ -178,6 +179,18 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         time: timeSchema('Start clock time of the session, 24-hour, as the owner said it'),
       },
       required: ['date', 'time'],
+    },
+  },
+  {
+    name: 'viewWaitlist',
+    description: 'See WHO is on the waitlist for a full class/service — the people waiting for a spot to open. Use this whenever the owner asks who is waiting, how many are on the list, or who is next for a session (e.g. "who\'s on the waitlist for yoga?", "anyone waiting for tomorrow\'s 10:00 pilates?", "how many waiting for the Tuesday class?"). Read-only: it never adds, offers, or removes anyone. Returns each waiter\'s name, phone, status, and fairness tier ("priority" = nothing else booked this week, offered first; "normal" = already has a session this week), already ordered the way the system would offer a freed seat. Identify the list by service name; add the date + time only if the owner asked about ONE specific session. Report date/time as structured pieces — never compute an absolute or ISO date yourself.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        serviceName: { type: Type.STRING, description: 'Name of the class/service whose waitlist to read (matched fuzzily). Optional only when the business has a single service; otherwise required.' },
+        date: { ...DATE_PIECES_SCHEMA, description: 'Only when the owner asks about ONE specific session — the day of that session, as structured pieces. Omit to see the whole service\'s waitlist.' },
+        time: timeSchema('Only with date — the session\'s start clock time, 24-hour, as the owner said it. Omit to see the whole service\'s waitlist.'),
+      },
     },
   },
   {
@@ -904,6 +917,8 @@ async function dispatchTool(
       return executeManageBusinessSettings(args as unknown as Parameters<typeof executeManageBusinessSettings>[0], ctx)
     case 'getSessionRoster':
       return executeGetSessionRoster(args as unknown as Parameters<typeof executeGetSessionRoster>[0], ctx)
+    case 'viewWaitlist':
+      return executeViewWaitlist(args as unknown as Parameters<typeof executeViewWaitlist>[0], ctx)
     case 'searchWeb':
       return executeSearchWeb(args as unknown as Parameters<typeof executeSearchWeb>[0], ctx)
     case 'lookupCustomer':

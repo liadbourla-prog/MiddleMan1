@@ -42,6 +42,10 @@ export interface CustomerIntentOutput {
   // True when the customer asks to UNDO a cancellation / bring back a just-cancelled
   // booking. Drives the snapshot-based restore path (re-offers the exact cancelled slot).
   restorePrevious?: boolean
+  // True ONLY when the customer explicitly asks to join a waitlist / have their place
+  // kept for a slot or class that is full. Three-state like the flags above: omitted →
+  // undefined (model never spoke), never silently false. Consumed by the join flow (WL-4).
+  joinWaitlist?: boolean
 }
 
 export interface ManagerInstructionOutput {

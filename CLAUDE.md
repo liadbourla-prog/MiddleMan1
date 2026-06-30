@@ -7,7 +7,7 @@
 
 A B2B WhatsApp-based Personal Assistant product for local businesses. Each business gets one dedicated PA — customers and the manager interact with it exclusively via WhatsApp. The core product is calendar management and booking. Advanced capabilities are built as **skills**: self-contained modules that extend the PA without touching the core engine.
 
-The system is live at **v1.0.0** on GCP Cloud Run (europe-west3, project: `deepr-490316`).
+The system is live at **v1.0.107** on GCP Cloud Run (europe-west3, project: `deepr-490316`).
 
 ---
 
@@ -114,7 +114,7 @@ Design + plan: `docs/superpowers/specs/2026-06-30-central-number-manager-channel
 
 ## Current State
 
-- v1.0.14 is live. All V1 milestones complete.
+- v1.0.107 is live. All V1 milestones complete.
 - No businesses provisioned yet — first provisioning is the immediate next step.
 - Meta test number (+15551946756) is still the MiddleMan central number (V0.5 designation).
 - **Branch 3 multi-agent upgrade complete.** The old `classifyManagerInstruction → generateManagerReply` pipeline has been replaced with a Gemini native function-calling orchestrator (`src/adapters/llm/orchestrator.ts`). 7 tools implemented: calendar read/write/delete, web search (Tavily), customer lookup, contact notes, business settings.

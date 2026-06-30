@@ -182,11 +182,27 @@ export interface BookingFlowContext {
   // selection from the cancellation selection (same path, one flag). Set in PARALLEL with
   // the legacy fields (cancellationCandidates / awaitingConfirmationFor / isReschedulingFlow)
   // which remain the source of truth for the confirm/reschedule callers.
-  pendingDecision?: {
-    kind: 'booking_selection'
-    candidateIds: string[]
-    isRescheduling: boolean
-  }
+  pendingDecision?:
+    | {
+        kind: 'booking_selection'
+        candidateIds: string[]
+        isRescheduling: boolean
+      }
+    // WL-6: a live waitlist offer awaiting the customer's yes/no. The OPERATIVE binding is the
+    // loadOpenWaitlistOffer lookup in customer-booking.ts (proactive "a spot opened" offers set no
+    // session state); this member exists for plan fidelity and future in-session offers.
+    | {
+        kind: 'waitlist_offer'
+        waitlistId: string
+        serviceTypeId: string
+        slotStart: string
+      }
+  // WL-3: a pending "keep my place on the waitlist?" offer for a full requested slot, surfaced
+  // by the lead-protection (full-slot) path alongside the later-session substitute. Carried
+  // across the turn so a follow-up "yes" joins THAT exact slot via handleWaitlistJoinRequest
+  // instead of being re-parsed as a fresh booking. ISO strings (matching pendingSlot). Cleared
+  // on the paths that clear other pending state.
+  pendingWaitlistJoin?: { serviceTypeId: string; slotStart: string; slotEnd: string }
   targetBookingId?: string
   detectedLanguage?: 'he' | 'en'
   cancellationCandidates?: string[]

@@ -32,6 +32,15 @@ vi.mock('./waitlist-revalidate.js', () => ({
   revalidateWaitlistSlotOpen: vi.fn(async () => true),
 }))
 
+// WL-5: the offer is preceded by a genuine engine hold. Stub it to succeed so the durable-send
+// path under test is reached; the calendar client is an opaque handle.
+vi.mock('../domain/booking/engine.js', () => ({
+  requestBooking: vi.fn(async () => ({ ok: true, bookingId: 'bk-1', held: true, message: 'held' })),
+}))
+vi.mock('../adapters/calendar/client.js', () => ({
+  createCalendarClient: vi.fn(() => ({})),
+}))
+
 // db singleton — queries return rows from a shared array, consumed in call order.
 let dbQueryIdx = 0
 const dbRows: unknown[][] = []
@@ -63,6 +72,8 @@ function makeSelectChain(): Record<string, unknown> {
   for (const m of ['from', 'where', 'leftJoin', 'innerJoin', 'orderBy', 'select']) {
     chain[m] = () => chain
   }
+  // A select awaited WITHOUT .limit() (the WL-2a load-ALL-pending query) resolves on the chain.
+  chain['then'] = (resolve: (v: unknown) => unknown) => resolve(dbRows[dbQueryIdx++] ?? [])
   chain['limit'] = async () => dbRows[dbQueryIdx++] ?? []
   return chain
 }
@@ -123,27 +134,33 @@ import * as messageRetry from './message-retry.js'
 import * as sender from '../adapters/whatsapp/sender.js'
 
 // ── Helper: populate db rows for the offer_slot happy path ────────────────────
-// Query order in processJob (offer_slot):
-//   1. select next pending waitlist entry (limit 1)
-//   2. CAS update returning (flip to 'offered')
-//   3. customer identity (limit 1)
-//   4. service (limit 1)
-//   5. business (limit 1)
+// Query order in processJob (offer_slot) after WL-2a:
+//   1. load ALL pending waitlist entries (no .limit)
+//   2. per-candidate active-booking-in-window lookup (limit 1) — empty ⇒ priority tier
+//   3. CAS update returning (flip the ranked top to 'offered')
+//   4. customer identity (limit 1)
+//   5. service (limit 1)
+//   6. business (limit 1)
+//   7. hold-manager lookup (limit 1) — WL-5, for the calendar client (manager phone)
 function setupOfferRows() {
   dbQueryIdx = 0
   dbRows.length = 0
 
   dbRows.push([{
     id: 'wl-1', customerId: 'cust-1', businessId: 'biz-1', serviceTypeId: 'svc-1',
-    slotStart: new Date('2026-07-01T10:00:00Z'), status: 'pending',
+    slotStart: new Date('2026-07-01T10:00:00Z'), createdAt: new Date('2026-06-28T09:00:00Z'),
+    status: 'pending',
   }])
+  dbRows.push([]) // booking-in-window lookup for the single candidate → none (priority)
   dbRows.push([{ id: 'wl-1' }]) // CAS won
-  dbRows.push([{ phoneNumber: '+972501234567', preferredLanguage: 'en' }])
+  dbRows.push([{ phoneNumber: '+972501234567', preferredLanguage: 'en', displayName: 'Dana' }])
   dbRows.push([{ name: 'Haircut' }])
   dbRows.push([{
     name: 'Test Salon', timezone: 'Asia/Jerusalem', defaultLanguage: 'en',
     whatsappPhoneNumberId: 'PNID', whatsappAccessToken: 'TOKEN',
+    googleRefreshToken: null, googleCalendarId: null,
   }])
+  dbRows.push([{ phoneNumber: '+972599999999' }]) // WL-5: hold-manager lookup
 }
 
 const JOB = {
