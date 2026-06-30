@@ -104,6 +104,10 @@ export const customerIntentSchema = z.object({
   specialArrangementRequest: z.boolean().optional().catch(undefined),
   restorePrevious: z.boolean().optional().catch(undefined),
   joinWaitlist: z.boolean().optional().catch(undefined),
+  // Addressee-gender evidence from the SENDER's OWN first-person Hebrew (e.g. "מעוניינת"→female,
+  // "מעוניין"→male). 'none' when no gendered self-reference appears. Feeds resolveAddresseeGender
+  // (self_morphology signal). Defaults to 'none' so the consumer always has a value.
+  selfGenderEvidence: z.enum(['male', 'female', 'none']).default('none').catch('none'),
 })
 
 // Defensive normalization: gemini-2.5-flash sometimes emits snake_case top-level
@@ -178,7 +182,8 @@ Return a JSON object with EXACTLY this structure (all fields required):
   "avoidConstraints": { "beforeHour": 0-23|null, "afterHour": 0-23|null, "weekdays": [0-6]|null } | null,
   "specialArrangementRequest": boolean,
   "restorePrevious": boolean,
-  "joinWaitlist": boolean
+  "joinWaitlist": boolean,
+  "selfGenderEvidence": "male" | "female" | "none"
 }
 
 Rules:
@@ -204,6 +209,7 @@ Rules:
 - specialArrangementRequest: true ONLY when the customer asks for something the standard service list can't provide as-is — a PRIVATE/one-off version of a normally-group class, a GROUP/party booking larger than a service allows, an explicitly OUTSIDE-OPENING-HOURS session, or a custom event ("private workshop", "just for my group", "after you close", "סדנה פרטית", "מחוץ לשעות הפעילות", "אירוע פרטי"). false for an ordinary booking, a normal party size, or merely asking about a time that happens to be unavailable. When in doubt, false.
 - restorePrevious: true when the customer asks to UNDO a cancellation or bring back a booking they just cancelled ("restore it", "bring it back", "give me back the class we cancelled", "תחזיר לי את התור שביטלנו", "בוא נחזיר את זה", "תחזיר את השיעור"). false otherwise. A brand-new booking request is NOT a restore.
 - joinWaitlist: true ONLY when the customer explicitly asks to be put on a waitlist or have their place kept for a slot/class that is full ("put me on the waitlist", "keep my place", "let me know if a spot opens", "תכניס אותי לרשימת המתנה", "תשמור לי מקום", "תעדכן אם מתפנה"). false for an ordinary booking request or merely asking whether a time is free. When in doubt, false.
+- selfGenderEvidence: infer the SENDER's OWN grammatical gender ONLY from their first-person Hebrew about THEMSELVES — feminine self-reference ("אני מעוניינת", "אני צריכה", "גרה", "רוצָה", "באתי") → "female"; masculine ("אני מעוניין", "אני צריך", "גר", "באתי" with masc forms) → "male". Use "none" when the message has no gendered self-reference (English, neutral phrasing, or only mentions OTHER people). NEVER infer from a third party the sender talks about, from their name, or from who they want to book for. When in doubt, "none".
 - detectedLanguage: "he" if message is in Hebrew; "en" for English or any other language.
 - Respond only with valid JSON matching the structure above. No explanation.`
 
