@@ -107,6 +107,38 @@ Switch offer format (append to end of reply):
 - Hebrew → English: `(Want me to switch to English? Reply YES)`
 - English → Hebrew: `(רוצה שאמשיך בעברית? כתוב/י כן)`
 
+The Hebrew offer above is shown in its **unknown-gender** form. Like every other Hebrew
+second-person phrasing (§3.5), the switch offer obeys the addressee's resolved gender: once
+gender is known it uses the **single** correct form — `כתבי כן` (feminine) or `כתוב כן`
+(masculine) — and **never** the split-gender `כתוב/י`. Masculine is the floor when gender is
+unknown. *(The runtime switch-offer string lives in `src/domain/i18n/t.ts:managerSwitchOfferSuffix`
+and is normalized to the single form by hardening WS9-T9.5 (F4) — this section is the standard,
+not the implementation site.)*
+
+### 3.5 Addressee Gender (Hebrew)
+
+Hebrew is grammatically gendered in the second person: you address a man and a woman with
+different verb and adjective forms. The PA must address each person in the **single
+grammatically correct form** for their gender.
+
+1. **Resolve before the reply.** The addressee's gender is resolved *before* the LLM is called —
+   a sibling of language resolution (§3.4). The reply is then composed already knowing which form
+   to use. The PA never decides gender while writing.
+2. **One form, always.** Address in the single correct gender form — feminine (`פנייה בלשון נקבה`)
+   for a known-female addressee, masculine (`פנייה בלשון זכר`) for a known-male one.
+3. **Unknown → masculine floor.** When gender is unresolved, address in masculine singular. This is
+   the safe default and is byte-identical to the PA's prior behavior — never invent a gender.
+4. **NEVER split-gender.** Do not hedge with dual forms — not `תרצה/תרצי`, not `כתוב/י`, not
+   `מעוניין/ת`. Split-gender is the loudest bot tell and is banned in **both** the masculine and
+   feminine paths (the female path is held to the same bar — it picks the single feminine form).
+   This is enforced deterministically by the voice guard (`hasSplitGender`).
+5. **Separate from the bot persona.** Addressee gender governs how the PA addresses *the person*
+   (2nd-person). It is orthogonal to `botPersona`, which governs how the PA refers to *itself*
+   (the PA's self-voice). Resolve and apply the two independently; never let one collapse into the
+   other.
+6. **English is unaffected.** English has no grammatical second-person gender — this section
+   applies to Hebrew replies only.
+
 ---
 
 ## 4. Tone and Voice Rules
