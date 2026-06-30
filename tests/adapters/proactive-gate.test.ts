@@ -79,4 +79,44 @@ describe('gateProactiveBody (T2a.1)', () => {
     })
     expect(r.swapped).toBe(false)
   })
+
+  // P3-C1 — the proactive door previously had NO check/ask enforcement and NO voice monitor.
+  describe('P3-C1: check/ask (Gate-4) enforcement + voice monitor on the proactive door', () => {
+    it('swaps a self-authored "I\'ll check and get back to you" to the template (En)', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const r = gateProactiveBody("Let me check with the owner and I'll get back to you on that.", {
+        language: 'en', fallback: 'safe template', businessId: 'b1',
+      })
+      expect(r).toEqual({ body: 'safe template', swapped: true })
+      warn.mockRestore()
+    })
+
+    it('swaps a Hebrew "אבדוק ואחזור אליך" check/ask claim to the template', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const r = gateProactiveBody('אין לי את זה כרגע — אבדוק מול הבעלים ואחזור אליך.', {
+        language: 'he', fallback: 'תבנית בטוחה', businessId: 'b1',
+      })
+      expect(r.swapped).toBe(true)
+      expect(r.body).toBe('תבנית בטוחה')
+      warn.mockRestore()
+    })
+
+    it('runs the mechanical voice monitor (monitor-only — logs a bot-tell, never mutates)', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      // A numbered-menu IVR tell: monitored (logged) but NOT mutated — the body is returned as-is.
+      const body = 'Reply 1 to confirm, 2 to cancel.'
+      const r = gateProactiveBody(body, { language: 'en', fallback: 'fb', businessId: 'b1' })
+      expect(r.body).toBe(body)
+      expect(r.swapped).toBe(false)
+      expect(warn).toHaveBeenCalled()
+      warn.mockRestore()
+    })
+
+    it('a clean proactive body passes the new checks untouched', () => {
+      const r = gateProactiveBody('A spot opened tomorrow — first to reply gets it!', {
+        language: 'en', fallback: 'fb',
+      })
+      expect(r.swapped).toBe(false)
+    })
+  })
 })

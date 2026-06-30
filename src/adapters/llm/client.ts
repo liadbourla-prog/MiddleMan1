@@ -6,6 +6,7 @@ import { buildVoiceCore } from './voice.js'
 import { MODELS } from './models.js'
 import { detectActionClaims, type ActionClaim } from '../../domain/flows/reply-guard.js'
 import { findUnbackedTimes } from '../../domain/flows/slot-fabrication-guard.js'
+import { hasActionFabrication, observeVoiceTells } from '../../domain/flows/voice-guard.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
@@ -1293,6 +1294,24 @@ export function gateProactiveBody(body: string, opts: {
   allowedTimes?: Iterable<string> | undefined
   businessId?: string | undefined
 }): { body: string; swapped: boolean } {
+  // Run the mechanical bot-tell monitor (monitor-only — logs, never mutates) on whatever body
+  // we ultimately return. P3-C1: the proactive door previously had no voice monitor at all.
+  const monitor = (b: string): { body: string; swapped: boolean } => {
+    observeVoiceTells(b, { businessId: opts.businessId, language: opts.language })
+    return { body: b, swapped: b !== body }
+  }
+
+  // Gate 4 (check/ask) ENFORCE (P3-C1): a self-authored "I'll check / get back to you" in an
+  // AUTOMATED message is always unbacked — workers don't escalate to the owner — so it is a
+  // fabrication regardless of any truth set. Swap to the safe template. (Branch 4 enforces this
+  // via the unified gate; the proactive door had no equivalent before.)
+  if (hasActionFabrication(body)) {
+    console.warn('[proactive-gate] action-fabrication (check/ask) — swapped to template', {
+      gate: 'proactive', businessId: opts.businessId, tell: 'action_fabrication',
+    })
+    return monitor(opts.fallback)
+  }
+
   const claims = detectActionClaims(body, opts.language)
   const unbackedTimes = opts.allowedTimes ? findUnbackedTimes(body, opts.allowedTimes) : []
 
@@ -1304,9 +1323,9 @@ export function gateProactiveBody(body: string, opts: {
       console.warn('[proactive-gate] unbacked claim — swapped to template', {
         gate: 'proactive', businessId: opts.businessId, claims: unbacked, times: unbackedTimes,
       })
-      return { body: opts.fallback, swapped: true }
+      return monitor(opts.fallback)
     }
-    return { body, swapped: false }
+    return monitor(body)
   }
 
   // ENFORCE time where an allowlist was supplied even without backedActions (D3 — opt-in).
@@ -1314,7 +1333,7 @@ export function gateProactiveBody(body: string, opts: {
     console.warn('[proactive-gate] unbacked time — swapped to template', {
       gate: 'proactive', businessId: opts.businessId, times: unbackedTimes,
     })
-    return { body: opts.fallback, swapped: true }
+    return monitor(opts.fallback)
   }
 
   // MONITOR: no truth set → observe the softer classes (H8/H12 are monitored, not closed).
@@ -1323,7 +1342,7 @@ export function gateProactiveBody(body: string, opts: {
       gate: 'proactive', businessId: opts.businessId, claims,
     })
   }
-  return { body, swapped: false }
+  return monitor(body)
 }
 
 export async function generateProactiveCustomerMessage(input: {
