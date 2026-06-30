@@ -13,6 +13,7 @@ import {
   executeMessageCustomer,
   executeAnswerCustomerQuestion,
   executeSetCustomerName,
+  executeSetCustomerGender,
   executeManageAllowedContacts,
   executeConfigureDailyBriefing,
   type ToolContext,
@@ -478,6 +479,69 @@ describe('setCustomerName', () => {
     const res = await executeSetCustomerName({ identityId: 'c1', displayName: 'Guy Cohen' }, ctx) as { ok: boolean }
     expect(res.ok).toBe(true)
     expect(captured.patch).toEqual({ displayName: 'Guy Cohen', lastName: 'Cohen' })
+  })
+})
+
+describe('setCustomerGender (T1.2 — owner correction, source=explicit + ledger)', () => {
+  function genderCtx(role: ToolContext['role'], grants?: Action[]): {
+    ctx: ToolContext
+    patches: Array<Record<string, unknown>>
+    audits: Array<Record<string, unknown>>
+  } {
+    const patches: Array<Record<string, unknown>> = []
+    const audits: Array<Record<string, unknown>> = []
+    const updateChain: Record<string, unknown> = {}
+    updateChain['set'] = (p: Record<string, unknown>) => { patches.push(p); return updateChain }
+    updateChain['where'] = () => Promise.resolve(undefined)
+    const db = {
+      update: () => updateChain,
+      insert: () => ({ values: async (v: Record<string, unknown>) => { audits.push(v) } }),
+    }
+    return {
+      ctx: {
+        db: db as unknown as ToolContext['db'],
+        calendar: {} as ToolContext['calendar'],
+        businessId: 'biz1', identityId: 'mgr1', timezone: 'Asia/Jerusalem', lang: 'he',
+        ...(role ? { role } : {}),
+        ...(grants ? { delegatedPermissions: new Set<Action>(grants) } : {}),
+      },
+      patches,
+      audits,
+    }
+  }
+
+  it('rejects a non-manager/non-granted caller (no write, no ledger)', async () => {
+    const { ctx, patches, audits } = genderCtx('customer')
+    const res = await executeSetCustomerGender({ identityId: 'c1', gender: 'female' }, ctx) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+    expect(patches).toHaveLength(0)
+    expect(audits).toHaveLength(0)
+  })
+
+  it('writes addresseeGender=female source=explicit for the owner and logs an audit row', async () => {
+    const { ctx, patches, audits } = genderCtx('manager')
+    const res = await executeSetCustomerGender({ identityId: 'c1', gender: 'female' }, ctx) as { ok: boolean }
+    expect(res.ok).toBe(true)
+    expect(patches.at(-1)).toMatchObject({ addresseeGender: 'female', addresseeGenderSource: 'explicit' })
+    expect(audits).toHaveLength(1)
+    expect(audits[0]).toMatchObject({ businessId: 'biz1', action: 'customer.gender_set', entityId: 'c1' })
+  })
+
+  it('requires a target id', async () => {
+    const { ctx, patches } = genderCtx('manager')
+    const res = await executeSetCustomerGender({ gender: 'male' }, ctx) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('no_target')
+    expect(patches).toHaveLength(0)
+  })
+
+  it('rejects an invalid gender value', async () => {
+    const { ctx, patches } = genderCtx('manager')
+    const res = await executeSetCustomerGender({ identityId: 'c1', gender: 'other' as 'male' }, ctx) as { ok: boolean; reason?: string }
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe('invalid_gender')
+    expect(patches).toHaveLength(0)
   })
 })
 

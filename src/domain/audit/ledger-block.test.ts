@@ -47,4 +47,11 @@ describe('renderAction — booking ground-truth wording', () => {
     expect(line).toContain('a customer')
     expect(line).toContain('an appointment')
   })
+
+  it('customer.gender_set → names who + which gender, framed as already saved (T1.2)', () => {
+    const line = renderAction('customer.gender_set', { customerName: 'Dana', gender: 'female' }, when, tz, locale)
+    expect(line).toContain('Dana')
+    expect(line).toContain('female')
+    expect(line).toMatch(/saved|set/i)
+  })
 })

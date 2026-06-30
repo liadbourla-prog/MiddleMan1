@@ -131,6 +131,21 @@ export async function setCustomerName(
   await db.update(identities).set(patch).where(and(eq(identities.businessId, businessId), eq(identities.id, identityId)))
 }
 
+/** Owner's explicit correction of how the PA addresses a customer in Hebrew (decision 1).
+ *  Writes `addresseeGender` with source `explicit` (rank 4) so a later name/self-morphology
+ *  guess can never override the owner's word. Sibling of setCustomerName; scoped by business. */
+export async function setCustomerGender(
+  db: Db,
+  businessId: string,
+  identityId: string,
+  gender: 'male' | 'female',
+): Promise<void> {
+  await db
+    .update(identities)
+    .set({ addresseeGender: gender, addresseeGenderSource: 'explicit' })
+    .where(and(eq(identities.businessId, businessId), eq(identities.id, identityId)))
+}
+
 /** Most recent booking (date + service name) for an identity, or null if none. */
 export async function latestBookingFor(
   db: Db,

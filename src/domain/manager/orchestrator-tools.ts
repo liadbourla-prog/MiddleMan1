@@ -44,7 +44,7 @@ import { findProviderByName } from '../provider/lookup.js'
 import { sendMessage, sendTemplateMessage, canSendFreeForm } from '../../adapters/whatsapp/sender.js'
 import { bodyComponents } from '../../adapters/whatsapp/templates.js'
 import { registerCustomer, isValidE164 } from '../identity/resolver.js'
-import { resolveTargetForOwnerAction, setCustomerName, deriveLastName, type CandidateView } from '../identity/customer-resolver.js'
+import { resolveTargetForOwnerAction, setCustomerName, setCustomerGender, deriveLastName, type CandidateView } from '../identity/customer-resolver.js'
 import { logAudit } from '../audit/logger.js'
 import { resolveCalendarSwitch, isPlausibleCalendarId, isWritableRole, type CalendarListEntry } from '../calendar/calendar-id.js'
 import { cancelClassSessionBookings, summarizeSessionCancellation } from '../scheduling/session-cancellation.js'
@@ -1545,6 +1545,43 @@ export async function executeSetCustomerName(args: SetCustomerNameArgs, ctx: Too
     ...(lastName !== undefined ? { lastName } : {}),
   })
   return { ok: true, guidance: 'Tell the owner the name is saved, in your own words.' }
+}
+
+// ── setCustomerGender ───────────────────────────────────────────────────────────
+
+// Owner corrects how the PA addresses a customer in Hebrew (decision 1). Writes
+// addresseeGender with source='explicit' (rank 4) so a later name/self-morphology guess can
+// never override it, and records an audit_log row (Principle 7 + lawbook §7.4 tool-contract).
+// Authorization-gated like other customer-management actions.
+interface SetCustomerGenderArgs {
+  identityId?: string
+  gender?: 'male' | 'female'
+}
+
+export async function executeSetCustomerGender(args: SetCustomerGenderArgs, ctx: ToolContext): Promise<object> {
+  const auth = authorize(
+    { role: ctx.role ?? 'manager', ...(ctx.delegatedPermissions ? { delegatedPermissions: ctx.delegatedPermissions } : {}) },
+    'customer.manage',
+  )
+  if (!auth.allowed) {
+    return { ok: false, reason: 'not_authorized', guidance: 'This person is not allowed to edit customer details. Tell them only the owner (or granted staff) can do that.' }
+  }
+  if (!args.identityId) {
+    return { ok: false, reason: 'no_target', guidance: 'Look up the customer first (lookupCustomer) to get their id, then set how to address them.' }
+  }
+  if (args.gender !== 'male' && args.gender !== 'female') {
+    return { ok: false, reason: 'invalid_gender', guidance: 'Ask whether to address this customer in masculine or feminine Hebrew, then set it.' }
+  }
+  await setCustomerGender(ctx.db, ctx.businessId, args.identityId, args.gender)
+  await logAudit(ctx.db, {
+    businessId: ctx.businessId,
+    actorId: ctx.identityId,
+    action: 'customer.gender_set',
+    entityType: 'identity',
+    entityId: args.identityId,
+    metadata: { gender: args.gender },
+  })
+  return { ok: true, guidance: 'Tell the owner you\'ll address them that way from now on, in your own words.' }
 }
 
 // ── pauseConversation ─────────────────────────────────────────────────────────

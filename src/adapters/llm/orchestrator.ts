@@ -55,6 +55,7 @@ import {
   executeAnswerCustomerQuestion,
   executeBroadcastAnnouncement,
   executeSetCustomerName,
+  executeSetCustomerGender,
   type ToolContext,
 } from '../../domain/manager/orchestrator-tools.js'
 import { executeViewWaitlist } from '../../domain/manager/waitlist-view.js'
@@ -403,6 +404,18 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
         lastName: { type: Type.STRING, description: "The customer's last name, when stated explicitly. If omitted, it is derived from displayName." },
       },
       required: ['identityId'],
+    },
+  },
+  {
+    name: 'setCustomerGender',
+    description: "Set or correct how the PA addresses a customer in Hebrew — masculine or feminine second-person. Use ONLY when the owner explicitly tells you a customer's gender or that the PA is addressing someone in the wrong gender (e.g. \"דנה זה אישה, פני אליה בנקבה\"). Look the customer up first (lookupCustomer) to get their identityId. This is the owner's final word — it overrides any automatic guess.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        identityId: { type: Type.STRING, description: "The customer's identityId, from lookupCustomer." },
+        gender: { type: Type.STRING, enum: ['male', 'female'], description: "How to address the customer: 'male' (לשון זכר) or 'female' (לשון נקבה)." },
+      },
+      required: ['identityId', 'gender'],
     },
   },
   {
@@ -927,6 +940,8 @@ async function dispatchTool(
       return executeSaveContactNote(args as unknown as Parameters<typeof executeSaveContactNote>[0], ctx)
     case 'setCustomerName':
       return executeSetCustomerName(args as unknown as Parameters<typeof executeSetCustomerName>[0], ctx)
+    case 'setCustomerGender':
+      return executeSetCustomerGender(args as unknown as Parameters<typeof executeSetCustomerGender>[0], ctx)
     case 'connectGoogleCalendar':
       return executeConnectGoogleCalendar(args as unknown as Parameters<typeof executeConnectGoogleCalendar>[0], ctx)
     case 'connectPayments':

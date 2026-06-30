@@ -21,6 +21,7 @@ const REPORTABLE_ACTIONS = [
   'booking.cancelled',
   'booking.manager_cancelled',
   'booking.failed',
+  'customer.gender_set',
 ] as const
 
 const DEFAULT_LIMIT = 10
@@ -101,6 +102,10 @@ export function renderAction(
       return `${when} — ${svc} for ${who}${slotPhrase} was cancelled — done.`
     case 'booking.failed':
       return `${when} — A booking attempt FAILED (no booking was made).`
+    case 'customer.gender_set': {
+      const g = m['gender'] === 'female' ? 'female' : m['gender'] === 'male' ? 'male' : 'a set'
+      return `${when} — How to address ${who} was saved as ${g} (Hebrew). ALREADY DONE — don't ask the owner to confirm it again.`
+    }
     default:
       return `${when} — ${action.replace(/[._]/g, ' ')}.`
   }
