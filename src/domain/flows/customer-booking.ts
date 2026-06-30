@@ -269,6 +269,29 @@ export function resolveContinuationFocusDay(
 }
 
 /**
+ * T2.3 (PRIMARY/PREVENTIVE — §K "Sunday full") — which day a specific-time inquiry that names
+ * NO day should ground against. The live failure: after the PA listed Sunday's Pilates, the
+ * customer asked "פילאטיס ב 12" (Pilates at 12, a Yoga-only time) with no day; this turn resolved
+ * no date, so the builder pivoted to next-classes on OTHER days and the situation carried no
+ * Sunday open times → the model laundered the miss into "all Sunday Pilates full" + other-day
+ * offers. The fix RE-ANCHORS a day-less, concrete-TIME follow-up to the day already in context
+ * (the prior inquiry focus) so the situation carries THAT day's real whole-service options.
+ *
+ * Returns the dateStr to ground against, or null to leave the existing day/next-classes paths
+ * untouched. Gated on a CONCRETE time (not a bare service/topic question) so it only fires when
+ * the customer clearly references a slot on the day in context. Pure.
+ */
+export function reanchorInquiryGroundingDay(
+  hasThisTurnDay: boolean,
+  hasSpecificTime: boolean,
+  lastInquiryDateStr: string | undefined,
+): string | null {
+  if (hasThisTurnDay) return null // this turn named a day — the existing resolvedDay path owns it
+  if (!hasSpecificTime) return null // no concrete slot referenced — don't assume the context day
+  return lastInquiryDateStr ?? null
+}
+
+/**
  * H19 (T2b.3) — every Branch-4 inquiry hands the occupancy gate a focus day, even when the
  * customer scoped none. Without one, Gate-3 signal-a (the fresh-spine backstop) never runs, so
  * an unscoped "nothing available" answer built on a TRANSIENT-empty availability load is trusted
@@ -885,7 +908,7 @@ export function makeGenReply(
   businessFacts: string,
   actionLedger: string,
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
-  dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
+  dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ openOverall: boolean; openInService: boolean; text: string | null }>,
   businessId?: string,
   // Phase 0 (X1): per-turn identity for the gate-decision line. Mutable so handleBookingFlow can
   // set `intent` once it is extracted (genReply is built before intent resolution). Optional so
@@ -1187,23 +1210,42 @@ export async function handleBookingFlow(
     loadCustomerBookingTimes(db, identity.id, businessTimezone).catch(() => [] as string[]),
   ])
   // Fresh-spine occupancy reader for the output gate: re-reads a focused day's real
-  // class/slot availability so a "full" claim can never launder past makeGenReply
-  // without a current spine check. `open` counts ONLY genuinely-open capacity (classes
-  // with spotsLeft > 0, or any private gap) — buildDayOptionsText's `offered` includes
-  // FULL classes too, so it must NOT be used as the open signal (that would misfire the
-  // gate on a genuinely full day and degrade a correct "fully booked" reply). We
-  // deliberately read WITHOUT negotiation constraints: the backstop only judges the
-  // truthfulness of a BLANKET "full" claim, and the fallback names no specific time, so
-  // a session-rejected-but-open slot should still prevent a false "the whole day is dead".
-  const dayHasOpenOptions = async (dateStr: string, serviceTypeId?: string): Promise<{ open: boolean; text: string | null }> => {
-    if (!business) return { open: false, text: null }
+  // class/slot availability so a "full" claim can never launder past makeGenReply without a
+  // current spine check. Open counts ONLY genuinely-open capacity (classes with spotsLeft > 0,
+  // or any private gap) — buildDayOptionsText's `offered` includes FULL classes too, so it must
+  // NOT be used as the open signal (that would misfire the gate on a genuinely full day and
+  // degrade a correct "fully booked" reply). We deliberately read WITHOUT negotiation
+  // constraints: the backstop only judges the truthfulness of a BLANKET "full" claim, and the
+  // fallback names no specific time, so a session-rejected-but-open slot should still prevent a
+  // false "the whole day is dead".
+  // T2.1 — reads the WHOLE requested day and reports BOTH scope signals: `openOverall` (any
+  // service open that day) and `openInService` (the named service open that day, unfiltered by
+  // time). A service+specific-time miss ("Pilates at 12") can therefore never read as
+  // whole-service-empty — `openInService` still sees Pilates 9/11/14/18. `text` carries the
+  // service's real open options when the service is open, else the whole day's, so the occupancy
+  // correction re-grounds on real times (every one from a class block / real private opening —
+  // never a between-class gap).
+  const dayHasOpenOptions = async (
+    dateStr: string,
+    serviceTypeId?: string,
+  ): Promise<{ openOverall: boolean; openInService: boolean; text: string | null }> => {
+    if (!business) return { openOverall: false, openInService: false, text: null }
     try {
-      const day = await listDayOptions(db, business, dateStr, businessTimezone, serviceTypeId ? { serviceTypeId } : {})
-      const open = day.classes.some((c) => c.spotsLeft > 0) || day.privateOpenings.some((p) => p.slots.length > 0)
-      const r = await buildDayOptionsText(db, business, dateStr, businessTimezone, serviceTypeId, undefined)
-      return { open, text: r.text }
+      const wholeDay = await listDayOptions(db, business, dateStr, businessTimezone, {})
+      const openOverall = wholeDay.classes.some((c) => c.spotsLeft > 0) || wholeDay.privateOpenings.some((p) => p.slots.length > 0)
+      let openInService = openOverall
+      if (serviceTypeId) {
+        const svcDay = await listDayOptions(db, business, dateStr, businessTimezone, { serviceTypeId })
+        openInService = svcDay.classes.some((c) => c.spotsLeft > 0) || svcDay.privateOpenings.some((p) => p.slots.length > 0)
+      }
+      // Surface the named service's day when it has openings; otherwise fall back to the whole
+      // day (so "the whole day is full" regenerates against the open cross-service options).
+      const r = openInService
+        ? await buildDayOptionsText(db, business, dateStr, businessTimezone, serviceTypeId, undefined)
+        : await buildDayOptionsText(db, business, dateStr, businessTimezone, undefined, undefined)
+      return { openOverall, openInService, text: r.text }
     } catch {
-      return { open: false, text: null }
+      return { openOverall: false, openInService: false, text: null }
     }
   }
   // Phase 0 (X1): per-turn identity for the gate-decision telemetry line. `intent` is filled in
@@ -1631,6 +1673,27 @@ export async function handleBookingFlow(
             const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null, true)
             availabilityText = r.text
             inquiryOffered.push(...r.offered)
+          }
+          // T2.3 (PRIMARY/PREVENTIVE) — a day-less follow-up that names a concrete TIME
+          // ("פילאטיס ב 12") references the day already in context. Re-anchor to the prior
+          // inquiry focus and ground the WHOLE day UNFILTERED by service and time-bucket, so the
+          // situation carries that day's real whole-service set (Pilates 9/11/14/18) AND the
+          // cross-service option at the asked time (Yoga at 12) — never an empty/narrowed
+          // situation the model launders into "all full" + a premature pivot to OTHER days. Every
+          // surfaced time comes from buildDayOptionsText (class blocks / real private openings),
+          // so a between-class gap can never leak as bookable. Runs BEFORE the next-classes
+          // fallback so it pre-empts the other-day pivot.
+          if (!availabilityText) {
+            const reanchorDay = reanchorInquiryGroundingDay(
+              !!(resolvedDay && resolvedDay.ok),
+              intent.slotRequest?.time != null,
+              updatedCtx.lastInquiryFocus?.dateStr,
+            )
+            if (reanchorDay) {
+              const r = await buildDayOptionsText(db, business, reanchorDay, businessTimezone, undefined, ctx.negotiationConstraints, null, true)
+              availabilityText = r.text
+              inquiryOffered.push(...r.offered)
+            }
           }
           // No specific day resolved (or that day had nothing): answer from the right
           // availability MODEL. For a class-mode focus — or a class business with no

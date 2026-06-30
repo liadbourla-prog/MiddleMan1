@@ -12,7 +12,7 @@ vi.mock('../../adapters/llm/client.js', async (importActual) => ({
 import { makeGenReply } from './customer-booking.js'
 import { BOOKING_NOT_CONFIRMED_FALLBACK, FABRICATED_TIME_FALLBACK, SAFE_AUDIT_FALLBACK } from '../grounding/output-gate.js'
 
-const noSpine = async () => ({ open: false, text: null })
+const noSpine = async () => ({ openOverall: false, openInService: false, text: null })
 const base = { boundaryTimes: [] as string[], bookingTimes: [] as string[] }
 const reqInput = { businessName: 'X', language: 'he' as const, situation: 's', transcript: [] }
 

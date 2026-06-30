@@ -55,7 +55,7 @@ describe('buildAllowedTimes — per-turn base ∪ per-call merge (D1)', () => {
 })
 
 describe('buildTurnLedger — assembles the per-turn record', () => {
-  const spine = async () => ({ open: false, text: null })
+  const spine = async () => ({ openOverall: false, openInService: false, text: null })
 
   it('packages the per-turn pieces into one TurnLedger struct', () => {
     const ledger = buildTurnLedger({

@@ -38,7 +38,7 @@ function captureGateLines(): { lines: () => Record<string, unknown>[]; restore: 
   return { lines: () => collected, restore: () => spy.mockRestore() }
 }
 
-const NEVER_SPINE: OccupancySpine = async () => ({ open: false, text: null })
+const NEVER_SPINE: OccupancySpine = async () => ({ openOverall: false, openInService: false, text: null })
 
 function ctx(opts: {
   input?: Partial<GateContext['input']>
@@ -153,7 +153,7 @@ describe('gateReply telemetry — occupancyOutcome encodes grounding-empty vs ga
   it('FIRED: focusDay set, no surfaced time, spine reports open → occupancy fires', async () => {
     const res = await gateReply('אין מקום ביום ראשון, הכל תפוס.', ctx({
       gateOpts: { focusDay: { dateStr: '2026-07-05' } },
-      spine: async () => ({ open: true, text: 'יש מקום ב-09:00' }),
+      spine: async () => ({ openOverall: true, openInService: true, text: 'יש מקום ב-09:00' }),
       regen: async () => 'בשמחה, יש מקום ב-09:00',
     }))
     expect(res.telemetry.occupancySpineConsulted).toBe(true)
@@ -165,7 +165,7 @@ describe('gateReply telemetry — occupancyOutcome encodes grounding-empty vs ga
   it('PASSED (honest full): focusDay set, spine reports closed → passed_spine_closed (no fire)', async () => {
     const res = await gateReply('אין מקום ביום ראשון, הכל תפוס.', ctx({
       gateOpts: { focusDay: { dateStr: '2026-07-05' } },
-      spine: async () => ({ open: false, text: null }),
+      spine: async () => ({ openOverall: false, openInService: false, text: null }),
     }))
     expect(res.telemetry.occupancySpineConsulted).toBe(true)
     expect(res.telemetry.occupancyOutcome).toBe('passed_spine_closed')

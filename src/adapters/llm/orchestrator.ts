@@ -1501,13 +1501,25 @@ export async function runManagerOrchestratorLoop(params: OrchestratorParams): Pr
   // dayHasOpenOptions does. Best-effort — a read failure yields `open:false` (the gate then trusts
   // the reply, never inventing availability).
   const occupancySpine: OccupancySpine = async (dateStr, serviceTypeId) => {
-    if (!businessRow) return { open: false, text: null }
+    if (!businessRow) return { openOverall: false, openInService: false, text: null }
     try {
-      const day = await listDayOptions(db, businessRow, dateStr, timezone, serviceTypeId ? { serviceTypeId } : {})
-      const open = day.classes.some((c) => c.spotsLeft > 0) || day.privateOpenings.some((p) => p.slots.length > 0)
-      return { open, text: open ? renderOpenDayText(day, timezone, gateLocale) : null }
+      // T2.1 — whole-day read + both scope signals (parity with Branch-4 dayHasOpenOptions): a
+      // service+specific-time miss can never read as whole-service-empty. Surface the service's
+      // open day when it has openings, else the whole day's.
+      const wholeDay = await listDayOptions(db, businessRow, dateStr, timezone, {})
+      const openOverall = wholeDay.classes.some((c) => c.spotsLeft > 0) || wholeDay.privateOpenings.some((p) => p.slots.length > 0)
+      let openInService = openOverall
+      let svcDay = wholeDay
+      if (serviceTypeId) {
+        svcDay = await listDayOptions(db, businessRow, dateStr, timezone, { serviceTypeId })
+        openInService = svcDay.classes.some((c) => c.spotsLeft > 0) || svcDay.privateOpenings.some((p) => p.slots.length > 0)
+      }
+      const text = openInService
+        ? renderOpenDayText(svcDay, timezone, gateLocale)
+        : openOverall ? renderOpenDayText(wholeDay, timezone, gateLocale) : null
+      return { openOverall, openInService, text }
     } catch {
-      return { open: false, text: null }
+      return { openOverall: false, openInService: false, text: null }
     }
   }
 

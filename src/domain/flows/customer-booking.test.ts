@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions, buildHoldConfirmSituation } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, reanchorInquiryGroundingDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions, buildHoldConfirmSituation } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -291,6 +291,24 @@ describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day
   })
   it('returns undefined when all empty', () => {
     expect(resolveContinuationFocusDay(undefined, undefined, undefined)).toBeUndefined()
+  })
+})
+
+describe('reanchorInquiryGroundingDay — T2.3 (§K "Sunday full" preventive grounding re-anchor)', () => {
+  const SUN = '2026-07-05' // the day already in context (prior inquiry focus)
+  it('REPRO: "פילאטיס ב 12" (no day, concrete time) re-anchors to the prior inquiry focus', () => {
+    // The live bug: a day-less, specific-time follow-up pivoted to other days. It must instead
+    // ground against the day already in context so the situation carries that day's whole-service set.
+    expect(reanchorInquiryGroundingDay(false, true, SUN)).toBe(SUN)
+  })
+  it('does NOT re-anchor when this turn already named a day (existing resolvedDay path owns it)', () => {
+    expect(reanchorInquiryGroundingDay(true, true, SUN)).toBeNull()
+  })
+  it('does NOT re-anchor a bare service/topic question with no concrete time (no context-day assumption)', () => {
+    expect(reanchorInquiryGroundingDay(false, false, SUN)).toBeNull()
+  })
+  it('does NOT re-anchor when there is no prior inquiry focus to anchor to', () => {
+    expect(reanchorInquiryGroundingDay(false, true, undefined)).toBeNull()
   })
 })
 
