@@ -17,8 +17,10 @@ import type { ProviderOnboardingSession } from '../../db/schema.js'
 import { handleOperatorMessage } from './operator.js'
 import { i18n, detectLang, type Lang } from '../i18n/t.js'
 import { sendMessage } from '../../adapters/whatsapp/sender.js'
-import { explainOnboardingConcept, generateProviderOnboardingReply } from '../../adapters/llm/client.js'
+import { explainOnboardingConcept, generateProviderOnboardingReply as generateProviderOnboardingReplyImpl } from '../../adapters/llm/client.js'
 import { isPlausibleCalendarId } from '../calendar/calendar-id.js'
+import { inferSelfGenderFromHebrew } from '../identity/hebrew-self-morphology.js'
+import type { AddresseeGender } from '../identity/addressee-gender.js'
 
 export interface ProviderOnboardingResult {
   reply: string
@@ -43,6 +45,10 @@ type CollectedData = {
   language?: Lang
   _wabaType?: 'app' | 'meta'
   _wabaCase?: '1' | '2' | '3a' | '3b'
+  // Owner's Hebrew addressee gender, inferred from their onboarding self-morphology (decision 3).
+  // Carried across steps so replies stay gender-correct, and persisted to the manager identity
+  // at provisioning. Absent → unknown → masculine floor.
+  ownerGender?: AddresseeGender
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -64,7 +70,7 @@ export async function handleProviderOnboarding(
     session = await createSession(db, fromNumber)
     // Welcome is bilingual — language not yet known
     const welcomeFallback = `${i18n.mm_welcome.he}\n\n${i18n.mm_welcome.en}`
-    const welcomeReply = await generateProviderOnboardingReply({ step: 'welcome', lang: 'bilingual', fallback: welcomeFallback })
+    const welcomeReply = await generateProviderOnboardingReplyImpl({ step: 'welcome', lang: 'bilingual', fallback: welcomeFallback })
     return { reply: welcomeReply }
   }
 
@@ -86,10 +92,11 @@ export async function handleProviderOnboarding(
     }
 
     const alreadyDoneFallback = i18n.mm_already_done[lang]
-    const alreadyDoneReply = await generateProviderOnboardingReply({
+    const alreadyDoneReply = await generateProviderOnboardingReplyImpl({
       step: 'already_done',
       lang,
       collectedData: data.businessName ? { businessName: data.businessName } : {},
+      ...(data.ownerGender ? { addresseeGender: data.ownerGender } : {}),
       fallback: alreadyDoneFallback,
     })
     return { reply: alreadyDoneReply }
@@ -107,6 +114,17 @@ async function handleStep(
 ): Promise<ProviderOnboardingResult> {
   const data = session.collectedData as CollectedData
   const lang: Lang = data.language ?? 'he'
+
+  // Owner gender (decision 3): infer from THIS message's Hebrew self-morphology, keep the first
+  // confident read across the conversation, and carry it on `data` so every step persists it via
+  // the `advance({ ...data })` spreads and provisioning can write it to the manager identity.
+  const ownerGender: AddresseeGender | null = data.ownerGender ?? inferSelfGenderFromHebrew(text)
+  if (ownerGender) data.ownerGender = ownerGender
+  // Local shadow: inject the resolved gender into every onboarding reply this turn. null →
+  // masculine floor (byte-identical), so a neutral message changes nothing.
+  const generateProviderOnboardingReply = (
+    args: Parameters<typeof generateProviderOnboardingReplyImpl>[0],
+  ): Promise<string> => generateProviderOnboardingReplyImpl({ ...args, ...(ownerGender ? { addresseeGender: ownerGender } : {}) })
 
   switch (session.step) {
     case 'business_name': {
@@ -515,6 +533,9 @@ export async function provisionBusiness(
     phoneNumber: managerPhone,
     role: 'manager',
     displayName: 'Owner',
+    // Seed how the PA addresses the owner in Hebrew when onboarding gave us evidence (decision 3).
+    // source=self_morphology (rank 3) so the owner's explicit setting can still override later.
+    ...(data.ownerGender ? { addresseeGender: data.ownerGender, addresseeGenderSource: 'self_morphology' as const } : {}),
   })
 
   if (services && services.length > 0) {

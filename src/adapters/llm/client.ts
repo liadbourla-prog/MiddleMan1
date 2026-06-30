@@ -1498,6 +1498,9 @@ export async function generateProviderOnboardingReply(input: {
   justConfirmed?: string
   isRetry?: boolean
   extraContext?: string
+  // How to address the owner in Hebrew (inferred from their onboarding self-morphology).
+  // null/undefined → masculine floor (decision 1).
+  addresseeGender?: 'male' | 'female' | null
   fallback: string
 }): Promise<string> {
   const isBilingual = input.lang === 'bilingual'
@@ -1523,7 +1526,7 @@ export async function generateProviderOnboardingReply(input: {
 
   const systemPrompt = `You are MiddleMan — a WhatsApp service that sets up booking assistants for local businesses. You are onboarding a new business owner via WhatsApp, texting them as the service.
 
-${buildVoiceCore('onboarding')}
+${buildVoiceCore('onboarding', input.addresseeGender ?? null)}
 
 ${langInstruction}
 Extra rules:
