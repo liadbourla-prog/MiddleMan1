@@ -33,6 +33,8 @@ import { i18n, type Lang } from '../i18n/t.js'
 import { createBlock, deleteBlockById, getBlockById, updateBlock, listBlocksInRange, parseBlockId, blockLabel, BLOCK_ID_PREFIX, type UpdateBlockPatch } from '../availability/blocks.js'
 import { enqueueBlockMirror, enqueueBlockDeletion } from '../../workers/calendar-mirror.js'
 import { reconcileScheduleWindowOnRead } from '../calendar/inbound-sync.js'
+import { confirmImportedClass } from '../calendar/imported-class.js'
+import { parseConfirmation } from '../flows/types.js'
 import type { ListedEvent } from '../../adapters/calendar/types.js'
 import type { CalendarBlock } from '../../db/schema.js'
 import { getOpenSlots } from '../availability/service.js'
@@ -2658,16 +2660,16 @@ export async function executeAnswerCustomerQuestion(
   if (!answer) return { ok: false, reason: 'empty_answer', guidance: 'No answer text was provided. Ask the owner what to tell the customer.' }
 
   // Resolve the target question: by id, or — the free-text fallback — the single open one.
-  let q: { id: string; customerPhone: string } | undefined
+  let q: { id: string; customerPhone: string; relatedBlockId: string | null } | undefined
   if (args.questionId) {
     [q] = await ctx.db
-      .select({ id: pendingOwnerQuestions.id, customerPhone: pendingOwnerQuestions.customerPhone })
+      .select({ id: pendingOwnerQuestions.id, customerPhone: pendingOwnerQuestions.customerPhone, relatedBlockId: pendingOwnerQuestions.relatedBlockId })
       .from(pendingOwnerQuestions)
       .where(and(eq(pendingOwnerQuestions.id, args.questionId), eq(pendingOwnerQuestions.businessId, ctx.businessId), eq(pendingOwnerQuestions.status, 'pending')))
       .limit(1)
   } else {
     const open = await ctx.db
-      .select({ id: pendingOwnerQuestions.id, customerPhone: pendingOwnerQuestions.customerPhone })
+      .select({ id: pendingOwnerQuestions.id, customerPhone: pendingOwnerQuestions.customerPhone, relatedBlockId: pendingOwnerQuestions.relatedBlockId })
       .from(pendingOwnerQuestions)
       .where(and(eq(pendingOwnerQuestions.businessId, ctx.businessId), eq(pendingOwnerQuestions.status, 'pending')))
       .orderBy(desc(pendingOwnerQuestions.createdAt))
@@ -2677,6 +2679,19 @@ export async function executeAnswerCustomerQuestion(
     q = open[0]
   }
   if (!q) return { ok: false, reason: 'not_found', guidance: 'That question was not found or has already been answered.' }
+
+  // Inbound-translator T1.3 (owner confirms an uncertain imported class): when the question is
+  // linked to a pending-import block AND the owner AFFIRMS, open the class (materialize block→class)
+  // and re-notify every waiting customer with the re-engage template. We gate on an affirmative to
+  // preserve decision #10 — a non-yes answer (e.g. "it's private") NEVER auto-opens the class; it
+  // falls through to the ordinary relay below, leaving the slot occupied-but-not-bookable.
+  if (q.relatedBlockId && parseConfirmation(answer) === 'yes') {
+    const res = await confirmImportedClass(ctx.db, ctx.businessId, q.relatedBlockId)
+    if (res.opened) {
+      return { ok: true, openedClass: true, notifiedCustomers: res.notifiedCustomers, guidance: 'Opened the imported class for booking and let the waiting customer(s) know. Tell the owner it\'s live.' }
+    }
+    // The block was already opened/removed — fall through to a normal relay so the owner's note still reaches the customer.
+  }
 
   const [biz] = await ctx.db
     .select({ name: businesses.name, defaultLanguage: businesses.defaultLanguage })

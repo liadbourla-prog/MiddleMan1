@@ -1134,6 +1134,10 @@ export const pendingOwnerQuestions = pgTable(
     status: text('status', { enum: ['pending', 'answered', 'expired'] }).notNull().default('pending'),
     // The manager the question was sent to (for the owner-reply binding / free-text fallback).
     askedManagerId: uuid('asked_manager_id').references(() => identities.id),
+    // Inbound translator (T1.3): when this question is a customer asking about an uncertain
+    // owner-imported class, links to the pending-class calendar_block so confirmImportedClass
+    // can re-notify the waiting customer when the owner opens it. null for a plain question relay.
+    relatedBlockId: uuid('related_block_id'),
     answerText: text('answer_text'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     answeredAt: timestamp('answered_at', { withTimezone: true }),

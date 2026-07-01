@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, reanchorInquiryGroundingDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions, buildHoldConfirmSituation, inquiryNeedKey, inquiryNeedsAreSimilar, repeatedUnmetNeedStep } from './customer-booking.js'
 import { t } from '../i18n/t.js'
@@ -18,6 +18,43 @@ vi.mock('../availability/blocks.js', () => ({
   findClassBlockProviderForSlot: vi.fn(),
 }))
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
+
+vi.mock('../calendar/imported-class.js', () => ({
+  findPendingImportedClassForSlot: vi.fn(),
+  relayPendingClassToOwner: vi.fn(),
+}))
+import { findPendingImportedClassForSlot, relayPendingClassToOwner } from '../calendar/imported-class.js'
+import { maybePendingImportedClassReply } from './customer-booking.js'
+
+describe('maybePendingImportedClassReply — Branch-4 pending imported class (T1.3, test b)', () => {
+  beforeEach(() => { vi.mocked(findPendingImportedClassForSlot).mockReset(); vi.mocked(relayPendingClassToOwner).mockReset() })
+  const business = { id: 'biz-1', name: 'Studio Zen', defaultLanguage: 'en' } as never
+  const identity = { id: 'cust-1', phoneNumber: '+972500000009' } as never
+  const classSvc = { id: 'svc-pilates', name: 'Pilates', schedulingMode: 'class' as const }
+  const SLOT = new Date('2026-07-05T19:00:00Z')
+
+  it('returns the honest studio-confirm reply + relays when a pending class occupies the slot', async () => {
+    vi.mocked(findPendingImportedClassForSlot).mockResolvedValue({ id: 'blk-1', serviceTypeId: 'svc-pilates', startTs: SLOT, endTs: SLOT, maxParticipants: 8 })
+    vi.mocked(relayPendingClassToOwner).mockResolvedValue({ customerReply: "There's a Pilates at that time — let me confirm with the studio.", escalated: true })
+    const r = await maybePendingImportedClassReply({} as never, business, identity, classSvc, SLOT, 'en')
+    expect(r?.reply).toContain('confirm')
+    expect(relayPendingClassToOwner).toHaveBeenCalledOnce()
+  })
+
+  it('returns null (falls through to normal availability) when nothing pending is at the slot', async () => {
+    vi.mocked(findPendingImportedClassForSlot).mockResolvedValue(null)
+    const r = await maybePendingImportedClassReply({} as never, business, identity, classSvc, SLOT, 'en')
+    expect(r).toBeNull()
+    expect(relayPendingClassToOwner).not.toHaveBeenCalled()
+  })
+
+  it('never fires for an appointment-mode service (no class to confirm)', async () => {
+    const apptSvc = { id: 'svc-massage', name: 'Massage', schedulingMode: 'appointment' as const }
+    const r = await maybePendingImportedClassReply({} as never, business, identity, apptSvc, SLOT, 'en')
+    expect(r).toBeNull()
+    expect(findPendingImportedClassForSlot).not.toHaveBeenCalled()
+  })
+})
 
 describe('persistCapturedName', () => {
   const db = {} as never
