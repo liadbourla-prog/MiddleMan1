@@ -16,6 +16,9 @@ import {
   executeSetCustomerGender,
   executeManageAllowedContacts,
   executeConfigureDailyBriefing,
+  executeConfigureProactiveFeatures,
+  proactiveFeatureColumn,
+  PROACTIVE_FEATURE_COLUMNS,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
@@ -843,5 +846,107 @@ describe('configureDailyBriefing', () => {
     const res = await executeConfigureDailyBriefing({}, ctx) as { success: boolean; reason?: string }
     expect(res.success).toBe(false)
     expect(res.reason).toBe('nothing_to_change')
+  })
+})
+
+// ── configureProactiveFeatures ──────────────────────────────────────────────
+// A capture-db ctx: proves the executor writes the RIGHT column (the map is the whole
+// behaviour) without a real DB. Mirrors dailyBriefingCtx.
+function proactiveCtx(): { ctx: ToolContext; patch: Record<string, unknown> } {
+  const patch: Record<string, unknown> = {}
+  const db = {
+    update: () => ({ set: (p: Record<string, unknown>) => ({ where: async () => { Object.assign(patch, p) } }) }),
+    insert: () => ({ values: async () => { /* logAudit */ } }),
+  }
+  const ctx: ToolContext = {
+    db: db as unknown as ToolContext['db'],
+    calendar: {} as ToolContext['calendar'],
+    businessId: 'biz-1',
+    identityId: 'mgr-1',
+    timezone: 'Asia/Jerusalem',
+    lang: 'en',
+    role: 'manager',
+  }
+  return { ctx, patch }
+}
+
+describe('proactiveFeatureColumn — feature→column map', () => {
+  it('maps every known feature to its businesses column', () => {
+    expect(proactiveFeatureColumn('winback')).toBe('proactiveWinbackEnabled')
+    expect(proactiveFeatureColumn('subscription_renewal')).toBe('subscriptionRenewalEnabled')
+    expect(proactiveFeatureColumn('post_appointment_thankyou')).toBe('postAppointmentThankyouEnabled')
+    expect(proactiveFeatureColumn('periodic_treatment')).toBe('periodicTreatmentEnabled')
+    expect(proactiveFeatureColumn('birthday_greetings')).toBe('birthdayGreetingsEnabled')
+    expect(proactiveFeatureColumn('reschedule_retention')).toBe('rescheduleRetentionEnabled')
+  })
+
+  it('returns null for an unknown feature (allow-list, no accidental column writes)', () => {
+    expect(proactiveFeatureColumn('marketing_blast')).toBeNull()
+    expect(proactiveFeatureColumn('')).toBeNull()
+    expect(Object.keys(PROACTIVE_FEATURE_COLUMNS)).toHaveLength(6)
+  })
+})
+
+describe('configureProactiveFeatures — write', () => {
+  it('enabling birthday_greetings sets birthdayGreetingsEnabled = true', async () => {
+    const { ctx, patch } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'birthday_greetings', enabled: true }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch).toEqual({ birthdayGreetingsEnabled: true })
+  })
+
+  it('disabling winback sets proactiveWinbackEnabled = false', async () => {
+    const { ctx, patch } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'winback', enabled: false }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch).toEqual({ proactiveWinbackEnabled: false })
+  })
+
+  it('enabling winback tells the owner it will ask-first (guidance mentions checking each one)', async () => {
+    const { ctx } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'winback', enabled: true }, ctx) as { success: boolean; guidance: string }
+    expect(res.success).toBe(true)
+    expect(res.guidance).toMatch(/check each one|before sending/i)
+  })
+
+  it('unknown feature writes nothing and asks which feature (as manager)', async () => {
+    const { ctx, patch } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'marketing_blast', enabled: true }, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('unknown_feature')
+    expect(patch).toEqual({})
+  })
+})
+
+describe('configureProactiveFeatures — authorization (no state touched)', () => {
+  const args = { feature: 'birthday_greetings', enabled: true }
+
+  it('customer is refused', async () => {
+    const res = await executeConfigureProactiveFeatures(args, payCtx('customer')) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('contact is refused', async () => {
+    const res = await executeConfigureProactiveFeatures(args, payCtx('contact')) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('delegated user WITHOUT settings.configure is refused', async () => {
+    const res = await executeConfigureProactiveFeatures(args, payCtx('delegated_user')) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('delegated user WITH settings.configure passes auth (unknown feature reached, no write)', async () => {
+    // A granted delegate + unknown feature proves the grant opens the gate without touching the
+    // trap DB: we get unknown_feature, not not_authorized.
+    const res = await executeConfigureProactiveFeatures(
+      { feature: 'nope', enabled: true },
+      payCtx('delegated_user', ['settings.configure']),
+    ) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('unknown_feature')
   })
 })

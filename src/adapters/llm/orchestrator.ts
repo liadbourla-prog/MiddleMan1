@@ -48,6 +48,7 @@ import {
   executeManageAllowedContacts,
   executeConfigurePaymentTiming,
   executeSetInitiationAutonomy,
+  executeConfigureProactiveFeatures,
   executeDecideFreedSlotOffer,
   executeCheckCalendarIntegrity,
   executeConnectGoogleCalendar,
@@ -688,6 +689,22 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'configureProactiveFeatures',
+    description: "Turn a proactive-engagement feature on or off for the business. Use when the owner says things like 'start sending birthday messages', 'stop the win-back follow-ups', 'turn on renewal reminders', 'send a thank-you after appointments', or 'offer people a reschedule when they cancel'. This is the master on/off switch — for whether the PA should ASK vs handle win-backs automatically, use setInitiationAutonomy instead.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        feature: {
+          type: Type.STRING,
+          enum: ['winback', 'subscription_renewal', 'post_appointment_thankyou', 'periodic_treatment', 'birthday_greetings', 'reschedule_retention'],
+          description: 'Which proactive feature: winback = re-engage lapsed customers; subscription_renewal = renewal reminders; post_appointment_thankyou = thank-you after a visit; periodic_treatment = nudge when a treatment is due again; birthday_greetings = birthday messages; reschedule_retention = offer a new time when a customer cancels',
+        },
+        enabled: { type: Type.BOOLEAN, description: 'true = turn the feature on; false = turn it off' },
+      },
+      required: ['feature', 'enabled'],
+    },
+  },
+  {
     name: 'decideFreedSlotOffer',
     description: "Decide what to do with a slot that just freed up (after a cancellation) when customers are waiting for it. Use this when you previously asked the owner whether to offer a freed slot and they answered — 'yes/offer it' → decision 'offer'; 'no/leave it' → decision 'leave_open'. Also use it to set a standing preference when the owner says how to handle these going forward: 'always do it automatically' → setStandingPreference 'always_auto'; 'always ask me' → 'always_ask'; 'never offer' → 'never'. The owner can set a preference with or without a slot currently waiting.",
     parameters: {
@@ -1009,6 +1026,8 @@ async function dispatchTool(
       return executeConfigurePaymentTiming(args as unknown as Parameters<typeof executeConfigurePaymentTiming>[0], ctx)
     case 'setInitiationAutonomy':
       return executeSetInitiationAutonomy(args as unknown as Parameters<typeof executeSetInitiationAutonomy>[0], ctx)
+    case 'configureProactiveFeatures':
+      return executeConfigureProactiveFeatures(args as unknown as Parameters<typeof executeConfigureProactiveFeatures>[0], ctx)
     case 'decideFreedSlotOffer':
       return executeDecideFreedSlotOffer(args as unknown as Parameters<typeof executeDecideFreedSlotOffer>[0], ctx)
     case 'checkCalendarIntegrity':

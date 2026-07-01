@@ -2167,6 +2167,67 @@ export async function executeSetInitiationAutonomy(args: SetInitiationAutonomyAr
   return { success: true, fact: JSON.stringify({ category: args.category, mode: args.mode }), guidance: 'Saved. Confirm to the owner in plain words (fact is raw — never quote it).' }
 }
 
+// ── configureProactiveFeatures ──────────────────────────────────────────────
+// Master ON/OFF for each proactive-engagement feature. These booleans were column-only until
+// now (workers read them; nothing wrote them) — this is the Branch-3 owner switch. Enabling a
+// feature is safe-by-default: the only category with an outreach autonomy is `winback`, whose
+// effective autonomy defaults to `ai_proposed` (resolveAutonomy) — the PA proposes each send for
+// owner approval until the trust-ratchet earns auto. So flipping the boolean is sufficient; we do
+// NOT touch initiation_autonomy here (an owner who already set winback to auto keeps it on re-enable).
+// The other five are transactional/courtesy sends gated solely by their flag.
+export const PROACTIVE_FEATURE_COLUMNS = {
+  winback: 'proactiveWinbackEnabled',
+  subscription_renewal: 'subscriptionRenewalEnabled',
+  post_appointment_thankyou: 'postAppointmentThankyouEnabled',
+  periodic_treatment: 'periodicTreatmentEnabled',
+  birthday_greetings: 'birthdayGreetingsEnabled',
+  reschedule_retention: 'rescheduleRetentionEnabled',
+} as const
+
+export type ProactiveFeature = keyof typeof PROACTIVE_FEATURE_COLUMNS
+
+/** Pure map from a proactive-feature key to its businesses column, or null if unknown. */
+export function proactiveFeatureColumn(feature: string): (typeof PROACTIVE_FEATURE_COLUMNS)[ProactiveFeature] | null {
+  return (PROACTIVE_FEATURE_COLUMNS as Record<string, (typeof PROACTIVE_FEATURE_COLUMNS)[ProactiveFeature]>)[feature] ?? null
+}
+
+interface ConfigureProactiveFeaturesArgs {
+  feature: string
+  enabled: boolean
+}
+
+export async function executeConfigureProactiveFeatures(args: ConfigureProactiveFeaturesArgs, ctx: ToolContext): Promise<object> {
+  // 1. Authorization — managers always; delegated only with the grant; customers/contacts never.
+  const auth = authorize(
+    { role: ctx.role ?? 'manager', ...(ctx.delegatedPermissions ? { delegatedPermissions: ctx.delegatedPermissions } : {}) },
+    'settings.configure',
+  )
+  if (!auth.allowed) {
+    return { success: false, reason: 'not_authorized', guidance: 'This person is not allowed to change business settings. Tell them only the owner (or staff the owner has granted settings to) can turn proactive features on or off — change nothing.' }
+  }
+
+  // 2. Validate — the column map is the allow-list; enabled must be a real boolean.
+  const column = proactiveFeatureColumn(args.feature)
+  if (!column) {
+    return { success: false, reason: 'unknown_feature', guidance: 'Ask the owner which proactive feature they mean — win-back follow-ups, subscription-renewal reminders, post-appointment thank-yous, periodic-treatment nudges, birthday greetings, or reschedule offers on cancellation.' }
+  }
+  if (typeof args.enabled !== 'boolean') {
+    return { success: false, reason: 'invalid_args', guidance: 'Ask the owner whether to turn this feature on or off.' }
+  }
+
+  // 3. Deterministic write + audit. Flipping the flag is the whole change (see note above).
+  await ctx.db.update(businesses).set({ [column]: args.enabled }).where(eq(businesses.id, ctx.businessId))
+  await logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action: 'proactive_feature.updated', entityType: 'business', entityId: ctx.businessId, metadata: { feature: args.feature, enabled: args.enabled } })
+
+  return {
+    success: true,
+    fact: JSON.stringify({ feature: args.feature, enabled: args.enabled }),
+    guidance: args.feature === 'winback' && args.enabled
+      ? "Saved. Tell the owner win-backs are on, and that you'll check each one with them before sending until they tell you to just handle it (fact is raw — never quote it)."
+      : 'Saved. Confirm the change to the owner in plain words (fact is raw — never quote it).',
+  }
+}
+
 interface AmendReshuffleArgs {
   change: string
 }
