@@ -7,6 +7,7 @@ import { MODELS } from './models.js'
 import { detectActionClaims, type ActionClaim } from '../../domain/flows/reply-guard.js'
 import { findUnbackedTimes } from '../../domain/flows/slot-fabrication-guard.js'
 import { hasActionFabrication, observeVoiceTells } from '../../domain/flows/voice-guard.js'
+import { logGateDecision } from '../../domain/grounding/gate-telemetry.js'
 
 const LLM_API_KEY = process.env['LLM_API_KEY']
 if (!LLM_API_KEY) throw new Error('LLM_API_KEY is required')
@@ -1345,6 +1346,30 @@ export function gateProactiveBody(body: string, opts: {
     return { body: b, swapped: b !== body }
   }
 
+  // Phase 0 (X1) — emit ONE gate-decision line per call at the proactive door, then return.
+  // Proactive sends are business-scoped automated messages: no customer identity/session/intent,
+  // and the door builds no day-scoped grounding, so those fields are null / not_applicable. The
+  // gate SWAPS to a template (never regenerates), so fellToTemplate = the body was swapped.
+  const finish = (gatesFired: string[], b: string): { body: string; swapped: boolean } => {
+    const result = monitor(b)
+    logGateDecision({
+      door: 'proactive',
+      businessId: opts.businessId ?? null,
+      identityId: null,
+      sessionId: null,
+      intent: null,
+      focusDay: null,
+      gatesFired,
+      regenCount: 0,
+      fellToTemplate: result.swapped,
+      situationHadOpenTimes: false,
+      occupancyAsserted: false,
+      occupancySpineConsulted: false,
+      occupancyOutcome: 'not_applicable',
+    })
+    return result
+  }
+
   // Gate 4 (check/ask) ENFORCE (P3-C1): a self-authored "I'll check / get back to you" in an
   // AUTOMATED message is always unbacked — workers don't escalate to the owner — so it is a
   // fabrication regardless of any truth set. Swap to the safe template. (Branch 4 enforces this
@@ -1353,7 +1378,7 @@ export function gateProactiveBody(body: string, opts: {
     console.warn('[proactive-gate] action-fabrication (check/ask) — swapped to template', {
       gate: 'proactive', businessId: opts.businessId, tell: 'action_fabrication',
     })
-    return monitor(opts.fallback)
+    return finish(['action'], opts.fallback)
   }
 
   const claims = detectActionClaims(body, opts.language)
@@ -1367,9 +1392,9 @@ export function gateProactiveBody(body: string, opts: {
       console.warn('[proactive-gate] unbacked claim — swapped to template', {
         gate: 'proactive', businessId: opts.businessId, claims: unbacked, times: unbackedTimes,
       })
-      return monitor(opts.fallback)
+      return finish([...(unbacked.length > 0 ? ['action'] : []), ...(unbackedTimes.length > 0 ? ['time'] : [])], opts.fallback)
     }
-    return monitor(body)
+    return finish([], body)
   }
 
   // ENFORCE time where an allowlist was supplied even without backedActions (D3 — opt-in).
@@ -1377,7 +1402,7 @@ export function gateProactiveBody(body: string, opts: {
     console.warn('[proactive-gate] unbacked time — swapped to template', {
       gate: 'proactive', businessId: opts.businessId, times: unbackedTimes,
     })
-    return monitor(opts.fallback)
+    return finish(['time'], opts.fallback)
   }
 
   // MONITOR: no truth set → observe the softer classes (H8/H12 are monitored, not closed).
@@ -1386,7 +1411,7 @@ export function gateProactiveBody(body: string, opts: {
       gate: 'proactive', businessId: opts.businessId, claims,
     })
   }
-  return monitor(body)
+  return finish([], body)
 }
 
 export async function generateProactiveCustomerMessage(input: {

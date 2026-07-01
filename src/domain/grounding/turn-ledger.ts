@@ -26,11 +26,23 @@ export interface BaseAllowedTimes {
   bookingTimes: string[]
 }
 
-/** Fresh-spine occupancy reader for a focused (day, service): genuinely-open capacity only. */
+/**
+ * Fresh-spine occupancy reader for a focused (day, service): genuinely-open capacity only.
+ *
+ * T2.1 — reads the WHOLE requested day and exposes TWO scope signals so a service+time miss
+ * can never read as whole-service-empty (the §K "Sunday full" laundering):
+ *  - `openOverall`   — ANY service has genuinely-open capacity that day (so "the whole day is
+ *                      full" is checkable even when the named service is closed).
+ *  - `openInService` — the NAMED service (when one is focused) has open capacity that day,
+ *                      UNFILTERED by time (so "all Pilates is taken Sunday" is checkable against
+ *                      Pilates at 9/11/14/18). When no service is focused it equals `openOverall`.
+ * `text` carries the real open options to re-ground the reply on (the service's day when open,
+ * else the whole day). Replaces the former single `open`.
+ */
 export type OccupancySpine = (
   dateStr: string,
   serviceTypeId?: string,
-) => Promise<{ open: boolean; text: string | null }>
+) => Promise<{ openOverall: boolean; openInService: boolean; text: string | null }>
 
 export interface TurnLedger {
   /** Closed-world business facts (exhaustive services/prices/instructors). */

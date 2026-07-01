@@ -24,6 +24,7 @@ import {
   hasGrovel,
   hasDeadEnd,
   hasBilingualLeak,
+  hasEitherOrPrompt,
 } from './voice-guard.js'
 import { i18n } from '../i18n/t.js'
 
@@ -112,11 +113,14 @@ describe('golden GOOD replies — the quality bar (detectBotTells === [], one qu
     it('EN asks exactly one clarifying question with both options grounded', () => {
       expectGoldenGood(en)
       expect(hasStackedQuestions(en)).toBe(false)
+      // A grounded "which works better?" clarification is NOT an either/or bot-tell.
+      expect(hasEitherOrPrompt(en)).toBe(false)
     })
     it('HE asks exactly one clarifying question', () => {
       expectGoldenGood(he)
       expect(hasStackedQuestions(he)).toBe(false)
       expect(hasBilingualLeak(he)).toBe(false)
+      expect(hasEitherOrPrompt(he)).toBe(false)
     })
   })
 
@@ -272,6 +276,18 @@ describe('golden BAD replies — the gate flags real bot-tells', () => {
   it('dead-end (unavailability assertion, no forward step)', () => {
     const en = 'Sunday is fully booked.'
     expect(detectBotTells(en)).toContain('dead_end')
+  })
+
+  // Phase 4 / X2 — the P1 proximate trigger: an either/or two-arm confirm PROMPT makes a
+  // bare "yes" semantically void. Backed structurally by T1.2 (single yes/no confirm prompt);
+  // graduated here from cosmetic-monitor to a FUNCTIONAL tell.
+  it('either/or two-arm confirm prompt (He + En)', () => {
+    const he = 'לשחרר את המקום ולחפש לך שיעור יוגה ביום אחר, או שאתה רוצה לקחת אותו?'
+    const en = 'Should I release the spot and look for another day, or do you want to take it?'
+    expect(detectBotTells(he)).toContain('either_or')
+    expect(detectBotTells(en)).toContain('either_or')
+    expect(hasEitherOrPrompt(he)).toBe(true)
+    expect(hasEitherOrPrompt(en)).toBe(true)
   })
 
   it('bilingual leak (Hebrew reply with an English sentence)', () => {

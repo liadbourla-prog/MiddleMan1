@@ -33,6 +33,15 @@ describe('classifyConfirmWithQuestion — same-day side-question vs day revision
     // ראשון = Sunday
     expect(classifyConfirmWithQuestion('כן, ראשון מלא?', SUN)).toBe('confirm')
   })
+
+  // T1.1 (red-team catch): the SAME decline precedence must hold on the yes_with_question path,
+  // else "כן תשחרר, מתי עוד יש?" (yes release, when else is there?) — a same-day side question on
+  // the HELD weekday — collapses to 'confirm' and BOOKS against the decline. A decline/release verb
+  // vetoes the confirm even on a same-day question → 'revise' (route to the pivot, never a silent book).
+  it('a decline/release verb on a held-day question → revise, never confirm', () => {
+    expect(classifyConfirmWithQuestion('כן תשחרר, מתי עוד יש?', SUN)).toBe('revise')
+    expect(classifyConfirmWithQuestion('yes release it, anything else on Sunday?', SUN)).toBe('revise')
+  })
 })
 
 describe('parseRetentionReply', () => {
@@ -107,6 +116,37 @@ describe('parseConfirmation — lenient affirmatives', () => {
   for (const t of no) {
     it(`'${t}' → no`, () => expect(parseConfirmation(t)).toBe('no'))
   }
+})
+
+// T1.1 (live bug, סטודיוגה 2026-06-30): the PA asked an either/or hold-confirm ("release the
+// spot … OR take it?"); the customer said "כן תשחרר" (yes, release it); the windowed-yes path saw
+// the embedded כן and returned 'yes', so the system BOOKED against an explicit decline. A
+// semantic-decline / release verb must VETO the embedded affirmative — the decline wins. The
+// lexicon is conservative (the שחרר family + unambiguous English); ambiguous עזוב/ותר/אין צורך
+// are deliberately deferred. BOTH polarities live in this file so the precedence can't over-reach.
+describe('parseConfirmation — decline/release precedence (T1.1)', () => {
+  const decline = [
+    'כן תשחרר', // THE live transcript — "yes, release it" → a DECLINE, never a confirm
+    'תשחרר', // bare "release it"
+    'לשחרר', // "to release"
+    'אשחרר', // "I'll release"
+    'תשחרר בבקשה', // "release it please"
+    'כן תשחרר את המקום', // "yes, release the spot"
+    'שחרור', // "release" (noun form, ש-ח-ר-ו-ר)
+    'yes, release it',
+    'release it please',
+    'never mind, yes',
+    'yes but drop it',
+    "let it go, yes",
+  ]
+  for (const t of decline) {
+    it(`'${t}' → no (decline wins over any embedded yes)`, () => expect(parseConfirmation(t)).toBe('no'))
+  }
+
+  // The decline lexicon must NOT flip a genuine confirmation — "pass by" means COME BY, not decline.
+  it('does NOT misread "pass by" as a decline', () => {
+    expect(parseConfirmation('yes I will pass by at 17:00')).not.toBe('no')
+  })
 })
 
 describe('parseConfirmation — bundled yes + question', () => {

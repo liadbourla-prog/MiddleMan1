@@ -73,6 +73,54 @@ describe('observeVoiceTells — MONITOR-ONLY (detect + log, never mutate)', () =
   })
 })
 
+describe('observeVoiceTells — FUNCTIONAL classification (Phase 4 / X2), still monitor-only', () => {
+  // Two tells graduate from cosmetic-monitor to FUNCTIONAL because a structural fix now backs
+  // each: either_or ← T1.2 (single yes/no confirm prompt), dead_end ← T3.1/T3.2 (repeated-unmet-
+  // need escalation). Graduation = a distinct `functional` flag on the monitor line. It is still
+  // MONITOR-ONLY: the observer returns the reply byte-for-byte and NEVER regenerates.
+  it('flags either_or as functional (backed by T1.2) — reply unchanged', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const reply = 'לשחרר את המקום ולחפש ביום אחר, או שאתה רוצה לקחת אותו?'
+    const out = observeVoiceTells(reply, { businessId: 'biz-e', language: 'he' })
+    expect(out).toBe(reply) // no regen, no mutation
+    expect(warn).toHaveBeenCalledTimes(1)
+    const [, fields] = warn.mock.calls[0] as [string, Record<string, unknown>]
+    expect(fields.tells).toContain('either_or')
+    expect(fields.functional).toContain('either_or')
+    expect(fields.hasFunctional).toBe(true)
+  })
+
+  it('flags dead_end as functional (backed by T3.1/T3.2) — reply unchanged', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const reply = 'Sunday is fully booked.'
+    const out = observeVoiceTells(reply, { businessId: 'biz-d', language: 'en' })
+    expect(out).toBe(reply)
+    expect(warn).toHaveBeenCalledTimes(1)
+    const [, fields] = warn.mock.calls[0] as [string, Record<string, unknown>]
+    expect(fields.functional).toContain('dead_end')
+    expect(fields.hasFunctional).toBe(true)
+  })
+
+  it('cosmetic tells stay monitor-only — NOT flagged functional (yes/no menu)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const reply = 'לקבוע? (כן/לא)'
+    const out = observeVoiceTells(reply, { businessId: 'biz-c', language: 'he' })
+    expect(out).toBe(reply)
+    const [, fields] = warn.mock.calls[0] as [string, Record<string, unknown>]
+    expect(fields.tells).toContain('yes_no_menu')
+    expect(fields.functional).toEqual([])
+    expect(fields.hasFunctional).toBe(false)
+  })
+
+  it('a safe-fallback dead_end is exempt → no warn, no functional flag', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const reply = 'אין מקום בשיעור הזה.'
+    const out = observeVoiceTells(reply, { businessId: 'biz-sf', language: 'he' }, { isSafeFallback: true })
+    expect(out).toBe(reply)
+    expect(warn).not.toHaveBeenCalled()
+  })
+})
+
 // Source-introspection guard (mirrors customer-booking.test.ts readFileSync pattern):
 // every gateReply return point must be wrapped in observeVoiceTells so a future edit
 // can't silently bypass the deterministic Gate 7 (non-bypass invariant). The Branch-4

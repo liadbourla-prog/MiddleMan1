@@ -16,6 +16,7 @@ import { inferSelfGenderFromHebrew } from '../identity/hebrew-self-morphology.js
 import { canonicalTime } from './slot-fabrication-guard.js'
 import { buildTurnLedger } from '../grounding/turn-ledger.js'
 import { gateReply, makeRegenBudget, SAFE_AUDIT_FALLBACK } from '../grounding/output-gate.js'
+import { logGateDecision } from '../grounding/gate-telemetry.js'
 import type { ActionClaim } from './reply-guard.js'
 import { matchCancelBookings, type CancelBooking } from './cancellation-match.js'
 import { inferFocusService, customerReferencedService } from './service-resolution.js'
@@ -268,6 +269,29 @@ export function resolveContinuationFocusDay(
   lastInquiryDateStr: string | undefined,
 ): string | undefined {
   return thisTurnDateStr ?? draftDateStr ?? lastInquiryDateStr
+}
+
+/**
+ * T2.3 (PRIMARY/PREVENTIVE — §K "Sunday full") — which day a specific-time inquiry that names
+ * NO day should ground against. The live failure: after the PA listed Sunday's Pilates, the
+ * customer asked "פילאטיס ב 12" (Pilates at 12, a Yoga-only time) with no day; this turn resolved
+ * no date, so the builder pivoted to next-classes on OTHER days and the situation carried no
+ * Sunday open times → the model laundered the miss into "all Sunday Pilates full" + other-day
+ * offers. The fix RE-ANCHORS a day-less, concrete-TIME follow-up to the day already in context
+ * (the prior inquiry focus) so the situation carries THAT day's real whole-service options.
+ *
+ * Returns the dateStr to ground against, or null to leave the existing day/next-classes paths
+ * untouched. Gated on a CONCRETE time (not a bare service/topic question) so it only fires when
+ * the customer clearly references a slot on the day in context. Pure.
+ */
+export function reanchorInquiryGroundingDay(
+  hasThisTurnDay: boolean,
+  hasSpecificTime: boolean,
+  lastInquiryDateStr: string | undefined,
+): string | null {
+  if (hasThisTurnDay) return null // this turn named a day — the existing resolvedDay path owns it
+  if (!hasSpecificTime) return null // no concrete slot referenced — don't assume the context day
+  return lastInquiryDateStr ?? null
 }
 
 /**
@@ -887,12 +911,16 @@ export function makeGenReply(
   businessFacts: string,
   actionLedger: string,
   timeGuard: { boundaryTimes: string[]; bookingTimes: string[] },
-  dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ open: boolean; text: string | null }>,
+  dayHasOpenOptions: (dateStr: string, serviceTypeId?: string) => Promise<{ openOverall: boolean; openInService: boolean; text: string | null }>,
   businessId?: string,
   // Resolved addressee gender for THIS conversation, read by-reference at reply time so a
   // mid-turn refinement (name → self-morphology after intent extraction) reaches every reply.
   // null = unknown → masculine floor; merged into every generateCustomerReply input.
   addresseeGenderRef?: { gender: AddresseeGender | null },
+  // Phase 0 (X1): per-turn identity for the gate-decision line. Mutable so handleBookingFlow can
+  // set `intent` once it is extracted (genReply is built before intent resolution). Optional so
+  // the existing unit callers stay 5-arg; production always threads it.
+  telemetryCtx?: { identityId?: string | null; sessionId?: string | null; intent?: string | null },
 ): GenReply {
   const ledger = buildTurnLedger({
     businessFacts,
@@ -938,8 +966,35 @@ export function makeGenReply(
         regen,
         budget,
       })
+      // Phase 0 (X1) — one gate-decision line per gated reply at the Branch-4 door.
+      logGateDecision({
+        door: 'branch4',
+        businessId: businessId ?? null,
+        identityId: telemetryCtx?.identityId ?? null,
+        sessionId: telemetryCtx?.sessionId ?? null,
+        intent: telemetryCtx?.intent ?? null,
+        focusDay: opts.focusDay?.dateStr ?? null,
+        ...result.telemetry,
+      })
       return result.reply
     } catch {
+      // The draft pipeline threw — the door still fell to a safe template; record it so a turn
+      // that dropped to fallback is never invisible (no gates fired, no grounding observed).
+      logGateDecision({
+        door: 'branch4',
+        businessId: businessId ?? null,
+        identityId: telemetryCtx?.identityId ?? null,
+        sessionId: telemetryCtx?.sessionId ?? null,
+        intent: telemetryCtx?.intent ?? null,
+        focusDay: opts.focusDay?.dateStr ?? null,
+        gatesFired: [],
+        regenCount: 0,
+        fellToTemplate: true,
+        situationHadOpenTimes: false,
+        occupancyAsserted: false,
+        occupancySpineConsulted: false,
+        occupancyOutcome: 'not_applicable',
+      })
       return SAFE_AUDIT_FALLBACK[input.language]
     }
   }
@@ -966,7 +1021,11 @@ export function buildBusinessFacts(
     const k = businessKnowledge?.services.find((ks) => ks.id === s.id)
     const price = k?.price != null
       ? `${k.price}${k.currency ? ' ' + k.currency : ''}`
-      : 'no price on record — do NOT quote a price'
+      // T3.3: frame a null price as a GAP to relay, not a fact to steer past. "do NOT quote a price"
+      // alone read to the model as "I know the answer (there's no price) → steer", which dead-ended
+      // a real price question instead of escalating. Naming the honest route nudges the ask-the-owner
+      // relay (belt-and-suspenders with T3.2's deterministic repeated-unmet-need trigger).
+      : 'no price on record — do NOT quote or invent a price; if the customer asks the price, this is a studio question to relay, not to steer past'
     lines.push(`• ${s.name} — ${s.durationMinutes} min, ${model}, ${price}`)
     // T2b.1: surface the owner-authored narrative closed-world. This is the studio's own
     // words about the service (equipment, level, what to expect) — the model may answer
@@ -1009,6 +1068,66 @@ const ASK_STUDIO_INSTRUCTION = `If — and ONLY if — you genuinely cannot answ
 // True when a drafted reply is the model's "I can't answer" signal. Pure + exported for tests.
 export function isAskStudioSentinel(reply: string): boolean {
   return reply.trim().includes(ASK_STUDIO_SENTINEL)
+}
+
+// ── T3.2 — repeated-unmet-need deterministic escalation net (P3) ──────────────
+// The live bug: a customer asked the price 3× (price genuinely null) and the PA deflected each
+// time, never escalating, because escalation was gated ONLY on the LLM emitting [[ASK_STUDIO]].
+// This raises the deterministic floor: when a customer re-asks a SIMILAR unmet info-need, the core
+// escalates itself (on the 2nd recurrence) through the SAME throttled owner-relay — topic-agnostic,
+// no intent-extraction change. The honest reply stays the question_passed_to_studio CODE TEMPLATE.
+//
+// Similarity is deliberately LEXICAL (content-token overlap), not concept-clustering: the regression
+// guard requires "price?" and "any discount?" to be DISTINCT (a related follow-up, not a repeat), so
+// clustering all payment words together would over-escalate. A true re-ask (same words) is the signal.
+const INQUIRY_STOPWORDS = new Set<string>([
+  // English connectives / fillers that carry no info-need.
+  'the', 'a', 'an', 'is', 'are', 'do', 'does', 'did', 'can', 'could', 'would', 'will', 'to', 'of',
+  'for', 'and', 'or', 'me', 'my', 'it', 'this', 'that', 'there', 'you', 'your', 'please', 'so',
+  'ok', 'okay', 'yes', 'no', 'hi', 'hey', 'hello',
+  // Hebrew connectives / pronouns (the salient content word, e.g. עולה / מחיר, survives).
+  'את', 'זה', 'אני', 'אתה', 'של', 'יש', 'לי', 'לך', 'כן', 'לא', 'גם', 'אם', 'עם', 'הוא', 'היא',
+])
+
+// Normalize a customer message into a compact content-token key for similarity comparison.
+// Pure + exported for tests. Returns '' when the message carries no trackable info-need (social/noise).
+export function inquiryNeedKey(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !INQUIRY_STOPWORDS.has(w))
+    .join(' ')
+}
+
+// Two info-needs are "the same ask" when their content tokens overlap heavily (Jaccard ≥ 0.5).
+// This links a verbatim/near-verbatim re-ask while keeping a related follow-up (price → discount)
+// distinct. Pure + exported for tests.
+export function inquiryNeedsAreSimilar(a: string, b: string): boolean {
+  const A = new Set(a.split(' ').filter(Boolean))
+  const B = new Set(b.split(' ').filter(Boolean))
+  if (A.size === 0 || B.size === 0) return false
+  let inter = 0
+  for (const w of A) if (B.has(w)) inter++
+  const union = new Set([...A, ...B]).size
+  return inter / union >= 0.5
+}
+
+// Advance the per-session repeated-unmet-need counter for one inquiry/unknown turn. Given the prior
+// key/count from context and the current message, returns the next counter state and whether the core
+// should now escalate (the 2nd recurrence of a similar unmet ask). On escalation the count resets to 0
+// so it never re-fires turn-after-turn (the engine's dedup gate is the backstop). Pure + exported.
+export function repeatedUnmetNeedStep(
+  priorKey: string | undefined,
+  priorCount: number | undefined,
+  messageText: string,
+): { key: string; count: number; escalate: boolean } {
+  const key = inquiryNeedKey(messageText)
+  if (!key) return { key: '', count: 0, escalate: false } // no content → not a trackable need
+  const similar = priorKey ? inquiryNeedsAreSimilar(key, priorKey) : false
+  const count = similar ? (priorCount ?? 1) + 1 : 1
+  const escalate = count >= 2
+  return { key, count: escalate ? 0 : count, escalate }
 }
 
 // F3a/S3 — perform the real owner escalation for an unanswerable question and return the honest
@@ -1164,23 +1283,42 @@ export async function handleBookingFlow(
     loadCustomerBookingTimes(db, identity.id, businessTimezone).catch(() => [] as string[]),
   ])
   // Fresh-spine occupancy reader for the output gate: re-reads a focused day's real
-  // class/slot availability so a "full" claim can never launder past makeGenReply
-  // without a current spine check. `open` counts ONLY genuinely-open capacity (classes
-  // with spotsLeft > 0, or any private gap) — buildDayOptionsText's `offered` includes
-  // FULL classes too, so it must NOT be used as the open signal (that would misfire the
-  // gate on a genuinely full day and degrade a correct "fully booked" reply). We
-  // deliberately read WITHOUT negotiation constraints: the backstop only judges the
-  // truthfulness of a BLANKET "full" claim, and the fallback names no specific time, so
-  // a session-rejected-but-open slot should still prevent a false "the whole day is dead".
-  const dayHasOpenOptions = async (dateStr: string, serviceTypeId?: string): Promise<{ open: boolean; text: string | null }> => {
-    if (!business) return { open: false, text: null }
+  // class/slot availability so a "full" claim can never launder past makeGenReply without a
+  // current spine check. Open counts ONLY genuinely-open capacity (classes with spotsLeft > 0,
+  // or any private gap) — buildDayOptionsText's `offered` includes FULL classes too, so it must
+  // NOT be used as the open signal (that would misfire the gate on a genuinely full day and
+  // degrade a correct "fully booked" reply). We deliberately read WITHOUT negotiation
+  // constraints: the backstop only judges the truthfulness of a BLANKET "full" claim, and the
+  // fallback names no specific time, so a session-rejected-but-open slot should still prevent a
+  // false "the whole day is dead".
+  // T2.1 — reads the WHOLE requested day and reports BOTH scope signals: `openOverall` (any
+  // service open that day) and `openInService` (the named service open that day, unfiltered by
+  // time). A service+specific-time miss ("Pilates at 12") can therefore never read as
+  // whole-service-empty — `openInService` still sees Pilates 9/11/14/18. `text` carries the
+  // service's real open options when the service is open, else the whole day's, so the occupancy
+  // correction re-grounds on real times (every one from a class block / real private opening —
+  // never a between-class gap).
+  const dayHasOpenOptions = async (
+    dateStr: string,
+    serviceTypeId?: string,
+  ): Promise<{ openOverall: boolean; openInService: boolean; text: string | null }> => {
+    if (!business) return { openOverall: false, openInService: false, text: null }
     try {
-      const day = await listDayOptions(db, business, dateStr, businessTimezone, serviceTypeId ? { serviceTypeId } : {})
-      const open = day.classes.some((c) => c.spotsLeft > 0) || day.privateOpenings.some((p) => p.slots.length > 0)
-      const r = await buildDayOptionsText(db, business, dateStr, businessTimezone, serviceTypeId, undefined)
-      return { open, text: r.text }
+      const wholeDay = await listDayOptions(db, business, dateStr, businessTimezone, {})
+      const openOverall = wholeDay.classes.some((c) => c.spotsLeft > 0) || wholeDay.privateOpenings.some((p) => p.slots.length > 0)
+      let openInService = openOverall
+      if (serviceTypeId) {
+        const svcDay = await listDayOptions(db, business, dateStr, businessTimezone, { serviceTypeId })
+        openInService = svcDay.classes.some((c) => c.spotsLeft > 0) || svcDay.privateOpenings.some((p) => p.slots.length > 0)
+      }
+      // Surface the named service's day when it has openings; otherwise fall back to the whole
+      // day (so "the whole day is full" regenerates against the open cross-service options).
+      const r = openInService
+        ? await buildDayOptionsText(db, business, dateStr, businessTimezone, serviceTypeId, undefined)
+        : await buildDayOptionsText(db, business, dateStr, businessTimezone, undefined, undefined)
+      return { openOverall, openInService, text: r.text }
     } catch {
-      return { open: false, text: null }
+      return { openOverall: false, openInService: false, text: null }
     }
   }
   // ── Addressee gender (decision 1): resolve how the PA addresses THIS customer in Hebrew ──
@@ -1210,7 +1348,15 @@ export async function handleBookingFlow(
   const addresseeGenderRef: { gender: AddresseeGender | null } = {
     gender: await applyGenderSignal(inferSelfGenderFromHebrew(messageText)),
   }
-  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id, addresseeGenderRef)
+  // Phase 0 (X1): per-turn identity for the gate-decision telemetry line. `intent` is filled in
+  // below once the customer intent is extracted (genReply is built before intent resolution);
+  // the few pre-intent genReply paths (rebook/greeting) emit with intent:null, which is correct.
+  const gateTelemetryCtx: { identityId: string | null; sessionId: string | null; intent: string | null } = {
+    identityId: identity.id,
+    sessionId: session.id,
+    intent: null,
+  }
+  const genReply = makeGenReply(businessFacts, actionLedger, { boundaryTimes, bookingTimes }, dayHasOpenOptions, business?.id, addresseeGenderRef, gateTelemetryCtx)
 
   // ── REBOOK shortcut — treat as fresh booking intent (B5: includes Hebrew variants) ──
   const rebookVariants = /^(rebook|re-book|תיאום מחדש|קביעת תור מחדש|לקבוע מחדש|להזמין מחדש)$/i
@@ -1437,6 +1583,7 @@ export async function handleBookingFlow(
   }
 
   const intent = intentResult.data
+  gateTelemetryCtx.intent = intent.intent // Phase 0 (X1): tag the gate-decision line with the resolved intent class.
   // Capture the customer's name the first time they state it (non-blocking, never clobbers).
   await persistCapturedName(db, identity.businessId, identity.id, identity.displayName ?? null, intent.customerNameHint ?? null)
   const detectedLanguage = intent.detectedLanguage
@@ -1478,12 +1625,24 @@ export async function handleBookingFlow(
   // total — handlers receive updatedCtx and persist from it, so the reset sticks.
   // WL-3: `let` (not const) — the full-slot waitlist follow-up clears pendingWaitlistJoin in-place
   // before falling through to normal booking on the slot_has_space (re-opened seat) path.
+  // T3.2 — repeated-unmet-need net. Only inquiry/unknown turns carry an info-need worth relaying;
+  // every other (actionable) intent means the customer moved on, so the counter RESETS (Discipline
+  // #3 — mirrors the sessionUnknownCount reset below). Computed once here; the inquiry/unknown cases
+  // below escalate through the SAME throttled owner-relay when a similar ask recurs (2nd time).
+  const tracksUnmetNeed = intent.intent === 'inquiry' || intent.intent === 'unknown'
+  const unmetNeed = tracksUnmetNeed
+    ? repeatedUnmetNeedStep(ctx.lastInquiryKey, ctx.inquiryRepeatCount, messageText)
+    : { key: '', count: 0, escalate: false }
+
   let updatedCtx: BookingFlowContext = {
     ...ctx,
     detectedLanguage,
     ...(mayGreet ? { greeted: true } : {}),
     ...(shouldOfferSwitch ? { languageSwitchOfferPending: true } : {}),
     ...(intent.intent !== 'unknown' ? { sessionUnknownCount: 0 } : {}),
+    ...(tracksUnmetNeed
+      ? { lastInquiryKey: unmetNeed.key, inquiryRepeatCount: unmetNeed.count }
+      : { lastInquiryKey: undefined, inquiryRepeatCount: 0 }),
   }
 
   // Prefix injected into situation strings for first-message targeted intents
@@ -1636,6 +1795,27 @@ export async function handleBookingFlow(
             availabilityText = r.text
             inquiryOffered.push(...r.offered)
           }
+          // T2.3 (PRIMARY/PREVENTIVE) — a day-less follow-up that names a concrete TIME
+          // ("פילאטיס ב 12") references the day already in context. Re-anchor to the prior
+          // inquiry focus and ground the WHOLE day UNFILTERED by service and time-bucket, so the
+          // situation carries that day's real whole-service set (Pilates 9/11/14/18) AND the
+          // cross-service option at the asked time (Yoga at 12) — never an empty/narrowed
+          // situation the model launders into "all full" + a premature pivot to OTHER days. Every
+          // surfaced time comes from buildDayOptionsText (class blocks / real private openings),
+          // so a between-class gap can never leak as bookable. Runs BEFORE the next-classes
+          // fallback so it pre-empts the other-day pivot.
+          if (!availabilityText) {
+            const reanchorDay = reanchorInquiryGroundingDay(
+              !!(resolvedDay && resolvedDay.ok),
+              intent.slotRequest?.time != null,
+              updatedCtx.lastInquiryFocus?.dateStr,
+            )
+            if (reanchorDay) {
+              const r = await buildDayOptionsText(db, business, reanchorDay, businessTimezone, undefined, ctx.negotiationConstraints, null, true)
+              availabilityText = r.text
+              inquiryOffered.push(...r.offered)
+            }
+          }
           // No specific day resolved (or that day had nothing): answer from the right
           // availability MODEL. For a class-mode focus — or a class business with no
           // appointment focus — that is the scheduled CLASSES, never getOpenSlots gaps
@@ -1696,6 +1876,15 @@ export async function handleBookingFlow(
         // F3a/S3: the model signalled it can't answer → relay the question to the owner FOR
         // REAL and reply honestly, instead of fabricating "I'll check with the studio".
         if (isAskStudioSentinel(inquiryReply)) {
+          const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
+          return { reply: relay, sessionComplete: false }
+        }
+        // T3.2 — deterministic floor: the model just deflected (no sentinel) an unmet info-need the
+        // customer already asked in a SIMILAR form. Route the repeat through the SAME throttled owner-relay
+        // (substance/dedup/rate) so a genuine gap doesn't dead-end forever waiting on a sentinel that never
+        // comes. The reply is the question_passed_to_studio CODE TEMPLATE — never makeGenReply — so Gate-4
+        // keeps owning the phrasing and the honest line can't be flagged as an unbacked claim.
+        if (unmetNeed.escalate) {
           const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
           return { reply: relay, sessionComplete: false }
         }
@@ -1818,6 +2007,12 @@ export async function handleBookingFlow(
         }, unknownFocus ? { focusDay: unknownFocus } : undefined)
         // F3a/S3: the model signalled it can't answer → relay the question to the owner for real.
         if (isAskStudioSentinel(unknownReply)) {
+          const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
+          return { reply: relay, sessionComplete: false }
+        }
+        // T3.2 — deterministic floor (same as the inquiry path): a repeated unmet ask that the model
+        // deflected without a sentinel escalates through the throttled owner-relay CODE TEMPLATE.
+        if (unmetNeed.escalate) {
           const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
           return { reply: relay, sessionComplete: false }
         }
@@ -2640,9 +2835,19 @@ async function handleBookingIntent(
   const reply = await genReply({
     businessTimezone,
     businessName, language: lang, transcript, ...persona, customerMemory: extractMemory(ctx),
-    situation: `${firstMsgPrefix}Customer wants to book ${svc.name} on ${displayDate} at ${displayTime}. Restate the service, day, date and time clearly, then ask them to confirm.`,
+    situation: buildHoldConfirmSituation(firstMsgPrefix, svc.name, displayDate, displayTime),
   })
   return { reply, sessionComplete: false }
+}
+
+// T1.2 — the hold-confirm prompt. The confirm question MUST be a SINGLE yes/no on the exact slot:
+// the live P1 bug was an LLM-authored EITHER/OR ("release the spot … OR take it?"), which made a
+// bare "כן" semantically void and let the system book against a decline. Constraining the shape at
+// the source removes the ambiguity AND satisfies the Voice-Bible one-question rule (T1.1 remains
+// the deterministic catch when a customer declines with an embedded yes regardless of shape). Pure
+// + exported so the shape is unit-tested; kept warm/first-person (no Voice regression).
+export function buildHoldConfirmSituation(prefix: string, serviceName: string, displayDate: string, displayTime: string): string {
+  return `${prefix}Customer wants to book ${serviceName} on ${displayDate} at ${displayTime}. Restate the service, day, date and time clearly, then ask ONE clear yes/no question to confirm this exact slot. Do NOT stack a second question, and do NOT offer an either/or or any alternative in the same breath — a single, warm, first-person yes/no confirmation only.`
 }
 
 /**

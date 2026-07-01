@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions } from './customer-booking.js'
+import { persistCapturedName, classInstanceMissing, memoryForActiveService, anchorRescheduleDraft, appendNameRequest, buildBusinessFacts, resolveContinuationFocusDay, reanchorInquiryGroundingDay, promotableOfferedSlots, isAskStudioSentinel, bestEffortInquiryFocusDay, handleWaitlistJoinRequest, resolveConcreteWaitlistSlot, renderDayOptions, buildHoldConfirmSituation, inquiryNeedKey, inquiryNeedsAreSimilar, repeatedUnmetNeedStep } from './customer-booking.js'
 import { t } from '../i18n/t.js'
 
 vi.mock('../identity/customer-resolver.js', () => ({
@@ -276,6 +276,65 @@ describe('owner-question relay is NON-BLOCKING (T2c.1 / constraint #3b)', () => 
   })
 })
 
+// ── T3.2 — repeated-unmet-need deterministic escalation net (P3) ──────────────
+// LIVE BUG: price asked 3× (price genuinely null) → 3 dead-end deflections, owner never pinged
+// because escalation fired only on the LLM's [[ASK_STUDIO]] sentinel. T3.2 raises the deterministic
+// floor: when a customer re-asks a SIMILAR unmet info-need, the core escalates itself (2nd
+// recurrence) through the SAME throttled owner-relay — topic-agnostic, no intent-extraction change.
+describe('T3.2 — repeated-unmet-need escalation (repeated ask → deterministic owner relay)', () => {
+  it('escalates on the 2nd recurrence of a SIMILAR unmet ask, not the 1st (the live "asked again, still deflected")', () => {
+    const s1 = repeatedUnmetNeedStep(undefined, undefined, 'כמה זה עולה?')
+    expect(s1.escalate).toBe(false)
+    expect(s1.count).toBe(1)
+    const s2 = repeatedUnmetNeedStep(s1.key, s1.count, 'כמה זה עולה?')
+    expect(s2.escalate).toBe(true) // one escalation on the 2nd → exactly one pending_owner_questions row
+  })
+
+  it('a DIFFERENT question each turn never escalates (only a true unmet REPEAT counts)', () => {
+    const s1 = repeatedUnmetNeedStep(undefined, undefined, 'what time do you open on Sunday?')
+    const s2 = repeatedUnmetNeedStep(s1.key, s1.count, 'do you have parking on site?')
+    expect(s2.escalate).toBe(false)
+    const s3 = repeatedUnmetNeedStep(s2.key, s2.count, 'is there a vegan option available?')
+    expect(s3.escalate).toBe(false)
+  })
+
+  it('a RELATED follow-up is NOT the same ask (price? → any discount?) — no over-escalation', () => {
+    const s1 = repeatedUnmetNeedStep(undefined, undefined, "what's the price?")
+    const s2 = repeatedUnmetNeedStep(s1.key, s1.count, 'is there any discount?')
+    expect(s2.escalate).toBe(false)
+  })
+
+  it('similarity: same info-need is similar to itself; a related-but-different ask is not', () => {
+    expect(inquiryNeedsAreSimilar(inquiryNeedKey('כמה זה עולה?'), inquiryNeedKey('כמה זה עולה'))).toBe(true)
+    expect(inquiryNeedsAreSimilar(inquiryNeedKey("what's the price?"), inquiryNeedKey('any discount?'))).toBe(false)
+    // A social/empty message yields no trackable key (never counts as a repeat).
+    expect(inquiryNeedKey('?!')).toBe('')
+  })
+
+  it('after escalating it does not immediately re-escalate on the very next identical ask (dedup is the backstop)', () => {
+    const s1 = repeatedUnmetNeedStep(undefined, undefined, 'how much does it cost?')
+    const s2 = repeatedUnmetNeedStep(s1.key, s1.count, 'how much does it cost?')
+    expect(s2.escalate).toBe(true)
+    const s3 = repeatedUnmetNeedStep(s2.key, s2.count, 'how much does it cost?')
+    expect(s3.escalate).toBe(false) // counter reset on escalation; the engine dedup guards a re-ask
+  })
+
+  it('the inquiry AND unknown paths route the repeat through the throttled owner-relay CODE TEMPLATE (never makeGenReply → Gate-4 never authors it)', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    // Escalation goes through relayUnansweredToOwner → escalateCustomerQuestion (substance/dedup/rate
+    // throttle) whose customer reply is the question_passed_to_studio i18n template — a CODE TEMPLATE.
+    const hits = src.match(/unmetNeed\.escalate[\s\S]{0,200}?relayUnansweredToOwner\(db, business, identity, messageText/g) ?? []
+    expect(hits.length).toBeGreaterThanOrEqual(2) // inquiry path + default/unknown path
+  })
+
+  it('DISCIPLINE #3: the counter resets on every non-inquiry/non-unknown intent (mirrors the sessionUnknownCount reset)', () => {
+    const src = readFileSync(new URL('./customer-booking.ts', import.meta.url), 'utf8')
+    // The reset lives in the same updatedCtx construction as the sessionUnknownCount reset, so an
+    // actionable intent (book/cancel/reschedule) clears a stale unmet-need trail — no over-escalation.
+    expect(src).toMatch(/lastInquiryKey: undefined, inquiryRepeatCount: 0/)
+  })
+})
+
 describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day)', () => {
   it('this-turn day wins over draft and lastInquiry', () => {
     expect(resolveContinuationFocusDay('2026-07-05', '2026-07-01', '2026-06-28')).toBe('2026-07-05')
@@ -291,6 +350,24 @@ describe('resolveContinuationFocusDay — T2.2 Hole B (persist inquiry focus day
   })
   it('returns undefined when all empty', () => {
     expect(resolveContinuationFocusDay(undefined, undefined, undefined)).toBeUndefined()
+  })
+})
+
+describe('reanchorInquiryGroundingDay — T2.3 (§K "Sunday full" preventive grounding re-anchor)', () => {
+  const SUN = '2026-07-05' // the day already in context (prior inquiry focus)
+  it('REPRO: "פילאטיס ב 12" (no day, concrete time) re-anchors to the prior inquiry focus', () => {
+    // The live bug: a day-less, specific-time follow-up pivoted to other days. It must instead
+    // ground against the day already in context so the situation carries that day's whole-service set.
+    expect(reanchorInquiryGroundingDay(false, true, SUN)).toBe(SUN)
+  })
+  it('does NOT re-anchor when this turn already named a day (existing resolvedDay path owns it)', () => {
+    expect(reanchorInquiryGroundingDay(true, true, SUN)).toBeNull()
+  })
+  it('does NOT re-anchor a bare service/topic question with no concrete time (no context-day assumption)', () => {
+    expect(reanchorInquiryGroundingDay(false, false, SUN)).toBeNull()
+  })
+  it('does NOT re-anchor when there is no prior inquiry focus to anchor to', () => {
+    expect(reanchorInquiryGroundingDay(false, true, undefined)).toBeNull()
   })
 })
 
@@ -439,6 +516,26 @@ describe('buildBusinessFacts — service narrative grounding (T2b.1, H13/H15)', 
     // The narrative is attached to its own service line, not the other one.
     const yogaLine = out.split('\n').find((l) => l.includes('Yoga')) ?? ''
     expect(yogaLine).not.toContain('reformers')
+  })
+})
+
+describe('buildBusinessFacts — T3.3 null-price framing nudges relay, not deflection (P3)', () => {
+  const svcs = [{ id: 'p', name: 'Pilates', durationMinutes: 50, maxParticipants: 4 }]
+  it('a null-price service names the honest RELAY route (relay-if-asked), not just "steer past"', () => {
+    // Live bug: "no price on record — do NOT quote a price" read to the model as "I know the answer
+    // (there's no price) → steer", so it deflected instead of escalating. The line must still forbid
+    // invention AND name the relay route so a price gap routes to the owner (belt-and-suspenders w/ T3.2).
+    const out = buildBusinessFacts(svcs, undefined, undefined, [])
+    expect(out).toMatch(/do NOT quote|no price on record/i) // still forbids inventing a price
+    expect(out).toMatch(/relay|studio question/i)           // names the honest route
+    expect(out).toMatch(/not to steer past|if (the customer )?ask/i)
+  })
+  it('a present-price service is unchanged (no relay framing on a known price)', () => {
+    const knowledge = { services: [{ id: 'p', price: 80, currency: '₪' }] } as unknown as Parameters<typeof buildBusinessFacts>[1]
+    const out = buildBusinessFacts(svcs, knowledge, undefined, [])
+    expect(out).toContain('80')
+    const pilatesLine = out.split('\n').find((l) => l.includes('Pilates')) ?? ''
+    expect(pilatesLine).not.toMatch(/relay|studio question|steer past/i)
   })
 })
 
@@ -660,5 +757,36 @@ describe('full-slot waitlist offer + follow-up binding (WL-3)', () => {
   it('clears pendingWaitlistJoin on the paths that clear other pending state', () => {
     // The redirect/clear destructure that strips pendingSlot/pendingDecision also drops pendingWaitlistJoin.
     expect(src).toMatch(/const \{[^}]*pendingWaitlistJoin:[^}]*\}\s*=\s*ctx/)
+  })
+})
+
+// T1.2 (live P1 bug): the hold-confirm prompt was LLM-authored as an either/or
+// ("release the spot … OR take it?"), which made a bare "כן" semantically void and let the
+// system book against a decline. The prompt situation must now constrain the model to a SINGLE
+// yes/no confirmation of the exact slot — no stacked second question, no either/or — which also
+// satisfies the Voice-Bible one-question rule. Pure shape test on buildHoldConfirmSituation.
+describe('buildHoldConfirmSituation — single yes/no confirm, no either/or (T1.2)', () => {
+  const s = buildHoldConfirmSituation('Do NOT greet. ', 'פילאטיס', 'Sunday, 5 Jul', '18:00')
+
+  it('restates the exact slot (service, day, time) and carries the first-message prefix', () => {
+    expect(s).toContain('פילאטיס')
+    expect(s).toContain('Sunday, 5 Jul')
+    expect(s).toContain('18:00')
+    expect(s.startsWith('Do NOT greet. ')).toBe(true)
+  })
+
+  it('directs a SINGLE yes/no confirmation', () => {
+    expect(s).toMatch(/\bONE\b[^.]*yes\/no/i)
+    expect(s).toMatch(/single[^.]*yes\/no/i)
+  })
+
+  it('explicitly forbids stacking a second question or offering an either/or', () => {
+    expect(s).toMatch(/do NOT stack/i)
+    expect(s).toMatch(/either\/or/i) // the directive names and forbids the either/or shape
+  })
+
+  it('stays warm + first-person (no robotic menu tell)', () => {
+    expect(s).toMatch(/first-person/i)
+    expect(s).not.toMatch(/numbered|menu|press \d/i)
   })
 })

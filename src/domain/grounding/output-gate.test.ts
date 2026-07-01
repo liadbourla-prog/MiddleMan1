@@ -20,7 +20,7 @@ import { assertsBookingConfirmed } from '../flows/reply-guard.js'
 // exit paths: the bookingConfirmed early-return, the three gate exits, the occupancy-spine
 // early-return, and the isSafeFallback final return.
 
-const NEVER_SPINE: OccupancySpine = async () => ({ open: false, text: null })
+const NEVER_SPINE: OccupancySpine = async () => ({ openOverall: false, openInService: false, text: null })
 
 function ctx(opts: {
   input?: Partial<GateContext['input']>
@@ -101,7 +101,7 @@ describe('gateReply — Gate 2: fabricated time', () => {
 
 describe('gateReply — Gate 3: occupancy', () => {
   it('exit path 2: spine early-return regenerates a laundered "full" claim; fallback on persistence', async () => {
-    const spine: OccupancySpine = async () => ({ open: true, text: '10:00, 12:00' })
+    const spine: OccupancySpine = async () => ({ openOverall: true, openInService: true, text: '10:00, 12:00' })
     const regen = vi.fn(async () => 'עדיין מלא לגמרי אצלנו') // still asserts fullness, no time
     const res = await gateReply(
       'היום מלא לגמרי',
@@ -113,7 +113,7 @@ describe('gateReply — Gate 3: occupancy', () => {
   })
 
   it('exit path 2: spine early-return keeps a clean correction', async () => {
-    const spine: OccupancySpine = async () => ({ open: true, text: '10:00, 12:00' })
+    const spine: OccupancySpine = async () => ({ openOverall: true, openInService: true, text: '10:00, 12:00' })
     const regen = vi.fn(async () => 'יש מקומות פנויים, איזו שעה מתאימה?')
     const res = await gateReply(
       'אין מקום',
@@ -406,7 +406,7 @@ describe('gateReply — post-regen re-check kills oscillation (D6)', () => {
     // The reply asserts fullness with an open spine → occupancy gate regens. The regen "fixes"
     // occupancy but re-introduces an unbacked time (19:00 is not in any allowlist) — the re-check
     // must catch it and route to FABRICATED_TIME_FALLBACK, NOT ship the laundered time.
-    const spine: OccupancySpine = async () => ({ open: true, text: '10:00, 12:00' })
+    const spine: OccupancySpine = async () => ({ openOverall: true, openInService: true, text: '10:00, 12:00' })
     const regen = vi.fn(async () => 'יש מקום ב-19:00, רוצה?') // clean occupancy, NEW unbacked time
     const res = await gateReply(
       'היום מלא לגמרי',

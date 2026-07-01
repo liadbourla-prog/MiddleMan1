@@ -17,7 +17,8 @@ function branch3Ledger(opts: {
   occupancyText?: string | null
 }) {
   const spine: OccupancySpine = async () => ({
-    open: opts.occupancyOpen ?? false,
+    openOverall: opts.occupancyOpen ?? false,
+    openInService: opts.occupancyOpen ?? false,
     text: opts.occupancyText ?? null,
   })
   return buildTurnLedger({
@@ -307,7 +308,7 @@ describe('gateAndAuditBranch3Reply — budget + F-rev4 (T-REGEN)', () => {
     const ledger = buildTurnLedger({
       businessFacts: '', actionLedger: '',
       baseAllowedTimes: { boundaryTimes: [], bookingTimes: [] },
-      occupancySpine: async () => ({ open: false, text: null }), backedActions: [], calendarConnected: false, businessId: 'biz-1',
+      occupancySpine: async () => ({ openOverall: false, openInService: false, text: null }), backedActions: [], calendarConnected: false, businessId: 'biz-1',
     })
     const budget = makeRegenBudget({ max: 0, deadlineMs: Date.now() + 60_000 })
     const out = await gateAndAuditBranch3Reply({

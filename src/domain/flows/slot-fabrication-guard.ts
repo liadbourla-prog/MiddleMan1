@@ -158,6 +158,27 @@ const DAY_TOKENS: Array<{ re: RegExp; key: string }> = [
   { re: /שבת/, key: 'שבת' },
 ]
 
+// Canonical day keys (Hebrew core + English name) per weekday index 0=Sun..6=Sat — the exact
+// keys extractDayScopedTimes attributes times to. Lets a caller map a focus DATE to the day
+// section a reply would scope a same-day time under (T2.2 day-aware occupancy backstop).
+const WEEKDAY_DAY_KEYS: ReadonlyArray<{ he: string; en: string }> = [
+  { he: 'ראשון', en: 'sunday' }, { he: 'שני', en: 'monday' }, { he: 'שלישי', en: 'tuesday' },
+  { he: 'רביעי', en: 'wednesday' }, { he: 'חמישי', en: 'thursday' }, { he: 'שישי', en: 'friday' },
+  { he: 'שבת', en: 'saturday' },
+]
+
+/**
+ * The Hebrew + English day-section keys for a business-local 'YYYY-MM-DD'. A calendar date has a
+ * fixed weekday regardless of timezone, so we read it at UTC-noon (immune to DST/offset edges).
+ * Returns null for an unparseable string. Pure.
+ */
+export function weekdayKeysForDateStr(dateStr: string): { he: string; en: string } | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null
+  const d = new Date(`${dateStr}T12:00:00Z`)
+  const idx = d.getUTCDay()
+  return WEEKDAY_DAY_KEYS[idx] ?? null
+}
+
 // Find the day key whose token appears latest at-or-before `idx` in `text`.
 function dayKeyAt(text: string, idx: number): string {
   const head = text.slice(0, idx)

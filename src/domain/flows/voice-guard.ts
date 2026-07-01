@@ -159,6 +159,32 @@ export function hasDeadEnd(text: string): boolean {
   return true
 }
 
+// ── 8. Either/or two-arm confirm prompt ────────────────────────────────────
+// The P1 proximate trigger: a confirm PROMPT that offers a two-arm either/or ("take it,
+// OR release and look elsewhere?") makes a bare "yes" semantically void — the customer
+// declined one arm, the system read the embedded "yes" and booked. Backed structurally by
+// T1.2 (buildHoldConfirmSituation now constrains the confirm to a SINGLE yes/no), this
+// detector is the functional NET for when an either/or still slips into a prompt.
+//
+// PRECISION: fires ONLY on a QUESTION (a prompt has a `?`) that carries a two-arm CHOICE
+// connective — a comma/dash-preceded "או"/"or", "או ש…" ("or [do] you…"), or an explicit
+// "either … or …". A grounded single-question clarification ("which works better?") and a
+// bare statement with "or" (no `?`) do NOT match, so warm PA clarifications pass clean.
+const EITHER_OR_HE_RE: RegExp[] = [
+  /[,،—–-]\s*או\s/, // "…, או …" — a comma/dash-joined two-arm choice
+  /\bאו\s+ש(?:את|אתה|אתם|תרצ|רוצ|אני|נ)/, // "או ש[את/אתה/תרצה/רוצה…]" — "or [do] you…"
+]
+const EITHER_OR_EN_RE: RegExp[] = [
+  /\beither\b[^?]{0,80}\bor\b/i, // "either … or …"
+  /[,—–-]\s*or\s+(?:do|would|should|shall|are|you)\b/i, // "…, or do/would/… you …"
+  /\bor\s+would\s+you\s+rather\b/i, // "… or would you rather …"
+]
+export function hasEitherOrPrompt(text: string): boolean {
+  if (!text) return false
+  if (!/[?？]/.test(text)) return false // an either/or bot-tell is a PROMPT, not a statement
+  return EITHER_OR_HE_RE.some((re) => re.test(text)) || EITHER_OR_EN_RE.some((re) => re.test(text))
+}
+
 // Gate 4 (F3a/F3b/S3) — ACTION FABRICATION. A reply that CLAIMS the PA took an action it
 // cannot self-perform — asked/checked with the owner, reached out, "I'll get back to you",
 // "one of our guides will" — is honest ONLY when a real escalation produced it. The honest
@@ -187,6 +213,7 @@ export type BotTell =
   | 'stacked_questions'
   | 'grovel'
   | 'dead_end'
+  | 'either_or'
   | 'action_fabrication'
 
 const DETECTORS: ReadonlyArray<readonly [BotTell, (text: string) => boolean]> = [
@@ -197,6 +224,7 @@ const DETECTORS: ReadonlyArray<readonly [BotTell, (text: string) => boolean]> = 
   ['stacked_questions', hasStackedQuestions],
   ['grovel', hasGrovel],
   ['dead_end', hasDeadEnd],
+  ['either_or', hasEitherOrPrompt],
 ]
 // NOTE: hasActionFabrication is deliberately NOT in this aggregator. A warm, BACKED escalation
 // hand-off ("passed it to the studio, they'll get back to you") reads great and is honest, so
@@ -211,6 +239,17 @@ const DETECTORS: ReadonlyArray<readonly [BotTell, (text: string) => boolean]> = 
 export function detectBotTells(text: string): BotTell[] {
   return DETECTORS.filter(([, fn]) => fn(text)).map(([tell]) => tell)
 }
+
+// ── Phase 4 / X2 — FUNCTIONAL vs cosmetic-monitor classification ────────────
+// Two mechanical tells graduate from cosmetic-monitor to FUNCTIONAL because a structural
+// fix now backs each — they were the proximate triggers of real P1/P3 harm:
+//   • either_or ← T1.2 (buildHoldConfirmSituation constrains the confirm to a single yes/no)
+//   • dead_end  ← T3.1/T3.2 (repeated-unmet-need deterministic escalation)
+// Graduation is an OBSERVATION only: observeVoiceTells surfaces these as a distinct
+// `functional` flag on the monitor line so a functional issue is no longer indistinguishable
+// from a cosmetic one. It adds NO regen authority — the observer stays monitor-only (returns
+// the reply byte-for-byte, never mutates, never regenerates). Everything else stays cosmetic.
+export const FUNCTIONAL_TELLS: ReadonlySet<BotTell> = new Set<BotTell>(['either_or', 'dead_end'])
 
 // ── Gate 7 observer (MONITOR-ONLY) ─────────────────────────────────────────
 // Regen is OFF by default. The flag is read into a const that is never true in
@@ -234,8 +273,14 @@ export function observeVoiceTells(
   let tells = detectBotTells(reply)
   if (opts?.isSafeFallback) tells = tells.filter((t) => t !== 'dead_end')
   if (tells.length > 0) {
+    // Split the graduated FUNCTIONAL tells (either_or ← T1.2, dead_end ← T3.1/T3.2) out of the
+    // cosmetic set so a functional issue is distinguishable in the log. Still monitor-only:
+    // the reply is returned byte-for-byte below; no regen path is taken from this flag.
+    const functional = tells.filter((t) => FUNCTIONAL_TELLS.has(t))
     console.warn('[voice-gate] bot-tell detected (monitor-only)', {
-      businessId: ctx.businessId, gate: 'voice', tells, draftExcerpt: reply.slice(0, 200),
+      businessId: ctx.businessId, gate: 'voice', tells,
+      functional, hasFunctional: functional.length > 0,
+      draftExcerpt: reply.slice(0, 200),
     })
   }
   // Gate 4 (F3a/F3b/S3) — action-fabrication is now ENFORCED in gateReply (T3.1a), not
