@@ -73,14 +73,19 @@ export function buildInstructorRosterBlock(roster: InstructorRosterEntry[], lang
   return lines.join('\n')
 }
 
-export interface TeachingSlot { providerId: string; instructor: string; service: string; dayOfWeek: number; startTime: string }
+// providerId/instructor are nullable: an owner-imported class (source='google_import',
+// T1.5/R4) has no assigned instructor yet. It is still listed — the missing instructor is
+// surfaced honestly as "instructor TBD", never fabricated (G6-safe).
+export interface TeachingSlot { providerId: string | null; instructor: string | null; service: string; dayOfWeek: number; startTime: string }
 
 /**
  * Derive "who teaches what" from the upcoming scheduled class blocks
  * (calendar_blocks type='class' with a providerId) over the next `horizonDays`.
  * This is the live source for the instructor FAQ — it reflects the actual
- * week-to-week schedule, not a typed-once paragraph. Title-only classes and
- * instructor-less classes are skipped (no providerId or no linked service).
+ * week-to-week schedule, not a typed-once paragraph. A class with no linked service is
+ * skipped; a class with no assigned instructor (an owner-imported class, providerId=null)
+ * is KEPT via a LEFT JOIN and surfaced as "instructor TBD" (T1.5/R4) — the old INNER JOIN
+ * silently dropped it.
  */
 export async function loadTeachingSchedule(
   db: Db,
@@ -98,7 +103,7 @@ export async function loadTeachingSchedule(
       startTs: calendarBlocks.startTs,
     })
     .from(calendarBlocks)
-    .innerJoin(identities, eq(calendarBlocks.providerId, identities.id))
+    .leftJoin(identities, eq(calendarBlocks.providerId, identities.id))
     .innerJoin(serviceTypes, eq(calendarBlocks.serviceTypeId, serviceTypes.id))
     .where(and(
       eq(calendarBlocks.businessId, businessId),
@@ -112,10 +117,12 @@ export async function loadTeachingSchedule(
   const seen = new Set<string>()
   const out: TeachingSlot[] = []
   for (const r of rows) {
-    if (!r.providerId || !r.instructor || !r.service) continue
+    // Only a linked service is required. A null providerId/instructor (owner-imported class)
+    // is KEPT and rendered as "instructor TBD" — never dropped, never given a fabricated name.
+    if (!r.service) continue
     const lp = localParts(r.startTs, timezone)
     const startTime = `${String(Math.floor(lp.minutes / 60)).padStart(2, '0')}:${String(lp.minutes % 60).padStart(2, '0')}`
-    const key = `${r.providerId}|${r.service}|${lp.dayOfWeek}|${startTime}`
+    const key = `${r.providerId ?? 'tbd'}|${r.service}|${lp.dayOfWeek}|${startTime}`
     if (seen.has(key)) continue
     seen.add(key)
     out.push({ providerId: r.providerId, instructor: r.instructor, service: r.service, dayOfWeek: lp.dayOfWeek, startTime })
@@ -132,11 +139,15 @@ export function buildTeachingScheduleBlock(slots: TeachingSlot[], lang: 'he' | '
   const days = lang === 'he'
     ? ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ש']
     : ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+  // A null instructor (owner-imported class, T1.5) renders as a localized "instructor TBD"
+  // — the class is still listed, the missing instructor stated honestly (never fabricated).
+  const tbd = lang === 'he' ? 'מדריך/ה טרם נקבע' : 'instructor TBD'
   const byInstructor = new Map<string, TeachingSlot[]>()
   for (const s of slots) {
-    const arr = byInstructor.get(s.instructor) ?? []
+    const who = s.instructor ?? tbd
+    const arr = byInstructor.get(who) ?? []
     arr.push(s)
-    byInstructor.set(s.instructor, arr)
+    byInstructor.set(who, arr)
   }
   const lines = ['Upcoming classes by instructor (live; answer on demand, do not volunteer to customers):']
   for (const [instructor, list] of byInstructor) {

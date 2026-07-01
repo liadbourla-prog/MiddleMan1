@@ -17,7 +17,7 @@
  * authority. Occupancy is always counted internally; nothing here trusts a Google head-count.
  */
 
-import { and, eq, isNull } from 'drizzle-orm'
+import { and, eq, gte, isNull, lt } from 'drizzle-orm'
 import type { Db } from '../../db/client.js'
 import { businesses, calendarBlocks, identities, pendingOwnerQuestions, serviceTypes, type Business } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
@@ -69,6 +69,51 @@ export async function findPendingImportedClassForSlot(
     endTs: row.endTs as Date,
     maxParticipants: (row.maxParticipants as number | null) ?? null,
   }
+}
+
+/**
+ * Finding 3: the pending imported classes that START inside a day window, optionally narrowed
+ * to a named service. Used to surface a pending class on a DAY / any-time inquiry ("any Pilates
+ * Sunday?") — not only on a specific-time ask — so the day never reads as empty when a tentative
+ * class exists. These stay opaque type='block' rows (occupy-and-ask) and are surfaced as
+ * "tentative — confirming with the studio", NEVER as bookable. Occupancy is internal; nothing
+ * here trusts a Google head-count.
+ */
+export async function findPendingImportedClassesForDay(
+  db: Db,
+  businessId: string,
+  from: Date,
+  to: Date,
+  serviceTypeId?: string,
+): Promise<PendingImportedClass[]> {
+  const conds = [
+    eq(calendarBlocks.businessId, businessId),
+    eq(calendarBlocks.type, 'block'),
+    eq(calendarBlocks.source, 'google_import'),
+    gte(calendarBlocks.startTs, from),
+    lt(calendarBlocks.startTs, to),
+  ]
+  if (serviceTypeId) conds.push(eq(calendarBlocks.serviceTypeId, serviceTypeId))
+  const rows = await db
+    .select({
+      id: calendarBlocks.id,
+      serviceTypeId: calendarBlocks.serviceTypeId,
+      startTs: calendarBlocks.startTs,
+      endTs: calendarBlocks.endTs,
+      maxParticipants: calendarBlocks.maxParticipants,
+    })
+    .from(calendarBlocks)
+    .where(and(...conds))
+  // A plain opaque block (no serviceTypeId marker) is NOT a pending class — drop it.
+  return rows
+    .filter((r): r is typeof r & { serviceTypeId: string } => r.serviceTypeId != null)
+    .map((r) => ({
+      id: r.id as string,
+      serviceTypeId: r.serviceTypeId,
+      startTs: r.startTs as Date,
+      endTs: r.endTs as Date,
+      maxParticipants: (r.maxParticipants as number | null) ?? null,
+    }))
 }
 
 /**
