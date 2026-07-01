@@ -34,7 +34,9 @@ describe('buildBusinessFacts — closed-world grounding', () => {
 
   it('marks services with no price so the LLM cannot quote 450₪', () => {
     const facts = buildBusinessFacts(STUDIOGA_SERVICES, undefined, undefined)
-    expect(facts).toContain('do NOT quote a price')
+    // T3.3: still forbids quoting/inventing a price, now framed as a gap to RELAY (not steer past).
+    expect(facts).toMatch(/do NOT quote or invent a price/)
+    expect(facts).toMatch(/studio question to relay/)
   })
 
   it('renders a group service capacity when one genuinely exists', () => {

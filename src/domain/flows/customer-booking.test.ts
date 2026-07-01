@@ -519,6 +519,26 @@ describe('buildBusinessFacts — service narrative grounding (T2b.1, H13/H15)', 
   })
 })
 
+describe('buildBusinessFacts — T3.3 null-price framing nudges relay, not deflection (P3)', () => {
+  const svcs = [{ id: 'p', name: 'Pilates', durationMinutes: 50, maxParticipants: 4 }]
+  it('a null-price service names the honest RELAY route (relay-if-asked), not just "steer past"', () => {
+    // Live bug: "no price on record — do NOT quote a price" read to the model as "I know the answer
+    // (there's no price) → steer", so it deflected instead of escalating. The line must still forbid
+    // invention AND name the relay route so a price gap routes to the owner (belt-and-suspenders w/ T3.2).
+    const out = buildBusinessFacts(svcs, undefined, undefined, [])
+    expect(out).toMatch(/do NOT quote|no price on record/i) // still forbids inventing a price
+    expect(out).toMatch(/relay|studio question/i)           // names the honest route
+    expect(out).toMatch(/not to steer past|if (the customer )?ask/i)
+  })
+  it('a present-price service is unchanged (no relay framing on a known price)', () => {
+    const knowledge = { services: [{ id: 'p', price: 80, currency: '₪' }] } as unknown as Parameters<typeof buildBusinessFacts>[1]
+    const out = buildBusinessFacts(svcs, knowledge, undefined, [])
+    expect(out).toContain('80')
+    const pilatesLine = out.split('\n').find((l) => l.includes('Pilates')) ?? ''
+    expect(pilatesLine).not.toMatch(/relay|studio question|steer past/i)
+  })
+})
+
 describe('buildActiveServicesBlock — Branch-3 narrative parity (T2b.1)', () => {
   it('surfaces the same owner-authored narrative in the manager-facing services block', () => {
     const src = readFileSync(new URL('../../adapters/llm/orchestrator.ts', import.meta.url), 'utf8')

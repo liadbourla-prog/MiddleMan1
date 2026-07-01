@@ -1012,7 +1012,11 @@ export function buildBusinessFacts(
     const k = businessKnowledge?.services.find((ks) => ks.id === s.id)
     const price = k?.price != null
       ? `${k.price}${k.currency ? ' ' + k.currency : ''}`
-      : 'no price on record — do NOT quote a price'
+      // T3.3: frame a null price as a GAP to relay, not a fact to steer past. "do NOT quote a price"
+      // alone read to the model as "I know the answer (there's no price) → steer", which dead-ended
+      // a real price question instead of escalating. Naming the honest route nudges the ask-the-owner
+      // relay (belt-and-suspenders with T3.2's deterministic repeated-unmet-need trigger).
+      : 'no price on record — do NOT quote or invent a price; if the customer asks the price, this is a studio question to relay, not to steer past'
     lines.push(`• ${s.name} — ${s.durationMinutes} min, ${model}, ${price}`)
     // T2b.1: surface the owner-authored narrative closed-world. This is the studio's own
     // words about the service (equipment, level, what to expect) — the model may answer
