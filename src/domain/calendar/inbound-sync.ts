@@ -18,7 +18,7 @@ import { logAudit } from '../audit/logger.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { logInboundDecision, type ViaTrigger } from './inbound-telemetry.js'
 import { matchTitleToService, type ServiceMatch } from './service-match.js'
-import { parseStructuredClassMarker, localWeekday } from './classify.js'
+import { parseStructuredClassMarker, localWeekday, hasNegativeMarker, hasOccupancyProse } from './classify.js'
 
 // ── Inbound sync (Phase 3) ──────────────────────────────────────────────────────
 // Ingests owner-originated Google Calendar changes back into the internal record
@@ -420,12 +420,25 @@ export async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent
 
   // Class-mode match. Certainty via structured marker (secondary) or template/pattern
   // (primary). A marker naming this service is itself the certainty signal.
+  //
+  // Tightened gate (orchestrator "Tightened template", 2026-07-01): a certainty signal
+  // is necessary but no longer sufficient. Two VETOES demote a would-be-certain case to
+  // occupy-and-ASK, and the template path additionally requires a duration match:
+  //   · negative-marker veto (BOTH paths): a private/closed marker in title/description
+  //     is never auto-opened — a private class is safe by construction.
+  //   · phantom-occupancy veto (BOTH paths): occupancy-implying prose ("2/8", "booked")
+  //     implies external bookings we don't hold — ask the owner, never trust the count.
+  //   · duration match (template path): a same-service event of a DIFFERENT length is not
+  //     certainly a class instance. The marker path keeps its own declared capacity/duration.
   const markerCertain = marker != null && markerMatch != null
-  const templateCertain = !markerCertain && await hasExistingClassSeriesOnWeekday(
+  const eventDurationMinutes = Math.round((ev.end.getTime() - ev.start.getTime()) / 60000)
+  const durationMatches = service.classDurationMinutes != null && eventDurationMinutes === service.classDurationMinutes
+  const templateCertain = !markerCertain && durationMatches && await hasExistingClassSeriesOnWeekday(
     businessId, service.serviceTypeId, localWeekday(ev.start, ctx.business.timezone), ctx.business.timezone, ev.eventId,
   )
+  const vetoed = hasNegativeMarker(ev.summary, ev.description) || hasOccupancyProse(ev.description)
 
-  if (markerCertain || templateCertain) {
+  if ((markerCertain || templateCertain) && !vetoed) {
     // Capacity: the structured marker's declared capacity, else the service default.
     // NEVER a head-count parsed from prose — occupancy is counted internally.
     const capacity = marker?.capacity ?? service.defaultCapacity

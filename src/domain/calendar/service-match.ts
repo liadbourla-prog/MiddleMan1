@@ -25,6 +25,8 @@ export interface ServiceMatch {
   schedulingMode: 'appointment' | 'class'
   /** The service's default capacity (service_types.maxParticipants). */
   defaultCapacity: number
+  /** The service's class duration in minutes (service_types.durationMinutes), or null if unknown. */
+  classDurationMinutes: number | null
 }
 
 /**
@@ -80,6 +82,7 @@ export async function matchTitleToService(
       name: serviceTypes.name,
       schedulingMode: serviceTypes.schedulingMode,
       maxParticipants: serviceTypes.maxParticipants,
+      durationMinutes: serviceTypes.durationMinutes,
       isActive: serviceTypes.isActive,
     })
     .from(serviceTypes)
@@ -95,6 +98,7 @@ export async function matchTitleToService(
         serviceTypeId: s.id as string,
         schedulingMode: (s.schedulingMode as 'appointment' | 'class') ?? 'appointment',
         defaultCapacity: (s.maxParticipants as number) ?? 1,
+        classDurationMinutes: (s.durationMinutes as number | null | undefined) ?? null,
       }
       bestLen = normName.length
     }

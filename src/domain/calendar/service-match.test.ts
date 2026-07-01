@@ -45,14 +45,14 @@ describe('normalizeServiceTitle', () => {
 
 describe('matchTitleToService', () => {
   const SERVICES = [
-    { id: 'svc-pilates', name: 'פילאטיס', schedulingMode: 'class', maxParticipants: 8 },
-    { id: 'svc-massage', name: 'Massage', schedulingMode: 'appointment', maxParticipants: 1 },
+    { id: 'svc-pilates', name: 'פילאטיס', schedulingMode: 'class', maxParticipants: 8, durationMinutes: 60 },
+    { id: 'svc-massage', name: 'Massage', schedulingMode: 'appointment', maxParticipants: 1, durationMinutes: 30 },
   ]
 
   it('matches an exact-normalized Hebrew service name', async () => {
     const db = dbWithServices(SERVICES)
     const m = await matchTitleToService(db as never, 'biz-1', 'פילאטיס')
-    expect(m).toEqual({ serviceTypeId: 'svc-pilates', schedulingMode: 'class', defaultCapacity: 8 })
+    expect(m).toEqual({ serviceTypeId: 'svc-pilates', schedulingMode: 'class', defaultCapacity: 8, classDurationMinutes: 60 })
   })
 
   it('matches when the title CONTAINS the service name as a token ("Pilates class")', async () => {
@@ -64,7 +64,7 @@ describe('matchTitleToService', () => {
   it('matches an appointment-mode service and carries its mode + capacity', async () => {
     const db = dbWithServices(SERVICES)
     const m = await matchTitleToService(db as never, 'biz-1', 'massage')
-    expect(m).toEqual({ serviceTypeId: 'svc-massage', schedulingMode: 'appointment', defaultCapacity: 1 })
+    expect(m).toEqual({ serviceTypeId: 'svc-massage', schedulingMode: 'appointment', defaultCapacity: 1, classDurationMinutes: 30 })
   })
 
   it('returns null on a non-service title (privacy gate) — "dentist", "lunch", ""', async () => {

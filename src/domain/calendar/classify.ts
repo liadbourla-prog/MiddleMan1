@@ -13,6 +13,60 @@
  * are pure so the certainty gate is unit-testable in isolation.
  */
 
+import { normalizeServiceTitle } from './service-match.js'
+
+/**
+ * Negative/closed markers that VETO auto-open. If any appears in the (normalized)
+ * title or description, the event is NEVER auto-opened — it routes to occupy-and-ASK
+ * (weak_pending_confirm) regardless of any certainty signal. This is what makes a
+ * private/tentative/invite-only class safe by construction. Conservative + extendable.
+ * Single-word markers match as a whole token (so "household" never trips "hold");
+ * multi-word phrases match as a normalized substring.
+ */
+const NEGATIVE_MARKERS = [
+  // EN
+  'private', 'closed', 'blocked', 'personal', 'hold', 'do not book', 'cancelled', 'canceled',
+  // HE — פרטי(private) סגור(closed) חסום(blocked) אישי(personal) מבוטל(cancelled) ביטול(cancellation) לא לקבוע(do-not-schedule)
+  'פרטי', 'סגור', 'חסום', 'אישי', 'מבוטל', 'ביטול', 'לא לקבוע',
+] as const
+
+/**
+ * Occupancy-implying prose that VETOES auto-open: an N/M head-count (e.g. "2/8") or an
+ * occupancy word ("booked" / HE "נרשמו"/"תפוס"/"מלא"). Such prose implies pre-existing
+ * external bookings we don't hold, so it is a reason to ASK the owner — never a green
+ * light. We never PARSE the count; we only detect that prose exists and route to relay.
+ */
+const OCCUPANCY_WORDS = ['booked', 'נרשמו', 'תפוס', 'מלא'] as const
+const NM_HEADCOUNT = /\d+\s*\/\s*\d+/ // "2/8", "2 / 8" — a head-count we must never trust
+
+/**
+ * True iff any of the given texts (title, description) carries a private/closed marker.
+ * Applies to BOTH the template and structured-marker auto-open paths.
+ */
+export function hasNegativeMarker(...texts: Array<string | null | undefined>): boolean {
+  for (const raw of texts) {
+    const norm = normalizeServiceTitle(raw)
+    if (!norm) continue
+    const tokens = new Set(norm.split(' '))
+    for (const marker of NEGATIVE_MARKERS) {
+      if (marker.includes(' ')) {
+        if (norm.includes(marker)) return true // multi-word phrase → substring
+      } else if (tokens.has(marker)) {
+        return true // single word → whole-token (no partial-word false positives)
+      }
+    }
+  }
+  return false
+}
+
+/** True iff the description carries occupancy-implying prose (a head-count we must never trust). */
+export function hasOccupancyProse(description: string | null | undefined): boolean {
+  if (!description) return false
+  if (NM_HEADCOUNT.test(description)) return true // detect on RAW: normalization eats the '/'
+  const tokens = new Set(normalizeServiceTitle(description).split(' '))
+  return OCCUPANCY_WORDS.some((w) => tokens.has(w))
+}
+
 /** A parsed machine-readable class marker from an event description. */
 export interface StructuredClassMarker {
   serviceName: string

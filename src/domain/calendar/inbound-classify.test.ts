@@ -74,8 +74,9 @@ vi.mock('../initiations/booking-notify.js', () => ({
 import { reconcileOwnerEvent, type SyncContext } from './inbound-sync.js'
 import { INBOUND_DECISION_LOG_TYPE } from './inbound-telemetry.js'
 
-const PILATES = { id: 'svc-pilates', name: 'Pilates', schedulingMode: 'class', maxParticipants: 8, isActive: true }
-const MASSAGE = { id: 'svc-massage', name: 'Massage', schedulingMode: 'appointment', maxParticipants: 1, isActive: true }
+// 60-minute Pilates class, matching the 19:00→20:00 owner event below (template duration-match).
+const PILATES = { id: 'svc-pilates', name: 'Pilates', schedulingMode: 'class', maxParticipants: 8, durationMinutes: 60, isActive: true }
+const MASSAGE = { id: 'svc-massage', name: 'Massage', schedulingMode: 'appointment', maxParticipants: 1, durationMinutes: 30, isActive: true }
 
 function ctx(): SyncContext {
   return {
