@@ -113,6 +113,21 @@ describe('canHandle', () => {
     }
   })
 
+  it('returns true for the rich per-section phrasings the orchestrator cannot handle', () => {
+    for (const phrase of ['change my communication style', 'set the tone of voice', 'set up a handoff to a person', 'edit the automated messages', 'reword a message template', 'סגנון תקשורת', 'הודעות אוטומטיות', 'מסירה ללקוח']) {
+      const c = ctx(phrase)
+      expect(businessKnowledgeSetupSkill.canHandle(c), phrase).toBe(true)
+    }
+  })
+
+  it('does NOT swallow the orchestrator-owned settings (escalation, reminder timing, notifications)', () => {
+    // These belong to dedicated Branch-3 tools — the skill must let them fall through to the orchestrator.
+    for (const phrase of ['let me know if anyone mentions refund', 'escalate angry customers to me', 'remind customers 48 hours before', 'notify me about new bookings']) {
+      const c = ctx(phrase)
+      expect(businessKnowledgeSetupSkill.canHandle(c), phrase).toBe(false)
+    }
+  })
+
   it('returns false for customer callers even with trigger phrase', () => {
     const c = { ...ctx('update business info'), caller: { ...baseCtx.caller, role: 'customer' as const } }
     expect(businessKnowledgeSetupSkill.canHandle(c)).toBe(false)

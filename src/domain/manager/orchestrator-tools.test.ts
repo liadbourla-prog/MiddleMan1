@@ -19,11 +19,14 @@ import {
   executeConfigureProactiveFeatures,
   proactiveFeatureColumn,
   PROACTIVE_FEATURE_COLUMNS,
+  executeConfigureEscalationRules,
+  addEscalationRule,
+  removeEscalationRule,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
 import type { Action } from '../authorization/check.js'
-import type { BookingState } from '../../db/schema.js'
+import type { BookingState, EscalationRule } from '../../db/schema.js'
 
 // A ctx whose db/calendar throw on ANY access. If an executor returns a
 // clarification BEFORE touching either, we've proven the deterministic date
@@ -948,5 +951,113 @@ describe('configureProactiveFeatures — authorization (no state touched)', () =
     ) as { success: boolean; reason?: string }
     expect(res.success).toBe(false)
     expect(res.reason).toBe('unknown_feature')
+  })
+})
+
+// ── configureEscalationRules ────────────────────────────────────────────────
+describe('escalation-rule pure helpers', () => {
+  const kw = (value: string): EscalationRule => ({ trigger: 'keyword', value, customerMessage: 'passed_to_owner' })
+
+  it('add appends and is idempotent on the same keyword (case-insensitive)', () => {
+    const a = addEscalationRule(null, kw('refund'))
+    expect(a).toHaveLength(1)
+    const b = addEscalationRule(a, kw('REFUND'))
+    expect(b).toHaveLength(1) // same keyword, not duplicated
+    const c = addEscalationRule(b, kw('lawyer'))
+    expect(c).toHaveLength(2)
+  })
+
+  it('only one emotional / one unknown_intent rule is kept', () => {
+    const list = addEscalationRule(null, { trigger: 'emotional', customerMessage: 'silent' })
+    const again = addEscalationRule(list, { trigger: 'emotional', customerMessage: 'owner_callback' })
+    expect(again).toHaveLength(1)
+  })
+
+  it('remove drops a matching keyword and is a no-op otherwise', () => {
+    const list = addEscalationRule(null, kw('refund'))
+    expect(removeEscalationRule(list, 'keyword', 'refund')).toEqual([])
+    expect(removeEscalationRule(list, 'keyword', 'other')).toEqual(list)
+    expect(removeEscalationRule(list, 'emotional')).toEqual(list)
+  })
+})
+
+// A capture-db ctx that also answers the initial SELECT of current rules.
+function escCtx(rules: EscalationRule[] = [], role: ToolContext['role'] = 'manager', grants?: Action[]): { ctx: ToolContext; patch: Record<string, unknown> } {
+  const patch: Record<string, unknown> = {}
+  const db = {
+    select: () => ({ from: () => ({ where: () => ({ limit: async () => [{ rules }] }) }) }),
+    update: () => ({ set: (p: Record<string, unknown>) => ({ where: async () => { Object.assign(patch, p) } }) }),
+    insert: () => ({ values: async () => { /* logAudit */ } }),
+  }
+  const ctx: ToolContext = {
+    db: db as unknown as ToolContext['db'],
+    calendar: {} as ToolContext['calendar'],
+    businessId: 'biz-1',
+    identityId: 'mgr-1',
+    timezone: 'Asia/Jerusalem',
+    lang: 'en',
+    ...(role ? { role } : {}),
+    ...(grants ? { delegatedPermissions: new Set<Action>(grants) } : {}),
+  }
+  return { ctx, patch }
+}
+
+describe('configureEscalationRules — write', () => {
+  it('adds a keyword rule and persists it', async () => {
+    const { ctx, patch } = escCtx([])
+    const res = await executeConfigureEscalationRules({ op: 'add', trigger: 'keyword', value: 'refund' }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch['escalationRules']).toEqual([{ trigger: 'keyword', value: 'refund', customerMessage: 'passed_to_owner' }])
+  })
+
+  it('removes an existing rule', async () => {
+    const existing: EscalationRule[] = [{ trigger: 'keyword', value: 'refund', customerMessage: 'passed_to_owner' }]
+    const { ctx, patch } = escCtx(existing)
+    const res = await executeConfigureEscalationRules({ op: 'remove', trigger: 'keyword', value: 'refund' }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch['escalationRules']).toEqual([])
+  })
+
+  it('list returns current rules without writing', async () => {
+    const existing: EscalationRule[] = [{ trigger: 'emotional', customerMessage: 'owner_callback' }]
+    const { ctx, patch } = escCtx(existing)
+    const res = await executeConfigureEscalationRules({ op: 'list' }, ctx) as { success: boolean; fact: string }
+    expect(res.success).toBe(true)
+    expect(JSON.parse(res.fact)).toEqual(existing)
+    expect(patch).toEqual({}) // no write on a read
+  })
+
+  it('keyword trigger without a value asks for the word (no write)', async () => {
+    const { ctx, patch } = escCtx([])
+    const res = await executeConfigureEscalationRules({ op: 'add', trigger: 'keyword' }, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('missing_keyword')
+    expect(patch).toEqual({})
+  })
+
+  it('removing a rule that is not there reports rule_not_found', async () => {
+    const { ctx } = escCtx([])
+    const res = await executeConfigureEscalationRules({ op: 'remove', trigger: 'keyword', value: 'ghost' }, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('rule_not_found')
+  })
+})
+
+describe('configureEscalationRules — authorization', () => {
+  const args = { op: 'add' as const, trigger: 'emotional' }
+
+  it('customer / contact / un-granted delegate are refused before any DB touch', async () => {
+    for (const role of ['customer', 'contact', 'delegated_user'] as const) {
+      const res = await executeConfigureEscalationRules(args, payCtx(role)) as { success: boolean; reason?: string }
+      expect(res.success, role).toBe(false)
+      expect(res.reason, role).toBe('not_authorized')
+    }
+  })
+
+  it('delegated user WITH settings.configure passes auth and writes', async () => {
+    const { ctx, patch } = escCtx([], 'delegated_user', ['settings.configure'])
+    const res = await executeConfigureEscalationRules(args, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch['escalationRules']).toEqual([{ trigger: 'emotional', customerMessage: 'passed_to_owner' }])
   })
 })

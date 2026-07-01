@@ -9,7 +9,7 @@ import type { Db } from '../../db/client.js'
 import { identities, bookings, businesses, customerProfiles, managerInstructions, businessContacts, serviceTypes, classSeries, conversationSessions, conversationMessages, initiationApprovals, pendingOwnerQuestions } from '../../db/schema.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { createSeries } from '../scheduling/series.js'
-import type { IdentityRole } from '../../db/schema.js'
+import type { IdentityRole, EscalationRule } from '../../db/schema.js'
 import { authorize, type Action } from '../authorization/check.js'
 import type { CalendarClient } from '../../adapters/calendar/client.js'
 import { classifyManagerInstruction, } from '../../adapters/llm/client.js'
@@ -2226,6 +2226,104 @@ export async function executeConfigureProactiveFeatures(args: ConfigureProactive
       ? "Saved. Tell the owner win-backs are on, and that you'll check each one with them before sending until they tell you to just handle it (fact is raw — never quote it)."
       : 'Saved. Confirm the change to the owner in plain words (fact is raw — never quote it).',
   }
+}
+
+// ── configureEscalationRules ────────────────────────────────────────────────
+// The owner's automatic "flag this to me" rules (businesses.escalationRules → escalation/engine.ts).
+// Until now these were onboarding-only; this is the Branch-3 editor. Deliberately distinct from the
+// business-knowledge-setup skill's handoff-rules (which writes handoffBehavior — how the PA hands a
+// conversation to a person). Here a rule = a trigger (a keyword, an upset/emotional tone, or repeated
+// unknown intents) plus what the customer is told when it fires.
+
+export type EscalationTrigger = EscalationRule['trigger']       // 'keyword' | 'unknown_intent' | 'emotional'
+export type CustomerMessageMode = EscalationRule['customerMessage'] // 'silent' | 'passed_to_owner' | 'owner_callback' | 'custom'
+
+const ESCALATION_TRIGGERS: readonly EscalationTrigger[] = ['keyword', 'unknown_intent', 'emotional']
+const CUSTOMER_MESSAGE_MODES: readonly CustomerMessageMode[] = ['silent', 'passed_to_owner', 'owner_callback', 'custom']
+
+/** Two rules are "the same" when they share a trigger and (for keywords) the same case-insensitive value. */
+function sameEscalationRule(a: EscalationRule, b: { trigger: EscalationTrigger; value?: string }): boolean {
+  if (a.trigger !== b.trigger) return false
+  if (a.trigger === 'keyword') return (a.value ?? '').toLowerCase() === (b.value ?? '').toLowerCase()
+  return true // only one emotional / one unknown_intent rule makes sense
+}
+
+/** Pure add: append the rule unless an equivalent one already exists (idempotent). */
+export function addEscalationRule(list: EscalationRule[] | null, rule: EscalationRule): EscalationRule[] {
+  const current = list ?? []
+  if (current.some((r) => sameEscalationRule(r, rule))) return current
+  return [...current, rule]
+}
+
+/** Pure remove: drop any rule matching trigger (+ value for keywords). */
+export function removeEscalationRule(list: EscalationRule[] | null, trigger: EscalationTrigger, value?: string): EscalationRule[] {
+  return (list ?? []).filter((r) => !sameEscalationRule(r, { trigger, ...(value !== undefined ? { value } : {}) }))
+}
+
+interface ConfigureEscalationRulesArgs {
+  op: 'add' | 'remove' | 'list'
+  trigger?: string
+  value?: string
+  threshold?: number
+  customerMessage?: string
+  customText?: string
+}
+
+export async function executeConfigureEscalationRules(args: ConfigureEscalationRulesArgs, ctx: ToolContext): Promise<object> {
+  // 1. Authorization — managers always; delegated only with the grant; customers/contacts never.
+  const auth = authorize(
+    { role: ctx.role ?? 'manager', ...(ctx.delegatedPermissions ? { delegatedPermissions: ctx.delegatedPermissions } : {}) },
+    'settings.configure',
+  )
+  if (!auth.allowed) {
+    return { success: false, reason: 'not_authorized', guidance: 'This person is not allowed to change business settings. Tell them only the owner (or staff the owner has granted settings to) can set escalation rules — change nothing.' }
+  }
+
+  const [biz] = await ctx.db.select({ rules: businesses.escalationRules }).from(businesses).where(eq(businesses.id, ctx.businessId)).limit(1)
+  if (!biz) return { success: false, reason: 'business_not_found' }
+  const current = (biz.rules as EscalationRule[] | null) ?? []
+
+  if (args.op === 'list') {
+    return { success: true, fact: JSON.stringify(current), guidance: 'Read the owner their current escalation rules in plain words. If there are none, say so and offer to add one.' }
+  }
+
+  const trigger = args.trigger as EscalationTrigger | undefined
+  if (!trigger || !ESCALATION_TRIGGERS.includes(trigger)) {
+    return { success: false, reason: 'invalid_trigger', guidance: 'Ask the owner what should trigger the flag: a specific word a customer types (keyword), an upset/angry tone (emotional), or repeated messages you could not understand (unknown_intent).' }
+  }
+  if (trigger === 'keyword' && !(args.value ?? '').trim()) {
+    return { success: false, reason: 'missing_keyword', guidance: 'Ask the owner which word or phrase should trigger the flag.' }
+  }
+
+  let next: EscalationRule[]
+  if (args.op === 'remove') {
+    next = removeEscalationRule(current, trigger, args.value)
+    if (next.length === current.length) {
+      return { success: false, reason: 'rule_not_found', guidance: 'Tell the owner there was no matching rule to remove, and read back what they do have.' }
+    }
+  } else {
+    // add — build a valid rule; default to a friendly "passed to you" acknowledgement unless the
+    // owner chose silence or a custom line.
+    const mode = (CUSTOMER_MESSAGE_MODES.includes(args.customerMessage as CustomerMessageMode) ? args.customerMessage : 'passed_to_owner') as CustomerMessageMode
+    if (mode === 'custom' && !(args.customText ?? '').trim()) {
+      return { success: false, reason: 'missing_custom_text', guidance: 'The owner wants a custom reply to the customer — ask them what it should say.' }
+    }
+    const rule: EscalationRule = {
+      trigger,
+      ...(trigger === 'keyword' ? { value: args.value!.trim() } : {}),
+      ...(trigger === 'unknown_intent' ? { threshold: Number.isFinite(args.threshold) && (args.threshold as number) > 0 ? Math.round(args.threshold as number) : 1 } : {}),
+      customerMessage: mode,
+      ...(mode === 'custom' ? { customText: args.customText!.trim() } : {}),
+    }
+    next = addEscalationRule(current, rule)
+    if (next.length === current.length) {
+      return { success: false, reason: 'already_exists', guidance: 'Tell the owner that rule is already in place — nothing to add.' }
+    }
+  }
+
+  await ctx.db.update(businesses).set({ escalationRules: next as unknown as Record<string, unknown>[] }).where(eq(businesses.id, ctx.businessId))
+  await logAudit(ctx.db, { businessId: ctx.businessId, actorId: ctx.identityId, action: 'escalation_rules.updated', entityType: 'business', entityId: ctx.businessId, metadata: { op: args.op, trigger, value: args.value ?? null } })
+  return { success: true, fact: JSON.stringify(next), guidance: 'Saved. Confirm the change to the owner in plain words (fact is raw config — never quote it).' }
 }
 
 interface AmendReshuffleArgs {

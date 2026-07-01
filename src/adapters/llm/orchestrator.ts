@@ -49,6 +49,7 @@ import {
   executeConfigurePaymentTiming,
   executeSetInitiationAutonomy,
   executeConfigureProactiveFeatures,
+  executeConfigureEscalationRules,
   executeDecideFreedSlotOffer,
   executeCheckCalendarIntegrity,
   executeConnectGoogleCalendar,
@@ -705,6 +706,22 @@ const MANAGER_TOOLS: FunctionDeclaration[] = [
     },
   },
   {
+    name: 'configureEscalationRules',
+    description: "Manage the owner's automatic escalation rules — when the PA should flag a customer message to the owner. Use for 'let me know if anyone mentions refund', 'ping me when a customer sounds angry', 'flag messages you can't understand', or 'stop flagging the word cancel', or 'what are my escalation rules'. This is about ALERTING the owner on a trigger — NOT how the PA hands a chat to a person (that's separate) and NOT booking cancellations.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        op: { type: Type.STRING, enum: ['add', 'remove', 'list'], description: 'add a rule, remove one, or list the current rules' },
+        trigger: { type: Type.STRING, enum: ['keyword', 'emotional', 'unknown_intent'], description: "keyword = a specific word/phrase the customer types; emotional = an upset/angry tone; unknown_intent = repeated messages the PA can't understand" },
+        value: { type: Type.STRING, description: "the word or phrase to watch for (required when trigger = 'keyword')" },
+        threshold: { type: Type.NUMBER, description: "for trigger = 'unknown_intent': how many unclear messages before flagging (default 1)" },
+        customerMessage: { type: Type.STRING, enum: ['silent', 'passed_to_owner', 'owner_callback', 'custom'], description: 'what the customer is told when the rule fires: silent = nothing; passed_to_owner = we passed it on; owner_callback = we’ll call back; custom = a specific line (needs customText)' },
+        customText: { type: Type.STRING, description: "the exact reply to the customer when customerMessage = 'custom'" },
+      },
+      required: ['op'],
+    },
+  },
+  {
     name: 'decideFreedSlotOffer',
     description: "Decide what to do with a slot that just freed up (after a cancellation) when customers are waiting for it. Use this when you previously asked the owner whether to offer a freed slot and they answered — 'yes/offer it' → decision 'offer'; 'no/leave it' → decision 'leave_open'. Also use it to set a standing preference when the owner says how to handle these going forward: 'always do it automatically' → setStandingPreference 'always_auto'; 'always ask me' → 'always_ask'; 'never offer' → 'never'. The owner can set a preference with or without a slot currently waiting.",
     parameters: {
@@ -1028,6 +1045,8 @@ async function dispatchTool(
       return executeSetInitiationAutonomy(args as unknown as Parameters<typeof executeSetInitiationAutonomy>[0], ctx)
     case 'configureProactiveFeatures':
       return executeConfigureProactiveFeatures(args as unknown as Parameters<typeof executeConfigureProactiveFeatures>[0], ctx)
+    case 'configureEscalationRules':
+      return executeConfigureEscalationRules(args as unknown as Parameters<typeof executeConfigureEscalationRules>[0], ctx)
     case 'decideFreedSlotOffer':
       return executeDecideFreedSlotOffer(args as unknown as Parameters<typeof executeDecideFreedSlotOffer>[0], ctx)
     case 'checkCalendarIntegrity':
