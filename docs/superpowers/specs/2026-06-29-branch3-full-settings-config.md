@@ -40,7 +40,7 @@ Every executor returns `fact` (raw config, never quoted to the owner) + `guidanc
 
 Current `Action` union (`src/domain/authorization/check.ts`) has `policy.change`, `service.modify`, `staff.manage`, etc., but **no generic settings action**.
 
-**Decision:** add one new action `settings.configure` to the `Action` union and to `MANAGER_ACTIONS`. All new Tier 1/2/3 tools authorize against it (managers always; delegated users only if granted; customers/contacts never). Rationale: these are owner-preference toggles distinct from booking-policy money rules (`policy.change`) — a clean single gate keeps delegation legible without inventing 12 micro-actions.
+**DECISION (locked 2026-07-01):** add one new action `settings.configure` to the `Action` union and to `MANAGER_ACTIONS`. All new Tier 1/2/3 tools authorize against it (managers always; delegated users only if granted; customers/contacts never). Rationale: these are owner-preference toggles distinct from booking-policy money rules (`policy.change`) — a clean single gate keeps delegation legible without inventing 12 micro-actions.
 
 Each executor calls the same `authorize(ctx, 'settings.configure')` guard used by sibling tools, returning the standard `not_authorized` outcome on failure.
 
@@ -64,6 +64,8 @@ interface ConfigureProactiveFeaturesArgs {
 - `logAudit` action `proactive_feature.updated`, metadata `{ feature, enabled }`.
 - Description primes the LLM on intent like *"start sending birthday messages"*, *"stop the win-back follow-ups"*.
 
+**DECISION (locked 2026-07-01) — default behaviour on enable:** enabling a proactive feature turns it ON but defaults its autonomy to **ask-first** (the PA proposes each outreach for owner approval) rather than auto-sending. For categories with an autonomy row (`winback` today), `configureProactiveFeatures` sets the boolean AND writes `initiation_autonomy` state `ai_proposed`. For the transactional/courtesy sends without an autonomy category (birthday, renewal, thank-you, periodic, reschedule-retention), "ask-first" means the worker's existing per-send approval/preview path is used where one exists; where a feature has no proposal path, flag it so the owner is told it sends automatically. Prevents a switch-flip from firing mass outreach with no preview.
+
 ### Interplay with `setInitiationAutonomy` (important)
 `setInitiationAutonomy` already exists and controls **auto-vs-ask mode** per outreach category (`winback`, `coldfill`, `review`, `no_show`, `reshuffle`) in the `initiation_autonomy` table — it does **not** flip these booleans. Keep them separate but make the relationship coherent:
 - `configureProactiveFeatures` = the master ON/OFF (does the feature run at all).
@@ -75,25 +77,26 @@ interface ConfigureProactiveFeaturesArgs {
 
 ## 5. Tier 2 — Simple scalar/enum settings
 
-One small tool per coherent cluster (or fold into `manageBusinessSettings` where the NLP pipeline already fits — see note). All writes are single-column `businesses` patches with validation.
+All writes are single-column `businesses` patches with validation.
 
-| Setting | Column | Type / validation | Downstream consumer |
-|---|---|---|---|
-| Reminder lead time | `reminderOffsetHours` | int ≥ 1, sane cap (e.g. ≤ 168) | `workers/reminder.ts` (+ per-service `serviceTypes.reminderOffsetHours` override) |
-| Bot persona | `botPersona` | enum `female\|male\|neutral` | LLM prompt builders (`client.ts`, `orchestrator.ts`) |
-| Brand voice | `brandVoice` | free text, length-capped | LLM prompt builders, skills |
-| Google review URL | `googleReviewUrl` | URL validation | review-request outreach / `automatedMessagesConfig.review_request` |
-| Confirmation gate | `confirmationGate` | enum `immediate\|post_payment` | booking engine |
-| 24/7 availability | `available247` | boolean | availability resolution |
-| Default language | `defaultLanguage` | enum `he\|en` | all reply paths |
-| Business name | `name` | non-empty text | everywhere |
+> **Updated for v1.0.111:** a `business_profile` instruction type **already exists** in `manageBusinessSettings` (`apply.ts:254` dispatch, `businessProfileSchema:290`, deterministic writer `~305-365`). It currently handles the physical **address** (already chat-configurable — remove from gap list) and its own comment says *"Currently the physical address —"*, i.e. it is built to grow. **This is the Tier-2 extension point.** Fold the value-set fields into `businessProfileSchema` + its writer rather than inventing new tools → **zero net-new top-level tools for Tier 2.**
 
-### Tooling decision
-- **`reminderOffsetHours`** is naturally a **policy_change subtype** — extend `policyChangeSchema` in `apply.ts` with subtype `reminder_offset` (mirrors `booking_buffer`). Reuses the existing money/time-policy NLP path and audit.
-- **`confirmationGate`, `available247`, `name`, `defaultLanguage`** — also fold into `manageBusinessSettings` (new `policy_change` subtypes / a `business_profile` instruction type), because they share the "owner states a value, we set a column" shape the apply pipeline already does.
-- **`botPersona`, `brandVoice`, `googleReviewUrl`** — these read most naturally as identity/voice tone settings; group into one dedicated tool `configureBusinessVoice` (args: optional `persona`, `brandVoice`, `reviewUrl`) so an owner can say *"talk in a warmer, female voice and here's my Google review link"* in one turn.
+| Setting | Column | Type / validation | Downstream consumer | Where it goes |
+|---|---|---|---|---|
+| Reminder lead time | `reminderOffsetHours` | int ≥ 1, cap ≤ 168 | `workers/reminder.ts` (+ per-service override) | `policy_change` subtype `reminder_offset` (mirrors `booking_buffer`) |
+| Confirmation gate | `confirmationGate` | enum `immediate\|post_payment` | booking engine (`approval.ts`, `engine.ts`) | `business_profile` field |
+| 24/7 availability | `available247` | boolean | availability resolution | `business_profile` field |
+| Default language | `defaultLanguage` | enum `he\|en` | all reply paths | `business_profile` field |
+| Business name | `name` | non-empty text | everywhere | `business_profile` field |
+| Bot persona | `botPersona` | enum `female\|male\|neutral` | LLM prompt builders | `business_profile` field |
+| Brand voice | `brandVoice` | free text, length-capped | LLM prompt builders, skills | `business_profile` field |
+| Google review URL | `googleReviewUrl` | URL validation | review-request outreach | `business_profile` field |
+| ~~Physical address~~ | ~~`address`~~ | — | — | **DONE in v1.0.111** |
 
-**Recommendation:** prefer extending `manageBusinessSettings` for the value-set settings (reuses deterministic apply + audit), and add the single `configureBusinessVoice` tool for the tone cluster. This keeps new surface area to **one** new tool in Tier 2.
+**Recommendation:** extend the existing `businessProfileSchema` + writer for the enum/text/boolean fields, and add the one `reminder_offset` subtype to `policy_change`. **No new top-level tools in Tier 2** — pure schema/writer extension, matching the codebase's own trajectory and reusing its deterministic apply + audit.
+
+- **`confirmationGate` note:** the booking engine reads it live (`engine.ts:192`, `approval.ts:153`) — verify a mid-session change doesn't strand an in-flight booking; the write is idempotent and only affects *new* bookings, so risk is low, but add a test.
+- **`available247` note:** interacts with the availability resolver that the v1.0.111 gcal reconcile work also touches — test the toggle against availability resolution, don't assume orthogonality.
 
 ---
 
@@ -162,8 +165,31 @@ Each phase is independently shippable and deployable via `/update-agent`. Branch
 | Tier | New top-level tools | Reused machinery |
 |---|---|---|
 | 1 | `configureProactiveFeatures` | audit, authorize |
-| 2 | `configureBusinessVoice` (+ `manageBusinessSettings` subtypes) | `apply.ts` policy pipeline |
+| 2 | **none** — extend existing `business_profile` + one `policy_change` subtype | `apply.ts` `businessProfileSchema` + policy pipeline (v1.0.111) |
 | 3 | `initiateBusinessKnowledgeSetup(section)` (Route A) + keyed-write tools (Route B) | `business-knowledge-setup` skill, `createWorkflow()`, jsonb patch |
 | — | `settings.configure` authorization action | `check.ts` |
 
-**Migrations: none. New columns: none. Net new top-level tools: ~3–4.**
+**Migrations: none. New columns: none. Net new top-level tools: ~2–3** (down from ~3–4 — v1.0.111's `business_profile` type absorbs Tier 2).
+
+---
+
+## 11. v1.0.111 reconciliation (2026-07-01)
+
+Re-verified the whole plan against `main` at v1.0.111. **No regressions to the plan; it gets slightly smaller.**
+
+**Still true (all load-bearing assumptions hold):**
+- The 6 proactive flags **still have zero write path** (Tier 1 gap intact).
+- Every target column still exists — no migration.
+- Config-tool anatomy intact (`executeConfigureDailyBriefing` etc., line-shifted only).
+- Manager-path skill dispatch intact (now `webhook.ts:1190-1235`); `business-knowledge-setup` `canHandle`/`detectStartStep` intact.
+- Authorization `Action` union unchanged — still no `settings.configure`; the decision to add it stands.
+- No one pre-built any planned tool — no conflict.
+
+**Changed (in our favour):**
+- **`address` is now chat-configurable** via the new `business_profile` instruction type → dropped from scope.
+- **Tier 2 gets simpler:** extend `businessProfileSchema` + writer instead of a new `configureBusinessVoice` tool → **zero net-new top-level tools for Tier 2.**
+
+**New non-chat item (correctly excluded):**
+- `managerChannel` (0053, `own_number|central`) is set from the **operator channel** (`operator.ts:744`, Branch 1) — provisioning-tier, stays out of Branch 3 by design.
+
+**Operational note (not a plan change):** the working tree is currently on a **dirty `main`** (uncommitted `src/routes/legal.ts` / `PRIVACY_POLICY.md`, `M src/server.ts`). Build must start from a **clean branch** off `main` (`dev/system/ws-branch3-settings`); the legal/privacy changes are unrelated and should be committed or stashed first so our work doesn't entangle with them.
