@@ -16,6 +16,9 @@ export type Action =
   | 'customer.manage'
   | 'payment.charge'
   | 'payment.refund'
+  // Owner-preference plane (Branch-3 settings): proactive-feature switches, business voice/persona,
+  // structured behaviour config. Managers always; delegated only if granted; customers never.
+  | 'settings.configure'
 
 export type AuthResult =
   | { allowed: true }
@@ -45,6 +48,8 @@ const MANAGER_ACTIONS = new Set<Action>([
   // Money plane (Grow Phase 4/5): managers always; delegated only if granted; customers never.
   'payment.charge',
   'payment.refund',
+  // Owner-preference plane (Branch-3 settings): same gate model as the money plane.
+  'settings.configure',
 ])
 
 const CUSTOMER_ACTIONS = new Set<Action>([

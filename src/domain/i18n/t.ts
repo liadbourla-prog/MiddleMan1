@@ -575,6 +575,10 @@ const strings = {
     he: (days: number) => `עדכנתי — אפשר להזמין עד ${days} ימים קדימה.`,
     en: (days: number) => `Done — customers can now book up to ${days} days ahead.`,
   },
+  apply_policy_reminder_offset: {
+    he: (hours: number) => `עדכנתי — תזכורת תישלח ${hours} שעות לפני התור.`,
+    en: (hours: number) => `Done — reminders now go out ${hours} hours before the appointment.`,
+  },
   apply_policy_cancellation_fee: {
     he: (amount: number, currency: string) => `עדכנתי את עמלת הביטול ל-${amount} ${currency}.`,
     en: (amount: number, currency: string) => `Set the cancellation fee to ${amount} ${currency}.`,

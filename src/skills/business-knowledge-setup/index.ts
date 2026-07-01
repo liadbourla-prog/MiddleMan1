@@ -536,7 +536,13 @@ export const businessKnowledgeSetupSkill: Skill = {
   canHandle(ctx: SkillContext): boolean {
     if (ctx.workflowState?.skillName === 'business-knowledge-setup') return true
     if (ctx.caller.role !== 'manager') return false
-    return /business info|brand voice|update.*faq|update.*info|business setup|update.*brand|business knowledge|עדכן עסק|עדכן מידע|ידע עסקי|הגדרות עסק|עדכן פרטים/i.test(ctx.message.text)
+    // Broad "business knowledge" triggers PLUS the rich per-section phrasings the Branch-3
+    // orchestrator has no tool for (communication style, handoff behaviour, automated-message
+    // wording). Tokens are chosen to line up with detectStartStep so the matched message routes to
+    // the right section. Deliberately NOT here: "escalat" (owner escalation rules are a dedicated
+    // orchestrator tool → businesses.escalationRules), and bare "message"/"reminder"/"notification"
+    // (would hijack the reminder-timing / proactive-feature / notification tools).
+    return /business info|brand voice|update.*faq|update.*info|business setup|update.*brand|business knowledge|communication style|tone of voice|handoff|automated message|message template|עדכן עסק|עדכן מידע|ידע עסקי|הגדרות עסק|עדכן פרטים|סגנון תקשורת|טון דיבור|מסירה|הודעות אוטומטיות|תבניות הודעות/i.test(ctx.message.text)
   },
 
   async handle(ctx: SkillContext): Promise<SkillOutcome> {

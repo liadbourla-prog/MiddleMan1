@@ -263,8 +263,8 @@ booking_cancellation:
 
 policy_change:
   {
-    "subtype": "cancellation_cutoff" | "booking_buffer" | "max_days_ahead" | "cancellation_fee" | "booking_authority" | "approval_window" | "other",
-    "valueHours": number | null,    // for cancellation_cutoff (hours before appt), booking_buffer (hours in advance), and approval_window (hours to wait for owner approval)
+    "subtype": "cancellation_cutoff" | "booking_buffer" | "max_days_ahead" | "cancellation_fee" | "booking_authority" | "approval_window" | "reminder_offset" | "other",
+    "valueHours": number | null,    // for cancellation_cutoff (hours before appt), booking_buffer (hours in advance), approval_window (hours to wait for owner approval), and reminder_offset (hours before appt to send the reminder)
     "valueDays": number | null,     // for max_days_ahead
     "valueAmount": number | null,   // for cancellation_fee (monetary amount)
     "valueMode": "auto" | "owner_approval" | null,  // for booking_authority only
@@ -278,6 +278,7 @@ policy_change:
   - cancellation_fee: manager wants to charge a fee for late cancellations (e.g. "charge 50 for cancellations")
   - booking_authority: manager controls whether the PA may book on their behalf without asking. Set valueMode="owner_approval" when they want to approve bookings first (e.g. "don't book anything without asking me", "always check with me before you put something on the calendar", "אל תקבע כלום בלי לשאול אותי"); set valueMode="auto" when they want the PA to just book open slots itself (e.g. "just book open slots yourself", "you don't need to ask me, just schedule it", "תקבע לבד מה שפנוי"). This is about the PA/owner booking on the owner's behalf — NOT about customers booking themselves.
   - approval_window: how long a customer self-booking that is HELD for the owner's approval waits before it auto-expires (only relevant when the owner approves customer bookings for some service). Set valueHours from the owner's wording (e.g. "give me 48 hours to approve bookings", "expire approval requests after 12 hours", "תן לי יומיים לאשר"). This sets the waiting window only — it does NOT turn approval on/off for a service (that is service_change requiresApproval).
+  - reminder_offset: how many hours before an appointment the PA sends the customer's reminder (e.g. "remind customers 48 hours before", "send reminders 2 hours ahead", "תזכיר ללקוחות יומיים לפני התור"). Set valueHours to the number of hours (a day = 24). This is the business-wide default; a single service can override its own reminder timing via service settings.
   - other: anything else — policy cannot be enforced automatically; set ambiguous=true and clarificationNeeded explaining what IS enforceable
 
   For subtype "other", ALWAYS set ambiguous=true and clarificationNeeded to a message (in the manager's language) explaining:
@@ -301,12 +302,17 @@ provider_change:
   - dayOfWeek: 0=Sunday … 6=Saturday. Times are 24-hour "HH:MM".
 
 business_profile:
-  { "field": "address", "value": string, "streetAddress": string|null, "city": string|null, "region": string|null, "country": string|null, "postalCode": string|null, "mapsUrl": string|null }
-  Use when the owner sets, changes, or corrects the business's PHYSICAL ADDRESS / location — where customers physically come (e.g. "our address is Herzl 1, Tel Aviv", "we moved to 5 Dizengoff", "set the address to ...", "הכתובת שלנו היא הרצל 1 תל אביב", "עברנו לדיזנגוף 5", "תעדכן את הכתובת"). This is the customer-facing location the PA gives out — NOT a Google Calendar id, email, phone, or service area. If the owner only asks to ANNOUNCE a new address to customers (a broadcast), that is not this; this is about storing the business's own address.
-  - field: always "address".
-  - value: the full address text exactly as the owner stated it, in their own language — this is what customers are shown.
-  - streetAddress / city / region / country / postalCode: break the SAME address into structured parts for the business's website. Fill each part you can identify from the owner's words; set a part to null if it isn't stated. Do NOT invent a city or country the owner didn't give. country may be a name or code ("Israel"/"IL"). Keep each part in the owner's language.
-  - mapsUrl: a Google Maps / g.page link ONLY if the owner pasted one (e.g. "https://maps.google.com/...", "https://g.page/..."). null otherwise — never fabricate or guess a link.
+  { "field": "address"|"name"|"bot_persona"|"brand_voice"|"google_review_url"|"confirmation_gate"|"available_247"|"default_language", "value": ..., plus the address-only parts below }
+  Use when the owner sets, changes, or corrects a business-level profile or preference setting. Choose exactly one "field" and put its value in "value". Only return the keys for the chosen field.
+  - field "address": the business's PHYSICAL location — where customers physically come (e.g. "our address is Herzl 1, Tel Aviv", "we moved to 5 Dizengoff", "הכתובת שלנו היא הרצל 1 תל אביב", "עברנו לדיזנגוף 5"). This is the customer-facing location the PA gives out — NOT a Google Calendar id, email, phone, or service area. If the owner only asks to ANNOUNCE a new address (a broadcast), that is NOT this. value = the full address text exactly as stated, in the owner's language. Also fill streetAddress / city / region / country / postalCode by breaking the SAME address into parts you can identify (null any part not stated; never invent a city/country; country may be a name or code "Israel"/"IL"; keep parts in the owner's language). mapsUrl = a Google Maps / g.page link ONLY if the owner pasted one — null otherwise, never fabricate.
+  - field "name": the business's own name (e.g. "rename the business to Studio Flow", "שנה את שם העסק ל...", "we're now called ..."). value = the new name.
+  - field "bot_persona": how the PA refers to ITSELF — its own voice gender. value = "female" | "male" | "neutral" ("speak as a woman"/"use a female voice"/"תשתמשי בקול נשי" → "female"; masculine → "male"; "no gendered voice"/"בלי הבחנה מגדרית" → "neutral"). This is the PA's self-voice, NOT how it addresses a specific customer.
+  - field "brand_voice": a free-text description of the tone the owner wants the PA to use (e.g. "be warm and playful", "keep it professional and concise", "תהיה חמים ומקצועי"). value = the description in the owner's own words.
+  - field "google_review_url": the business's Google review link, ONLY when the owner pastes a URL (e.g. "here's our review link https://g.page/.../review"). value = the URL.
+  - field "confirmation_gate": WHEN a booking becomes confirmed. value = "immediate" (confirm right away) or "post_payment" (confirm only after the customer pays) (e.g. "only confirm after they pay" → "post_payment"; "confirm bookings right away" → "immediate").
+  - field "available_247": whether the business takes bookings around the clock. value = true (always available / 24-7) or false (only within set opening hours). This is ONLY the all-hours on/off switch — setting specific weekday hours is availability_change, NOT this.
+  - field "default_language": the business's default language. value = "he" or "en".
+  Service prices/durations/colors are service_change; cancellation/booking/reminder policy is policy_change; a customer's own address-gender is elsewhere. Only use business_profile for the fields above.
 
 If the instruction is ambiguous or missing required detail, set ambiguous=true and clarificationNeeded to the exact question to ask back.
 

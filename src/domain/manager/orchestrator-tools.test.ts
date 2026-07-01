@@ -16,11 +16,17 @@ import {
   executeSetCustomerGender,
   executeManageAllowedContacts,
   executeConfigureDailyBriefing,
+  executeConfigureProactiveFeatures,
+  proactiveFeatureColumn,
+  PROACTIVE_FEATURE_COLUMNS,
+  executeConfigureEscalationRules,
+  addEscalationRule,
+  removeEscalationRule,
   type ToolContext,
 } from './orchestrator-tools.js'
 import type { CalendarListEntry } from '../calendar/calendar-id.js'
 import type { Action } from '../authorization/check.js'
-import type { BookingState } from '../../db/schema.js'
+import type { BookingState, EscalationRule } from '../../db/schema.js'
 
 // A ctx whose db/calendar throw on ANY access. If an executor returns a
 // clarification BEFORE touching either, we've proven the deterministic date
@@ -843,5 +849,215 @@ describe('configureDailyBriefing', () => {
     const res = await executeConfigureDailyBriefing({}, ctx) as { success: boolean; reason?: string }
     expect(res.success).toBe(false)
     expect(res.reason).toBe('nothing_to_change')
+  })
+})
+
+// ── configureProactiveFeatures ──────────────────────────────────────────────
+// A capture-db ctx: proves the executor writes the RIGHT column (the map is the whole
+// behaviour) without a real DB. Mirrors dailyBriefingCtx.
+function proactiveCtx(): { ctx: ToolContext; patch: Record<string, unknown> } {
+  const patch: Record<string, unknown> = {}
+  const db = {
+    update: () => ({ set: (p: Record<string, unknown>) => ({ where: async () => { Object.assign(patch, p) } }) }),
+    insert: () => ({ values: async () => { /* logAudit */ } }),
+  }
+  const ctx: ToolContext = {
+    db: db as unknown as ToolContext['db'],
+    calendar: {} as ToolContext['calendar'],
+    businessId: 'biz-1',
+    identityId: 'mgr-1',
+    timezone: 'Asia/Jerusalem',
+    lang: 'en',
+    role: 'manager',
+  }
+  return { ctx, patch }
+}
+
+describe('proactiveFeatureColumn — feature→column map', () => {
+  it('maps every known feature to its businesses column', () => {
+    expect(proactiveFeatureColumn('winback')).toBe('proactiveWinbackEnabled')
+    expect(proactiveFeatureColumn('subscription_renewal')).toBe('subscriptionRenewalEnabled')
+    expect(proactiveFeatureColumn('post_appointment_thankyou')).toBe('postAppointmentThankyouEnabled')
+    expect(proactiveFeatureColumn('periodic_treatment')).toBe('periodicTreatmentEnabled')
+    expect(proactiveFeatureColumn('birthday_greetings')).toBe('birthdayGreetingsEnabled')
+    expect(proactiveFeatureColumn('reschedule_retention')).toBe('rescheduleRetentionEnabled')
+  })
+
+  it('returns null for an unknown feature (allow-list, no accidental column writes)', () => {
+    expect(proactiveFeatureColumn('marketing_blast')).toBeNull()
+    expect(proactiveFeatureColumn('')).toBeNull()
+    expect(Object.keys(PROACTIVE_FEATURE_COLUMNS)).toHaveLength(6)
+  })
+})
+
+describe('configureProactiveFeatures — write', () => {
+  it('enabling birthday_greetings sets birthdayGreetingsEnabled = true', async () => {
+    const { ctx, patch } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'birthday_greetings', enabled: true }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch).toEqual({ birthdayGreetingsEnabled: true })
+  })
+
+  it('disabling winback sets proactiveWinbackEnabled = false', async () => {
+    const { ctx, patch } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'winback', enabled: false }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch).toEqual({ proactiveWinbackEnabled: false })
+  })
+
+  it('enabling winback tells the owner it will ask-first (guidance mentions checking each one)', async () => {
+    const { ctx } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'winback', enabled: true }, ctx) as { success: boolean; guidance: string }
+    expect(res.success).toBe(true)
+    expect(res.guidance).toMatch(/check each one|before sending/i)
+  })
+
+  it('unknown feature writes nothing and asks which feature (as manager)', async () => {
+    const { ctx, patch } = proactiveCtx()
+    const res = await executeConfigureProactiveFeatures({ feature: 'marketing_blast', enabled: true }, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('unknown_feature')
+    expect(patch).toEqual({})
+  })
+})
+
+describe('configureProactiveFeatures — authorization (no state touched)', () => {
+  const args = { feature: 'birthday_greetings', enabled: true }
+
+  it('customer is refused', async () => {
+    const res = await executeConfigureProactiveFeatures(args, payCtx('customer')) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('contact is refused', async () => {
+    const res = await executeConfigureProactiveFeatures(args, payCtx('contact')) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('delegated user WITHOUT settings.configure is refused', async () => {
+    const res = await executeConfigureProactiveFeatures(args, payCtx('delegated_user')) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('not_authorized')
+  })
+
+  it('delegated user WITH settings.configure passes auth (unknown feature reached, no write)', async () => {
+    // A granted delegate + unknown feature proves the grant opens the gate without touching the
+    // trap DB: we get unknown_feature, not not_authorized.
+    const res = await executeConfigureProactiveFeatures(
+      { feature: 'nope', enabled: true },
+      payCtx('delegated_user', ['settings.configure']),
+    ) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('unknown_feature')
+  })
+})
+
+// ── configureEscalationRules ────────────────────────────────────────────────
+describe('escalation-rule pure helpers', () => {
+  const kw = (value: string): EscalationRule => ({ trigger: 'keyword', value, customerMessage: 'passed_to_owner' })
+
+  it('add appends and is idempotent on the same keyword (case-insensitive)', () => {
+    const a = addEscalationRule(null, kw('refund'))
+    expect(a).toHaveLength(1)
+    const b = addEscalationRule(a, kw('REFUND'))
+    expect(b).toHaveLength(1) // same keyword, not duplicated
+    const c = addEscalationRule(b, kw('lawyer'))
+    expect(c).toHaveLength(2)
+  })
+
+  it('only one emotional / one unknown_intent rule is kept', () => {
+    const list = addEscalationRule(null, { trigger: 'emotional', customerMessage: 'silent' })
+    const again = addEscalationRule(list, { trigger: 'emotional', customerMessage: 'owner_callback' })
+    expect(again).toHaveLength(1)
+  })
+
+  it('remove drops a matching keyword and is a no-op otherwise', () => {
+    const list = addEscalationRule(null, kw('refund'))
+    expect(removeEscalationRule(list, 'keyword', 'refund')).toEqual([])
+    expect(removeEscalationRule(list, 'keyword', 'other')).toEqual(list)
+    expect(removeEscalationRule(list, 'emotional')).toEqual(list)
+  })
+})
+
+// A capture-db ctx that also answers the initial SELECT of current rules.
+function escCtx(rules: EscalationRule[] = [], role: ToolContext['role'] = 'manager', grants?: Action[]): { ctx: ToolContext; patch: Record<string, unknown> } {
+  const patch: Record<string, unknown> = {}
+  const db = {
+    select: () => ({ from: () => ({ where: () => ({ limit: async () => [{ rules }] }) }) }),
+    update: () => ({ set: (p: Record<string, unknown>) => ({ where: async () => { Object.assign(patch, p) } }) }),
+    insert: () => ({ values: async () => { /* logAudit */ } }),
+  }
+  const ctx: ToolContext = {
+    db: db as unknown as ToolContext['db'],
+    calendar: {} as ToolContext['calendar'],
+    businessId: 'biz-1',
+    identityId: 'mgr-1',
+    timezone: 'Asia/Jerusalem',
+    lang: 'en',
+    ...(role ? { role } : {}),
+    ...(grants ? { delegatedPermissions: new Set<Action>(grants) } : {}),
+  }
+  return { ctx, patch }
+}
+
+describe('configureEscalationRules — write', () => {
+  it('adds a keyword rule and persists it', async () => {
+    const { ctx, patch } = escCtx([])
+    const res = await executeConfigureEscalationRules({ op: 'add', trigger: 'keyword', value: 'refund' }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch['escalationRules']).toEqual([{ trigger: 'keyword', value: 'refund', customerMessage: 'passed_to_owner' }])
+  })
+
+  it('removes an existing rule', async () => {
+    const existing: EscalationRule[] = [{ trigger: 'keyword', value: 'refund', customerMessage: 'passed_to_owner' }]
+    const { ctx, patch } = escCtx(existing)
+    const res = await executeConfigureEscalationRules({ op: 'remove', trigger: 'keyword', value: 'refund' }, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch['escalationRules']).toEqual([])
+  })
+
+  it('list returns current rules without writing', async () => {
+    const existing: EscalationRule[] = [{ trigger: 'emotional', customerMessage: 'owner_callback' }]
+    const { ctx, patch } = escCtx(existing)
+    const res = await executeConfigureEscalationRules({ op: 'list' }, ctx) as { success: boolean; fact: string }
+    expect(res.success).toBe(true)
+    expect(JSON.parse(res.fact)).toEqual(existing)
+    expect(patch).toEqual({}) // no write on a read
+  })
+
+  it('keyword trigger without a value asks for the word (no write)', async () => {
+    const { ctx, patch } = escCtx([])
+    const res = await executeConfigureEscalationRules({ op: 'add', trigger: 'keyword' }, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('missing_keyword')
+    expect(patch).toEqual({})
+  })
+
+  it('removing a rule that is not there reports rule_not_found', async () => {
+    const { ctx } = escCtx([])
+    const res = await executeConfigureEscalationRules({ op: 'remove', trigger: 'keyword', value: 'ghost' }, ctx) as { success: boolean; reason?: string }
+    expect(res.success).toBe(false)
+    expect(res.reason).toBe('rule_not_found')
+  })
+})
+
+describe('configureEscalationRules — authorization', () => {
+  const args = { op: 'add' as const, trigger: 'emotional' }
+
+  it('customer / contact / un-granted delegate are refused before any DB touch', async () => {
+    for (const role of ['customer', 'contact', 'delegated_user'] as const) {
+      const res = await executeConfigureEscalationRules(args, payCtx(role)) as { success: boolean; reason?: string }
+      expect(res.success, role).toBe(false)
+      expect(res.reason, role).toBe('not_authorized')
+    }
+  })
+
+  it('delegated user WITH settings.configure passes auth and writes', async () => {
+    const { ctx, patch } = escCtx([], 'delegated_user', ['settings.configure'])
+    const res = await executeConfigureEscalationRules(args, ctx) as { success: boolean }
+    expect(res.success).toBe(true)
+    expect(patch['escalationRules']).toEqual([{ trigger: 'emotional', customerMessage: 'passed_to_owner' }])
   })
 })
