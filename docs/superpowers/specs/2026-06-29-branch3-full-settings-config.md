@@ -166,8 +166,17 @@ Each phase is independently shippable and deployable via `/update-agent`. Branch
 |---|---|---|
 | 1 | `configureProactiveFeatures` | audit, authorize |
 | 2 | **none** — extend existing `business_profile` + one `policy_change` subtype | `apply.ts` `businessProfileSchema` + policy pipeline (v1.0.111) |
-| 3 | `initiateBusinessKnowledgeSetup(section)` (Route A) + keyed-write tools (Route B) | `business-knowledge-setup` skill, `createWorkflow()`, jsonb patch |
+| 3 | **As built:** `configureEscalationRules` tool (Route B) + widened `business-knowledge-setup` `canHandle` triggers | escalation/engine.ts column; the skill as the editor for communication style / handoff / automated messages |
 | — | `settings.configure` authorization action | `check.ts` |
+
+### Phase 3 as-built (2026-07-01) — decision recorded
+
+Investigation changed the Tier-3 approach. The planned fragile Route A (orchestrator seeds a skill workflow) was **rejected**: on resume the skill dispatches the seeded step and treats the next message as the *answer* (the question shows only on fresh start), so clean seeding would force Developer-A code to duplicate the skill's per-section questions + state hydration and hardcode Developer-B step names — exactly the coupling the skill boundary forbids. Chosen instead (owner decision):
+
+1. **`configureEscalationRules`** — deterministic add/remove/list on `businesses.escalationRules` (onboarding-only until now; consumed by `escalation/engine.ts`). Gated by `settings.configure`. A rule = trigger (`keyword` / `emotional` / `unknown_intent`) + what the customer is told. Kept intentionally distinct from the skill's `handoff-rules` (which writes `handoffBehavior`).
+2. **Widened the skill's `canHandle`** (Developer-B file, user-approved) to also fire on the rich per-section phrasings the orchestrator has no tool for — `communication style`, `tone of voice`, `handoff`, `automated message`, `message template` (+ Hebrew). Tokens chosen to line up with `detectStartStep`. Deliberately **excludes** `escalat` (→ the new tool) and bare `message`/`reminder`/`notification` (→ Tier-1/2 tool collisions). Since manager skill-dispatch runs before the orchestrator, widening `canHandle` is sufficient — no orchestrator change needed for the rich flows.
+
+Net Tier-3 surface: **one** new orchestrator tool + a trigger-regex widening. No fragile cross-boundary workflow seeding.
 
 **Migrations: none. New columns: none. Net new top-level tools: ~2–3** (down from ~3–4 — v1.0.111's `business_profile` type absorbs Tier 2).
 
