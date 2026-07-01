@@ -605,6 +605,7 @@ type GoogleApiEvent = {
   id?: string | null
   status?: string | null
   summary?: string | null
+  description?: string | null
   etag?: string | null
   start?: { dateTime?: string | null; date?: string | null } | null
   end?: { dateTime?: string | null; date?: string | null } | null
@@ -619,6 +620,7 @@ function mapRawEvent(ev: GoogleApiEvent): RawCalendarEvent {
     eventId: ev.id ?? '',
     status: ev.status ?? null,
     summary: ev.summary ?? null,
+    description: ev.description ?? null,
     start: startRaw ? new Date(startRaw) : null,
     end: endRaw ? new Date(endRaw) : null,
     etag: ev.etag ?? null,

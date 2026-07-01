@@ -35,6 +35,7 @@ import { t } from '../i18n/t.js'
 import { getOpenSlots, isSlotBookable } from '../availability/service.js'
 import { listDayOptions, type ClassSession, type DayOptions } from '../availability/day-options.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
+import { findPendingImportedClassForSlot, relayPendingClassToOwner } from '../calendar/imported-class.js'
 import { resolveGoogleMapsUrl } from '../location/maps.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
@@ -1148,6 +1149,36 @@ async function relayUnansweredToOwner(
   return res.escalated && res.customerReply ? res.customerReply : honestNoOwner
 }
 
+/**
+ * Inbound-translator T1.3 (customer path): the customer asked about a specific class-mode
+ * slot that an owner added in Google but that we have NOT yet confirmed is an open class
+ * (an occupy-and-ASK pending import). We must never say "free"/"nothing there" — the slot
+ * is occupied — but nor may we book it (it's not a class yet). Reply honestly ("let me
+ * confirm with the studio") and relay to the owner, LINKED to the block so this customer
+ * is re-notified when the owner opens it. Returns null when there's no pending class here,
+ * so the normal availability answer runs. Best-effort: never throws into the reply path.
+ */
+export async function maybePendingImportedClassReply(
+  db: Db,
+  business: Business,
+  identity: ResolvedIdentity,
+  service: { id: string; name: string; schedulingMode: 'appointment' | 'class' },
+  slotStart: Date,
+  lang: 'he' | 'en',
+): Promise<{ reply: string } | null> {
+  if (service.schedulingMode !== 'class') return null
+  try {
+    const block = await findPendingImportedClassForSlot(db, business.id, service.id, slotStart)
+    if (!block) return null
+    const { customerReply } = await relayPendingClassToOwner(
+      db, business, { id: identity.id, phoneNumber: identity.phoneNumber }, block, service.name, lang,
+    )
+    return { reply: customerReply }
+  } catch {
+    return null // a hiccup here must never break the inquiry reply; fall through to normal availability
+  }
+}
+
 // F1c/S1 — the open waitlist offer (if any) this customer can accept by replying. The
 // "a spot opened" proactive offer (workers/waitlist.ts) flips the row to 'offered' but wires
 // NO session state and has no inbound consumer, so a "yes" used to fall through to fresh
@@ -1789,6 +1820,17 @@ export async function handleBookingFlow(
           if (resolvedDay && resolvedDay.ok && intent.slotRequest?.time) {
             const askedStart = resolveSlotStart(resolvedDay.dateStr, intent.slotRequest.time, businessTimezone)
             ctx = withConstraints(ctx, removeRejectedSlot(ctx.negotiationConstraints, askedStart.toISOString()))
+            // Inbound-translator T1.3: if this exact class slot is an owner-imported class we
+            // haven't confirmed open yet, answer honestly ("let me confirm with the studio") and
+            // relay to the owner — never say "free"/"nothing" (occupied) and never book it (not a
+            // class yet). Runs BEFORE availability so the pending slot can't read as empty.
+            if (inquiryService) {
+              const pending = await maybePendingImportedClassReply(db, business, identity, inquiryService, askedStart, detectedLanguage)
+              if (pending) {
+                await updateSessionContext(db, session.id, updatedCtx, 'active')
+                return { reply: pending.reply, sessionComplete: false }
+              }
+            }
           }
           if (resolvedDay && resolvedDay.ok) {
             const r = await buildDayOptionsText(db, business, resolvedDay.dateStr, businessTimezone, inquiryService?.id, ctx.negotiationConstraints, intent.slotRequest?.timeOfDay ?? null, true)

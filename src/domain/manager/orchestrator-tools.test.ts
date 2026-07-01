@@ -391,6 +391,14 @@ describe('answerCustomerQuestion — guards + wiring (F3a/S3)', () => {
     // Open questions are surfaced so the model knows to answer them.
     expect(src).toMatch(/Customer questions waiting for your answer/)
   })
+  it('opens a pending imported class when the owner AFFIRMS a block-linked question (T1.3, test f)', () => {
+    // Wiring lock-in (this file's convention): a block-linked question + affirmative answer
+    // materializes the class via confirmImportedClass, gated on parseConfirmation to preserve
+    // decision #10 (a non-yes answer never auto-opens a private class).
+    const src = readFileSync(new URL('./orchestrator-tools.ts', import.meta.url), 'utf8')
+    expect(src).toMatch(/relatedBlockId && parseConfirmation\(answer\) === 'yes'/)
+    expect(src).toMatch(/confirmImportedClass\(ctx\.db, ctx\.businessId, q\.relatedBlockId\)/)
+  })
 })
 
 describe('saveContactNote — tenant isolation (D1 IDOR guard)', () => {

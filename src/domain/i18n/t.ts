@@ -832,6 +832,29 @@ const strings = {
     he: (n: number) => `סנכרנתי שינוי שביצעת ביומן Google: ${n === 1 ? 'הזמנה אחת בוטלה' : `${n} הזמנות בוטלו`} בהתאם. הלקוחות שהושפעו עודכנו.`,
     en: (n: number) => `I synced a change you made in your Google Calendar: ${n === 1 ? '1 booking was cancelled' : `${n} bookings were cancelled`} to match. The affected customers have been notified.`,
   },
+  // Inbound translator (T1.3): a CERTAIN owner-added class was auto-opened for booking.
+  // Informational + owner-wins — reply to change or cancel. Code template (Gate-4 owns phrasing).
+  calendar_owner_class_imported: {
+    he: (service: string, when: string, n: number) => `ראיתי שהוספת ${service} ב-Google Calendar (${when}) ופתחתי אותו להזמנות עם ${n} מקומות. אם זה לא שיעור פתוח או שתרצה לשנות קיבולת/מדריך — רק תכתוב לי.`,
+    en: (service: string, when: string, n: number) => `I saw you added ${service} in your Google Calendar (${when}) and opened it for booking with ${n} spots. Reply to change the capacity/instructor, or if this isn't an open class.`,
+  },
+  // Inbound translator (T1.3): an UNCERTAIN owner-added class — occupied but not opened.
+  // A question; the slot stays blocked (never double-booked) until the owner confirms.
+  calendar_owner_class_confirm: {
+    he: (service: string, when: string) => `הוספת ${service} ב-Google Calendar (${when}). שריינתי את הזמן, אבל לפני שאפתח אותו להזמנות — זה שיעור פתוח שאפשר להזמין אליו? השב/י "כן" כדי לפתוח, או ספר/י לי מה זה.`,
+    en: (service: string, when: string) => `You added ${service} in your Google Calendar (${when}). I've reserved the time, but before I open it for booking — is this an open class customers can book? Reply "yes" to open it, or tell me what it is.`,
+  },
+  // Inbound translator (T1.3): a customer asked about an uncertain (pending-confirm) class.
+  // Honest — the slot is occupied but not yet confirmed open. Code template.
+  class_pending_studio_confirm: {
+    he: (service: string) => `יש ${service} בזמן הזה — אני מוודא/ת מול הסטודיו שהוא באמת פתוח להרשמה ואחזור אליך.`,
+    en: (service: string) => `There's a ${service} at that time — let me confirm with the studio that it's actually open for booking and I'll get back to you.`,
+  },
+  // Inbound translator (T1.3): the owner confirmed a pending class — re-engage the waiting customer.
+  class_now_open_reengage: {
+    he: (service: string, when: string) => `בשורה טובה — ${service} (${when}) אושר ופתוח להרשמה. רוצה שאשמור לך מקום?`,
+    en: (service: string, when: string) => `Good news — the ${service} (${when}) is confirmed and open for booking. Want me to save you a spot?`,
+  },
   // Inbound sync (Phase 3): owner change touches many bookings — blast-radius gate.
   calendar_owner_reconcile_gate: {
     he: (n: number) => `שמתי לב שמחקת מ-Google Calendar אירוע שמשפיע על ${n} הזמנות לקוחות. כדי לא לבטל בטעות הזמנות, לא ביטלתי כלום אוטומטית. רוצה שאבטל את כל ${n} ההזמנות? השב/י "כן לבטל" כדי לאשר.`,

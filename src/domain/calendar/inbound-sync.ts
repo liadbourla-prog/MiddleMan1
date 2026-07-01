@@ -7,6 +7,7 @@ import {
   calendarBlocks,
   calendarSyncChannels,
   identities,
+  serviceTypes,
   type Business,
 } from '../../db/schema.js'
 import { createCalendarClient } from '../../adapters/calendar/client.js'
@@ -16,6 +17,8 @@ import { notifyBusinessBookingChange, notifyOwnerBookingChange } from '../initia
 import { logAudit } from '../audit/logger.js'
 import { i18n, type Lang } from '../i18n/t.js'
 import { logInboundDecision, type ViaTrigger } from './inbound-telemetry.js'
+import { matchTitleToService, type ServiceMatch } from './service-match.js'
+import { parseStructuredClassMarker, localWeekday } from './classify.js'
 
 // ── Inbound sync (Phase 3) ──────────────────────────────────────────────────────
 // Ingests owner-originated Google Calendar changes back into the internal record
@@ -44,12 +47,19 @@ function webhookAddress(): string | null {
   return process.env['CALENDAR_WEBHOOK_ADDRESS'] ?? null
 }
 
-interface SyncContext {
+export interface SyncContext {
   business: Business
   calendarId: string
   refreshToken: string
   managerPhone: string | null
   lang: Lang
+}
+
+/** Human "when" for an owner note, e.g. "Sun 19:00" — business-local, never a raw UTC ISO. */
+function formatWhenForOwner(start: Date, timezone: string, lang: Lang): string {
+  const day = new Intl.DateTimeFormat(lang === 'he' ? 'he-IL' : 'en-US', { timeZone: timezone, weekday: 'short' }).format(start)
+  const time = new Intl.DateTimeFormat('en-GB', { timeZone: timezone, hour: '2-digit', minute: '2-digit', hour12: false }).format(start)
+  return `${day} ${time}`
 }
 
 function buildCalendar(ctx: SyncContext) {
@@ -176,7 +186,7 @@ export async function unregisterWatchChannel(businessId: string): Promise<void> 
  * reconcile when there is no token, when `opts.full` is set, or when Google
  * reports the token expired (410).
  */
-export async function runInboundSync(businessId: string, opts: { full?: boolean } = {}): Promise<{ ok: boolean; reason?: string }> {
+export async function runInboundSync(businessId: string, opts: { full?: boolean } = {}, viaTrigger: ViaTrigger = 'push'): Promise<{ ok: boolean; reason?: string }> {
   if (!isInboundSyncEnabled()) return { ok: false, reason: 'inbound sync disabled' }
   const ctx = await loadSyncContext(businessId)
   if (!ctx) return { ok: false, reason: 'business not in connected Google mode' }
@@ -220,10 +230,10 @@ export async function runInboundSync(businessId: string, opts: { full?: boolean 
   for (const ev of result.events) {
     if (!ev.eventId) continue
     if (ev.paManaged) {
-      const affected = await reconcileManagedEvent(ctx, ev, 'push')
+      const affected = await reconcileManagedEvent(ctx, ev, viaTrigger)
       if (affected) ownerCancellations.push(affected)
     } else {
-      await reconcileOwnerEvent(ctx, ev, 'push')
+      await reconcileOwnerEvent(ctx, ev, viaTrigger)
     }
   }
 
@@ -251,6 +261,10 @@ interface AffectedBooking {
   customerId: string
   serviceTypeId: string | null
   slotStart: Date
+  // Carried so booking_cancelled telemetry is emitted where the cancellation is actually
+  // APPLIED (post-blast-radius-gate), not at detection — a gated booking is never logged cancelled.
+  googleEventId: string
+  viaTrigger: ViaTrigger
 }
 
 /**
@@ -282,8 +296,9 @@ async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent, via
       return null
     }
     if (cancelled && (booking.state === 'confirmed' || booking.state === 'held' || booking.state === 'pending_payment')) {
-      logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'booking_cancelled', matchedServiceTypeId: booking.serviceTypeId, matchTier: null, viaTrigger })
-      return { bookingId: booking.id, customerId: booking.customerId, serviceTypeId: booking.serviceTypeId, slotStart: booking.slotStart }
+      // Do NOT log booking_cancelled here — detection ≠ application. The blast-radius gate in
+      // applyOwnerCancellations may block it; we log only where a cancel is actually applied.
+      return { bookingId: booking.id, customerId: booking.customerId, serviceTypeId: booking.serviceTypeId, slotStart: booking.slotStart, googleEventId: ev.eventId, viaTrigger }
     }
     return null
   }
@@ -306,11 +321,51 @@ async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent, via
 }
 
 /**
- * Reconcile an owner-created Google event into an opaque internal busy-block.
- * We never surface the owner's title (privacy — personal-calendar leak). A
- * cancelled/deleted owner event removes the imported block.
+ * Does the business already run this class service on `weekday` (business-local)? This
+ * is the PRIMARY certainty signal for auto-opening an owner-added class (T1.2, R1): a
+ * new Sun 19:00 Pilates is certain when Sunday already runs Pilates at other times — it
+ * is unmistakably another instance of a class we already manage. Time need NOT match;
+ * only the weekday. The event being reconciled is excluded (by googleEventId) so it can
+ * never vouch for its own certainty.
  */
-async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent, viaTrigger: ViaTrigger): Promise<void> {
+async function hasExistingClassSeriesOnWeekday(
+  businessId: string,
+  serviceTypeId: string,
+  weekday: number,
+  timezone: string,
+  excludeGoogleEventId: string,
+): Promise<boolean> {
+  const rows = await db
+    .select({ startTs: calendarBlocks.startTs, googleEventId: calendarBlocks.googleEventId })
+    .from(calendarBlocks)
+    .where(and(
+      eq(calendarBlocks.businessId, businessId),
+      eq(calendarBlocks.type, 'class'),
+      eq(calendarBlocks.serviceTypeId, serviceTypeId),
+    ))
+  return rows.some((r) => r.googleEventId !== excludeGoogleEventId && localWeekday(r.startTs, timezone) === weekday)
+}
+
+/**
+ * Reconcile an owner-created Google event into the internal record — the inbound
+ * *translator* (Google is never a source of truth). Certainty-gated (T1.2, R1):
+ *
+ *  - No service-name match           → opaque busy-block (title discarded). Decision #10.
+ *  - Class-service match + CERTAIN    → materialize a bookable type='class' block
+ *      (certainty = the weekday already runs this class, OR a machine-readable marker).
+ *  - Class-service match, NOT certain → occupy the slot with an opaque block carrying a
+ *      pending-class marker (serviceTypeId set, type='block' ⇒ NOT bookable) and relay to
+ *      the owner to confirm it's really open. Becomes a class only on owner confirm.
+ *  - Appointment-mode / weak match    → opaque block + owner relay (never a class).
+ *
+ * HARD invariant: occupancy is ALWAYS counted internally. A description is read only to
+ * classify / read a declared capacity — never to trust a head-count ("2/8 booked" is a
+ * reason to ASK the owner, never to auto-open). We never surface the owner's title.
+ *
+ * A cancelled/deleted owner event removes the imported block. Reconciling an EXISTING
+ * event only moves its time (re-classification of an existing row is T1.4, deferred).
+ */
+export async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent, viaTrigger: ViaTrigger): Promise<void> {
   const businessId = ctx.business.id
   const [existing] = await db
     .select({ id: calendarBlocks.id })
@@ -328,29 +383,135 @@ async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent, viaTr
   // Need a concrete time range to occupy a slot; skip malformed events.
   if (!ev.start || !ev.end) return
 
+  // Update of an already-imported event: only move its time. Do NOT re-classify an
+  // existing row (owner update/delete lifecycle for imported classes is T1.4, deferred).
   if (existing) {
     await db
       .update(calendarBlocks)
       .set({ startTs: ev.start, endTs: ev.end, googleEtag: ev.etag, updatedAt: new Date() })
       .where(eq(calendarBlocks.id, existing.id))
-  } else {
-    await db.insert(calendarBlocks).values({
-      businessId,
-      type: 'block',
-      startTs: ev.start,
-      endTs: ev.end,
-      title: null, // never surface the owner's event title (opaque block)
-      reason: null,
-      googleEventId: ev.eventId,
-      googleEtag: ev.etag,
-      source: 'google_import',
-    })
+    logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'block_opaque', matchedServiceTypeId: null, matchTier: null, viaTrigger })
+    return
   }
 
-  // Phase 0 telemetry — today the owner event is always kept as an opaque block
-  // (Phase 1 will widen this to class_materialized / weak_pending_confirm). Ids +
-  // enums only; the owner's title is NEVER logged.
-  logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'block_opaque', matchedServiceTypeId: null, matchTier: null, viaTrigger })
+  // ── Classify (T1.2) ─────────────────────────────────────────────────────────
+  // Resolve a service from the title; a structured marker can name the service too.
+  const titleMatch = await matchTitleToService(db, businessId, ev.summary)
+  const marker = parseStructuredClassMarker(ev.description)
+  const markerMatch: ServiceMatch | null =
+    marker && !titleMatch ? await matchTitleToService(db, businessId, marker.serviceName) : titleMatch
+  const service = titleMatch ?? markerMatch
+
+  // No service match at all → opaque block, exactly today's behavior (privacy gate).
+  if (!service) {
+    await insertOpaqueBlock(businessId, ev, null)
+    logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'block_opaque', matchedServiceTypeId: null, matchTier: null, viaTrigger })
+    return
+  }
+
+  // Appointment-mode (or a class-mode marker that only matched by appointment title):
+  // never a class. Occupy + relay so the owner tells us what it is.
+  if (service.schedulingMode !== 'class') {
+    await insertOpaqueBlock(businessId, ev, null) // no pending-class marker for appointment mode
+    logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'weak_pending_confirm', matchedServiceTypeId: service.serviceTypeId, matchTier: null, viaTrigger })
+    await enqueueOwnerClassConfirm(ctx, ev, service)
+    return
+  }
+
+  // Class-mode match. Certainty via structured marker (secondary) or template/pattern
+  // (primary). A marker naming this service is itself the certainty signal.
+  const markerCertain = marker != null && markerMatch != null
+  const templateCertain = !markerCertain && await hasExistingClassSeriesOnWeekday(
+    businessId, service.serviceTypeId, localWeekday(ev.start, ctx.business.timezone), ctx.business.timezone, ev.eventId,
+  )
+
+  if (markerCertain || templateCertain) {
+    // Capacity: the structured marker's declared capacity, else the service default.
+    // NEVER a head-count parsed from prose — occupancy is counted internally.
+    const capacity = marker?.capacity ?? service.defaultCapacity
+    await db.insert(calendarBlocks).values({
+      businessId,
+      type: 'class',
+      startTs: ev.start,
+      endTs: ev.end,
+      title: null, // never surface the owner's title
+      reason: null,
+      serviceTypeId: service.serviceTypeId,
+      maxParticipants: capacity,
+      providerId: null, // never fabricate an instructor (G6-safe)
+      googleEventId: ev.eventId,
+      googleEtag: ev.etag,
+      source: 'google_import', // trips the outbound-mirror skip (calendar-mirror.ts) — no echo loop
+    })
+    logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'class_materialized', matchedServiceTypeId: service.serviceTypeId, matchTier: markerCertain ? 'marker' : 'template', viaTrigger })
+    await enqueueOwnerClassImported(ctx, ev, service, capacity)
+    return
+  }
+
+  // Uncertain class → occupy-and-ASK. Opaque block carrying the pending-class marker
+  // (serviceTypeId set but type='block' ⇒ findClassBlockProviderForSlot skips it, so it
+  // is NOT bookable) + relay to the owner. It becomes a class only on owner confirm.
+  await insertOpaqueBlock(businessId, ev, {
+    serviceTypeId: service.serviceTypeId,
+    maxParticipants: service.defaultCapacity,
+  })
+  logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'weak_pending_confirm', matchedServiceTypeId: service.serviceTypeId, matchTier: null, viaTrigger })
+  await enqueueOwnerClassConfirm(ctx, ev, service)
+}
+
+/**
+ * Insert an opaque busy-block for an owner event (title always discarded). When
+ * `pending` is provided the row carries a pending-imported-class marker (serviceTypeId +
+ * capacity) while STAYING type='block' — occupies the slot but is never bookable until
+ * the owner confirms. Mirrors the original reconcileOwnerEvent insert (source='google_import',
+ * no enqueueBlockMirror, mirrorToGoogle at its default true).
+ */
+async function insertOpaqueBlock(
+  businessId: string,
+  ev: RawCalendarEvent,
+  pending: { serviceTypeId: string; maxParticipants: number } | null,
+): Promise<void> {
+  await db.insert(calendarBlocks).values({
+    businessId,
+    type: 'block',
+    startTs: ev.start!,
+    endTs: ev.end!,
+    title: null, // never surface the owner's event title (opaque block)
+    reason: null,
+    serviceTypeId: pending?.serviceTypeId ?? null,
+    maxParticipants: pending?.maxParticipants ?? null,
+    googleEventId: ev.eventId,
+    googleEtag: ev.etag,
+    source: 'google_import',
+  })
+}
+
+/** T1.3 — informational owner note after a CERTAIN materialize (owner-wins, code template). */
+async function enqueueOwnerClassImported(ctx: SyncContext, ev: RawCalendarEvent, service: ServiceMatch, capacity: number): Promise<void> {
+  if (!ctx.managerPhone || !ev.start) return
+  const serviceName = await serviceNameFor(ctx.business.id, service.serviceTypeId)
+  const when = formatWhenForOwner(ev.start, ctx.business.timezone, ctx.lang)
+  await enqueueMessage(ctx.business.id, ctx.managerPhone, i18n.calendar_owner_class_imported[ctx.lang](serviceName, when, capacity))
+    .catch(() => { /* non-fatal */ })
+}
+
+/** T1.3 — owner confirm QUESTION for an uncertain class (slot occupied until answered). */
+async function enqueueOwnerClassConfirm(ctx: SyncContext, ev: RawCalendarEvent, service: ServiceMatch): Promise<void> {
+  if (!ctx.managerPhone || !ev.start) return
+  const serviceName = await serviceNameFor(ctx.business.id, service.serviceTypeId)
+  const when = formatWhenForOwner(ev.start, ctx.business.timezone, ctx.lang)
+  await enqueueMessage(ctx.business.id, ctx.managerPhone, i18n.calendar_owner_class_confirm[ctx.lang](serviceName, when))
+    .catch(() => { /* non-fatal */ })
+}
+
+/** Resolve a service name for an owner note. Falls back to a neutral label if the row is gone. */
+async function serviceNameFor(businessId: string, serviceTypeId: string): Promise<string> {
+  const [row] = await db
+    .select({ name: serviceTypes.name })
+    .from(serviceTypes)
+    .where(and(eq(serviceTypes.id, serviceTypeId), eq(serviceTypes.businessId, businessId)))
+    .limit(1)
+  return row?.name ?? 'class'
 }
 
 /**
@@ -412,6 +573,10 @@ async function applyOwnerCancellations(ctx: SyncContext, affected: AffectedBooki
       serviceTypeId: a.serviceTypeId,
       slotStart: a.slotStart,
     }).catch(() => { /* non-fatal */ })
+
+    // Telemetry at the point of APPLICATION (post-gate) — a gated booking (early return
+    // above) is never logged as cancelled, so the decision log reflects reality.
+    logInboundDecision({ businessId, googleEventId: a.googleEventId, decision: 'booking_cancelled', matchedServiceTypeId: a.serviceTypeId, matchTier: null, viaTrigger: a.viaTrigger })
 
     await logAudit(db, {
       businessId,
@@ -496,7 +661,7 @@ export async function handleWatchNotification(headers: {
     return
   }
 
-  await runInboundSync(channel.businessId).catch((err: unknown) => {
+  await runInboundSync(channel.businessId, {}, 'push').catch((err: unknown) => {
     console.error('[inbound-sync] webhook-triggered sync failed', err)
   })
 }
@@ -523,8 +688,9 @@ export async function renewExpiringChannels(lookaheadMs = 24 * 60 * 60 * 1000): 
         console.error('[inbound-sync] channel renewal failed', { businessId: row.businessId, err })
       })
     } else {
-      // Not expiring yet — still run a safety full reconcile to catch dropped pushes.
-      await runInboundSync(row.businessId, { full: true }).catch(() => { /* non-fatal */ })
+      // Not expiring yet — still run a safety full reconcile to catch dropped pushes. This
+      // is the renewal cron, not a push, so it's labelled 'cron' in the decision log.
+      await runInboundSync(row.businessId, { full: true }, 'cron').catch(() => { /* non-fatal */ })
     }
   }
 }

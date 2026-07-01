@@ -84,6 +84,9 @@ export interface RawCalendarEvent {
   eventId: string
   status: string | null // 'confirmed' | 'tentative' | 'cancelled'
   summary: string | null
+  // Owner event body. Read ONLY for a machine-readable class marker / classification;
+  // never surfaced to a customer and never logged (privacy — decision #10).
+  description: string | null
   start: Date | null
   end: Date | null
   etag: string | null

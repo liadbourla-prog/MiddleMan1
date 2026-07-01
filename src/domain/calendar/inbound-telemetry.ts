@@ -38,8 +38,14 @@ export type InboundDecision =
   | 'booking_cancelled'
   | 'echo_ignored'
 
-/** Which trigger drove the reconcile that produced this decision. */
-export type ViaTrigger = 'push' | 'tick' | 'read'
+/**
+ * Which trigger drove the reconcile that produced this decision.
+ *  - `push` — a Google push notification (handleWatchNotification).
+ *  - `cron` — the renewal cron's periodic safety full-reconcile (renewExpiringChannels).
+ *  - `tick` — a time-driven freshness reconcile tick (Phase 2, not built yet).
+ *  - `read` — a passive read-time reconcile (reconcileScheduleWindowOnRead).
+ */
+export type ViaTrigger = 'push' | 'cron' | 'tick' | 'read'
 
 /** The per-event inbound-decision record. Ids + enums + null ONLY — no titles/bodies. */
 export interface InboundDecisionLog {
