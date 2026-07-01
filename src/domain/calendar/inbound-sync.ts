@@ -15,6 +15,7 @@ import { enqueueMessage } from '../../workers/message-retry.js'
 import { notifyBusinessBookingChange, notifyOwnerBookingChange } from '../initiations/booking-notify.js'
 import { logAudit } from '../audit/logger.js'
 import { i18n, type Lang } from '../i18n/t.js'
+import { logInboundDecision, type ViaTrigger } from './inbound-telemetry.js'
 
 // ── Inbound sync (Phase 3) ──────────────────────────────────────────────────────
 // Ingests owner-originated Google Calendar changes back into the internal record
@@ -219,10 +220,10 @@ export async function runInboundSync(businessId: string, opts: { full?: boolean 
   for (const ev of result.events) {
     if (!ev.eventId) continue
     if (ev.paManaged) {
-      const affected = await reconcileManagedEvent(ctx, ev)
+      const affected = await reconcileManagedEvent(ctx, ev, 'push')
       if (affected) ownerCancellations.push(affected)
     } else {
-      await reconcileOwnerEvent(ctx, ev)
+      await reconcileOwnerEvent(ctx, ev, 'push')
     }
   }
 
@@ -262,7 +263,7 @@ interface AffectedBooking {
  *  - other edits (e.g. time move) ⇒ out of scope for v1; stamp the new etag so we
  *    don't reprocess, and leave the internal record authoritative.
  */
-async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent): Promise<AffectedBooking | null> {
+async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent, viaTrigger: ViaTrigger): Promise<AffectedBooking | null> {
   const businessId = ctx.business.id
   const cancelled = ev.status === 'cancelled'
 
@@ -276,8 +277,12 @@ async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent): Pr
       .limit(1)
     if (!booking) return null
     // Echo of our own write — identical etag means nothing changed on Google's side.
-    if (!cancelled && ev.etag && booking.googleEtag && ev.etag === booking.googleEtag) return null
+    if (!cancelled && ev.etag && booking.googleEtag && ev.etag === booking.googleEtag) {
+      logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'echo_ignored', matchedServiceTypeId: null, matchTier: null, viaTrigger })
+      return null
+    }
     if (cancelled && (booking.state === 'confirmed' || booking.state === 'held' || booking.state === 'pending_payment')) {
+      logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'booking_cancelled', matchedServiceTypeId: booking.serviceTypeId, matchTier: null, viaTrigger })
       return { bookingId: booking.id, customerId: booking.customerId, serviceTypeId: booking.serviceTypeId, slotStart: booking.slotStart }
     }
     return null
@@ -305,7 +310,7 @@ async function reconcileManagedEvent(ctx: SyncContext, ev: RawCalendarEvent): Pr
  * We never surface the owner's title (privacy — personal-calendar leak). A
  * cancelled/deleted owner event removes the imported block.
  */
-async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent): Promise<void> {
+async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent, viaTrigger: ViaTrigger): Promise<void> {
   const businessId = ctx.business.id
   const [existing] = await db
     .select({ id: calendarBlocks.id })
@@ -341,6 +346,11 @@ async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent): Prom
       source: 'google_import',
     })
   }
+
+  // Phase 0 telemetry — today the owner event is always kept as an opaque block
+  // (Phase 1 will widen this to class_materialized / weak_pending_confirm). Ids +
+  // enums only; the owner's title is NEVER logged.
+  logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'block_opaque', matchedServiceTypeId: null, matchTier: null, viaTrigger })
 }
 
 /**
@@ -563,7 +573,7 @@ export async function reconcileScheduleWindowOnRead(
   for (const ev of result.events) {
     if (!ev.eventId || ev.status === 'cancelled') continue
     presentGoogleIds.add(ev.eventId)
-    if (!ev.paManaged) await reconcileOwnerEvent(ctx, ev)
+    if (!ev.paManaged) await reconcileOwnerEvent(ctx, ev, 'read')
   }
 
   // Diff-based deletion. We only ever consider blocks that START inside the window
@@ -578,6 +588,32 @@ export async function reconcileScheduleWindowOnRead(
       gte(calendarBlocks.startTs, window.from),
       lt(calendarBlocks.startTs, window.to),
     ))
+
+  // ── C0.1 completeness guard ────────────────────────────────────────────────
+  // Absence-in-the-returned-set is only a valid "the owner deleted it" signal when
+  // the fetch completed fully (status==='ok' ⇒ all pages drained, HTTP ok — checked
+  // above) AND the returned set is not implausibly empty relative to what we hold.
+  // A successful-but-eventually-consistent/empty Google page (0 live events) while
+  // we hold ≥1 mirrored block in-window is NOT "everything was deleted" — treating
+  // it as such would permanently destroy valid class/blocks for ALL callers (the
+  // pre-existing manager/web data-loss exposure). Abort the diff, log, delete nothing.
+  const mirroredInWindow = blocks.filter((b) => b.googleEventId)
+  if (presentGoogleIds.size === 0 && mirroredInWindow.length > 0) {
+    await logAudit(db, {
+      businessId,
+      actorId: null,
+      action: 'calendar.reconcile_completeness_guard',
+      entityType: 'business',
+      entityId: businessId,
+      metadata: {
+        via: 'reconcile_on_read',
+        reason: 'empty_response_over_nonempty_window',
+        mirroredInWindow: mirroredInWindow.length,
+      },
+    })
+    return { ok: true, reason: 'completeness-guard: empty Google response over non-empty mirrored window; diff-deletion aborted' }
+  }
+
   for (const b of blocks) {
     if (!b.googleEventId || presentGoogleIds.has(b.googleEventId)) continue
     await db.delete(calendarBlocks).where(eq(calendarBlocks.id, b.id))

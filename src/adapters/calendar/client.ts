@@ -24,6 +24,17 @@ import type { CalendarListEntry } from '../../domain/calendar/calendar-id.js'
 const HOLD_PREFIX = '[HOLD]'
 const HOLD_COLOR_ID = '5' // banana — visually distinct in Google Calendar
 
+// C0.2 — hard deadline on Google calls. There is otherwise NO timeout anywhere in
+// this client, so a hanging Google response (a customer reply, the reconcile tick)
+// would stall the caller indefinitely. An AbortController deadline caps every
+// incrementalSync so the caller always falls back to the internal record. Tunable
+// via GOOGLE_CALL_TIMEOUT_MS (evaluated per-call so ops/tests can override).
+const DEFAULT_GOOGLE_CALL_TIMEOUT_MS = 15_000
+function googleCallTimeoutMs(): number {
+  const raw = Number(process.env['GOOGLE_CALL_TIMEOUT_MS'])
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_GOOGLE_CALL_TIMEOUT_MS
+}
+
 function buildOAuth2Client() {
   const client = useNativeFetch(new google.auth.OAuth2(
     process.env['GOOGLE_CLIENT_ID'],
@@ -500,25 +511,34 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
   // one we do a windowed full reconcile. A 410 means the token expired ⇒ caller must
   // re-seed with a full reconcile. Paginates internally and returns nextSyncToken.
   async function incrementalSync(opts: IncrementalSyncOptions): Promise<IncrementalSyncResult> {
+    // C0.2 — one deadline covering the whole (possibly multi-page) sync, so a hang
+    // on ANY page can never stall the caller. On abort the signalled events.list
+    // rejects; we translate that into a plain error result (never a throw).
+    const timeoutMs = googleCallTimeoutMs()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const events: RawCalendarEvent[] = []
       let pageToken: string | undefined
       let nextSyncToken: string | null = null
       do {
         const response = await withTokenRefresh(() =>
-          calendar.events.list({
-            calendarId,
-            singleEvents: true,
-            showDeleted: true,
-            maxResults: 250,
-            ...(opts.syncToken
-              ? { syncToken: opts.syncToken }
-              : {
-                  timeMin: (opts.timeMin ?? new Date()).toISOString(),
-                  ...(opts.timeMax ? { timeMax: opts.timeMax.toISOString() } : {}),
-                }),
-            ...(pageToken ? { pageToken } : {}),
-          }),
+          calendar.events.list(
+            {
+              calendarId,
+              singleEvents: true,
+              showDeleted: true,
+              maxResults: 250,
+              ...(opts.syncToken
+                ? { syncToken: opts.syncToken }
+                : {
+                    timeMin: (opts.timeMin ?? new Date()).toISOString(),
+                    ...(opts.timeMax ? { timeMax: opts.timeMax.toISOString() } : {}),
+                  }),
+              ...(pageToken ? { pageToken } : {}),
+            },
+            { signal: controller.signal },
+          ),
         )
         for (const ev of response.data.items ?? []) events.push(mapRawEvent(ev))
         pageToken = response.data.nextPageToken ?? undefined
@@ -527,7 +547,12 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
       return { status: 'ok', events, nextSyncToken }
     } catch (err: unknown) {
       if (isGoogleApiError(err) && err.code === 410) return { status: 'expired' }
+      if (controller.signal.aborted) {
+        return { status: 'error', reason: `Google incrementalSync timed out after ${timeoutMs}ms` }
+      }
       return { status: 'error', reason: extractErrorMessage(err) }
+    } finally {
+      clearTimeout(timer)
     }
   }
 
