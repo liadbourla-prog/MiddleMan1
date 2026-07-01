@@ -239,6 +239,13 @@ export interface BookingFlowContext {
   isReschedulingFlow?: boolean
   botPersona?: 'female' | 'male' | 'neutral'
   sessionUnknownCount?: number
+  // T3.2 — repeated-unmet-need deterministic escalation net. lastInquiryKey is the normalized
+  // content-token key of the customer's last info-need (inquiry/unknown turn); inquiryRepeatCount
+  // counts how many times a SIMILAR ask has recurred without being satisfied. On the 2nd recurrence
+  // the core escalates to the owner through the throttled relay (the LLM sentinel is not the only
+  // safety net). Both reset on any non-inquiry/non-unknown intent — the customer moved on.
+  lastInquiryKey?: string | undefined
+  inquiryRepeatCount?: number | undefined
   // Set once a genuine special-arrangement request (private/group/out-of-hours) has been
   // escalated to the owner this session, so we notify them at most once per conversation.
   specialRequestEscalated?: boolean

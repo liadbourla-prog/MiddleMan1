@@ -1057,6 +1057,66 @@ export function isAskStudioSentinel(reply: string): boolean {
   return reply.trim().includes(ASK_STUDIO_SENTINEL)
 }
 
+// ── T3.2 — repeated-unmet-need deterministic escalation net (P3) ──────────────
+// The live bug: a customer asked the price 3× (price genuinely null) and the PA deflected each
+// time, never escalating, because escalation was gated ONLY on the LLM emitting [[ASK_STUDIO]].
+// This raises the deterministic floor: when a customer re-asks a SIMILAR unmet info-need, the core
+// escalates itself (on the 2nd recurrence) through the SAME throttled owner-relay — topic-agnostic,
+// no intent-extraction change. The honest reply stays the question_passed_to_studio CODE TEMPLATE.
+//
+// Similarity is deliberately LEXICAL (content-token overlap), not concept-clustering: the regression
+// guard requires "price?" and "any discount?" to be DISTINCT (a related follow-up, not a repeat), so
+// clustering all payment words together would over-escalate. A true re-ask (same words) is the signal.
+const INQUIRY_STOPWORDS = new Set<string>([
+  // English connectives / fillers that carry no info-need.
+  'the', 'a', 'an', 'is', 'are', 'do', 'does', 'did', 'can', 'could', 'would', 'will', 'to', 'of',
+  'for', 'and', 'or', 'me', 'my', 'it', 'this', 'that', 'there', 'you', 'your', 'please', 'so',
+  'ok', 'okay', 'yes', 'no', 'hi', 'hey', 'hello',
+  // Hebrew connectives / pronouns (the salient content word, e.g. עולה / מחיר, survives).
+  'את', 'זה', 'אני', 'אתה', 'של', 'יש', 'לי', 'לך', 'כן', 'לא', 'גם', 'אם', 'עם', 'הוא', 'היא',
+])
+
+// Normalize a customer message into a compact content-token key for similarity comparison.
+// Pure + exported for tests. Returns '' when the message carries no trackable info-need (social/noise).
+export function inquiryNeedKey(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !INQUIRY_STOPWORDS.has(w))
+    .join(' ')
+}
+
+// Two info-needs are "the same ask" when their content tokens overlap heavily (Jaccard ≥ 0.5).
+// This links a verbatim/near-verbatim re-ask while keeping a related follow-up (price → discount)
+// distinct. Pure + exported for tests.
+export function inquiryNeedsAreSimilar(a: string, b: string): boolean {
+  const A = new Set(a.split(' ').filter(Boolean))
+  const B = new Set(b.split(' ').filter(Boolean))
+  if (A.size === 0 || B.size === 0) return false
+  let inter = 0
+  for (const w of A) if (B.has(w)) inter++
+  const union = new Set([...A, ...B]).size
+  return inter / union >= 0.5
+}
+
+// Advance the per-session repeated-unmet-need counter for one inquiry/unknown turn. Given the prior
+// key/count from context and the current message, returns the next counter state and whether the core
+// should now escalate (the 2nd recurrence of a similar unmet ask). On escalation the count resets to 0
+// so it never re-fires turn-after-turn (the engine's dedup gate is the backstop). Pure + exported.
+export function repeatedUnmetNeedStep(
+  priorKey: string | undefined,
+  priorCount: number | undefined,
+  messageText: string,
+): { key: string; count: number; escalate: boolean } {
+  const key = inquiryNeedKey(messageText)
+  if (!key) return { key: '', count: 0, escalate: false } // no content → not a trackable need
+  const similar = priorKey ? inquiryNeedsAreSimilar(key, priorKey) : false
+  const count = similar ? (priorCount ?? 1) + 1 : 1
+  const escalate = count >= 2
+  return { key, count: escalate ? 0 : count, escalate }
+}
+
 // F3a/S3 — perform the real owner escalation for an unanswerable question and return the honest
 // customer reply. On no business / no reachable owner, returns a truthful no-promise message
 // (never claims it asked anyone — that would re-introduce the fabrication).
@@ -1516,12 +1576,24 @@ export async function handleBookingFlow(
   // total — handlers receive updatedCtx and persist from it, so the reset sticks.
   // WL-3: `let` (not const) — the full-slot waitlist follow-up clears pendingWaitlistJoin in-place
   // before falling through to normal booking on the slot_has_space (re-opened seat) path.
+  // T3.2 — repeated-unmet-need net. Only inquiry/unknown turns carry an info-need worth relaying;
+  // every other (actionable) intent means the customer moved on, so the counter RESETS (Discipline
+  // #3 — mirrors the sessionUnknownCount reset below). Computed once here; the inquiry/unknown cases
+  // below escalate through the SAME throttled owner-relay when a similar ask recurs (2nd time).
+  const tracksUnmetNeed = intent.intent === 'inquiry' || intent.intent === 'unknown'
+  const unmetNeed = tracksUnmetNeed
+    ? repeatedUnmetNeedStep(ctx.lastInquiryKey, ctx.inquiryRepeatCount, messageText)
+    : { key: '', count: 0, escalate: false }
+
   let updatedCtx: BookingFlowContext = {
     ...ctx,
     detectedLanguage,
     ...(mayGreet ? { greeted: true } : {}),
     ...(shouldOfferSwitch ? { languageSwitchOfferPending: true } : {}),
     ...(intent.intent !== 'unknown' ? { sessionUnknownCount: 0 } : {}),
+    ...(tracksUnmetNeed
+      ? { lastInquiryKey: unmetNeed.key, inquiryRepeatCount: unmetNeed.count }
+      : { lastInquiryKey: undefined, inquiryRepeatCount: 0 }),
   }
 
   // Prefix injected into situation strings for first-message targeted intents
@@ -1758,6 +1830,15 @@ export async function handleBookingFlow(
           const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
           return { reply: relay, sessionComplete: false }
         }
+        // T3.2 — deterministic floor: the model just deflected (no sentinel) an unmet info-need the
+        // customer already asked in a SIMILAR form. Route the repeat through the SAME throttled owner-relay
+        // (substance/dedup/rate) so a genuine gap doesn't dead-end forever waiting on a sentinel that never
+        // comes. The reply is the question_passed_to_studio CODE TEMPLATE — never makeGenReply — so Gate-4
+        // keeps owning the phrasing and the honest line can't be flagged as an unbacked claim.
+        if (unmetNeed.escalate) {
+          const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
+          return { reply: relay, sessionComplete: false }
+        }
         return { reply: inquiryReply, sessionComplete: false }
       }
 
@@ -1877,6 +1958,12 @@ export async function handleBookingFlow(
         }, unknownFocus ? { focusDay: unknownFocus } : undefined)
         // F3a/S3: the model signalled it can't answer → relay the question to the owner for real.
         if (isAskStudioSentinel(unknownReply)) {
+          const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
+          return { reply: relay, sessionComplete: false }
+        }
+        // T3.2 — deterministic floor (same as the inquiry path): a repeated unmet ask that the model
+        // deflected without a sentinel escalates through the throttled owner-relay CODE TEMPLATE.
+        if (unmetNeed.escalate) {
           const relay = await relayUnansweredToOwner(db, business, identity, messageText, detectedLanguage)
           return { reply: relay, sessionComplete: false }
         }
