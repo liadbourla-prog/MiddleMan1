@@ -68,7 +68,7 @@ function formatWhenForOwner(start: Date, timezone: string, lang: Lang): string {
   return `${day} ${time}`
 }
 
-function buildCalendar(ctx: SyncContext) {
+export function buildCalendar(ctx: SyncContext) {
   return createCalendarClient({
     accessToken: '',
     refreshToken: ctx.refreshToken,
@@ -80,7 +80,7 @@ function buildCalendar(ctx: SyncContext) {
   })
 }
 
-async function loadSyncContext(businessId: string): Promise<SyncContext | null> {
+export async function loadSyncContext(businessId: string): Promise<SyncContext | null> {
   const [business] = await db.select().from(businesses).where(eq(businesses.id, businessId)).limit(1)
   if (!business) return null
   if (business.calendarMode !== 'google' || !business.googleRefreshToken) return null
@@ -207,18 +207,20 @@ export async function runInboundSync(businessId: string, opts: { full?: boolean 
   const useToken = !opts.full && channel?.syncToken ? channel.syncToken : null
 
   const now = new Date()
+  const windowMax = new Date(now.getTime() + FULL_RECONCILE_FORWARD_MS)
+  // Track whether this pull was WINDOWED (full/no-token/after-410) vs INCREMENTAL (live
+  // syncToken). The booking-diff (T2.2) only runs on the windowed path: an incremental
+  // delta legitimately omits unchanged bookings, so absence there proves nothing; deletions
+  // on the incremental path arrive as `status:'cancelled'` tombstones instead.
+  let windowed = !useToken
   let result = await calendar.incrementalSync(
-    useToken
-      ? { syncToken: useToken }
-      : { timeMin: now, timeMax: new Date(now.getTime() + FULL_RECONCILE_FORWARD_MS) },
+    useToken ? { syncToken: useToken } : { timeMin: now, timeMax: windowMax },
   )
 
   // Expired token ⇒ re-run as a full reconcile (the real guarantee).
   if (result.status === 'expired') {
-    result = await calendar.incrementalSync({
-      timeMin: now,
-      timeMax: new Date(now.getTime() + FULL_RECONCILE_FORWARD_MS),
-    })
+    windowed = true
+    result = await calendar.incrementalSync({ timeMin: now, timeMax: windowMax })
   }
 
   if (result.status === 'error') {
@@ -241,6 +243,19 @@ export async function runInboundSync(businessId: string, opts: { full?: boolean 
     } else {
       await reconcileOwnerEvent(ctx, ev, viaTrigger)
     }
+  }
+
+  // ── Booking-diff deletion detection (T2.2 — closes PRE-EXISTING BUG A) ────────
+  // The windowed/full pull does NOT reliably return a `cancelled` tombstone for a booking
+  // event the owner deleted standalone — so a dropped push + expired token would otherwise
+  // strand a freed booking as `confirmed` FOREVER. On the windowed path only, diff the
+  // PA-managed bookings we expect in-window (that carry a mirrored Google event id) against
+  // the ids Google actually returned; an absent one was owner-deleted and is routed through
+  // the SAME gated applyOwnerCancellations (blast-radius + notify) as a tombstone. Guarded by
+  // C0.1 so a partial/empty-but-200 response can NEVER mass-cancel real bookings.
+  if (windowed) {
+    const diffDeleted = await detectDeletedBookingsByDiff(ctx, result.events, now, windowMax, ownerCancellations, viaTrigger)
+    ownerCancellations.push(...diffDeleted)
   }
 
   // Apply the owner-wins reconcile for cancelled PA bookings, behind the gate.
@@ -567,6 +582,85 @@ async function deleteImportedBlock(businessId: string, blockId: string, googleEv
     entityId: blockId,
     metadata: { googleEventId },
   })
+}
+
+/**
+ * Booking-diff deletion detection (T2.2 — closes PRE-EXISTING BUG A). On the WINDOWED path
+ * only, an owner who deleted a booking event standalone in Google leaves no reliable
+ * tombstone (unlike the incremental path); the event simply stops appearing. We detect that
+ * by DIFF: any live PA-managed booking we expect in-window that carries a mirrored Google
+ * event id (`calendarEventId`) whose id is absent from Google's returned set was owner-
+ * deleted. Returns those as AffectedBooking records for the SAME gated applyOwnerCancellations
+ * path (blast-radius + notify) — never a raw delete.
+ *
+ * ⚠️ C0.1 COMPLETENESS GUARD (the single most dangerous thing in the plan). Absence is a
+ * valid "deleted" signal ONLY when the fetch completed fully (status==='ok' ⇒ all pages
+ * drained + HTTP ok, established by the caller) AND the returned set is not implausibly empty
+ * relative to what we hold internally. A successful-but-eventually-consistent/empty Google
+ * page (0 live events) while we hold ≥1 mirrored booking in-window is NOT "everything was
+ * cancelled" — treating it so would fire false cancellation WhatsApps at real paying
+ * customers. In that case we ABORT the diff, log, and cancel NOTHING (zero notifications).
+ * A non-zero-but-implausibly-short response that omits many bookings is caught downstream by
+ * the blast-radius gate (asks the manager, auto-cancels nothing) — never by silent mass-cancel.
+ *
+ * Occupancy stays 100% internal: this reads the bookings table, never a Google head-count.
+ * Bookings already flagged this pass (by a tombstone via reconcileManagedEvent) are skipped
+ * so a booking is never double-counted. GROUP-class seats carry calendarEventId=null (no
+ * individual mirror event) and are correctly excluded — they have no id to be absent.
+ */
+async function detectDeletedBookingsByDiff(
+  ctx: SyncContext,
+  events: RawCalendarEvent[],
+  windowMin: Date,
+  windowMax: Date,
+  alreadyFlagged: AffectedBooking[],
+  viaTrigger: ViaTrigger,
+): Promise<AffectedBooking[]> {
+  const businessId = ctx.business.id
+
+  // The ids Google actually returned as PRESENT (a `cancelled` tombstone is an absence signal,
+  // not a presence one, so it is excluded here).
+  const returnedIds = new Set<string>()
+  for (const ev of events) {
+    if (ev.eventId && ev.status !== 'cancelled') returnedIds.add(ev.eventId)
+  }
+
+  // Live PA-managed bookings expected in-window that carry a mirrored Google event id.
+  const expected = await db
+    .select({ id: bookings.id, customerId: bookings.customerId, serviceTypeId: bookings.serviceTypeId, slotStart: bookings.slotStart, calendarEventId: bookings.calendarEventId })
+    .from(bookings)
+    .where(and(
+      eq(bookings.businessId, businessId),
+      gte(bookings.slotStart, windowMin),
+      lt(bookings.slotStart, windowMax),
+      inArray(bookings.state, [...CLASS_SEAT_STATES]),
+    ))
+  const mirrored = expected.filter((b) => b.calendarEventId)
+
+  // ── C0.1 completeness guard ────────────────────────────────────────────────
+  // Google returned ZERO live events over a window in which we hold ≥1 mirrored booking ⇒
+  // implausible (a connected calendar with live bookings should return at least those events).
+  // Abort the diff, audit, cancel nothing — silent (audit only) so ZERO notifications fire.
+  if (returnedIds.size === 0 && mirrored.length > 0) {
+    await logAudit(db, {
+      businessId,
+      actorId: null,
+      action: 'calendar.reconcile_completeness_guard',
+      entityType: 'business',
+      entityId: businessId,
+      metadata: { via: 'booking_diff', reason: 'empty_response_over_nonempty_window', mirroredInWindow: mirrored.length },
+    })
+    return []
+  }
+
+  const flaggedIds = new Set(alreadyFlagged.map((a) => a.bookingId))
+  const deleted: AffectedBooking[] = []
+  for (const b of mirrored) {
+    if (flaggedIds.has(b.id)) continue // already caught by a tombstone this pass
+    if (returnedIds.has(b.calendarEventId!)) continue // still present in Google
+    deleted.push({ bookingId: b.id, customerId: b.customerId, serviceTypeId: b.serviceTypeId, slotStart: b.slotStart, googleEventId: b.calendarEventId!, viaTrigger })
+  }
+  return deleted
 }
 
 /**
