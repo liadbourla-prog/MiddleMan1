@@ -287,7 +287,9 @@ const addressPart = z.preprocess(
   z.string().max(120).optional(),
 )
 
-export const businessProfileSchema = z.object({
+// The physical address — the original, richest business_profile field: free text plus an optional
+// structured breakdown and a pasted Maps link.
+const profileAddressSchema = z.object({
   field: z.literal('address'),
   value: z.string().trim().min(1).max(300),
   streetAddress: addressPart,
@@ -301,6 +303,28 @@ export const businessProfileSchema = z.object({
     z.string().url().max(2048).optional(),
   ),
 })
+
+// Scalar owner-preference fields, each a single businesses column. value is validated per field so a
+// bad enum/URL/blank never reaches the DB (the writer only sets the mapped column). Booleans must be
+// real JSON booleans — a stringy "false" fails rather than coercing to true.
+const profileNameSchema = z.object({ field: z.literal('name'), value: z.string().trim().min(1).max(120) })
+const profilePersonaSchema = z.object({ field: z.literal('bot_persona'), value: z.enum(['female', 'male', 'neutral']) })
+const profileBrandVoiceSchema = z.object({ field: z.literal('brand_voice'), value: z.string().trim().min(1).max(2000) })
+const profileReviewUrlSchema = z.object({ field: z.literal('google_review_url'), value: z.string().trim().url().max(2048) })
+const profileConfirmationGateSchema = z.object({ field: z.literal('confirmation_gate'), value: z.enum(['immediate', 'post_payment']) })
+const profileAvailable247Schema = z.object({ field: z.literal('available_247'), value: z.boolean() })
+const profileLanguageSchema = z.object({ field: z.literal('default_language'), value: z.enum(['he', 'en']) })
+
+export const businessProfileSchema = z.discriminatedUnion('field', [
+  profileAddressSchema,
+  profileNameSchema,
+  profilePersonaSchema,
+  profileBrandVoiceSchema,
+  profileReviewUrlSchema,
+  profileConfirmationGateSchema,
+  profileAvailable247Schema,
+  profileLanguageSchema,
+])
 
 // Deterministic writer for owner-set business profile fields. Currently the physical address —
 // the customer-facing location surfaced in Branch 4 and shared with the website/GMB skills. We
@@ -320,46 +344,79 @@ async function applyBusinessProfileChange(
     return {
       ok: false,
       reason: lang === 'he'
-        ? 'לא הצלחתי לקרוא את הכתובת. בקש/י מהבעלים לכתוב אותה שוב.'
-        : "Could not read the address — ask the owner to state it again.",
+        ? 'לא הצלחתי לקרוא את ההגדרה. בקש/י מהבעלים לנסח אותה שוב.'
+        : "Could not read that setting — ask the owner to state it again.",
     }
   }
 
   const p = parsed.data
-  const address = p.value
-  const components = {
-    streetAddress: p.streetAddress ?? null,
-    city: p.city ?? null,
-    region: p.region ?? null,
-    country: p.country ?? null,
-    postalCode: p.postalCode ?? null,
+
+  // Address keeps its richer behaviour (structured parts + Maps link); every other field is a single
+  // column set. One writer, one audit per field, a plain confirmation the LLM relays.
+  if (p.field === 'address') {
+    const address = p.value
+    const components = {
+      streetAddress: p.streetAddress ?? null,
+      city: p.city ?? null,
+      region: p.region ?? null,
+      country: p.country ?? null,
+      postalCode: p.postalCode ?? null,
+    }
+    // null the whole jsonb when no part was identified, rather than store an all-null object.
+    const addressComponents = Object.values(components).some((v) => v !== null) ? components : null
+    // A new address makes any previously-pinned link stale: keep the override only when the owner
+    // re-supplies one in the same instruction, otherwise reset so we derive from the new address.
+    const googleMapsUrl = p.mapsUrl ?? null
+
+    await db.update(businesses).set({ address, addressComponents, googleMapsUrl }).where(eq(businesses.id, businessId))
+    await logAudit(db, { businessId, actorId, action: 'business.address_updated', entityType: 'business', entityId: businessId, metadata: { address, addressComponents, googleMapsUrl } })
+    return { ok: true, confirmationMessage: lang === 'he' ? `✅ הכתובת עודכנה ל: ${address}` : `✅ Address updated to: ${address}` }
   }
-  // null the whole jsonb when no part was identified, rather than store an all-null object.
-  const addressComponents = Object.values(components).some((v) => v !== null) ? components : null
-  // A new address makes any previously-pinned link stale: keep the override only when the owner
-  // re-supplies one in the same instruction, otherwise reset so we derive from the new address.
-  const googleMapsUrl = p.mapsUrl ?? null
 
-  await db
-    .update(businesses)
-    .set({ address, addressComponents, googleMapsUrl })
-    .where(eq(businesses.id, businessId))
-
-  await logAudit(db, {
-    businessId,
-    actorId,
-    action: 'business.address_updated',
-    entityType: 'business',
-    entityId: businessId,
-    metadata: { address, addressComponents, googleMapsUrl },
-  })
-
-  return {
-    ok: true,
-    confirmationMessage: lang === 'he'
-      ? `✅ הכתובת עודכנה ל: ${address}`
-      : `✅ Address updated to: ${address}`,
+  let patch: Record<string, unknown>
+  let confirmationMessage: string
+  switch (p.field) {
+    case 'name':
+      patch = { name: p.value }
+      confirmationMessage = lang === 'he' ? `✅ שם העסק עודכן ל: ${p.value}` : `✅ Business name updated to: ${p.value}`
+      break
+    case 'bot_persona':
+      patch = { botPersona: p.value }
+      confirmationMessage = lang === 'he'
+        ? `✅ מעכשיו אשתמש בקול ${p.value === 'female' ? 'נשי' : p.value === 'male' ? 'גברי' : 'ניטרלי'}.`
+        : `✅ I'll use a ${p.value} voice from now on.`
+      break
+    case 'brand_voice':
+      patch = { brandVoice: p.value }
+      confirmationMessage = lang === 'he' ? '✅ עדכנתי את קול המותג.' : '✅ Brand voice updated.'
+      break
+    case 'google_review_url':
+      patch = { googleReviewUrl: p.value }
+      confirmationMessage = lang === 'he' ? '✅ קישור הביקורות של Google נשמר.' : '✅ Your Google review link is saved.'
+      break
+    case 'confirmation_gate':
+      patch = { confirmationGate: p.value }
+      confirmationMessage = lang === 'he'
+        ? `✅ מעכשיו הזמנות מאושרות ${p.value === 'immediate' ? 'מיד' : 'רק אחרי תשלום'}.`
+        : `✅ Bookings are now confirmed ${p.value === 'immediate' ? 'immediately' : 'only after payment'}.`
+      break
+    case 'available_247':
+      patch = { available247: p.value }
+      confirmationMessage = lang === 'he'
+        ? `✅ מעכשיו העסק ${p.value ? 'זמין תמיד (24/7)' : 'עובד לפי שעות הפעילות'}.`
+        : `✅ The business is now ${p.value ? 'available around the clock (24/7)' : 'open only within your set hours'}.`
+      break
+    case 'default_language':
+      patch = { defaultLanguage: p.value }
+      confirmationMessage = lang === 'he'
+        ? `✅ שפת ברירת המחדל היא ${p.value === 'he' ? 'עברית' : 'אנגלית'}.`
+        : `✅ Default language set to ${p.value === 'he' ? 'Hebrew' : 'English'}.`
+      break
   }
+
+  await db.update(businesses).set(patch).where(eq(businesses.id, businessId))
+  await logAudit(db, { businessId, actorId, action: `business.${p.field}_updated`, entityType: 'business', entityId: businessId, metadata: patch })
+  return { ok: true, confirmationMessage }
 }
 
 // ── Availability change ───────────────────────────────────────────────────────
@@ -1074,7 +1131,7 @@ async function applyRecurringClassChange(
 // ── Policy change ─────────────────────────────────────────────────────────────
 
 export const policyChangeSchema = z.object({
-  subtype: z.enum(['cancellation_cutoff', 'booking_buffer', 'max_days_ahead', 'cancellation_fee', 'booking_authority', 'approval_window', 'other']),
+  subtype: z.enum(['cancellation_cutoff', 'booking_buffer', 'max_days_ahead', 'cancellation_fee', 'booking_authority', 'approval_window', 'reminder_offset', 'other']),
   valueHours: z.coerce.number().nonnegative().nullable().optional(),
   valueDays: z.coerce.number().int().positive().nullable().optional(),
   valueAmount: z.coerce.number().nonnegative().nullable().optional(),
@@ -1125,6 +1182,18 @@ async function applyPolicyChange(
         .where(eq(businesses.id, businessId))
       await logAudit(db, { businessId, actorId, action: 'policy.max_days_ahead_updated', entityType: 'business', entityId: businessId, afterState: { maxBookingDaysAhead: days } })
       return { ok: true, confirmationMessage: i18n.apply_policy_max_days[lang](days) }
+    }
+
+    case 'reminder_offset': {
+      // Business-wide default lead time for the customer reminder (a service can override its own).
+      // Clamp to a sane 1h–168h (7d) window so a fat-fingered 0 or 9999 never lands.
+      const hours = Math.min(168, Math.max(1, Math.round(p.valueHours ?? 24)))
+      await db
+        .update(businesses)
+        .set({ reminderOffsetHours: hours })
+        .where(eq(businesses.id, businessId))
+      await logAudit(db, { businessId, actorId, action: 'policy.reminder_offset_updated', entityType: 'business', entityId: businessId, afterState: { reminderOffsetHours: hours } })
+      return { ok: true, confirmationMessage: i18n.apply_policy_reminder_offset[lang](hours) }
     }
 
     case 'cancellation_fee': {
