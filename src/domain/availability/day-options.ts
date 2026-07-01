@@ -18,6 +18,7 @@ import { calendarBlocks, serviceTypes, bookings } from '../../db/schema.js'
 import type { Business } from '../../db/schema.js'
 import { resolveSlotStart, addDaysToDateStr } from './resolve-slot.js'
 import { getOpenSlots } from './service.js'
+import { findPendingImportedClassesForDay } from '../calendar/imported-class.js'
 
 // Booking states that occupy a class seat — mirrors the capacity check in
 // booking/engine.ts requestGroupClassBooking so "spots left" matches reality.
@@ -40,10 +41,24 @@ export interface PrivateOpening {
   slots: Date[]
 }
 
+/**
+ * Finding 3: an owner-imported class that is occupied but NOT yet confirmed open (an opaque
+ * type='block' google_import row carrying a serviceTypeId marker). Surfaced on a day/any-time
+ * inquiry as "tentative — confirming with the studio", NEVER as a bookable slot.
+ */
+export interface PendingClassSession {
+  serviceTypeId: string
+  serviceName: string
+  start: Date
+  end: Date
+}
+
 export interface DayOptions {
   dateStr: string
   classes: ClassSession[]
   privateOpenings: PrivateOpening[]
+  /** Tentative (occupy-and-ask) imported classes — surfaced as pending, never bookable. */
+  pendingClasses?: PendingClassSession[]
 }
 
 /**
@@ -196,5 +211,17 @@ export async function listDayOptions(
     }
   }
 
-  return { dateStr, classes, privateOpenings }
+  // ── Pending (tentative) imported classes for the day (Finding 3) ────────────
+  // Occupy-and-ask imported classes (opaque type='block' google_import rows with a service
+  // marker) so a day/any-time inquiry surfaces them as "tentative — confirming with the studio"
+  // instead of reading empty. They are NEVER bookable (renderer never offers them).
+  const pendingRows = await findPendingImportedClassesForDay(db, business.id, from, dayEnd, opts.serviceTypeId)
+  const pendingClasses: PendingClassSession[] = pendingRows.map((p) => ({
+    serviceTypeId: p.serviceTypeId,
+    serviceName: serviceById.get(p.serviceTypeId)?.name ?? 'Class',
+    start: p.startTs,
+    end: p.endTs,
+  }))
+
+  return { dateStr, classes, privateOpenings, pendingClasses }
 }

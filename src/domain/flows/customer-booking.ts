@@ -677,6 +677,17 @@ export function renderDayOptions(
     parts.push(`Open private times on ${dayLabel}: ${items.join('; ')}.`)
   }
 
+  // Finding 3: surface any tentative (occupy-and-ask) imported class for the day as pending —
+  // "confirming with the studio" — so a vague "any Pilates Sunday?" never reads as empty. It is
+  // NEVER added to `offered` (not bookable); the phrasing tells the model to present it as
+  // tentative only. A specific-time ask for the same slot is caught earlier by
+  // maybePendingImportedClassReply. Same part-of-day narrowing as the real options.
+  const pendingClasses = byBucket(day.pendingClasses ?? [])
+  if (pendingClasses.length > 0) {
+    const items = pendingClasses.map((p) => `${p.serviceName} at ${formatSlotTime(p.start, tz)}`)
+    parts.push(`Tentative on ${dayLabel} (NOT yet bookable — confirming with the studio): ${items.join('; ')}. Present these as tentative/pending confirmation only; do NOT offer them as bookable times or invent a spot count.`)
+  }
+
   const flag = fullRequestedSlot ? { fullRequestedSlot } : {}
   if (parts.length > 0) return { text: parts.join(' '), offered, ...flag }
   // A part-of-day was asked but nothing real falls in it.

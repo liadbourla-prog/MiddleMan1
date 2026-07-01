@@ -36,6 +36,12 @@ const WATCH_TTL_MS = 7 * 24 * 60 * 60 * 1000 // Google caps event channels at ~1
 const FULL_RECONCILE_FORWARD_MS = 90 * 24 * 60 * 60 * 1000 // reconcile window: now → +90d
 const BLAST_RADIUS_THRESHOLD = 2 // >this many affected bookings ⇒ ask before cancelling
 
+// Booking states that hold a live class seat — the ones a materialized-class MOVE must
+// relocate and a materialized-class DELETE must route through the owner-wins gate. Terminal
+// states (cancelled/expired/failed/attended/no_show) already released the slot. Mirrors the
+// occupancy set in availability/day-options.ts, plus 'held' (a reserved seat mid-booking).
+const CLASS_SEAT_STATES = ['requested', 'held', 'pending_payment', 'confirmed'] as const
+
 /** True only when ops has provisioned the public callback and flipped the flag. */
 export function isInboundSyncEnabled(): boolean {
   const v = process.env['CALENDAR_INBOUND_SYNC_ENABLED']
@@ -368,24 +374,72 @@ async function hasExistingClassSeriesOnWeekday(
 export async function reconcileOwnerEvent(ctx: SyncContext, ev: RawCalendarEvent, viaTrigger: ViaTrigger): Promise<void> {
   const businessId = ctx.business.id
   const [existing] = await db
-    .select({ id: calendarBlocks.id })
+    .select({ id: calendarBlocks.id, type: calendarBlocks.type, serviceTypeId: calendarBlocks.serviceTypeId, startTs: calendarBlocks.startTs, endTs: calendarBlocks.endTs })
     .from(calendarBlocks)
     .where(and(eq(calendarBlocks.businessId, businessId), eq(calendarBlocks.googleEventId, ev.eventId)))
     .limit(1)
 
+  // ── DELETE (T1.4) ────────────────────────────────────────────────────────────
+  // The owner removed the event in Google. A pending block or a 0-booking class is a
+  // clean removal (today's behavior). A materialized class that HAS live bookings must
+  // never be silently dropped — route its co-bookings through the owner-wins blast-radius
+  // gate (applyOwnerCancellations): >threshold ⇒ ask the manager and cancel NOTHING (keep
+  // the block occupied so seats aren't orphaned while the manager decides); ≤threshold ⇒
+  // cancel each + notify, then remove the now-empty class block.
   if (ev.status === 'cancelled') {
-    if (existing) {
-      await db.delete(calendarBlocks).where(eq(calendarBlocks.id, existing.id))
+    if (!existing) return
+    if (existing.type === 'class' && existing.serviceTypeId && viaTrigger !== 'read') {
+      const affected = await loadClassSeatBookings(businessId, existing.serviceTypeId, existing.startTs, ev.eventId, viaTrigger)
+      if (affected.length > 0) {
+        await applyOwnerCancellations(ctx, affected)
+        // Only remove the class block once its bookings were actually cancelled (≤ threshold).
+        // Over threshold the gate cancelled nothing, so keeping the block preserves the seats.
+        if (affected.length <= BLAST_RADIUS_THRESHOLD) {
+          await deleteImportedBlock(businessId, existing.id, ev.eventId)
+        }
+        return
+      }
     }
+    await deleteImportedBlock(businessId, existing.id, ev.eventId)
     return
   }
 
   // Need a concrete time range to occupy a slot; skip malformed events.
   if (!ev.start || !ev.end) return
 
-  // Update of an already-imported event: only move its time. Do NOT re-classify an
-  // existing row (owner update/delete lifecycle for imported classes is T1.4, deferred).
+  // ── MOVE / UPDATE (T1.4) ──────────────────────────────────────────────────────
+  // Update of an already-imported event: move its time. We do NOT re-classify an existing
+  // row (that would need the full classifier). When a MATERIALIZED class moves and carries
+  // live bookings, the seats follow the class to the new slot (owner-wins, non-destructive —
+  // the class instance persists, only its clock time shifts) and each affected customer + the
+  // owner is notified via the 'moved' spine.
+  //
+  // Read-path DEFERRAL (hard): a booked-class move must NOT be applied on a passive read.
+  // Beyond the no-notification invariant, patching the block time on a read while leaving the
+  // seats behind would STRAND them — the later push would see no time change and never relocate
+  // them. So on a read we leave the block at its old time and defer the whole move (patch +
+  // relocate + notify) to the push/tick. An unbooked class / opaque block still patches on read.
   if (existing) {
+    const oldStart = existing.startTs
+    const oldEnd = existing.endTs
+    const timeChanged = !oldStart || !oldEnd || oldStart.getTime() !== ev.start.getTime() || oldEnd.getTime() !== ev.end.getTime()
+    const isClassMove = existing.type === 'class' && existing.serviceTypeId != null && oldStart != null && timeChanged
+    if (isClassMove) {
+      const seats = await loadClassSeatBookings(businessId, existing.serviceTypeId!, oldStart!, ev.eventId, viaTrigger)
+      if (seats.length > 0 && viaTrigger === 'read') {
+        // Deferred — do not mutate anything on the read path; the push/tick applies it with notifications.
+        logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'block_opaque', matchedServiceTypeId: null, matchTier: null, viaTrigger })
+        return
+      }
+      await db
+        .update(calendarBlocks)
+        .set({ startTs: ev.start, endTs: ev.end, googleEtag: ev.etag, updatedAt: new Date() })
+        .where(eq(calendarBlocks.id, existing.id))
+      if (seats.length > 0) await relocateClassSeats(ctx, seats, oldStart!, ev.start, ev.end)
+      logInboundDecision({ businessId, googleEventId: ev.eventId, decision: 'block_opaque', matchedServiceTypeId: null, matchTier: null, viaTrigger })
+      return
+    }
+    // Opaque block, unchanged time, or a class with no move → patch as before.
     await db
       .update(calendarBlocks)
       .set({ startTs: ev.start, endTs: ev.end, googleEtag: ev.etag, updatedAt: new Date() })
@@ -496,6 +550,98 @@ async function insertOpaqueBlock(
     googleEventId: ev.eventId,
     googleEtag: ev.etag,
     source: 'google_import',
+  })
+}
+
+/**
+ * Delete an imported block by id and audit it (T1.4). Single home so the cancelled-event
+ * removal always leaves an audit trail (the old cancelled branch deleted silently).
+ */
+async function deleteImportedBlock(businessId: string, blockId: string, googleEventId: string): Promise<void> {
+  await db.delete(calendarBlocks).where(and(eq(calendarBlocks.id, blockId), eq(calendarBlocks.businessId, businessId)))
+  await logAudit(db, {
+    businessId,
+    actorId: null,
+    action: 'calendar.owner_deleted_block',
+    entityType: 'calendar_block',
+    entityId: blockId,
+    metadata: { googleEventId },
+  })
+}
+
+/**
+ * Load the live class co-bookings occupying (serviceTypeId, classStart) as AffectedBooking
+ * records for the owner-wins blast-radius gate (T1.4 DELETE). Occupancy is always counted
+ * internally — this reads the bookings table, never a Google head-count.
+ */
+async function loadClassSeatBookings(
+  businessId: string,
+  serviceTypeId: string,
+  classStart: Date,
+  googleEventId: string,
+  viaTrigger: ViaTrigger,
+): Promise<AffectedBooking[]> {
+  const rows = await db
+    .select({ id: bookings.id, customerId: bookings.customerId, serviceTypeId: bookings.serviceTypeId, slotStart: bookings.slotStart })
+    .from(bookings)
+    .where(and(
+      eq(bookings.businessId, businessId),
+      eq(bookings.serviceTypeId, serviceTypeId),
+      eq(bookings.slotStart, classStart),
+      inArray(bookings.state, [...CLASS_SEAT_STATES]),
+    ))
+  return rows.map((r) => ({ bookingId: r.id, customerId: r.customerId, serviceTypeId: r.serviceTypeId, slotStart: r.slotStart, googleEventId, viaTrigger }))
+}
+
+/**
+ * Relocate a materialized class's already-loaded live seats to the new slot (T1.4). The seat
+ * follows the class (owner-wins, non-destructive: no seat is lost, so no blast-radius ask-gate is
+ * needed — the gate exists to prevent surprise mass-cancellation, and a move cancels nothing).
+ * Each affected customer + the owner is notified via the existing 'moved' spine (honest, never a
+ * silent time change). Never called on the passive read path (no notification side effect there).
+ */
+async function relocateClassSeats(
+  ctx: SyncContext,
+  affected: AffectedBooking[],
+  fromSlotStart: Date,
+  newStart: Date,
+  newEnd: Date,
+): Promise<void> {
+  const businessId = ctx.business.id
+  if (affected.length === 0) return
+
+  for (const a of affected) {
+    await db
+      .update(bookings)
+      .set({ slotStart: newStart, slotEnd: newEnd, updatedAt: new Date() })
+      .where(eq(bookings.id, a.bookingId))
+
+    await notifyBusinessBookingChange(db, businessId, {
+      kind: 'moved',
+      bookingId: a.bookingId,
+      customerId: a.customerId,
+      serviceTypeId: a.serviceTypeId,
+      fromSlotStart,
+      slotStart: newStart,
+    })
+    notifyOwnerBookingChange(db, businessId, {
+      kind: 'moved',
+      origin: 'google',
+      actorIsManager: false,
+      bookingId: a.bookingId,
+      customerId: a.customerId,
+      serviceTypeId: a.serviceTypeId,
+      fromSlotStart,
+      slotStart: newStart,
+    }).catch(() => { /* non-fatal */ })
+  }
+
+  await logAudit(db, {
+    businessId,
+    actorId: null,
+    action: 'calendar.owner_moved_class',
+    entityType: 'calendar_block',
+    metadata: { serviceTypeId: affected[0]?.serviceTypeId ?? null, fromSlotStart: fromSlotStart.toISOString(), toSlotStart: newStart.toISOString(), affectedCount: affected.length },
   })
 }
 
@@ -760,7 +906,7 @@ export async function reconcileScheduleWindowOnRead(
   // googleEventId) — a not-yet-mirrored block has no Google counterpart to be
   // absent from, so its absence proves nothing.
   const blocks = await db
-    .select({ id: calendarBlocks.id, googleEventId: calendarBlocks.googleEventId })
+    .select({ id: calendarBlocks.id, googleEventId: calendarBlocks.googleEventId, type: calendarBlocks.type, serviceTypeId: calendarBlocks.serviceTypeId, startTs: calendarBlocks.startTs })
     .from(calendarBlocks)
     .where(and(
       eq(calendarBlocks.businessId, businessId),
@@ -795,6 +941,24 @@ export async function reconcileScheduleWindowOnRead(
 
   for (const b of blocks) {
     if (!b.googleEventId || presentGoogleIds.has(b.googleEventId)) continue
+    // T1.4 guard: a materialized class with LIVE bookings must never be silently diff-deleted
+    // on a passive read — that would orphan the customers with no notification. Defer it to the
+    // gated push/tick path (applyOwnerCancellations), which cancels + notifies behind the
+    // blast-radius gate. Skip + audit; a 0-booking class or an opaque block deletes as before.
+    if (b.type === 'class' && b.serviceTypeId) {
+      const seats = await loadClassSeatBookings(businessId, b.serviceTypeId, b.startTs, b.googleEventId, 'read')
+      if (seats.length > 0) {
+        await logAudit(db, {
+          businessId,
+          actorId: null,
+          action: 'calendar.reconcile_booked_class_delete_deferred',
+          entityType: 'calendar_block',
+          entityId: b.id,
+          metadata: { googleEventId: b.googleEventId, via: 'reconcile_on_read', liveBookings: seats.length },
+        })
+        continue
+      }
+    }
     await db.delete(calendarBlocks).where(eq(calendarBlocks.id, b.id))
     await logAudit(db, {
       businessId,
