@@ -15,6 +15,7 @@ import type {
   StopChannelResult,
   IncrementalSyncResult,
   IncrementalSyncOptions,
+  GetEventResult,
   RawCalendarEvent,
 } from './types.js'
 import { sendMessage } from '../whatsapp/sender.js'
@@ -188,13 +189,19 @@ function createInternalCalendarClient(options: CalendarClientOptions) {
   async function incrementalSync(): Promise<IncrementalSyncResult> {
     return { status: 'ok', events: [], nextSyncToken: null }
   }
+  // Internal mode has no Google events to confirm. Return 'error' (absence unconfirmed), never
+  // 'not_found' — the booking-diff treats not_found as a genuine deletion, and internal mode must
+  // never (mis)confirm a cancellation. In practice inbound sync only runs in google mode.
+  async function getEvent(): Promise<GetEventResult> {
+    return { status: 'error', reason: 'internal mode has no Google events' }
+  }
 
   // Internal mode has no Google account — there are no selectable calendars.
   async function listCalendars(): Promise<CalendarListEntry[]> {
     return []
   }
 
-  return { checkAvailability, placeHold, confirmHold, updateEventDetails, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
+  return { checkAvailability, placeHold, confirmHold, updateEventDetails, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, getEvent, listCalendars }
 }
 
 // ── Google Calendar ───────────────────────────────────────────────────────────
@@ -556,6 +563,30 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
     }
   }
 
+  // Authoritatively fetch a single event to CONFIRM a suspected deletion before the booking-diff
+  // cancels it (orchestrator review). Absence from a list page is not proof — a stale page can omit
+  // a live event. Semantics: 404/410 ⇒ genuinely gone (not_found); status==='cancelled' ⇒ tombstone
+  // (ok+cancelled:true); any live event ⇒ ok+cancelled:false (a stale-list omission, keep it). Bounded
+  // by the same C0.2 AbortController deadline as incrementalSync so a hang can never stall the tick.
+  async function getEvent(eventId: string): Promise<GetEventResult> {
+    const timeoutMs = googleCallTimeoutMs()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const response = await withTokenRefresh(() =>
+        calendar.events.get({ calendarId, eventId }, { signal: controller.signal }),
+      )
+      return { status: 'ok', cancelled: response.data.status === 'cancelled' }
+    } catch (err: unknown) {
+      // 404 (deleted) and 410 (GONE) both mean the event is no longer on Google.
+      if (isGoogleApiError(err) && (err.code === 404 || err.code === 410)) return { status: 'not_found' }
+      if (controller.signal.aborted) return { status: 'error', reason: `Google getEvent timed out after ${timeoutMs}ms` }
+      return { status: 'error', reason: extractErrorMessage(err) }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   // List the calendars the connected account can see, so the OAuth callback can
   // pick a VALID googleCalendarId and the owner can later switch to a secondary
   // calendar. Only owner/writer calendars are usable as write targets; the caller
@@ -572,7 +603,7 @@ function createGoogleCalendarClient(options: CalendarClientOptions) {
     })).filter((c) => c.id !== '')
   }
 
-  return { checkAvailability, placeHold, confirmHold, updateEventDetails, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, listCalendars }
+  return { checkAvailability, placeHold, confirmHold, updateEventDetails, deleteEvent, createConfirmedEvent, listEvents, createPersonalEvent, upsertMirrorEvent, watchEvents, stopChannel, incrementalSync, getEvent, listCalendars }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────

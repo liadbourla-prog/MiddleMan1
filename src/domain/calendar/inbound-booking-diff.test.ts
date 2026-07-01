@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
   bookingRows: [] as Array<Array<Record<string, unknown>>>, // FIFO per bookings .limit lookup
   bookingsInWindow: [] as Array<Record<string, unknown>>, // the booking-diff's awaited (no-limit) query
   incrementalSeq: [] as unknown[], // FIFO; the last element repeats
+  getEventResults: {} as Record<string, unknown>, // per-eventId getEvent(confirm-before-cancel) result
   bookingUpdates: 0,
   audits: [] as Array<{ action: string; metadata?: Record<string, unknown> | undefined }>,
   notifyCustomer: 0,
@@ -68,8 +69,13 @@ vi.mock('../../db/client.js', () => {
 })
 
 const incrementalSyncMock = vi.fn(async () => (h.incrementalSeq.length > 1 ? h.incrementalSeq.shift() : h.incrementalSeq[0]))
+// Confirm-before-cancel (orchestrator review): the booking-diff authoritatively re-fetches each
+// diff candidate before cancelling. Default → not_found (genuinely gone), so pre-existing repros
+// where an absent mirror IS a real deletion stay green; a test scripts getEventResults to make an
+// event "still exist" (stale-list omission) or "error" (absence unconfirmed).
+const getEventMock = vi.fn(async (eventId: string) => h.getEventResults[eventId] ?? { status: 'not_found' })
 vi.mock('../../adapters/calendar/client.js', () => ({
-  createCalendarClient: () => ({ incrementalSync: incrementalSyncMock }),
+  createCalendarClient: () => ({ incrementalSync: incrementalSyncMock, getEvent: getEventMock }),
 }))
 vi.mock('../audit/logger.js', () => ({
   logAudit: async (_db: unknown, entry: { action: string; metadata?: Record<string, unknown> | undefined }) => {
@@ -112,7 +118,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   process.env['CALENDAR_INBOUND_SYNC_ENABLED'] = '1'
   h.businessRow = null; h.managerRow = null; h.channelRow = null
-  h.bookingRows = []; h.bookingsInWindow = []; h.incrementalSeq = []
+  h.bookingRows = []; h.bookingsInWindow = []; h.incrementalSeq = []; h.getEventResults = {}
   h.bookingUpdates = 0; h.audits = []; h.notifyCustomer = 0; h.notifyOwner = 0; h.enqueued = []
   lines = []
   spy = vi.spyOn(console, 'log').mockImplementation((arg: unknown) => {
@@ -213,5 +219,59 @@ describe('(d) > blast-radius threshold freed bookings → gate asks the manager,
     expect(h.audits.some((a) => a.action === 'calendar.owner_reconcile_gated')).toBe(true)
     // Guard did NOT trip — this is a genuine gate case, not an empty response.
     expect(h.audits.some((a) => a.action === 'calendar.reconcile_completeness_guard')).toBe(false)
+  })
+})
+
+// ── (e) CONFIRM-BEFORE-CANCEL (orchestrator review) — the stale-single-omission fix ─────────────
+// A booking mirror absent from a NON-EMPTY returned set is only a candidate; before cancelling we
+// authoritatively re-fetch it via getEvent. The linchpin repro: the event STILL EXISTS (Google
+// merely omitted it from a stale list page) → keep the booking, cancel NOTHING, zero notifications.
+describe('(e) confirm-before-cancel — a mirror absent-but-still-existing (stale-list omission) is NOT cancelled', () => {
+  it('one mirror absent from a non-empty set, getEvent says it exists → 0 cancels, 0 notifications', async () => {
+    seed(null) // windowed via full
+    h.incrementalSeq = [{ status: 'ok', nextSyncToken: 'tok', events: [presentOwnerEvent('g-present')] }]
+    h.bookingsInWindow = [mirroredBooking('b1')] // g-b1 absent from the returned set…
+    h.getEventResults = { 'g-b1': { status: 'ok', cancelled: false } } // …but the event still exists → stale omission
+
+    await runInboundSync('biz-1', { full: true }, 'tick')
+
+    expect(getEventMock).toHaveBeenCalledWith('g-b1') // it was confirmed, not trusted-by-absence
+    expect(h.bookingUpdates).toBe(0) // kept
+    expect(h.notifyCustomer).toBe(0)
+    expect(h.notifyOwner).toBe(0)
+    expect(h.enqueued).toHaveLength(0)
+    expect(lines.filter((l) => l['decision'] === 'booking_cancelled')).toHaveLength(0)
+  })
+
+  it('getEvent confirms the event is genuinely gone (not_found) → cancelled + notified', async () => {
+    seed(null) // windowed via full
+    h.incrementalSeq = [{ status: 'ok', nextSyncToken: 'tok', events: [presentOwnerEvent('g-present')] }]
+    h.bookingsInWindow = [mirroredBooking('b1')]
+    h.getEventResults = { 'g-b1': { status: 'not_found' } } // authoritatively gone
+
+    await runInboundSync('biz-1', { full: true }, 'tick')
+
+    expect(getEventMock).toHaveBeenCalledWith('g-b1')
+    expect(h.bookingUpdates).toBe(1) // real deletion still cancels
+    expect(h.notifyCustomer).toBe(1)
+    const cancel = lines.filter((l) => l['decision'] === 'booking_cancelled')
+    expect(cancel).toHaveLength(1)
+    expect(cancel[0]).toMatchObject({ viaTrigger: 'tick', googleEventId: 'g-b1' })
+  })
+
+  it('getEvent errors/times out on the candidate → absence UNCONFIRMED → booking kept (fail-safe)', async () => {
+    seed(null) // windowed via full
+    h.incrementalSeq = [{ status: 'ok', nextSyncToken: 'tok', events: [presentOwnerEvent('g-present')] }]
+    h.bookingsInWindow = [mirroredBooking('b1')]
+    h.getEventResults = { 'g-b1': { status: 'error', reason: 'Google getEvent timed out after 15000ms' } }
+
+    await runInboundSync('biz-1', { full: true }, 'tick')
+
+    expect(getEventMock).toHaveBeenCalledWith('g-b1')
+    expect(h.bookingUpdates).toBe(0) // never false-cancel on unconfirmed absence
+    expect(h.notifyCustomer).toBe(0)
+    expect(lines.filter((l) => l['decision'] === 'booking_cancelled')).toHaveLength(0)
+    // Observable: the unconfirmed absence is audited (the next reconcile retries).
+    expect(h.audits.some((a) => a.action === 'calendar.reconcile_absence_unconfirmed')).toBe(true)
   })
 })

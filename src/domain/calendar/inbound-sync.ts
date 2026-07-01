@@ -10,7 +10,7 @@ import {
   serviceTypes,
   type Business,
 } from '../../db/schema.js'
-import { createCalendarClient } from '../../adapters/calendar/client.js'
+import { createCalendarClient, type CalendarClient } from '../../adapters/calendar/client.js'
 import type { RawCalendarEvent } from '../../adapters/calendar/types.js'
 import { enqueueMessage } from '../../workers/message-retry.js'
 import { notifyBusinessBookingChange, notifyOwnerBookingChange } from '../initiations/booking-notify.js'
@@ -254,7 +254,7 @@ export async function runInboundSync(businessId: string, opts: { full?: boolean 
   // the SAME gated applyOwnerCancellations (blast-radius + notify) as a tombstone. Guarded by
   // C0.1 so a partial/empty-but-200 response can NEVER mass-cancel real bookings.
   if (windowed) {
-    const diffDeleted = await detectDeletedBookingsByDiff(ctx, result.events, now, windowMax, ownerCancellations, viaTrigger)
+    const diffDeleted = await detectDeletedBookingsByDiff(ctx, calendar, result.events, now, windowMax, ownerCancellations, viaTrigger)
     ownerCancellations.push(...diffDeleted)
   }
 
@@ -593,15 +593,22 @@ async function deleteImportedBlock(businessId: string, blockId: string, googleEv
  * deleted. Returns those as AffectedBooking records for the SAME gated applyOwnerCancellations
  * path (blast-radius + notify) — never a raw delete.
  *
- * ⚠️ C0.1 COMPLETENESS GUARD (the single most dangerous thing in the plan). Absence is a
- * valid "deleted" signal ONLY when the fetch completed fully (status==='ok' ⇒ all pages
- * drained + HTTP ok, established by the caller) AND the returned set is not implausibly empty
- * relative to what we hold internally. A successful-but-eventually-consistent/empty Google
- * page (0 live events) while we hold ≥1 mirrored booking in-window is NOT "everything was
- * cancelled" — treating it so would fire false cancellation WhatsApps at real paying
- * customers. In that case we ABORT the diff, log, and cancel NOTHING (zero notifications).
- * A non-zero-but-implausibly-short response that omits many bookings is caught downstream by
- * the blast-radius gate (asks the manager, auto-cancels nothing) — never by silent mass-cancel.
+ * ⚠️ C0.1 COMPLETENESS GUARD (defense in depth). Absence is a valid "deleted" signal ONLY when
+ * the fetch completed fully (status==='ok' ⇒ all pages drained + HTTP ok, established by the
+ * caller) AND the returned set is not implausibly empty relative to what we hold internally. A
+ * successful-but-eventually-consistent/empty Google page (0 live events) while we hold ≥1 mirrored
+ * booking in-window is NOT "everything was cancelled" — treating it so would fire false cancellation
+ * WhatsApps at real paying customers. In that case we ABORT the diff, log, and cancel NOTHING.
+ *
+ * ⚠️ CONFIRM-BEFORE-CANCEL (orchestrator review — the PRIMARY correctness gate). The C0.1 guard and
+ * the blast-radius gate remain as-is, but absence from a (possibly stale) returned set is no longer
+ * sufficient to cancel even a SINGLE booking. For each remaining diff candidate we authoritatively
+ * re-fetch the event via calendar.getEvent(calendarEventId):
+ *   · not_found OR ok+cancelled:true → genuinely gone → include in the deleted set (gated cancel).
+ *   · ok+cancelled:false (event still exists) → it was a stale-LIST omission → keep the booking.
+ *   · error/timeout → absence UNCONFIRMED → do NOT cancel (fail safe; the next reconcile retries).
+ * This closes the false-cancel-on-stale-omission risk. It runs only for the rare windowed-path diff
+ * candidates, so the extra getEvent calls are bounded.
  *
  * Occupancy stays 100% internal: this reads the bookings table, never a Google head-count.
  * Bookings already flagged this pass (by a tombstone via reconcileManagedEvent) are skipped
@@ -610,6 +617,7 @@ async function deleteImportedBlock(businessId: string, blockId: string, googleEv
  */
 async function detectDeletedBookingsByDiff(
   ctx: SyncContext,
+  calendar: CalendarClient,
   events: RawCalendarEvent[],
   windowMin: Date,
   windowMax: Date,
@@ -657,7 +665,37 @@ async function detectDeletedBookingsByDiff(
   const deleted: AffectedBooking[] = []
   for (const b of mirrored) {
     if (flaggedIds.has(b.id)) continue // already caught by a tombstone this pass
-    if (returnedIds.has(b.calendarEventId!)) continue // still present in Google
+    if (returnedIds.has(b.calendarEventId!)) continue // still present in Google's returned set
+
+    // ── Confirm-before-cancel (PRIMARY correctness gate) ─────────────────────────
+    // Absence from a possibly-stale list page is only a candidate. Re-fetch the event directly to
+    // decide authoritatively; never cancel on unconfirmed absence.
+    const confirmation = await calendar.getEvent(b.calendarEventId!)
+    if (confirmation.status === 'ok' && !confirmation.cancelled) {
+      // The event still exists — Google merely omitted it from a stale list page. Keep the booking.
+      await logAudit(db, {
+        businessId,
+        actorId: null,
+        action: 'calendar.reconcile_stale_omission_kept',
+        entityType: 'booking',
+        entityId: b.id,
+        metadata: { via: 'booking_diff', googleEventId: b.calendarEventId },
+      })
+      continue
+    }
+    if (confirmation.status === 'error') {
+      // Absence unconfirmed (fetch failed / timed out) → fail safe: cancel nothing, retry next pass.
+      await logAudit(db, {
+        businessId,
+        actorId: null,
+        action: 'calendar.reconcile_absence_unconfirmed',
+        entityType: 'booking',
+        entityId: b.id,
+        metadata: { via: 'booking_diff', googleEventId: b.calendarEventId, reason: confirmation.reason },
+      })
+      continue
+    }
+    // not_found OR ok+cancelled:true → genuinely gone → owner-deleted.
     deleted.push({ bookingId: b.id, customerId: b.customerId, serviceTypeId: b.serviceTypeId, slotStart: b.slotStart, googleEventId: b.calendarEventId!, viaTrigger })
   }
   return deleted
