@@ -22,6 +22,7 @@ import { startDailyBriefingWorker } from './workers/daily-briefing.js'
 import { startCalendarMirrorWorker } from './workers/calendar-mirror.js'
 import { startReshuffleCampaignWorker } from './workers/reshuffle-campaign.js'
 import { startCalendarSyncRenewalWorker, scheduleCalendarSyncRenewalJob } from './workers/calendar-sync-renewal.js'
+import { startCalendarReconcileTickWorker, scheduleCalendarReconcileTickJob } from './workers/calendar-reconcile-tick.js'
 import { startSeriesMaterializerWorker } from './workers/series-materializer.js'
 import { startIntegritySentinelWorker, scheduleIntegritySentinelJob } from './workers/integrity-sentinel.js'
 import { startOutreachReplyNotifyWorker } from './workers/outreach-reply-notify.js'
@@ -111,6 +112,7 @@ startCustomerSummaryWorker()
 startDailyBriefingWorker()
 startCalendarMirrorWorker()
 startCalendarSyncRenewalWorker()
+startCalendarReconcileTickWorker()
 startSeriesMaterializerWorker()
 startReshuffleCampaignWorker()
 startIntegritySentinelWorker()
@@ -126,6 +128,7 @@ startPeriodicTreatmentWorker()
 startBirthdayWorker()
 await scheduleHoldExpiryJob()
 await scheduleCalendarSyncRenewalJob()
+await scheduleCalendarReconcileTickJob()
 await scheduleIntegritySentinelJob()
 await scheduleWinbackJob()
 await schedulePostAppointmentJob()

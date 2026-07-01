@@ -36,6 +36,7 @@ import { getOpenSlots, isSlotBookable } from '../availability/service.js'
 import { listDayOptions, type ClassSession, type DayOptions } from '../availability/day-options.js'
 import { findClassBlockProviderForSlot } from '../availability/blocks.js'
 import { findPendingImportedClassForSlot, relayPendingClassToOwner } from '../calendar/imported-class.js'
+import { foldInOwnerAdditionsForDay } from '../calendar/read-reconcile.js'
 import { resolveGoogleMapsUrl } from '../location/maps.js'
 import { resolveRequestedDate, resolveSlotStart, addDaysToDateStr, isDstGap, type RequestedDateParts } from '../availability/resolve-slot.js'
 import { localParts } from '../availability/compute.js'
@@ -1754,6 +1755,24 @@ export async function handleBookingFlow(
     if (intent.restorePrevious === true) {
       const restored = await handleRestoreCancelled(db, calendar, identity, session, updatedCtx, businessTimezone, businessName, transcript, genReply, activeServices, business)
       if (restored) return restored
+    }
+    // T2.1 — additions-only read-reconcile. In connected-Google mode, fold the owner's
+    // just-ADDED Google events for the inquiry's focus day into the internal record BEFORE
+    // we compute availability, so a class the owner added directly in Google (push not yet
+    // delivered) is classified and surfaced. Additions-only (NEVER diff-deletes on the
+    // customer path — R2), throttled per business+focus-day, timeout-bounded; best-effort,
+    // so any hiccup serves the internal record and never blocks or breaks the reply.
+    if (
+      business?.calendarMode === 'google' &&
+      (intent.intent === 'inquiry' || intent.intent === 'booking' || intent.intent === 'rescheduling')
+    ) {
+      const googleBusiness = business
+      const nowForReconcile = new Date()
+      const focus = resolveFocusDayFromText(messageText, businessTimezone, nowForReconcile)
+      const dateStr = focus?.dateStr ?? localParts(nowForReconcile, businessTimezone).dateStr
+      const from = resolveSlotStart(dateStr, { hour: 0, minute: 0 }, businessTimezone)
+      const to = new Date(from.getTime() + 24 * 60 * 60 * 1000)
+      await foldInOwnerAdditionsForDay(googleBusiness.id, { from, to }).catch(() => { /* best-effort; serve internal record */ })
     }
     switch (intent.intent) {
       case 'booking':

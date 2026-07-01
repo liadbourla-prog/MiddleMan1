@@ -100,6 +100,17 @@ export type IncrementalSyncResult =
   | { status: 'expired' } // 410 GONE — syncToken invalid; caller must full-reconcile
   | { status: 'error'; reason: string }
 
+// Result of an authoritative single-event fetch (getEvent). Used by the booking-diff to
+// CONFIRM a suspected deletion before cancelling: absence from a (possibly stale) list page is
+// not proof. `cancelled` reflects Google's own tombstone flag (status==='cancelled').
+//   ok+cancelled:false → the event still exists (a stale-list omission — keep the booking).
+//   ok+cancelled:true / not_found → genuinely gone (cancel via the gated owner-wins path).
+//   error → absence unconfirmed (fail safe: never cancel; the next reconcile retries).
+export type GetEventResult =
+  | { status: 'ok'; cancelled: boolean }
+  | { status: 'not_found' } // 404/410 — the event is gone from Google
+  | { status: 'error'; reason: string }
+
 export interface IncrementalSyncOptions {
   syncToken?: string | null
   timeMin?: Date
